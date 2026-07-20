@@ -18,6 +18,8 @@ import { resolveOpenCodeHomeDir } from "./paths.js";
 
 const OPENCODE_SERVER_GRACEFUL_SHUTDOWN_TIMEOUT_MS = 5_000;
 const OPENCODE_SERVER_FORCE_SHUTDOWN_TIMEOUT_MS = 1_000;
+// Startup can exceed 30s when the machine is saturated by concurrent agents.
+const OPENCODE_SERVER_STARTUP_TIMEOUT_MS = 90_000;
 
 export interface OpenCodeServerAcquisition {
   server: { port: number; url: string };
@@ -353,7 +355,7 @@ export class OpenCodeServerManager implements OpenCodeServerManagerLike {
         if (!started) {
           failStartup(new Error(buildStartupErrorMessage("OpenCode server startup timeout")));
         }
-      }, 30_000);
+      }, OPENCODE_SERVER_STARTUP_TIMEOUT_MS);
 
       serverProcess.stdout?.on("data", (data: Buffer) => {
         const output = data.toString();

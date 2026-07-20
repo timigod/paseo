@@ -335,6 +335,10 @@ type OpenCodeMcpConfig =
 
 const MCP_ALREADY_PRESENT_ERROR_TOKENS = ["already", "exists", "connected"] as const;
 const OPENCODE_PROVIDER_LIST_TIMEOUT_MS = 30_000;
+// Metadata calls (session.create, app.agents) share one timeout. 10s proved too
+// tight on a loaded machine running many agents: creation failed repeatedly with
+// "app.agents timed out" while a bare server answered fine once load dropped.
+const OPENCODE_METADATA_TIMEOUT_MS = 60_000;
 const OPENCODE_METADATA_CONCURRENCY = 4;
 const openCodeMetadataLimit = pLimit(OPENCODE_METADATA_CONCURRENCY);
 const OPENCODE_HANDLED_BUILTIN_SLASH_COMMANDS: AgentSlashCommand[] = [
@@ -1378,8 +1382,8 @@ export class OpenCodeAgentClient implements AgentClient {
     try {
       const response = await withTimeout(
         client.session.create({ directory: openCodeConfig.cwd }),
-        10_000,
-        "OpenCode session.create timed out after 10s",
+        OPENCODE_METADATA_TIMEOUT_MS,
+        `OpenCode session.create timed out after ${OPENCODE_METADATA_TIMEOUT_MS / 1000}s`,
       );
 
       if (response.error) {
@@ -1690,8 +1694,8 @@ export class OpenCodeAgentClient implements AgentClient {
     const response = await openCodeMetadataLimit(() =>
       withTimeout(
         client.app.agents({ directory }),
-        10_000,
-        "OpenCode app.agents timed out after 10s",
+        OPENCODE_METADATA_TIMEOUT_MS,
+        `OpenCode app.agents timed out after ${OPENCODE_METADATA_TIMEOUT_MS / 1000}s`,
       ),
     );
 
