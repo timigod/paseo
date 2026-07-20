@@ -102,6 +102,7 @@ export class TestOpenCodeClient {
   eventStream: AsyncIterable<unknown>;
   experimentalSessionListResponse: OpenCodeResponse = { data: [] };
   mcpAddResponse: OpenCodeResponse = {};
+  mcpAddResponses: OpenCodeResponse[] = [];
   mcpConnectResponse: OpenCodeResponse = {};
   permissionReplyResponse: OpenCodeResponse = {};
   providerListResponse: OpenCodeResponse = { data: { connected: [], all: [] } };
@@ -175,7 +176,7 @@ export class TestOpenCodeClient {
       mcp: {
         add: async (parameters: unknown) => {
           this.calls.mcpAdd.push(parameters);
-          return this.mcpAddResponse;
+          return this.mcpAddResponses.shift() ?? this.mcpAddResponse;
         },
         connect: async (parameters: unknown) => {
           this.calls.mcpConnect.push(parameters);

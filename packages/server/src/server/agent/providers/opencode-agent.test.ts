@@ -1096,6 +1096,7 @@ describe("OpenCode adapter startTurn error handling", () => {
   });
 
   test("fails the turn when OpenCode reports MCP add failure in data payload", async () => {
+    vi.useFakeTimers();
     const runtime = new TestOpenCodeHarness();
     const openCodeClient = new TestOpenCodeClient();
     openCodeClient.mcpAddResponse = {
@@ -1125,12 +1126,65 @@ describe("OpenCode adapter startTurn error handling", () => {
         },
       });
 
-      await expect(collectTurnEvents(streamSession(session, "hello"))).rejects.toThrow(
+      const turnPromise = collectTurnEvents(streamSession(session, "hello"));
+      turnPromise.catch(() => null);
+      // Exhaust every MCP add retry window before asserting the rejection.
+      await vi.advanceTimersByTimeAsync(17_000);
+      await expect(turnPromise).rejects.toThrow(
         /Failed to add OpenCode MCP server 'paseo': SSE error/,
       );
+      expect(openCodeClient.calls.mcpAdd).toHaveLength(4);
 
       await session.close();
     } finally {
+      vi.useRealTimers();
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test("retries transient MCP add failures and proceeds once registration succeeds", async () => {
+    vi.useFakeTimers();
+    const runtime = new TestOpenCodeHarness();
+    const openCodeClient = new TestOpenCodeClient();
+    openCodeClient.mcpAddResponses = [
+      {
+        data: {
+          paseo: {
+            status: "failed",
+            error: "SSE error: Non-200 status code (405)",
+          },
+        },
+      },
+    ];
+    runtime.enqueueClient(openCodeClient);
+    const cwd = tmpCwd();
+    const client = new OpenCodeAgentClient(createTestLogger(), undefined, {
+      serverManager: runtime,
+      createClient: runtime.createClient,
+    });
+
+    try {
+      const session = await client.createSession({
+        provider: "opencode",
+        cwd,
+        mcpServers: {
+          paseo: {
+            type: "http",
+            url: "http://127.0.0.1:6767/mcp/agents?callerAgentId=test-agent",
+          },
+        },
+      });
+
+      const turnPromise = collectTurnEvents(streamSession(session, "hello"));
+      await vi.advanceTimersByTimeAsync(2_000);
+      const turn = await turnPromise;
+      expect(turn.turnFailed).toBe(false);
+      expect(turn.turnCompleted).toBe(true);
+      expect(openCodeClient.calls.mcpAdd).toHaveLength(2);
+
+      await session.close();
+    } finally {
+      vi.useRealTimers();
       rmSync(cwd, { recursive: true, force: true });
     }
   });

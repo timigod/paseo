@@ -107,6 +107,7 @@ const OPENCODE_PERSISTED_SESSION_LIMIT = 200;
 const OPENCODE_PENDING_ABORT_START_TIMEOUT_MS = 10_000;
 const OPENCODE_EVENT_STREAM_RECONNECT_DELAY_MS = 100;
 const OPENCODE_EVENT_STREAM_RECONNECT_MAX_DELAY_MS = 5000;
+const OPENCODE_MCP_OPERATION_RETRY_DELAYS_MS = [2_000, 5_000, 10_000];
 
 function foregroundStructuredTextKey(messageId: string): string {
   return `structured:${messageId}`;
@@ -4698,18 +4699,43 @@ class OpenCodeAgentSession implements AgentSession {
     name: string,
     run: () => Promise<{ data?: unknown; error?: unknown }>,
   ): Promise<void> {
-    const response = await run();
-    const error = response.error ?? readOpenCodeMcpOperationError(response.data, name);
-    if (!error) {
-      return;
-    }
-
-    if (isAlreadyPresentMcpError(error)) {
-      return;
+    // MCP registration races the daemon's own warm-up: right after a daemon
+    // restart every resumed agent re-adds this server at once, OpenCode's
+    // streamable-HTTP connect can time out against the busy endpoint, and its
+    // SSE fallback surfaces as a bogus "Non-200 status code (405)". Those
+    // failures are transient, so ride them out instead of failing the turn.
+    let lastError: unknown = null;
+    for (let attempt = 0; attempt <= OPENCODE_MCP_OPERATION_RETRY_DELAYS_MS.length; attempt++) {
+      if (attempt > 0) {
+        const delayMs = OPENCODE_MCP_OPERATION_RETRY_DELAYS_MS[attempt - 1];
+        this.logger.warn(
+          { operation, name, attempt, delayMs, error: toDiagnosticErrorMessage(lastError) },
+          "OpenCode MCP operation failed; retrying",
+        );
+        await new Promise<void>((resolve) => setTimeout(resolve, delayMs));
+      }
+      if (this.closed) {
+        return;
+      }
+      let response: { data?: unknown; error?: unknown };
+      try {
+        response = await run();
+      } catch (error) {
+        lastError = error;
+        continue;
+      }
+      const error = response.error ?? readOpenCodeMcpOperationError(response.data, name);
+      if (!error) {
+        return;
+      }
+      if (isAlreadyPresentMcpError(error)) {
+        return;
+      }
+      lastError = error;
     }
 
     throw new Error(
-      `Failed to ${operation} OpenCode MCP server '${name}': ${toDiagnosticErrorMessage(error)}`,
+      `Failed to ${operation} OpenCode MCP server '${name}': ${toDiagnosticErrorMessage(lastError)}`,
     );
   }
 
