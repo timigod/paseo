@@ -236,6 +236,10 @@ import { CreateAgentLifecycleDispatch } from "./agent/create-agent-lifecycle-dis
 // the entire session message if they encounter an unknown provider.
 const LEGACY_PROVIDER_IDS = new Set(["claude", "codex", "opencode"]);
 const MIN_VERSION_ALL_PROVIDERS = "0.1.45";
+// Must stay under the 60s session RPC timeout shipped in 0.1.110 clients so
+// they always see a definitive create_agent outcome instead of timing out on a
+// creation that later succeeds unseen (which shows up as a duplicate thread).
+const CREATE_AGENT_RESPONSE_BUDGET_MS = 55_000;
 function errorToFriendlyMessage(error: unknown): string {
   if (error instanceof Error) return error.message;
   if (typeof error === "string") return error;
@@ -449,6 +453,9 @@ export interface SessionOptions {
   terminalManager: TerminalManager | null;
   providerSnapshotManager: ProviderSnapshotManager;
   providerUsageService: ProviderUsageService;
+  // Test seam: overrides the create_agent response budget (defaults to
+  // CREATE_AGENT_RESPONSE_BUDGET_MS).
+  createAgentResponseBudgetMs?: number;
   serviceProxy?: ServiceProxySubsystem;
   scriptRuntimeStore?: WorkspaceScriptRuntimeStore;
   workspaceSetupSnapshots?: Map<string, WorkspaceSetupSnapshot>;
@@ -579,6 +586,7 @@ export class Session {
   } | null = null;
   private readonly terminalManager: TerminalManager | null;
   private readonly providerSnapshotManager: ProviderSnapshotManager;
+  private readonly createAgentResponseBudgetMs: number;
   private readonly serviceProxy: ServiceProxySubsystem | null;
   private readonly scriptRuntimeStore: WorkspaceScriptRuntimeStore | null;
   private readonly getDaemonTcpPort: (() => number | null) | null;
@@ -857,6 +865,8 @@ export class Session {
       logger: this.sessionLogger,
     });
     this.providerSnapshotManager = providerSnapshotManager;
+    this.createAgentResponseBudgetMs =
+      options.createAgentResponseBudgetMs ?? CREATE_AGENT_RESPONSE_BUDGET_MS;
     this.serviceProxy = serviceProxy ?? null;
     this.scriptRuntimeStore = scriptRuntimeStore ?? null;
     this.workspaceSetupSnapshots = workspaceSetupSnapshots ?? new Map();
@@ -1931,6 +1941,39 @@ export class Session {
     return { agentId, archivedAt };
   }
 
+  private async awaitCreateAgentWithinResponseBudget<
+    T extends { snapshot: { id: string; provider: string } },
+  >(createPromise: Promise<T>): Promise<T> {
+    let budgetTimer: NodeJS.Timeout | undefined;
+    const budgetExceeded = Symbol("create-agent-budget-exceeded");
+    const raced = await Promise.race([
+      createPromise,
+      new Promise<typeof budgetExceeded>((resolveBudget) => {
+        budgetTimer = setTimeout(
+          () => resolveBudget(budgetExceeded),
+          this.createAgentResponseBudgetMs,
+        );
+        budgetTimer.unref?.();
+      }),
+    ]).finally(() => clearTimeout(budgetTimer));
+    if (raced !== budgetExceeded) {
+      return raced;
+    }
+    void createPromise
+      .then(({ snapshot }) => {
+        this.sessionLogger.warn(
+          { agentId: snapshot.id, provider: snapshot.provider },
+          "Agent creation completed after the response budget; archiving the orphan agent",
+        );
+        return this.archiveAgentForClose(snapshot.id);
+      })
+      .catch(() => undefined);
+    throw new Error(
+      `Agent creation timed out after ${Math.round(this.createAgentResponseBudgetMs / 1000)}s while the provider runtime was starting. ` +
+        "No agent was left behind from this attempt. The runtime keeps warming up in the background - retrying in a moment should succeed quickly.",
+    );
+  }
+
   private async handleDetachAgentRequest(agentId: string, requestId: string): Promise<void> {
     this.sessionLogger.info({ agentId, requestId }, "Detaching agent from parent");
 
@@ -2513,7 +2556,7 @@ export class Session {
       );
       const createdDirectoryWorkspaceForAgent = !createdWorktree && !msg.workspaceId;
 
-      const { snapshot, liveSnapshot } = await createAgentCommand(
+      const createPromise = createAgentCommand(
         {
           agentManager: this.agentManager,
           agentStorage: this.agentStorage,
@@ -2541,6 +2584,17 @@ export class Session {
             this.buildAgentSessionConfig(sessionConfig, gitOptions, legacyWorktreeName, ctx),
         },
       );
+      // Shipped 0.1.110 clients give up on this RPC after 60s. A creation that
+      // succeeds after the client stopped listening becomes an orphan thread the
+      // user never saw succeed, so they retry and end up with duplicates.
+      // Answer inside the client's window: fail cleanly at the budget, and if
+      // the creation still completes later, archive the orphan. The provider
+      // runtime warmed up by the slow attempt survives, so a retry is fast.
+      // Worktree creates are exempt: their catch-path cleanup would remove the
+      // worktree while the in-flight creation is still using it.
+      const { snapshot, liveSnapshot } = createdWorktree
+        ? await createPromise
+        : await this.awaitCreateAgentWithinResponseBudget(createPromise);
       createdAgentId = snapshot.id;
       await this.agentUpdates.forwardLiveAgent(snapshot);
       if (createdDirectoryWorkspaceForAgent && trimmedPrompt) {

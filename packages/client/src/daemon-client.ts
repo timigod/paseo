@@ -865,6 +865,11 @@ function toTimeoutError(error: unknown, label: string, timeoutMs: number): Error
 const DEFAULT_RECONNECT_BASE_DELAY_MS = 1500;
 const DEFAULT_RECONNECT_MAX_DELAY_MS = 30000;
 const DEFAULT_SESSION_RPC_TIMEOUT_MS = 60_000;
+// Agent creation can legitimately outlast the generic RPC timeout: the daemon
+// allows OpenCode server startup up to 90s on a loaded machine. A client that
+// gives up sooner reports failure while the daemon still finishes creating the
+// agent, leaving a duplicate the user never sees succeed.
+const CREATE_AGENT_RPC_TIMEOUT_MS = 180_000;
 const DEFAULT_CONNECT_TIMEOUT_MS = 15_000;
 const DEFAULT_LIVENESS_TIMEOUT_MS = 5000;
 const LIVENESS_HEARTBEAT_INTERVAL_MS = 10_000;
@@ -2197,6 +2202,7 @@ export class DaemonClient {
     const status = await this.sendRequest({
       requestId,
       message,
+      timeout: CREATE_AGENT_RPC_TIMEOUT_MS,
       options: { skipQueue: true },
       select: (msg) => {
         if (msg.type !== "status") {

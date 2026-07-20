@@ -7673,3 +7673,132 @@ test("workspace.create.response persists the first prompt as the initial title",
   const persisted = await session.workspaceRegistry.get(workspaceId as string);
   expect(persisted?.title).toBe("Add retries to the payments flow");
 });
+
+test("create_agent_request fails within the response budget and archives a late-completing agent", async () => {
+  const workdir = mkdtempSync(path.join(tmpdir(), "paseo-create-agent-budget-"));
+  try {
+    const cwd = path.join(workdir, "repo");
+    mkdirSync(cwd, { recursive: true });
+
+    const logger = {
+      child: () => logger,
+      trace: vi.fn(),
+      debug: vi.fn(),
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn(),
+    };
+    const agentStorage = new AgentStorage(path.join(workdir, "agents"), asSessionLogger(logger));
+
+    let releaseCreateSession: () => void = () => {};
+    const createSessionGate = new Promise<void>((resolve) => {
+      releaseCreateSession = resolve;
+    });
+    class SlowCreateAgentTestClient extends CreateAgentTestClient {
+      async createSession(
+        config: AgentSessionConfig,
+        launchContext?: AgentLaunchContext,
+        options?: AgentCreateSessionOptions,
+      ): Promise<AgentSession> {
+        await createSessionGate;
+        return super.createSession(config, launchContext, options);
+      }
+    }
+    const agentManager = new AgentManager({
+      clients: { codex: new SlowCreateAgentTestClient() },
+      registry: agentStorage,
+      logger: asSessionLogger(logger),
+      idFactory: () => "00000000-0000-4000-8000-000000000552",
+    });
+    const projectRegistry = new FileBackedProjectRegistry(
+      path.join(workdir, "projects.json"),
+      asSessionLogger(logger),
+    );
+    const workspaceRegistry = new FileBackedWorkspaceRegistry(
+      path.join(workdir, "workspaces.json"),
+      asSessionLogger(logger),
+    );
+    const workspaceGitService = createNoopWorkspaceGitService({
+      getCheckout: async (checkoutCwd: string) => ({
+        cwd: checkoutCwd,
+        isGit: false,
+        currentBranch: null,
+        remoteUrl: null,
+        worktreeRoot: null,
+        isPaseoOwnedWorktree: false,
+        mainRepoRoot: null,
+      }),
+    });
+
+    const emitted: SessionOutboundMessage[] = [];
+    const session = asTestSession(
+      new Session({
+        clientId: "test-client",
+        appVersion: null,
+        onMessage: (message) => emitted.push(message),
+        logger: asSessionLogger(logger),
+        downloadTokenStore: asDownloadTokenStore(),
+        pushTokenStore: asPushTokenStore(),
+        paseoHome: path.join(workdir, "paseo-home"),
+        agentManager,
+        agentStorage,
+        projectRegistry,
+        workspaceRegistry,
+        chatService: asChatService(),
+        scheduleService: asScheduleService(),
+        loopService: asLoopService(),
+        checkoutDiffManager: asCheckoutDiffManager({
+          subscribe: async () => ({
+            initial: { cwd, files: [], error: null },
+            unsubscribe: () => {},
+          }),
+          scheduleRefreshForCwd: () => {},
+          onWorkspaceStateMayHaveChanged: () => {},
+          getMetrics: () => ({
+            checkoutDiffTargetCount: 0,
+            checkoutDiffSubscriptionCount: 0,
+            checkoutDiffWatcherCount: 0,
+            checkoutDiffFallbackRefreshTargetCount: 0,
+          }),
+          dispose: () => {},
+        }),
+        workspaceGitService,
+        daemonConfigStore: asDaemonConfigStore({
+          get: () => ({ mcp: { injectIntoAgents: false }, providers: {} }),
+          onChange: () => () => {},
+        }),
+        mcpBaseUrl: null,
+        stt: null,
+        tts: null,
+        providerSnapshotManager: createProviderSnapshotManagerStub().manager,
+        terminalManager: null,
+        createAgentResponseBudgetMs: 50,
+      }),
+    );
+
+    await session.handleMessage({
+      type: "create_agent_request",
+      requestId: "req-budget",
+      config: { provider: "codex", cwd },
+      attachments: [],
+    });
+
+    const failedStatus = filterByType(emitted, "status")
+      .map((message) => message.payload)
+      .find((payload) => payload.status === "agent_create_failed");
+    expect(failedStatus).toMatchObject({ requestId: "req-budget" });
+    expect(String((failedStatus as { error?: unknown })?.error)).toMatch(/timed out/i);
+
+    // The creation now completes after the client already saw a failure; the
+    // orphan agent must be rolled back to archived instead of surviving as a
+    // duplicate thread.
+    releaseCreateSession();
+    await vi.waitFor(async () => {
+      const records = await agentStorage.list();
+      expect(records).toHaveLength(1);
+      expect(records[0]?.archivedAt).toBeTruthy();
+    });
+  } finally {
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
