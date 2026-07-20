@@ -108,6 +108,15 @@ const OPENCODE_PENDING_ABORT_START_TIMEOUT_MS = 10_000;
 const OPENCODE_EVENT_STREAM_RECONNECT_DELAY_MS = 100;
 const OPENCODE_EVENT_STREAM_RECONNECT_MAX_DELAY_MS = 5000;
 const OPENCODE_MCP_OPERATION_RETRY_DELAYS_MS = [2_000, 5_000, 10_000];
+const OPENCODE_PROMPT_DISPATCH_RETRY_DELAYS_MS = [2_000, 5_000, 10_000];
+
+// OpenCode persists every session to one shared SQLite database; when many
+// opencode serve processes write at once its lock timeout trips and requests
+// die with "Failed to execute statement" (upstream anomalyco/opencode#33159).
+function isOpenCodeTransientStatementFailure(error: unknown): boolean {
+  const text = toDiagnosticErrorMessage(error);
+  return text.includes("Failed to execute statement") || text.includes("database is locked");
+}
 
 function foregroundStructuredTextKey(messageId: string): string {
   return `structured:${messageId}`;
@@ -3286,53 +3295,97 @@ class OpenCodeAgentSession implements AgentSession {
           effectiveVariant,
           partTypes: parts.map((p) => p.type),
         });
-        try {
-          const systemPrompt = composeSystemPromptParts(
-            this.config.systemPrompt,
-            this.config.daemonAppendSystemPrompt,
-          );
-          this.foregroundNativeRequestDispatched = true;
-          const promptResponse = await this.client.session.promptAsync({
-            sessionID: this.sessionId,
-            directory: this.config.cwd,
-            parts,
-            ...(options?.outputSchema
-              ? {
-                  format: {
-                    type: "json_schema" as const,
-                    schema: options.outputSchema as Record<string, unknown>,
-                  },
-                }
-              : {}),
-            ...(systemPrompt ? { system: systemPrompt } : {}),
-            ...(model ? { model } : {}),
-            ...(effectiveMode ? { agent: effectiveMode } : {}),
-            ...(effectiveVariant ? { variant: effectiveVariant } : {}),
-          });
+        const systemPrompt = composeSystemPromptParts(
+          this.config.systemPrompt,
+          this.config.daemonAppendSystemPrompt,
+        );
+        this.foregroundNativeRequestDispatched = true;
+        const request = {
+          sessionID: this.sessionId,
+          directory: this.config.cwd,
+          parts,
+          ...(options?.outputSchema
+            ? {
+                format: {
+                  type: "json_schema" as const,
+                  schema: options.outputSchema as Record<string, unknown>,
+                },
+              }
+            : {}),
+          ...(systemPrompt ? { system: systemPrompt } : {}),
+          ...(model ? { model } : {}),
+          ...(effectiveMode ? { agent: effectiveMode } : {}),
+          ...(effectiveVariant ? { variant: effectiveVariant } : {}),
+        };
+        await this.dispatchForegroundPromptWithRetry(request, parts, turnId);
+      })();
+    }
+
+    return { turnId };
+  }
+
+  // OpenCode's shared SQLite store rejects writes with "Failed to execute
+  // statement" when concurrent servers contend for the lock. A failed dispatch
+  // may or may not have persisted the user message before dying, so before each
+  // retry check the session: if the prompt landed, let the event stream carry
+  // the turn instead of dispatching a duplicate.
+  private async dispatchForegroundPromptWithRetry(
+    request: Parameters<OpencodeClient["session"]["promptAsync"]>[0],
+    parts: ReturnType<typeof buildOpenCodePromptParts>,
+    turnId: string,
+  ): Promise<void> {
+    let lastError: unknown = null;
+    for (let attempt = 0; attempt <= OPENCODE_PROMPT_DISPATCH_RETRY_DELAYS_MS.length; attempt++) {
+      if (attempt > 0) {
+        const delayMs = OPENCODE_PROMPT_DISPATCH_RETRY_DELAYS_MS[attempt - 1];
+        this.logger.warn(
+          { turnId, attempt, delayMs, error: toDiagnosticErrorMessage(lastError) },
+          "OpenCode prompt dispatch hit a transient storage failure; retrying",
+        );
+        await new Promise<void>((resolve) => setTimeout(resolve, delayMs));
+        if (this.closed || this.activeForegroundTurnId !== turnId) {
+          return;
+        }
+        if (await this.foregroundPromptAlreadyPersisted(parts)) {
           this.traceOpenCode("provider.opencode.prompt_async.response", {
             turnId,
-            hasError: promptResponse.error !== undefined,
-            error: promptResponse.error,
-            data: promptResponse.data,
+            recoveredPersistedPrompt: true,
           });
-          if (promptResponse.error) {
-            this.finishForegroundTurn(
-              {
-                type: "turn_failed",
-                provider: "opencode",
-                error: toDiagnosticErrorMessage(promptResponse.error),
-              },
-              turnId,
-            );
-          }
-        } catch (error) {
-          this.traceOpenCode("provider.opencode.prompt_async.throw", {
+          return;
+        }
+      }
+      try {
+        const promptResponse = await this.client.session.promptAsync(request);
+        this.traceOpenCode("provider.opencode.prompt_async.response", {
+          turnId,
+          hasError: promptResponse.error !== undefined,
+          error: promptResponse.error,
+          data: promptResponse.data,
+        });
+        if (!promptResponse.error) {
+          return;
+        }
+        if (!isOpenCodeTransientStatementFailure(promptResponse.error)) {
+          this.finishForegroundTurn(
+            {
+              type: "turn_failed",
+              provider: "opencode",
+              error: toDiagnosticErrorMessage(promptResponse.error),
+            },
             turnId,
-            error:
-              error instanceof Error
-                ? { name: error.name, message: error.message, stack: error.stack }
-                : String(error),
-          });
+          );
+          return;
+        }
+        lastError = promptResponse.error;
+      } catch (error) {
+        this.traceOpenCode("provider.opencode.prompt_async.throw", {
+          turnId,
+          error:
+            error instanceof Error
+              ? { name: error.name, message: error.message, stack: error.stack }
+              : String(error),
+        });
+        if (!isOpenCodeTransientStatementFailure(error)) {
           this.finishForegroundTurn(
             {
               type: "turn_failed",
@@ -3341,11 +3394,61 @@ class OpenCodeAgentSession implements AgentSession {
             },
             turnId,
           );
+          return;
         }
-      })();
+        lastError = error;
+      }
     }
+    if (this.closed || this.activeForegroundTurnId !== turnId) {
+      return;
+    }
+    this.finishForegroundTurn(
+      {
+        type: "turn_failed",
+        provider: "opencode",
+        error: toDiagnosticErrorMessage(lastError),
+      },
+      turnId,
+    );
+  }
 
-    return { turnId };
+  private async foregroundPromptAlreadyPersisted(
+    parts: ReturnType<typeof buildOpenCodePromptParts>,
+  ): Promise<boolean> {
+    const promptText = parts
+      .filter(
+        (part): part is Extract<(typeof parts)[number], { type: "text" }> => part.type === "text",
+      )
+      .map((part) => part.text ?? "")
+      .join("")
+      .trim();
+    if (!promptText) {
+      return false;
+    }
+    const messages = await this.readForegroundSessionMessages();
+    if (!messages) {
+      return false;
+    }
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      const message = messages[index];
+      if (!message || message.info.role !== "user") {
+        continue;
+      }
+      const createdDuringTurn =
+        this.foregroundTurnStartedAt !== null &&
+        typeof message.info.time?.created === "number" &&
+        message.info.time.created >= this.foregroundTurnStartedAt;
+      if (!createdDuringTurn) {
+        return false;
+      }
+      const messageText = message.parts
+        .filter((part): part is Extract<OpenCodePart, { type: "text" }> => part.type === "text")
+        .map((part) => part.text ?? "")
+        .join("")
+        .trim();
+      return messageText === promptText;
+    }
+    return false;
   }
   subscribe(callback: (event: AgentStreamEvent) => void): () => void {
     this.subscribers.add(callback);

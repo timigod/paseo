@@ -1825,6 +1825,154 @@ describe("OpenCode adapter startTurn error handling", () => {
     }
   });
 
+  test("retries prompt dispatch after a transient statement failure when the prompt did not persist", async () => {
+    const eventsGate = createTestDeferred<void>();
+    const globalEvent = vi.fn().mockResolvedValue({
+      stream: (async function* () {
+        await eventsGate.promise;
+        yield {
+          type: "message.updated",
+          properties: {
+            info: { id: "msg_assistant", sessionID: "ses_unit_test", role: "assistant" },
+          },
+        };
+        yield {
+          type: "message.part.delta",
+          properties: {
+            sessionID: "ses_unit_test",
+            messageID: "msg_assistant",
+            partID: "prt_text",
+            field: "text",
+            delta: "Recovered",
+          },
+        };
+        yield {
+          type: "session.status",
+          properties: { sessionID: "ses_unit_test", status: { type: "idle" } },
+        };
+      })(),
+    });
+    const promptAsync = vi
+      .fn()
+      .mockResolvedValueOnce({
+        data: undefined,
+        error: { name: "UnknownError", data: { message: "Failed to execute statement" } },
+      })
+      .mockImplementation(async () => {
+        eventsGate.resolve();
+        return { data: {}, error: undefined };
+      });
+    const fakeClient = {
+      global: { event: globalEvent },
+      permission: { list: vi.fn().mockResolvedValue({ data: [], error: undefined }) },
+      question: { list: vi.fn().mockResolvedValue({ data: [], error: undefined }) },
+      session: {
+        abort: vi.fn().mockResolvedValue({ data: true, error: undefined }),
+        messages: vi.fn().mockResolvedValue({ data: [], error: undefined }),
+        promptAsync,
+        status: vi.fn().mockResolvedValue({ data: {}, error: undefined }),
+      },
+    } as never;
+    const session = new __openCodeInternals.OpenCodeAgentSession(
+      { provider: "opencode", cwd: "/tmp/test" },
+      fakeClient,
+      "ses_unit_test",
+      createTestLogger(),
+    );
+
+    const turn = await collectTurnEvents(streamSession(session, "hello"));
+
+    expect(turn.turnFailed).toBe(false);
+    expect(turn.turnCompleted).toBe(true);
+    expect(promptAsync).toHaveBeenCalledTimes(2);
+    await session.close();
+  }, 20000);
+
+  test("does not re-dispatch a prompt the failed attempt already persisted", async () => {
+    const eventsGate = createTestDeferred<void>();
+    const globalEvent = vi.fn().mockResolvedValue({
+      stream: (async function* () {
+        await eventsGate.promise;
+        yield {
+          type: "message.updated",
+          properties: {
+            info: { id: "msg_assistant", sessionID: "ses_unit_test", role: "assistant" },
+          },
+        };
+        yield {
+          type: "message.part.delta",
+          properties: {
+            sessionID: "ses_unit_test",
+            messageID: "msg_assistant",
+            partID: "prt_text",
+            field: "text",
+            delta: "Carried by stream",
+          },
+        };
+        yield {
+          type: "session.status",
+          properties: { sessionID: "ses_unit_test", status: { type: "idle" } },
+        };
+      })(),
+    });
+    const promptAsync = vi.fn().mockImplementation(async () => {
+      eventsGate.resolve();
+      return {
+        data: undefined,
+        error: { name: "UnknownError", data: { message: "Failed to execute statement" } },
+      };
+    });
+    const messages = vi
+      .fn()
+      .mockResolvedValueOnce({ data: [], error: undefined })
+      .mockResolvedValue({
+        data: [
+          {
+            info: {
+              id: "msg_user",
+              sessionID: "ses_unit_test",
+              role: "user",
+              time: { created: Date.now() + 60_000 },
+            },
+            parts: [
+              {
+                id: "prt_user",
+                sessionID: "ses_unit_test",
+                messageID: "msg_user",
+                type: "text",
+                text: "hello",
+              },
+            ],
+          },
+        ],
+        error: undefined,
+      });
+    const fakeClient = {
+      global: { event: globalEvent },
+      permission: { list: vi.fn().mockResolvedValue({ data: [], error: undefined }) },
+      question: { list: vi.fn().mockResolvedValue({ data: [], error: undefined }) },
+      session: {
+        abort: vi.fn().mockResolvedValue({ data: true, error: undefined }),
+        messages,
+        promptAsync,
+        status: vi.fn().mockResolvedValue({ data: {}, error: undefined }),
+      },
+    } as never;
+    const session = new __openCodeInternals.OpenCodeAgentSession(
+      { provider: "opencode", cwd: "/tmp/test" },
+      fakeClient,
+      "ses_unit_test",
+      createTestLogger(),
+    );
+
+    const turn = await collectTurnEvents(streamSession(session, "hello"));
+
+    expect(turn.turnFailed).toBe(false);
+    expect(turn.turnCompleted).toBe(true);
+    expect(promptAsync).toHaveBeenCalledTimes(1);
+    await session.close();
+  }, 20000);
+
   test("recovers a pending question that appears while the global stream reconnects", async () => {
     const eventsGate = createTestDeferred<void>();
     const question = {
