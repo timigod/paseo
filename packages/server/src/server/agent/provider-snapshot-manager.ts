@@ -34,7 +34,9 @@ import {
 } from "./providers/diagnostic-utils.js";
 import type { MutableDaemonConfig } from "../daemon-config-store.js";
 
-const DEFAULT_REFRESH_TIMEOUT_MS = 60_000;
+// Must exceed the OpenCode server startup cap (90s in server-manager.ts) plus
+// catalog-call headroom, or a slow serve boot always trips this budget first.
+const DEFAULT_REFRESH_TIMEOUT_MS = 120_000;
 const DEFAULT_DIAGNOSTIC_TIMEOUT_MS = 120_000;
 const REFRESH_TIMEOUT_ENV_VAR = "PASEO_PROVIDER_REFRESH_TIMEOUT_MS";
 export const GLOBAL_PROVIDER_SNAPSHOT_KEY = "paseo:global";
@@ -621,7 +623,12 @@ export class ProviderSnapshotManager {
       this.resetSnapshotToLoading(cwd, missingProviders);
     }
 
-    return providersToInspect.filter((provider) => snapshot.get(provider)?.status === "loading");
+    // Error entries stay retryable: a single timed-out refresh must not poison
+    // every subsequent create for this cwd until a forced refresh or restart.
+    return providersToInspect.filter((provider) => {
+      const status = snapshot.get(provider)?.status;
+      return status === "loading" || status === "error";
+    });
   }
 
   private clearCachedProviders(providers?: AgentProvider[]): void {
@@ -682,7 +689,12 @@ export class ProviderSnapshotManager {
       return existingLoad.promise;
     }
     const existingEntry = this.snapshots.get(options.snapshotCwd)?.get(options.provider);
-    if (existingEntry && existingEntry.status !== "loading" && !options.force) {
+    if (
+      existingEntry &&
+      existingEntry.status !== "loading" &&
+      existingEntry.status !== "error" &&
+      !options.force
+    ) {
       return Promise.resolve();
     }
 

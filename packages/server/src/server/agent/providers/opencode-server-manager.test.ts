@@ -121,7 +121,8 @@ describe("OpenCodeServerManager generations", () => {
     const failure = expect(acquisition).rejects.toThrow("OpenCode server startup timeout");
     await runtime.settle();
 
-    await vi.advanceTimersByTimeAsync(30_000);
+    // Matches OPENCODE_SERVER_STARTUP_TIMEOUT_MS in server-manager.ts.
+    await vi.advanceTimersByTimeAsync(90_000);
 
     await failure;
     expect(runtime.terminatedPorts).toEqual([4471]);

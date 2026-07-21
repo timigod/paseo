@@ -298,6 +298,47 @@ describe("ProviderSnapshotManager public surface", () => {
     }
   });
 
+  test("an error snapshot entry is retried on the next create-path lookup", async () => {
+    let attempts = 0;
+    const isAvailable = vi.fn(() => {
+      attempts += 1;
+      if (attempts === 1) {
+        return Promise.reject(new Error("transient probe failure"));
+      }
+      return Promise.resolve(true);
+    });
+    const manager = new ProviderSnapshotManager({
+      logger: createTestLogger(),
+      providerOverrides: {
+        claude: { enabled: false },
+        copilot: { enabled: false },
+        opencode: { enabled: false },
+        pi: { enabled: false },
+      },
+      extraClients: { codex: createExtraClient("codex", { isAvailable }) },
+    });
+    try {
+      const first = await manager.getProvider({
+        cwd: "/tmp/project",
+        provider: "codex",
+        wait: true,
+      });
+      expect(first.status).toBe("error");
+
+      // One failed refresh must not poison every subsequent create for this
+      // cwd: the next lookup retries instead of rethrowing the cached error.
+      const second = await manager.getProvider({
+        cwd: "/tmp/project",
+        provider: "codex",
+        wait: true,
+      });
+      expect(second.status).toBe("ready");
+      expect(attempts).toBe(2);
+    } finally {
+      manager.destroy();
+    }
+  });
+
   test("PASEO_PROVIDER_REFRESH_TIMEOUT_MS env var is honored when no option is given", async () => {
     vi.stubEnv("PASEO_PROVIDER_REFRESH_TIMEOUT_MS", "1");
     const isAvailable = vi.fn(() => new Promise<boolean>(() => {}));

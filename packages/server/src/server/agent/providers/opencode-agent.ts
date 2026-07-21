@@ -1644,12 +1644,13 @@ export class OpenCodeAgentClient implements AgentClient {
     client: OpencodeClient,
     directory: string,
   ): Promise<AgentModelDefinition[]> {
-    const response = await openCodeMetadataLimit(() =>
-      withTimeout(
-        client.provider.list({ directory }),
-        OPENCODE_PROVIDER_LIST_TIMEOUT_MS,
-        `OpenCode provider.list timed out after ${OPENCODE_PROVIDER_LIST_TIMEOUT_MS / 1000}s - server may not be authenticated or connected to any providers`,
-      ),
+    // Timer OUTSIDE the limiter: queue wait counts against this bound, so a
+    // starved limiter surfaces this specific message instead of the generic
+    // provider-refresh timeout. A timed-out entry still runs when dequeued.
+    const response = await withTimeout(
+      openCodeMetadataLimit(() => client.provider.list({ directory })),
+      OPENCODE_PROVIDER_LIST_TIMEOUT_MS,
+      `OpenCode provider.list timed out after ${OPENCODE_PROVIDER_LIST_TIMEOUT_MS / 1000}s - server may not be authenticated or connected to any providers`,
     );
 
     if (response.error) {
@@ -1701,24 +1702,32 @@ export class OpenCodeAgentClient implements AgentClient {
     client: OpencodeClient,
     directory: string,
   ): Promise<AgentMode[]> {
-    const response = await openCodeMetadataLimit(() =>
-      withTimeout(
-        client.app.agents({ directory }),
+    try {
+      // Timer OUTSIDE the limiter: queue wait counts against this bound, so a
+      // starved limiter surfaces this specific message instead of the generic
+      // provider-refresh timeout. A timed-out entry still runs when dequeued.
+      const response = await withTimeout(
+        openCodeMetadataLimit(() => client.app.agents({ directory })),
         OPENCODE_METADATA_TIMEOUT_MS,
         `OpenCode app.agents timed out after ${OPENCODE_METADATA_TIMEOUT_MS / 1000}s`,
-      ),
-    );
-
-    if (response.error || !response.data) {
-      // Discovery failed — return an empty list rather than fabricating
-      // modes. OpenCode users can rename or delete any agent (including
-      // "build"/"plan"), so a hardcoded fallback can validate a mode that
-      // does not actually exist, which then fails at prompt time.
+      );
+      if (response.error || !response.data) {
+        // Discovery failed — return an empty list rather than fabricating
+        // modes. OpenCode users can rename or delete any agent (including
+        // "build"/"plan"), so a hardcoded fallback can validate a mode that
+        // does not actually exist, which then fails at prompt time.
+        return [];
+      }
+      const discovered = response.data
+        .filter(isSelectableOpenCodeAgent)
+        .map(mapOpenCodeAgentToMode);
+      return mergeOpenCodeModes(discovered);
+    } catch (error) {
+      // A slow or timed-out discovery must not fail catalog refresh — treat it
+      // the same as an error response and fall back to no modes.
+      this.logger.warn({ err: error, directory }, "OpenCode agent-mode discovery failed");
       return [];
     }
-
-    const discovered = response.data.filter(isSelectableOpenCodeAgent).map(mapOpenCodeAgentToMode);
-    return mergeOpenCodeModes(discovered);
   }
   private assertConfig(config: AgentSessionConfig): OpenCodeAgentConfig {
     if (config.provider !== "opencode") {
@@ -1731,15 +1740,26 @@ export class OpenCodeAgentClient implements AgentClient {
     client: OpencodeClient,
     cwd: string,
   ): Promise<void> {
-    const response = await openCodeMetadataLimit(() => client.provider.list({ directory: cwd }));
-    if (response.error || !response.data) {
+    // Bounded so a wedged server cannot hold a metadata-limiter slot for
+    // minutes and starve provider refreshes; the cache tolerates absence.
+    try {
+      const response = await openCodeMetadataLimit(() =>
+        withTimeout(
+          client.provider.list({ directory: cwd }),
+          OPENCODE_PROVIDER_LIST_TIMEOUT_MS,
+          `OpenCode provider.list (context-window cache) timed out after ${OPENCODE_PROVIDER_LIST_TIMEOUT_MS / 1000}s`,
+        ),
+      );
+      if (response.error || !response.data) {
+        return;
+      }
+      const lookup = buildOpenCodeModelContextWindowLookup(response.data);
+      this.modelContextWindows.clear();
+      for (const [modelLookupKey, contextWindowMaxTokens] of lookup.entries()) {
+        this.modelContextWindows.set(modelLookupKey, contextWindowMaxTokens);
+      }
+    } catch {
       return;
-    }
-
-    const lookup = buildOpenCodeModelContextWindowLookup(response.data);
-    this.modelContextWindows.clear();
-    for (const [modelLookupKey, contextWindowMaxTokens] of lookup.entries()) {
-      this.modelContextWindows.set(modelLookupKey, contextWindowMaxTokens);
     }
   }
 }
@@ -4533,14 +4553,21 @@ class OpenCodeAgentSession implements AgentSession {
       return this.availableModesCache;
     }
 
-    const response = await openCodeMetadataLimit(() =>
-      this.client.app.agents({
-        directory: this.config.cwd,
-      }),
-    );
-    const agents = response.error || !response.data ? [] : response.data;
-
-    const discoveredModes = agents.filter(isSelectableOpenCodeAgent).map(mapOpenCodeAgentToMode);
+    let discoveredModes: AgentMode[] = [];
+    try {
+      const response = await openCodeMetadataLimit(() =>
+        withTimeout(
+          this.client.app.agents({ directory: this.config.cwd }),
+          OPENCODE_METADATA_TIMEOUT_MS,
+          `OpenCode app.agents timed out after ${OPENCODE_METADATA_TIMEOUT_MS / 1000}s`,
+        ),
+      );
+      const agents = response.error || !response.data ? [] : response.data;
+      discoveredModes = agents.filter(isSelectableOpenCodeAgent).map(mapOpenCodeAgentToMode);
+    } catch {
+      // Mode discovery is best-effort; a slow server must not hold a limiter
+      // slot indefinitely or fail the caller.
+    }
 
     this.availableModesCache = mergeOpenCodeModes(discoveredModes);
     return this.availableModesCache;

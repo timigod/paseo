@@ -211,12 +211,15 @@ export class OpenCodeServerManager implements OpenCodeServerManagerLike {
 
     this.newServerPromise = Promise.resolve()
       .then(async () => {
-        await this.rotateCurrentServer();
+        // Prove the replacement healthy BEFORE retiring the incumbent —
+        // rotating first turns one slow boot into a no-current-server outage
+        // for every create until the next successful refresh.
         const server = await this.startServer();
+        await server.ready;
+        await this.rotateCurrentServer();
         if (!server.retired) {
           this.currentServer = server;
         }
-        await server.ready;
         return server;
       })
       .finally(() => {
