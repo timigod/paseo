@@ -48,4 +48,11 @@ describe("runRunCommand option validation", () => {
       runRunCommand("do something", { worktree: "feat", provider: undefined }, {} as never),
     ).rejects.not.toMatchObject({ code: "INVALID_OPTIONS" });
   });
+
+  it("rejects --auto-archive with structured output because structured runs can need retries", async () => {
+    await expectInvalidOptions(
+      { autoArchive: true, outputSchema: "{}" },
+      /--auto-archive cannot be used with --output-schema/,
+    );
+  });
 });

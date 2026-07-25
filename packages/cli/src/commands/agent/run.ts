@@ -34,6 +34,10 @@ export function addRunOptions(cmd: Command): Command {
     )
     .option("--thinking <id>", "Thinking option ID to use for this run")
     .option("--mode <mode>", "Provider-specific mode (e.g., plan, default, bypass)")
+    .option(
+      "--auto-archive",
+      "Archive this one-shot task after its first terminal turn (including its Paseo-owned worktree)",
+    )
     .option("--worktree <name>", "Create agent in a new git worktree")
     .option("--base <branch>", "Base branch for worktree (default: current branch)")
     .option(
@@ -98,6 +102,7 @@ export interface AgentRunOptions extends CommandOptions {
   model?: string;
   thinking?: string;
   mode?: string;
+  autoArchive?: boolean;
   worktree?: string;
   base?: string;
   workspace?: string;
@@ -300,6 +305,15 @@ function validateRunOptions(prompt: string, options: AgentRunOptions, outputSche
       code: "INVALID_OPTIONS",
       message: "--output-schema cannot be used with --detach",
       details: "Structured output requires waiting for the agent to finish",
+    } satisfies CommandError;
+  }
+
+  if (outputSchema && options.autoArchive) {
+    throw {
+      code: "INVALID_OPTIONS",
+      message: "--auto-archive cannot be used with --output-schema",
+      details:
+        "Structured output may need follow-up turns; finish it explicitly with paseo agent finish.",
     } satisfies CommandError;
   }
 }
@@ -520,6 +534,7 @@ export async function runRunCommand(
             thinkingOptionId,
             initialPrompt: structuredPrompt,
             outputSchema,
+            autoArchive: options.autoArchive,
             images,
             env: requestEnv,
             labels: Object.keys(labels).length > 0 ? labels : undefined,
@@ -588,6 +603,7 @@ export async function runRunCommand(
       modeId: options.mode,
       model: resolvedProviderModel.model,
       thinkingOptionId,
+      autoArchive: options.autoArchive,
       initialPrompt: prompt,
       images,
       env: requestEnv,

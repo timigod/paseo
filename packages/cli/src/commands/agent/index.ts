@@ -12,6 +12,8 @@ import { addWaitOptions, runWaitCommand } from "./wait.js";
 import { addAttachOptions, runAttachCommand } from "./attach.js";
 import { addReloadOptions, runReloadCommand } from "./reload.js";
 import { addImportOptions, runImportCommand } from "./import.js";
+import { addFinishOptions, runFinishCommand } from "./finish.js";
+import { addRecoverOptions, runRecoverCommand } from "./recover.js";
 import { runUpdateCommand } from "./update.js";
 import { withOutput } from "../../output/index.js";
 import {
@@ -74,6 +76,14 @@ export function createAgentCommand(): Command {
 
   addJsonAndDaemonHostOptions(addReloadOptions(agent.command("reload"))).action(
     withOutput(runReloadCommand),
+  );
+
+  addJsonAndDaemonHostOptions(addFinishOptions(agent.command("finish"))).action(
+    withOutput(runFinishCommand),
+  );
+
+  addJsonAndDaemonHostOptions(addRecoverOptions(agent.command("recover"))).action(
+    withOutput(runRecoverCommand),
   );
 
   addJsonAndDaemonHostOptions(
