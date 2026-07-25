@@ -88,6 +88,19 @@ function assertFinishable(agent: AgentSnapshotPayload, force: boolean): void {
   }
 }
 
+async function fetchFinishTarget(
+  client: ConnectedDaemonClient,
+  agentId: string,
+): Promise<Awaited<ReturnType<ConnectedDaemonClient["fetchAgent"]>> | null> {
+  try {
+    return await client.fetchAgent({ agentId });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    if (message.startsWith("Agent not found:")) return null;
+    throw err;
+  }
+}
+
 async function determineWorktreeDisposition(
   client: ConnectedDaemonClient,
   agent: AgentSnapshotPayload,
@@ -172,7 +185,7 @@ export async function runFinishCommand(
   }
 
   try {
-    const target = await client.fetchAgent({ agentId: agentIdArg });
+    const target = await fetchFinishTarget(client, agentIdArg);
     if (!target) {
       throw {
         code: "AGENT_NOT_FOUND",

@@ -73,4 +73,17 @@ describe("runFinishCommand", () => {
     });
     expect(client.archiveAgent).not.toHaveBeenCalled();
   });
+
+  it("returns the typed not-found result when the daemon rejects an unknown agent", async () => {
+    const { connectToDaemon } = await import("../../utils/client.js");
+    const client = installClient({
+      fetchAgent: vi.fn().mockRejectedValue(new Error("Agent not found: missing-agent")),
+    });
+    vi.mocked(connectToDaemon).mockResolvedValue(client as never);
+
+    await expect(runFinishCommand("missing-agent", {}, {} as never)).rejects.toMatchObject({
+      code: "AGENT_NOT_FOUND",
+    });
+    expect(client.archiveAgent).not.toHaveBeenCalled();
+  });
 });
