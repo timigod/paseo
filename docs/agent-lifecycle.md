@@ -43,24 +43,24 @@ Archive is a **soft delete**: the agent record stays on disk with `archivedAt` s
 ### Orchestrator finish and recovery
 
 An idle turn is not the same thing as a finished task. Multi-step work often pauses for a
-human decision, another agent, or a scheduled event. The orchestrator must therefore make
-the terminal decision explicitly:
+human decision, another agent, or a scheduled event. The public task surface is three commands:
 
 ```sh
-paseo agent finish <id>
-paseo agent recover <id>
+paseo run --one-shot "..."
+paseo continue <id> "..."
+paseo finish <id>
 ```
 
+`run --one-shot` is only for work that has one terminal answer. `continue` recovers an archived
+task if necessary, then sends its next instruction; live tasks are sent without a restart.
 `finish` archives the selected task. When that task is the sole owner of a Paseo-created
 worktree, it releases that worktree too. It refuses to remove a shared worktree: other active
 agents remain untouched and the result reports that the directory was kept. A running task
-requires `--force`; otherwise the command fails rather than guessing that its current turn can
-be abandoned. `recover` is the cold-start counterpart: it unarchives provider state, restores
-the workspace record, and resumes the persisted session through the existing reload path.
+requires `--force`; otherwise the command fails rather than guessing that its current turn can be
+abandoned.
 
-For genuinely one-shot delegated work, create the task with `paseo run --auto-archive`. That
-opt-in archives it after its first terminal turn and releases a Paseo-owned worktree. Do not use
-it for a multi-step parent task: its lifecycle ends only when the orchestrator calls `finish`.
+`agent recover`, `agent send`, and `agent archive` remain advanced controls. Do not use a
+wait-and-reload chain for live conversations.
 
 `create_agent_request` can opt an agent into `autoArchive`. In that mode the daemon archives the agent after the first terminal turn event (`turn_completed`, `turn_failed`, or `turn_canceled`). If the same request created a Paseo worktree through its `worktree` field, auto-archive archives that worktree too, which removes the agent records inside the worktree.
 
