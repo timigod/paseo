@@ -14,6 +14,7 @@ import { addReloadOptions, runReloadCommand } from "./reload.js";
 import { addImportOptions, runImportCommand } from "./import.js";
 import { addFinishOptions, runFinishCommand } from "./finish.js";
 import { addRecoverOptions, runRecoverCommand } from "./recover.js";
+import { addContinueOptions, runContinueCommand } from "./continue.js";
 import { runUpdateCommand } from "./update.js";
 import { withOutput } from "../../output/index.js";
 import {
@@ -50,6 +51,10 @@ export function createAgentCommand(): Command {
 
   addJsonAndDaemonHostOptions(addSendOptions(agent.command("send"))).action(
     withOutput(runSendCommand),
+  );
+
+  addJsonAndDaemonHostOptions(addContinueOptions(agent.command("continue"))).action(
+    withOutput(runContinueCommand),
   );
 
   addJsonAndDaemonHostOptions(addInspectOptions(agent.command("inspect"))).action(

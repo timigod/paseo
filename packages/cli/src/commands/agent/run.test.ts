@@ -49,10 +49,10 @@ describe("runRunCommand option validation", () => {
     ).rejects.not.toMatchObject({ code: "INVALID_OPTIONS" });
   });
 
-  it("rejects --auto-archive with structured output because structured runs can need retries", async () => {
+  it("rejects one-shot cleanup with structured output because structured runs can need retries", async () => {
     await expectInvalidOptions(
-      { autoArchive: true, outputSchema: "{}" },
-      /--auto-archive cannot be used with --output-schema/,
+      { oneShot: true, outputSchema: "{}" },
+      /--one-shot cannot be used with --output-schema/,
     );
   });
 });

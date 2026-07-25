@@ -38,6 +38,7 @@ export function addRunOptions(cmd: Command): Command {
       "--auto-archive",
       "Archive this one-shot task after its first terminal turn (including its Paseo-owned worktree)",
     )
+    .option("--one-shot", "Finish and clean up this task after its first terminal turn")
     .option("--worktree <name>", "Create agent in a new git worktree")
     .option("--base <branch>", "Base branch for worktree (default: current branch)")
     .option(
@@ -103,6 +104,7 @@ export interface AgentRunOptions extends CommandOptions {
   thinking?: string;
   mode?: string;
   autoArchive?: boolean;
+  oneShot?: boolean;
   worktree?: string;
   base?: string;
   workspace?: string;
@@ -308,10 +310,10 @@ function validateRunOptions(prompt: string, options: AgentRunOptions, outputSche
     } satisfies CommandError;
   }
 
-  if (outputSchema && options.autoArchive) {
+  if (outputSchema && (options.autoArchive || options.oneShot)) {
     throw {
       code: "INVALID_OPTIONS",
-      message: "--auto-archive cannot be used with --output-schema",
+      message: "--one-shot cannot be used with --output-schema",
       details:
         "Structured output may need follow-up turns; finish it explicitly with paseo agent finish.",
     } satisfies CommandError;
@@ -534,7 +536,7 @@ export async function runRunCommand(
             thinkingOptionId,
             initialPrompt: structuredPrompt,
             outputSchema,
-            autoArchive: options.autoArchive,
+            autoArchive: options.autoArchive || options.oneShot,
             images,
             env: requestEnv,
             labels: Object.keys(labels).length > 0 ? labels : undefined,
@@ -603,7 +605,7 @@ export async function runRunCommand(
       modeId: options.mode,
       model: resolvedProviderModel.model,
       thinkingOptionId,
-      autoArchive: options.autoArchive,
+      autoArchive: options.autoArchive || options.oneShot,
       initialPrompt: prompt,
       images,
       env: requestEnv,
