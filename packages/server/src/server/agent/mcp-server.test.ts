@@ -13,7 +13,12 @@ import { createAgentMcpServer } from "./mcp-server.js";
 import { AgentManager, type ManagedAgent } from "./agent-manager.js";
 import { AgentStorage, type StoredAgentRecord } from "./agent-storage.js";
 import { createTestAgentClients } from "../test-utils/fake-agent-client.js";
-import type { AgentMode, AgentProvider, ProviderSnapshotEntry } from "./agent-sdk-types.js";
+import type {
+  AgentMode,
+  AgentProvider,
+  AgentTimelineItem,
+  ProviderSnapshotEntry,
+} from "./agent-sdk-types.js";
 import type { ProviderSnapshotManager } from "./provider-snapshot-manager.js";
 import { createProviderSnapshotManagerStub } from "../test-utils/session-stubs.js";
 import {
@@ -207,6 +212,8 @@ function buildAgentManagerSpies() {
     getAgent: vi.fn(),
     listAgents: vi.fn().mockReturnValue([]),
     getTimeline: vi.fn().mockReturnValue([]),
+    getRetainedOrDurableTimeline: vi.fn().mockResolvedValue(null),
+    waitForAgentLifecycleHandoff: vi.fn().mockResolvedValue(undefined),
     resumeAgentFromPersistence: vi.fn(),
     hydrateTimelineFromProvider: vi.fn().mockResolvedValue(undefined),
     appendTimelineItem: vi.fn().mockResolvedValue(undefined),
@@ -229,6 +236,7 @@ function buildAgentStorageSpies() {
     get: vi.fn().mockResolvedValue(null),
     setTitle: vi.fn().mockResolvedValue(undefined),
     upsert: vi.fn().mockResolvedValue(undefined),
+    update: vi.fn().mockResolvedValue(null),
     applySnapshot: vi.fn(),
     list: vi.fn().mockResolvedValue([]),
     remove: vi.fn(),
@@ -472,6 +480,32 @@ function createStoredRecord(overrides: Partial<StoredAgentRecord> = {}): StoredA
     archivedAt: "2026-04-12T00:00:00.000Z",
     ...overrides,
   };
+}
+
+interface Deferred<T> {
+  promise: Promise<T>;
+  resolve: (value: T) => void;
+}
+
+function deferred<T>(): Deferred<T> {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((resolvePromise) => {
+    resolve = resolvePromise;
+  });
+  return { promise, resolve };
+}
+
+class RetainedTimelineTestAgentManager extends AgentManager {
+  retainedTimelineReader: ((agentId: string) => Promise<AgentTimelineItem[] | null>) | null = null;
+
+  override async getRetainedOrDurableTimeline(
+    agentId: string,
+  ): Promise<AgentTimelineItem[] | null> {
+    if (this.retainedTimelineReader) {
+      return await this.retainedTimelineReader(agentId);
+    }
+    return await super.getRetainedOrDurableTimeline(agentId);
+  }
 }
 
 function createManagedAgent(overrides: Partial<ManagedAgent> = {}): ManagedAgent {
@@ -5296,26 +5330,18 @@ describe("agent snapshot MCP serialization", () => {
     ]);
   });
 
-  it("loads archived agents before reading get_agent_activity", async () => {
+  it("reads archived get_agent_activity from durable state without creating a runtime", async () => {
     const { agentManager, agentStorage, spies } = createTestDeps();
-    const record = createStoredRecord({ id: "archived-activity-agent" });
-    const snapshot = {
+    const record = createStoredRecord({
       id: "archived-activity-agent",
-      currentModeId: "default",
-    } as ManagedAgent;
-    spies.agentManager.getAgent
-      .mockReturnValueOnce(null)
-      .mockReturnValue(snapshot)
-      .mockReturnValue(snapshot);
+      timeline: [
+        {
+          type: "assistant_message",
+          text: "Archived work is complete",
+        },
+      ],
+    });
     spies.agentStorage.get.mockResolvedValue(record);
-    spies.agentManager.resumeAgentFromPersistence.mockResolvedValue(snapshot);
-    spies.agentManager.getTimeline.mockReturnValue([
-      {
-        kind: "status",
-        timestamp: "2026-04-11T00:00:00.000Z",
-        text: "Agent resumed",
-      },
-    ]);
 
     const server = await createAgentMcpServer({
       agentManager,
@@ -5331,12 +5357,196 @@ describe("agent snapshot MCP serialization", () => {
         agentId: "archived-activity-agent",
         updateCount: 1,
         currentModeId: "default",
+        content: expect.stringContaining("Archived work is complete"),
       }),
     );
-    expect(spies.agentManager.resumeAgentFromPersistence).toHaveBeenCalled();
-    expect(spies.agentManager.hydrateTimelineFromProvider).toHaveBeenCalledWith(
+    expect(spies.agentManager.waitForAgentLifecycleHandoff).toHaveBeenCalledWith(
       "archived-activity-agent",
     );
+    expect(spies.agentManager.createAgent).not.toHaveBeenCalled();
+    expect(spies.agentManager.resumeAgentFromPersistence).not.toHaveBeenCalled();
+    expect(spies.agentManager.hydrateTimelineFromProvider).not.toHaveBeenCalled();
+    expect(spies.agentManager.getTimeline).not.toHaveBeenCalled();
+    expect(spies.agentManager.getRetainedOrDurableTimeline).not.toHaveBeenCalled();
+  });
+
+  it("backfills archived get_agent_activity from retained history without creating a runtime", async () => {
+    const { agentManager, agentStorage, spies } = createTestDeps();
+    const record = createStoredRecord({
+      id: "legacy-archived-activity-agent",
+      timeline: undefined,
+    });
+    const retainedTimeline: AgentTimelineItem[] = [
+      {
+        type: "user_message",
+        text: "Preserve my archived request",
+      },
+      {
+        type: "assistant_message",
+        text: "The retained work is complete",
+      },
+    ];
+    spies.agentStorage.get.mockResolvedValue(record);
+    spies.agentManager.getRetainedOrDurableTimeline.mockResolvedValue(retainedTimeline);
+    spies.agentStorage.update.mockImplementation(async (_agentId, updater) => updater(record));
+
+    const server = await createAgentMcpServer({
+      agentManager,
+      agentStorage,
+      logger,
+      providerSnapshotManager: createClaudeOnlyManager(),
+    });
+    const tool = registeredTool(server, "get_agent_activity");
+    const response = await tool.handler({ agentId: record.id });
+
+    expect(response.structuredContent).toEqual(
+      expect.objectContaining({
+        agentId: record.id,
+        updateCount: 2,
+        currentModeId: "default",
+        content: expect.stringContaining("Preserve my archived request"),
+      }),
+    );
+    expect(spies.agentStorage.update).toHaveBeenCalledWith(record.id, expect.any(Function));
+    expect(spies.agentStorage.update.mock.calls[0]?.[1]?.(record)).toEqual({
+      ...record,
+      timeline: retainedTimeline,
+    });
+    expect(spies.agentManager.createAgent).not.toHaveBeenCalled();
+    expect(spies.agentManager.resumeAgentFromPersistence).not.toHaveBeenCalled();
+    expect(spies.agentManager.hydrateTimelineFromProvider).not.toHaveBeenCalled();
+  });
+
+  it("does not replace a newer timeline when archived backfill finishes late", async () => {
+    const workdir = await mkdtemp(join(tmpdir(), "mcp-activity-newer-timeline-"));
+    const storage = new AgentStorage(join(workdir, "agents"), logger);
+    const clients = createTestAgentClients();
+    const claudeClient = clients.claude;
+    if (!claudeClient) {
+      throw new Error("expected Claude test client");
+    }
+    const createSessionSpy = vi.spyOn(claudeClient, "createSession");
+    const resumeSessionSpy = vi.spyOn(claudeClient, "resumeSession");
+
+    const agentManager = new RetainedTimelineTestAgentManager({
+      clients,
+      registry: storage,
+      logger,
+    });
+    const retainedTimeline: AgentTimelineItem[] = [
+      { type: "user_message", text: "Stale retained request" },
+      { type: "assistant_message", text: "Stale retained result" },
+    ];
+    const newerTimeline: AgentTimelineItem[] = [
+      { type: "user_message", text: "Newer resumed request" },
+      { type: "assistant_message", text: "Newer close result" },
+    ];
+    const retainedTimelineRequested = deferred<void>();
+    const retainedTimelineAllowed = deferred<void>();
+    let server: Awaited<ReturnType<typeof createAgentMcpServer>> | null = null;
+
+    try {
+      const agent = await agentManager.createAgent(
+        {
+          provider: "claude",
+          cwd: workdir,
+          title: "Preserved title",
+          extra: { raceMarker: "preserved-metadata" },
+        },
+        undefined,
+        {
+          labels: { role: "reviewer", surface: "mobile" },
+          workspaceId: undefined,
+        },
+      );
+      await agentManager.archiveAgent(agent.id);
+      await storage.update(agent.id, (record) => ({
+        ...record,
+        timeline: undefined,
+      }));
+      createSessionSpy.mockClear();
+      resumeSessionSpy.mockClear();
+      agentManager.retainedTimelineReader = async (agentId) => {
+        expect(agentId).toBe(agent.id);
+        retainedTimelineRequested.resolve(undefined);
+        await retainedTimelineAllowed.promise;
+        return retainedTimeline;
+      };
+
+      server = await createAgentMcpServer({
+        agentManager,
+        agentStorage: storage,
+        logger,
+        providerSnapshotManager: createClaudeOnlyManager(),
+      });
+      const tool = registeredTool(server, "get_agent_activity");
+      const activity = tool.handler({ agentId: agent.id });
+      await retainedTimelineRequested.promise;
+
+      await agentManager.unarchiveSnapshot(agent.id);
+      await storage.update(agent.id, (record) => ({
+        ...record,
+        lastStatus: "closed",
+        updatedAt: "2026-07-29T00:00:02.000Z",
+        timeline: newerTimeline,
+      }));
+      retainedTimelineAllowed.resolve(undefined);
+      const response = await activity;
+
+      expect(response.structuredContent).toEqual(
+        expect.objectContaining({
+          agentId: agent.id,
+          updateCount: 2,
+          content: expect.stringContaining("Newer close result"),
+        }),
+      );
+      expect(await storage.get(agent.id)).toMatchObject({
+        archivedAt: null,
+        lastStatus: "closed",
+        updatedAt: "2026-07-29T00:00:02.000Z",
+        title: "Preserved title",
+        labels: { role: "reviewer", surface: "mobile" },
+        config: { extra: { raceMarker: "preserved-metadata" } },
+        timeline: newerTimeline,
+      });
+      expect(agentManager.getAgent(agent.id)).toBeNull();
+      expect(createSessionSpy).not.toHaveBeenCalled();
+      expect(resumeSessionSpy).not.toHaveBeenCalled();
+    } finally {
+      retainedTimelineAllowed.resolve(undefined);
+      await server?.close();
+      await removeTempDir(workdir);
+    }
+  });
+
+  it("reports unavailable activity for a legacy archive with no retained history", async () => {
+    const { agentManager, agentStorage, spies } = createTestDeps();
+    const record = createStoredRecord({
+      id: "legacy-archive-without-history",
+      timeline: undefined,
+    });
+    spies.agentStorage.get.mockResolvedValue(record);
+
+    const server = await createAgentMcpServer({
+      agentManager,
+      agentStorage,
+      logger,
+      providerSnapshotManager: createClaudeOnlyManager(),
+    });
+    const tool = registeredTool(server, "get_agent_activity");
+    const response = await tool.handler({ agentId: record.id });
+
+    expect(response.structuredContent).toEqual({
+      agentId: record.id,
+      updateCount: 0,
+      currentModeId: "default",
+      content:
+        "Archived activity is unavailable because this legacy record has no durable timeline snapshot.",
+    });
+    expect(spies.agentStorage.update).not.toHaveBeenCalled();
+    expect(spies.agentManager.createAgent).not.toHaveBeenCalled();
+    expect(spies.agentManager.resumeAgentFromPersistence).not.toHaveBeenCalled();
+    expect(spies.agentManager.hydrateTimelineFromProvider).not.toHaveBeenCalled();
   });
 
   it("get_agent_activity limit counts projected messages, not raw deltas", async () => {

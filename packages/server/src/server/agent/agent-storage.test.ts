@@ -192,6 +192,25 @@ describe("AgentStorage", () => {
     expect(persisted.config?.extra?.claude).toMatchObject({ maxThinkingTokens: 1024 });
   });
 
+  test("applySnapshot stores and preserves a durable timeline snapshot", async () => {
+    const agent = createManagedAgent({ id: "agent-timeline-snapshot" });
+    const timeline = [
+      { type: "user_message" as const, text: "Keep this activity" },
+      { type: "assistant_message" as const, text: "It is durable" },
+    ];
+
+    await storage.applySnapshot(agent, { timeline });
+    await storage.applySnapshot({
+      ...agent,
+      lifecycle: "closed",
+      session: null,
+      activeForegroundTurnId: null,
+    });
+
+    const reloaded = new AgentStorage(storagePath, logger);
+    expect((await reloaded.get(agent.id))?.timeline).toEqual(timeline);
+  });
+
   test("applySnapshot stores and reloads featureValues when present", async () => {
     await storage.applySnapshot(
       createManagedAgent({
@@ -388,6 +407,133 @@ describe("AgentStorage", () => {
     await applySnapshotPromise;
     const record = await storage.get(agentId);
     expect(record?.title).toBe("Generated title");
+  });
+
+  test.each(["activity-first", "unarchive-first"] as const)(
+    "update linearizes activity backfill and unarchive when %s",
+    async (completionOrder) => {
+      const agentId = `agent-update-${completionOrder}`;
+      const timeline = [
+        { type: "user_message" as const, text: "Retain this request" },
+        { type: "assistant_message" as const, text: "Retain this result" },
+      ];
+      await storage.applySnapshot(
+        createManagedAgent({
+          id: agentId,
+          config: { extra: { source: "preserved-metadata" } },
+        }),
+        { title: "Preserved title" },
+      );
+      await storage.update(agentId, (record) => ({
+        ...record,
+        archivedAt: "2026-07-29T00:00:00.000Z",
+        labels: { role: "reviewer", surface: "mobile" },
+        timeline: undefined,
+      }));
+
+      let releaseWrites: (() => void) | null = null;
+      const writesAllowed = new Promise<void>((resolve) => {
+        releaseWrites = resolve;
+      });
+      const storageInternals = storage as unknown as {
+        pendingWrites: Map<string, Promise<unknown>>;
+      };
+      storageInternals.pendingWrites.set(agentId, writesAllowed);
+
+      const backfillActivity = () => storage.update(agentId, (record) => ({ ...record, timeline }));
+      const unarchive = () =>
+        storage.update(agentId, (record) => ({
+          ...record,
+          archivedAt: null,
+          updatedAt: "2026-07-29T00:00:01.000Z",
+        }));
+      const operations =
+        completionOrder === "activity-first"
+          ? [backfillActivity(), unarchive()]
+          : [unarchive(), backfillActivity()];
+
+      releaseWrites?.();
+      await Promise.all(operations);
+
+      const record = await storage.get(agentId);
+      expect(record).toMatchObject({
+        archivedAt: null,
+        title: "Preserved title",
+        labels: { role: "reviewer", surface: "mobile" },
+        config: { extra: { source: "preserved-metadata" } },
+        timeline,
+      });
+
+      const reloaded = new AgentStorage(storagePath, logger);
+      expect(await reloaded.get(agentId)).toMatchObject({
+        archivedAt: null,
+        title: "Preserved title",
+        labels: { role: "reviewer", surface: "mobile" },
+        config: { extra: { source: "preserved-metadata" } },
+        timeline,
+      });
+    },
+  );
+
+  test("a failed record write does not suppress an already queued update", async () => {
+    const agentId = "agent-write-failure-recovery";
+    await storage.applySnapshot(
+      createManagedAgent({
+        id: agentId,
+        config: { extra: { source: "preserved-metadata" } },
+      }),
+      { title: "Initial title" },
+    );
+
+    const blockedProjectDir = path.join(storagePath, "tmp-blocked-write");
+    await fs.writeFile(blockedProjectDir, "not a directory", "utf8");
+
+    let releaseWrites: (() => void) | null = null;
+    const writesAllowed = new Promise<void>((resolve) => {
+      releaseWrites = resolve;
+    });
+    const storageInternals = storage as unknown as {
+      pendingWrites: Map<string, Promise<unknown>>;
+    };
+    storageInternals.pendingWrites.set(agentId, writesAllowed);
+
+    let firstUpdaterRuns = 0;
+    const firstUpdate = storage.update(agentId, (record) => {
+      firstUpdaterRuns += 1;
+      return {
+        ...record,
+        cwd: "/tmp/blocked-write",
+        title: "This write must fail",
+      };
+    });
+    let secondUpdaterRuns = 0;
+    const secondUpdate = storage.update(agentId, (record) => {
+      secondUpdaterRuns += 1;
+      return {
+        ...record,
+        title: "Second write succeeded",
+      };
+    });
+
+    await Promise.resolve();
+    expect(storageInternals.pendingWrites.get(agentId)).not.toBe(writesAllowed);
+    releaseWrites?.();
+
+    await expect(firstUpdate).rejects.toThrow();
+    await expect(secondUpdate).resolves.toMatchObject({
+      cwd: "/tmp/project",
+      title: "Second write succeeded",
+      config: { extra: { source: "preserved-metadata" } },
+    });
+    expect(firstUpdaterRuns).toBe(1);
+    expect(secondUpdaterRuns).toBe(1);
+
+    const reloaded = new AgentStorage(storagePath, logger);
+    expect(await reloaded.get(agentId)).toMatchObject({
+      cwd: "/tmp/project",
+      title: "Second write succeeded",
+      config: { extra: { source: "preserved-metadata" } },
+    });
   });
 
   test("list returns all agents including internal ones", async () => {

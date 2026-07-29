@@ -30,12 +30,7 @@ import { CursorError } from "./pagination/cursor.js";
 import { SortablePager, type SortSpec } from "./pagination/sortable-pager.js";
 import type { SpeechToTextProvider, TextToSpeechProvider } from "./speech/speech-provider.js";
 import type { TurnDetectionProvider } from "./speech/turn-detection-provider.js";
-import {
-  buildConfigOverrides,
-  extractTimestamps,
-  isStoredAgentProviderAvailable,
-  toAgentPersistenceHandle,
-} from "./persistence-hooks.js";
+import { isStoredAgentProviderAvailable } from "./persistence-hooks.js";
 import { ensureAgentLoaded } from "./agent/agent-loading.js";
 import {
   formatSystemNotificationPrompt,
@@ -1884,7 +1879,7 @@ export class Session {
 
     try {
       await this.agentStorage.remove(agentId);
-      await this.agentManager.deleteCommittedTimeline(agentId);
+      await this.agentManager.deleteAgentState(agentId);
     } catch (error) {
       this.sessionLogger.error({ err: error, agentId }, `Failed to fully delete agent ${agentId}`);
     }
@@ -2818,34 +2813,10 @@ export class Session {
     try {
       await unarchiveAgentState(this.agentStorage, this.agentManager, agentId);
       await this.unarchiveOwningWorkspaceForAgent(agentId);
-      let snapshot: ManagedAgent;
-      const existing = this.agentManager.getAgent(agentId);
-      if (existing) {
-        await this.interruptAgentIfRunning(agentId);
-        snapshot = await this.agentManager.reloadAgentSession(agentId, undefined, {
-          rehydrateFromDisk: true,
-        });
-      } else {
-        const record = await this.agentStorage.get(agentId);
-        if (!record) {
-          throw new Error(`Agent not found: ${agentId}`);
-        }
-        const registeredProviderIds = this.providerSnapshotManager.listRegisteredProviderIds();
-        if (!isStoredAgentProviderAvailable(record, registeredProviderIds)) {
-          throw new Error(`Agent ${agentId} references unavailable provider '${record.provider}'`);
-        }
-        const handle = toAgentPersistenceHandle(registeredProviderIds, record.persistence);
-        if (!handle) {
-          throw new Error(`Agent ${agentId} cannot be refreshed because it lacks persistence`);
-        }
-        snapshot = await this.agentManager.resumeAgentFromPersistence(
-          handle,
-          buildConfigOverrides(record),
-          agentId,
-          extractTimestamps(record),
-        );
-      }
-      await this.agentManager.hydrateTimelineFromProvider(agentId, { broadcast: true });
+      const snapshot = await this.agentManager.reloadAgentSession(agentId, undefined, {
+        rehydrateFromDisk: true,
+        hydrateTimeline: { broadcast: true },
+      });
       await this.agentUpdates.forwardLiveAgent(snapshot);
       const timelineSize = this.agentManager.getTimeline(agentId).length;
       if (requestId) {
@@ -3024,6 +2995,15 @@ export class Session {
     const agentIds = Array.isArray(agentId) ? agentId : [agentId];
 
     try {
+      await Promise.all(
+        agentIds.map((id) =>
+          ensureAgentLoaded(id, {
+            agentManager: this.agentManager,
+            agentStorage: this.agentStorage,
+            logger: this.sessionLogger,
+          }),
+        ),
+      );
       await Promise.all(agentIds.map((id) => this.agentManager.clearAgentAttention(id)));
       if (requestId) {
         const agents = (
@@ -3110,8 +3090,16 @@ export class Session {
     );
 
     try {
-      const agents = this.agentManager.listAgents();
-      const agent = agents.find((a) => a.id === agentId);
+      const existing = this.agentManager.getAgent(agentId);
+      const stored = existing ? null : await this.agentStorage.get(agentId);
+      const agent =
+        existing || (stored && !stored.archivedAt)
+          ? await ensureAgentLoaded(agentId, {
+              agentManager: this.agentManager,
+              agentStorage: this.agentStorage,
+              logger: this.sessionLogger,
+            })
+          : null;
 
       if (agent?.session?.listCommands) {
         const commands = await agent.session.listCommands();
@@ -5284,23 +5272,23 @@ export class Session {
             continue;
           }
 
-          const record = await this.agentStorage.get(agentId);
-          if (
-            !record ||
-            record.internal ||
-            record.archivedAt ||
-            record.requiresAttention !== true
-          ) {
+          let didClear = false;
+          const nextRecord = await this.agentStorage.update(agentId, (record) => {
+            if (record.internal || record.archivedAt || record.requiresAttention !== true) {
+              return undefined;
+            }
+            didClear = true;
+            return {
+              ...record,
+              updatedAt: new Date().toISOString(),
+              requiresAttention: false,
+              attentionReason: null,
+              attentionTimestamp: null,
+            };
+          });
+          if (!didClear || !nextRecord) {
             continue;
           }
-          const nextRecord: StoredAgentRecord = {
-            ...record,
-            updatedAt: new Date().toISOString(),
-            requiresAttention: false,
-            attentionReason: null,
-            attentionTimestamp: null,
-          };
-          await this.agentStorage.upsert(nextRecord);
           const agent = this.buildStoredAgentPayload(nextRecord);
           const project = await this.buildProjectPlacementForWorkspace(workspace);
           this.emit({
@@ -5577,6 +5565,11 @@ export class Session {
     msg: Extract<SessionInboundMessage, { type: "agent.provider_subagents.list.request" }>,
   ): Promise<void> {
     try {
+      await ensureAgentLoaded(msg.parentAgentId, {
+        agentManager: this.agentManager,
+        agentStorage: this.agentStorage,
+        logger: this.sessionLogger,
+      });
       this.emit({
         type: "agent.provider_subagents.list.response",
         payload: {
@@ -5604,6 +5597,11 @@ export class Session {
   ): Promise<void> {
     const direction: AgentTimelineFetchDirection = msg.direction ?? (msg.cursor ? "after" : "tail");
     try {
+      await ensureAgentLoaded(msg.parentAgentId, {
+        agentManager: this.agentManager,
+        agentStorage: this.agentStorage,
+        logger: this.sessionLogger,
+      });
       const descriptor = this.agentManager.getProviderSubagent(msg.parentAgentId, msg.subagentId);
       if (!descriptor) {
         throw new Error("Provider subagent not found");

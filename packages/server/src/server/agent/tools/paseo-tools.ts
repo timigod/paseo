@@ -2,7 +2,7 @@ import { z } from "zod";
 import { ensureValidJson } from "../../json-utils.js";
 import type { Logger } from "pino";
 
-import type { AgentMode, AgentProvider } from "../agent-sdk-types.js";
+import type { AgentMode, AgentProvider, AgentTimelineItem } from "../agent-sdk-types.js";
 import type { AgentManager } from "../agent-manager.js";
 import {
   AgentFeatureSchema,
@@ -2567,13 +2567,37 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
       },
     },
     async ({ agentId, limit }) => {
-      await ensureAgentLoaded(agentId, {
-        agentManager,
-        agentStorage,
-        logger: childLogger,
-      });
-      const timeline = agentManager.getTimeline(agentId);
-      const snapshot = agentManager.getAgent(agentId);
+      await agentManager.waitForAgentLifecycleHandoff(agentId);
+      const stored = await agentStorage.get(agentId);
+      let timeline: AgentTimelineItem[];
+      let currentModeId: string | null;
+      let archivedActivityUnavailable = false;
+      if (stored?.archivedAt) {
+        if (stored.timeline !== undefined) {
+          timeline = stored.timeline;
+        } else {
+          const retainedTimeline = await agentManager.getRetainedOrDurableTimeline(agentId);
+          if (retainedTimeline === null) {
+            timeline = [];
+            archivedActivityUnavailable = true;
+          } else {
+            timeline = retainedTimeline;
+            const latest = await agentStorage.update(agentId, (record) =>
+              record.timeline === undefined ? { ...record, timeline: retainedTimeline } : undefined,
+            );
+            timeline = latest?.timeline ?? retainedTimeline;
+          }
+        }
+        currentModeId = stored.lastModeId ?? stored.config?.modeId ?? null;
+      } else {
+        const snapshot = await ensureAgentLoaded(agentId, {
+          agentManager,
+          agentStorage,
+          logger: childLogger,
+        });
+        timeline = agentManager.getTimeline(agentId);
+        currentModeId = snapshot.currentModeId;
+      }
 
       const selection = selectItemsByProjectedLimit({
         items: timeline,
@@ -2584,19 +2608,24 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
       const { totalProjected, shownProjected } = selection;
 
       const noun = totalProjected === 1 ? "activity" : "activities";
-      const countHeader =
-        limit && shownProjected < totalProjected
-          ? `Showing ${shownProjected} of ${totalProjected} ${noun} (limited to ${limit})`
-          : `Showing all ${totalProjected} ${noun}`;
-
-      const contentWithCount = `${countHeader}\n\n${curatedContent}`;
+      let contentWithCount: string;
+      if (archivedActivityUnavailable) {
+        contentWithCount =
+          "Archived activity is unavailable because this legacy record has no durable timeline snapshot.";
+      } else {
+        const countHeader =
+          limit && shownProjected < totalProjected
+            ? `Showing ${shownProjected} of ${totalProjected} ${noun} (limited to ${limit})`
+            : `Showing all ${totalProjected} ${noun}`;
+        contentWithCount = `${countHeader}\n\n${curatedContent}`;
+      }
 
       return {
         content: [],
         structuredContent: ensureValidJson({
           agentId,
           updateCount: timeline.length,
-          currentModeId: snapshot?.currentModeId ?? null,
+          currentModeId,
           content: contentWithCount,
         }),
       };

@@ -156,6 +156,7 @@ import {
   createSystemManagedProcessTable,
   type ManagedProcessRegistry,
 } from "./managed-processes/managed-processes.js";
+import { IdleAgentRuntimeCollector } from "./agent/idle-agent-runtime-collector.js";
 import { terminateWithTreeKill } from "../utils/tree-kill.js";
 import { isHostnameAllowed, type HostnamesConfig } from "./hostnames.js";
 import {
@@ -1069,6 +1070,12 @@ export async function createPaseoDaemon(
     archiveWorkspace: archiveScheduleWorkspaceExternal,
   });
   await scheduleService.start();
+  const idleAgentRuntimeCollector = new IdleAgentRuntimeCollector({
+    agentManager,
+    activeAgentTargets: scheduleService,
+    logger,
+  });
+  idleAgentRuntimeCollector.start();
   agentManager.setAgentArchivedCallback(async (agentId) => {
     try {
       await scheduleService.completeForAgent(agentId);
@@ -1442,6 +1449,7 @@ export async function createPaseoDaemon(
   };
 
   const stop = async () => {
+    await idleAgentRuntimeCollector.stop();
     scriptHealthMonitor.stop();
     // Freeze both ingress and registration before taking the agent closure snapshot.
     wsServer?.prepareForShutdown();

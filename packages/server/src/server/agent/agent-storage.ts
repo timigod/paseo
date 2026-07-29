@@ -4,10 +4,14 @@ import { z } from "zod";
 import type { Logger } from "pino";
 
 import { writeJsonFileAtomic } from "../atomic-file.js";
-import { AgentFeatureSchema, AgentStatusSchema } from "../messages.js";
+import {
+  AgentFeatureSchema,
+  AgentStatusSchema,
+  AgentTimelineItemPayloadSchema,
+} from "../messages.js";
 import { toStoredAgentRecord } from "./agent-projections.js";
 import type { ManagedAgent } from "./agent-manager.js";
-import type { AgentSessionConfig } from "./agent-sdk-types.js";
+import type { AgentSessionConfig, AgentTimelineItem } from "./agent-sdk-types.js";
 
 const SERIALIZABLE_CONFIG_SCHEMA = z
   .object({
@@ -64,6 +68,7 @@ const STORED_AGENT_SCHEMA = z.object({
   attentionTimestamp: z.string().nullable().optional(),
   internal: z.boolean().optional(),
   archivedAt: z.string().nullable().optional(),
+  timeline: z.array(AgentTimelineItemPayloadSchema).optional(),
 });
 
 export type SerializableAgentConfig = Pick<
@@ -81,6 +86,10 @@ export type StoredAgentRecord = z.infer<typeof STORED_AGENT_SCHEMA>;
 export function parseStoredAgentRecord(value: unknown): StoredAgentRecord {
   return STORED_AGENT_SCHEMA.parse(value);
 }
+
+export type AgentRecordUpdater = (
+  record: Readonly<StoredAgentRecord>,
+) => StoredAgentRecord | undefined;
 
 export class AgentStorage {
   private cache: Map<string, StoredAgentRecord> = new Map();
@@ -114,29 +123,63 @@ export class AgentStorage {
 
   async upsert(record: StoredAgentRecord): Promise<void> {
     await this.load();
-    await this.queueRecordWrite(record);
+    await this.queueRecordMutation(record.id, () => record);
   }
 
-  private queueRecordWrite(record: StoredAgentRecord): Promise<void> {
-    const agentId = record.id;
+  /**
+   * Atomically update an existing record from the latest committed value.
+   *
+   * The updater runs synchronously inside the per-agent write queue. Returning
+   * undefined leaves the record unchanged. Callers that read a record before an
+   * await must use this method for the eventual mutation instead of upserting
+   * their stale snapshot.
+   */
+  async update(agentId: string, updater: AgentRecordUpdater): Promise<StoredAgentRecord | null> {
+    await this.load();
+    return await this.queueRecordMutation(agentId, (record) =>
+      record === null ? undefined : updater(record),
+    );
+  }
+
+  private queueRecordMutation(
+    agentId: string,
+    updater: (record: StoredAgentRecord | null) => StoredAgentRecord | undefined,
+  ): Promise<StoredAgentRecord | null> {
     const prev = this.pendingWrites.get(agentId) ?? Promise.resolve();
-    const next = prev.then(async () => {
-      if (this.deleting.has(agentId)) {
-        return undefined;
-      }
+    const next = prev
+      .catch(() => undefined)
+      .then(async () => {
+        if (this.deleting.has(agentId)) {
+          return null;
+        }
 
-      await this.writeRecord(record);
-      return undefined;
-    });
+        const current = this.cache.get(agentId) ?? null;
+        const record = updater(current);
+        if (record === undefined) {
+          return current;
+        }
+        if (record.id !== agentId) {
+          throw new Error(`Agent record update changed id from ${agentId} to ${record.id}`);
+        }
 
-    const tracked = next.finally(() => {
-      if (this.pendingWrites.get(agentId) === tracked) {
+        await this.writeRecord(record);
+        return record;
+      });
+
+    // The caller receives `next` (and its write error), while the internal queue
+    // keeps a recovered tail so one failed mutation cannot suppress later work.
+    const tracked = next.then(
+      () => undefined,
+      () => undefined,
+    );
+    const queueTail = tracked.finally(() => {
+      if (this.pendingWrites.get(agentId) === queueTail) {
         this.pendingWrites.delete(agentId);
       }
     });
 
-    this.pendingWrites.set(agentId, tracked);
-    return tracked;
+    this.pendingWrites.set(agentId, queueTail);
+    return next;
   }
 
   private async writeRecord(record: StoredAgentRecord): Promise<void> {
@@ -192,38 +235,44 @@ export class AgentStorage {
 
   async applySnapshot(
     agent: ManagedAgent,
-    options?: { title?: string | null; internal?: boolean },
+    options?: {
+      title?: string | null;
+      internal?: boolean;
+      timeline?: readonly AgentTimelineItem[];
+    },
   ): Promise<void> {
     await this.load();
-    await this.waitForPendingWrite(agent.id);
-    const existing = (await this.get(agent.id)) ?? null;
-    const hasTitleOverride =
-      options !== undefined && Object.prototype.hasOwnProperty.call(options, "title");
-    const hasInternalOverride =
-      options !== undefined && Object.prototype.hasOwnProperty.call(options, "internal");
-    const record = toStoredAgentRecord(agent, {
-      title: hasTitleOverride ? (options?.title ?? null) : (existing?.title ?? null),
-      createdAt: existing?.createdAt,
-      internal: hasInternalOverride ? options?.internal : (agent.internal ?? existing?.internal),
-    });
+    await this.queueRecordMutation(agent.id, (existing) => {
+      const hasTitleOverride =
+        options !== undefined && Object.prototype.hasOwnProperty.call(options, "title");
+      const hasInternalOverride =
+        options !== undefined && Object.prototype.hasOwnProperty.call(options, "internal");
+      const record = toStoredAgentRecord(agent, {
+        title: hasTitleOverride ? (options?.title ?? null) : (existing?.title ?? null),
+        createdAt: existing?.createdAt,
+        internal: hasInternalOverride ? options?.internal : (agent.internal ?? existing?.internal),
+      });
 
-    // Preserve soft-delete/archive status across snapshot flushes.
-    // `archivedAt` is not part of the ManagedAgent snapshot, so a naive projection
-    // would wipe it during normal persistence (including on daemon restart).
-    if (existing && existing.archivedAt !== undefined) {
-      record.archivedAt = existing.archivedAt;
-    }
-    await this.upsert(record);
+      // Preserve soft-delete/archive status across snapshot flushes.
+      // `archivedAt` is not part of the ManagedAgent snapshot, so a naive projection
+      // would wipe it during normal persistence (including on daemon restart).
+      if (existing?.archivedAt !== undefined) {
+        record.archivedAt = existing.archivedAt;
+      }
+      if (options?.timeline !== undefined) {
+        record.timeline = [...options.timeline];
+      } else if (existing?.timeline !== undefined) {
+        record.timeline = existing.timeline;
+      }
+      return record;
+    });
   }
 
   async setTitle(agentId: string, title: string): Promise<void> {
-    await this.load();
-    await this.waitForPendingWrite(agentId);
-    const record = await this.get(agentId);
-    if (!record) {
+    const record = await this.update(agentId, (current) => ({ ...current, title }));
+    if (record === null) {
       throw new Error(`Agent ${agentId} not found`);
     }
-    await this.upsert({ ...record, title });
   }
 
   async flush(): Promise<void> {
@@ -348,10 +397,6 @@ export class AgentStorage {
     if (paths.size === 0) {
       this.pathsById.delete(agentId);
     }
-  }
-
-  private async waitForPendingWrite(agentId: string): Promise<void> {
-    await (this.pendingWrites.get(agentId) ?? Promise.resolve()).catch(() => undefined);
   }
 }
 

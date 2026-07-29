@@ -86,19 +86,6 @@ class FakeLifecycleAgentManager implements LifecycleAgentManager {
     return { archivedAt };
   }
 
-  async archiveSnapshot(agentId: string, archivedAt: string): Promise<StoredAgentRecord> {
-    const existing = this.storage.records.get(agentId);
-    if (!existing) {
-      throw new Error(`Agent not found: ${agentId}`);
-    }
-    const archived = {
-      ...existing,
-      archivedAt,
-    };
-    this.storage.records.set(agentId, archived);
-    return archived;
-  }
-
   async closeAgent(agentId: string): Promise<void> {
     this.closedAgentIds.push(agentId);
     this.liveAgents.delete(agentId);
@@ -247,7 +234,7 @@ describe("agent lifecycle commands", () => {
     expect(result.agentId).toBe("agent-1");
     expect(result.archivedAt).toEqual(expect.any(String));
     expect(result.record.archivedAt).toBe(result.archivedAt);
-    expect(manager.archivedAgentIds).toEqual([]);
+    expect(manager.archivedAgentIds).toEqual(["agent-1"]);
   });
 
   test("normalizes metadata updates and rejects empty updates", async () => {

@@ -98,6 +98,10 @@ interface SessionTestAccess {
     list(...args: unknown[]): Promise<unknown[]>;
     get(agentId: string): Promise<unknown>;
     upsert(record: unknown): Promise<void>;
+    update(
+      agentId: string,
+      updater: (record: StoredAgentRecord) => StoredAgentRecord | undefined,
+    ): Promise<StoredAgentRecord | null>;
   };
   agentManager: {
     listAgents(): unknown[];
@@ -1403,8 +1407,12 @@ test("workspace clear attention clears stored-only agents and responds", async (
   session.projectRegistry.get = async (id: string) => (id === project.projectId ? project : null);
   session.agentStorage.get = async (agentId: string) =>
     agentId === storedRecord.id ? storedRecord : null;
-  session.agentStorage.upsert = async (record: unknown) => {
-    storedRecord = record as StoredAgentRecord;
+  session.agentStorage.update = async (agentId, updater) => {
+    if (agentId !== storedRecord.id) {
+      return null;
+    }
+    storedRecord = updater(storedRecord) ?? storedRecord;
+    return storedRecord;
   };
   session.listAgentPayloads = async () => [
     makeAgent({
@@ -1514,9 +1522,14 @@ test("workspace clear attention can clear multiple workspaces in one request", a
   session.projectRegistry.get = async (id: string) =>
     projects.find((project) => project.projectId === id) ?? null;
   session.agentStorage.get = async (agentId: string) => storedRecords.get(agentId) ?? null;
-  session.agentStorage.upsert = async (record: unknown) => {
-    const storedRecord = record as StoredAgentRecord;
-    storedRecords.set(storedRecord.id, storedRecord);
+  session.agentStorage.update = async (agentId, updater) => {
+    const storedRecord = storedRecords.get(agentId);
+    if (!storedRecord) {
+      return null;
+    }
+    const updated = updater(storedRecord) ?? storedRecord;
+    storedRecords.set(agentId, updated);
+    return updated;
   };
   session.listAgentPayloads = async () =>
     Array.from(storedRecords.values()).map((record) => {
@@ -1792,21 +1805,21 @@ test("close_items_request archives stored agents that are not currently loaded",
         getAgent: (agentId: string) => (agentId === "agent-live" ? { id: agentId } : null),
         hasInFlightRun: () => false,
         archiveAgent: async (agentId: string) => {
-          if (agentId !== "agent-live") {
-            throw new Error(`Unexpected live archive: ${agentId}`);
+          if (agentId === "agent-live") {
+            liveRecord.archivedAt = liveArchivedAt;
+            liveRecord.updatedAt = liveArchivedAt;
+            return { archivedAt: liveArchivedAt };
           }
-          liveRecord.archivedAt = liveArchivedAt;
-          liveRecord.updatedAt = liveArchivedAt;
-          return { archivedAt: liveArchivedAt };
-        },
-        archiveSnapshot: async (_agentId: string, archivedAt: string) => {
-          storedRecord.archivedAt = archivedAt;
-          storedRecord.updatedAt = archivedAt;
-          storedRecord.status = "completed";
-          storedRecord.requiresAttention = false;
-          storedRecord.attentionReason = null;
-          storedRecord.attentionTimestamp = null;
-          return storedRecord;
+          if (agentId === storedAgentId) {
+            const archivedAt = new Date().toISOString();
+            storedRecord.archivedAt = archivedAt;
+            storedRecord.updatedAt = archivedAt;
+            storedRecord.requiresAttention = false;
+            storedRecord.attentionReason = null;
+            storedRecord.attentionTimestamp = null;
+            return { archivedAt };
+          }
+          throw new Error(`Unexpected archive: ${agentId}`);
         },
         clearAgentAttention: async () => {},
         notifyAgentState: () => {},

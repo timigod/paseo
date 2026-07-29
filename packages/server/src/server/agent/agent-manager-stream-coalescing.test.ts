@@ -5,6 +5,7 @@ import { afterEach, describe, expect, test, vi } from "vitest";
 
 import { createTestLogger } from "../../test-utils/test-logger.js";
 import { AgentManager, type AgentManagerEvent } from "./agent-manager.js";
+import { AgentStorage } from "./agent-storage.js";
 import { AGENT_STREAM_COALESCE_DEFAULT_WINDOW_MS } from "./agent-stream-coalescer.js";
 import type { AgentTimelineRow } from "./agent-timeline-store-types.js";
 import type {
@@ -238,17 +239,22 @@ interface Harness {
   manager: AgentManager;
   client: TestAgentClient;
   events: AgentManagerEvent[];
+  storage: AgentStorage | null;
   workdir: string;
   cleanup: () => void;
 }
 
-function createHarness(options?: { provider?: AgentProvider }): Harness {
+function createHarness(options?: { provider?: AgentProvider; withStorage?: boolean }): Harness {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-stream-coalescing-"));
   const client = new TestAgentClient(options?.provider ?? "codex");
+  const storage = options?.withStorage
+    ? new AgentStorage(join(workdir, "agents"), createTestLogger())
+    : null;
   const manager = new AgentManager({
     clients: { [client.provider]: client },
     idFactory: createIdFactory(),
     logger: createTestLogger(),
+    ...(storage ? { registry: storage } : {}),
   });
   const events: AgentManagerEvent[] = [];
   manager.subscribe((event) => events.push(event), { replayState: false });
@@ -257,6 +263,7 @@ function createHarness(options?: { provider?: AgentProvider }): Harness {
     manager,
     client,
     events,
+    storage,
     workdir,
     cleanup: () => rmSync(workdir, { recursive: true, force: true }),
   };
@@ -378,6 +385,31 @@ afterEach(() => {
 });
 
 describe("target coalesced behavior", () => {
+  test("archive stores buffered final output before discarding the retained timeline", async () => {
+    vi.useFakeTimers();
+    const harness = createHarness({ withStorage: true });
+    try {
+      const { agentId, session } = await createManagedSession(harness);
+      session.pushEvent(assistant("buffered final output"));
+      await waitForSessionEventQueue();
+
+      expect(harness.manager.getTimeline(agentId)).toEqual([]);
+
+      const archived = await harness.manager.archiveAgent(agentId);
+
+      expect(await harness.storage?.get(agentId)).toMatchObject({
+        id: agentId,
+        archivedAt: archived.archivedAt,
+        lastStatus: "closed",
+        timeline: [{ type: "assistant_message", text: "buffered final output" }],
+      });
+      expect(harness.manager.getAgent(agentId)).toBeNull();
+    } finally {
+      vi.useRealTimers();
+      harness.cleanup();
+    }
+  });
+
   test("bounds tool output before persisting and streaming it", async () => {
     const harness = createHarness();
     try {

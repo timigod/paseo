@@ -15,12 +15,9 @@ const pendingAgentInitializations = new Map<string, Promise<ManagedAgent>>();
 
 type AgentLoaderManager = Pick<
   AgentManager,
-  | "createAgent"
-  | "getAgent"
-  | "getRegisteredProviderIds"
-  | "hydrateTimelineFromProvider"
-  | "resumeAgentFromPersistence"
->;
+  "createAgent" | "getAgent" | "getRegisteredProviderIds" | "resumeAgentFromPersistence"
+> &
+  Partial<Pick<AgentManager, "touchAgentActivity" | "waitForAgentLifecycleHandoff">>;
 
 export interface EnsureAgentLoadedDeps {
   agentManager: AgentLoaderManager;
@@ -33,10 +30,17 @@ export async function ensureAgentLoaded(
   agentId: string,
   deps: EnsureAgentLoadedDeps,
 ): Promise<ManagedAgent> {
-  const existing = deps.agentManager.getAgent(agentId);
+  await deps.agentManager.waitForAgentLifecycleHandoff?.(agentId);
+  const existing =
+    deps.agentManager.touchAgentActivity?.(agentId) ?? deps.agentManager.getAgent(agentId);
   if (existing) {
     return existing;
   }
+
+  // A lifecycle transition may have started after the first barrier observed
+  // no in-flight work. Once the live lookup is empty, this second barrier
+  // closes that gap before storage-backed resume begins.
+  await deps.agentManager.waitForAgentLifecycleHandoff?.(agentId);
 
   const inflight = pendingAgentInitializations.get(agentId);
   if (inflight) {
@@ -47,6 +51,9 @@ export async function ensureAgentLoaded(
     const record = await deps.agentStorage.get(agentId);
     if (!record) {
       throw new Error(`Agent not found: ${agentId}`);
+    }
+    if (record.archivedAt) {
+      throw new Error(`Agent ${agentId} is archived`);
     }
 
     const validProviders = deps.validProviders ?? deps.agentManager.getRegisteredProviderIds();
@@ -62,7 +69,10 @@ export async function ensureAgentLoaded(
         handle,
         buildConfigOverrides(record),
         agentId,
-        extractTimestamps(record),
+        {
+          ...extractTimestamps(record),
+          hydrateTimeline: {},
+        },
       );
       deps.logger.info({ agentId, provider: record.provider }, "Agent resumed from persistence");
     } else {
@@ -74,12 +84,11 @@ export async function ensureAgentLoaded(
       }
       snapshot = await deps.agentManager.createAgent(config, agentId, {
         labels: record.labels,
+        hydrateTimeline: {},
         workspaceId: record.workspaceId,
       });
       deps.logger.info({ agentId, provider: record.provider }, "Agent created from stored config");
     }
-
-    await deps.agentManager.hydrateTimelineFromProvider(agentId);
     return deps.agentManager.getAgent(agentId) ?? snapshot;
   })();
 

@@ -37,8 +37,8 @@ describe("OpenCodeServerManager generations", () => {
     expect(newAcquisition.server.url).toBe("http://127.0.0.1:4102");
     expect(runtime.terminatedPorts).toEqual([]);
 
-    newAcquisition.release();
-    oldAcquisition.release();
+    await newAcquisition.release();
+    await oldAcquisition.release();
 
     expect(runtime.terminatedPorts).toEqual([4101]);
   });
@@ -48,22 +48,22 @@ describe("OpenCodeServerManager generations", () => {
 
     const oldAcquisition = await manager.acquireCurrent();
     const rotatedAcquisition = await manager.acquireNew();
-    rotatedAcquisition.release();
+    await rotatedAcquisition.release();
 
     const nextAcquisition = await manager.acquireCurrent();
 
     expect(nextAcquisition.server.url).toBe("http://127.0.0.1:4202");
     expect(runtime.terminatedPorts).toEqual([]);
 
-    nextAcquisition.release();
-    oldAcquisition.release();
+    await nextAcquisition.release();
+    await oldAcquisition.release();
   });
 
   test("concurrent new-server acquisitions share one fresh generation", async () => {
     const { manager, runtime } = createTestManager([4251, 4252, 4253]);
 
     const initialAcquisition = await manager.acquireCurrent();
-    initialAcquisition.release();
+    await initialAcquisition.release();
 
     const [modelsAcquisition, modesAcquisition] = await Promise.all([
       manager.acquireNew(),
@@ -74,8 +74,8 @@ describe("OpenCodeServerManager generations", () => {
     expect(modesAcquisition.server.url).toBe("http://127.0.0.1:4252");
     expect(runtime.launchedPorts).toEqual([4251, 4252]);
 
-    modesAcquisition.release();
-    modelsAcquisition.release();
+    await modesAcquisition.release();
+    await modelsAcquisition.release();
   });
 
   test("release is idempotent", async () => {
@@ -83,12 +83,30 @@ describe("OpenCodeServerManager generations", () => {
 
     const oldAcquisition = await manager.acquireCurrent();
     const newAcquisition = await manager.acquireNew();
-    newAcquisition.release();
+    await newAcquisition.release();
 
-    oldAcquisition.release();
-    oldAcquisition.release();
+    await oldAcquisition.release();
+    await oldAcquisition.release();
 
     expect(runtime.terminatedPorts).toEqual([4301]);
+  });
+
+  test("keeps the current server warm, cancels its timer on reacquire, then shuts it down idle", async () => {
+    vi.useFakeTimers();
+    const { manager, runtime } = createTestManager([4351]);
+
+    const first = await manager.acquireCurrent();
+    await first.release();
+    await vi.advanceTimersByTimeAsync(59_999);
+
+    const reacquired = await manager.acquireCurrent();
+    expect(reacquired.server.url).toBe("http://127.0.0.1:4351");
+    await vi.advanceTimersByTimeAsync(1);
+    expect(runtime.terminatedPorts).toEqual([]);
+
+    await reacquired.release();
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(runtime.terminatedPorts).toEqual([4351]);
   });
 
   test("shutdown kills current and retired servers", async () => {
@@ -153,7 +171,7 @@ describe("OpenCodeServerManager generations", () => {
     const dedicatedStart = manager.acquireDedicated({ TEST_ENV: "custom" });
     await runtime.settle();
 
-    currentAcquisition.release();
+    await currentAcquisition.release();
     expect(runtime.terminatedPorts).toEqual([]);
 
     runtime.processForPort(4474).announceListening();
@@ -161,7 +179,7 @@ describe("OpenCodeServerManager generations", () => {
 
     expect(dedicatedAcquisition.server.url).toBe("http://127.0.0.1:4474");
 
-    dedicatedAcquisition.release();
+    await dedicatedAcquisition.release();
     expect(runtime.terminatedPorts).toEqual([4474]);
   });
 
@@ -173,10 +191,10 @@ describe("OpenCodeServerManager generations", () => {
 
     expect(existingAcquisition?.server.url).toBe("http://127.0.0.1:4475");
 
-    dedicatedAcquisition.release();
+    await dedicatedAcquisition.release();
     expect(runtime.terminatedPorts).toEqual([]);
 
-    existingAcquisition?.release();
+    await existingAcquisition?.release();
     expect(runtime.terminatedPorts).toEqual([4475]);
   });
 
@@ -188,7 +206,7 @@ describe("OpenCodeServerManager generations", () => {
 
     expect(manager.acquireExisting("http://127.0.0.1:9999")).toBe(null);
 
-    acquisition.release();
+    await acquisition.release();
     expect(runtime.terminatedPorts).toEqual([4476]);
     expect(manager.acquireExisting(url)).toBe(null);
   });
@@ -198,12 +216,34 @@ describe("OpenCodeServerManager generations", () => {
 
     const firstAcquisition = await manager.acquireCurrent();
     const secondAcquisition = await manager.acquireNew();
-    secondAcquisition.release();
+    await secondAcquisition.release();
     const thirdAcquisition = await manager.acquireNew();
-    thirdAcquisition.release();
-    firstAcquisition.release();
+    await thirdAcquisition.release();
+    await firstAcquisition.release();
 
     expect(runtime.terminatedPorts).toEqual([4502, 4501]);
+  });
+
+  test("idle timer detaches a terminating generation before a concurrent acquire", async () => {
+    vi.useFakeTimers();
+    const { manager, runtime } = createTestManager([4551, 4552]);
+    const releaseRemoval = runtime.managedProcesses.holdRemovals();
+
+    const first = await manager.acquireCurrent();
+    await first.release();
+    await vi.advanceTimersByTimeAsync(60_000);
+    const next = await manager.acquireCurrent();
+
+    expect(next.server.url).toBe("http://127.0.0.1:4552");
+    expect(runtime.terminatedPorts).toEqual([4551]);
+    expect(await runtime.managedProcesses.list()).toHaveLength(2);
+
+    releaseRemoval();
+    await runtime.settle();
+    expect(await runtime.managedProcesses.list()).toEqual([
+      expect.objectContaining({ metadata: { port: 4552 } }),
+    ]);
+    await next.release();
   });
 });
 
@@ -243,6 +283,28 @@ describe("OpenCodeServerManager managed process ledger", () => {
     expect(await runtime.managedProcesses.list()).toEqual([]);
   });
 
+  test("dedicated release waits for exact managed-process ledger removal", async () => {
+    const { manager, runtime } = createTestManager([4604]);
+    const releaseRemoval = runtime.managedProcesses.holdRemovals();
+    const acquisition = await manager.acquireDedicated({ PASEO_AGENT_ID: "idle-agent" });
+    let releaseSettled = false;
+
+    const release = acquisition.release().then(() => {
+      releaseSettled = true;
+      return undefined;
+    });
+    await runtime.settle();
+
+    expect(releaseSettled).toBe(false);
+    expect(await runtime.managedProcesses.list()).toHaveLength(1);
+
+    releaseRemoval();
+    await release;
+    expect(releaseSettled).toBe(true);
+    expect(runtime.terminatedPorts).toEqual([4604]);
+    expect(await runtime.managedProcesses.list()).toEqual([]);
+  });
+
   test("starts helper server from opencode-home", async () => {
     const tempDir = mkdtempSync(path.join(os.tmpdir(), "opencode-server-home-"));
     const opencodeHomeDir = path.join(tempDir, "opencode-home");
@@ -259,7 +321,7 @@ describe("OpenCodeServerManager managed process ledger", () => {
         }),
       ]);
 
-      acquisition.release();
+      await acquisition.release();
       await manager.shutdown();
     } finally {
       rmSync(tempDir, { recursive: true, force: true });
@@ -464,6 +526,18 @@ class FakeOpenCodeProcess extends EventEmitter {
 
 class FakeManagedProcesses implements ManagedProcessRegistry {
   private records: ManagedProcessRecord[] = [];
+  private removalGate: Promise<void> | null = null;
+
+  holdRemovals(): () => void {
+    let release!: () => void;
+    this.removalGate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    return () => {
+      release();
+      this.removalGate = null;
+    };
+  }
 
   async record(input: ManagedProcessRecordInput): Promise<ManagedProcessRecord> {
     const record: ManagedProcessRecord = {
@@ -478,6 +552,7 @@ class FakeManagedProcesses implements ManagedProcessRegistry {
   }
 
   async remove(id: string): Promise<void> {
+    await this.removalGate;
     this.records = this.records.filter((record) => record.id !== id);
   }
 

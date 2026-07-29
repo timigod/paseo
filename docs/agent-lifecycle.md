@@ -16,6 +16,43 @@ Each agent in `AgentManager` carries a `lastStatus` of `initializing`, `idle`, `
 
 Cancellation changes lifecycle state only after the provider acknowledges the interrupt or emits a terminal turn event. If the interrupt is rejected or times out, the agent remains `running` with its active foreground turn intact. Follow-up actions such as replacement, reload, rewind, and Stop must report that failure instead of accepting work they cannot perform. Synthesizing a local cancellation without provider acknowledgment creates a split-brain session: Paseo accepts a new prompt while the provider still owns the previous foreground turn.
 
+## Idle runtime sleep
+
+An idle turn is not terminal task completion. The daemon may put a long-idle,
+still-unarchived agent to sleep by closing only its live provider runtime and
+persisting `lastStatus: "closed"`. The task record, provider persistence handle,
+timeline, provider-subagent state, workspace, and worktree remain intact. A later
+prompt or `paseo continue` resumes the same agent ID and native session.
+
+The default collector checks every minute and considers agents whose last
+activity is at least two hours old. Collection is manager-owned and excludes:
+
+- initializing, running, error, or recently active agents
+- foreground or queued provider work, including pending replacement
+- pending, buffered, or in-flight permission handling
+- internal agents
+- active schedule targets
+- sessions without a persistence handle or without session-persistence support
+
+Runtime create, resume, refresh, close, archive, and unarchive transitions share
+one manager-owned queue per agent ID. A prompt or refresh that arrives during
+sleep waits for the exact close to finish, then one loader resumes the task.
+Archive makes its live-versus-stored decision only after earlier loading or
+closing has settled, so it cannot persist an archived record while leaving a
+same-ID runtime live. Opening an already-live task refreshes its activity
+timestamp so the same sweep cannot immediately collect it.
+
+`AgentSession.close()` is runtime-only. It must not archive or delete the
+provider's durable native session. For OpenCode, close aborts outstanding work
+and awaits release of the exact dedicated helper-server lease. Native OpenCode
+archive/unarchive happens only through the explicit archive hooks. Shared
+OpenCode catalog/discovery servers use a separate 60-second warm timeout; a
+generation is detached before asynchronous termination so it cannot be
+reacquired while closing.
+
+Shutdown stops the collector and awaits any in-flight sweep before taking the
+final live-agent close snapshot.
+
 ## Relationships
 
 Agents can launch other agents via the agent-scoped `create_agent` MCP tool. Agent-scoped creation is always asynchronous. `relationship` and `workspace` are separate decisions:
@@ -39,6 +76,20 @@ Users can also detach an existing subagent from the subagents track. Detach remo
 ## Archive
 
 Archive is a **soft delete**: the agent record stays on disk with `archivedAt` set, the runtime is closed, and the agent disappears from active lists. Archive is **global** — it lives on the server and propagates to every connected client.
+
+Archive is distinct from idle runtime sleep. Archive sets `archivedAt`, invokes
+the provider's native archive hook, copies the final timeline into the durable
+agent record for read-only activity access, discards retained in-memory
+timeline/subagent runtime state, and cascades to managed children. Reading
+archived activity never resumes a provider runtime. Idle sleep does none of
+those terminal operations.
+
+When a stored-only legacy record predates the durable `timeline` field, archive
+backfills it from retained in-memory activity before discarding that activity.
+Archived activity reads apply the same retained/durable fallback without
+resuming a provider. If no such history still exists, the activity tool reports
+that the legacy history is unavailable instead of presenting an empty timeline
+as complete.
 
 ### Orchestrator finish and recovery
 
@@ -66,11 +117,13 @@ wait-and-reload chain for live conversations.
 
 Archiving runs through `AgentManager.archiveAgent` (`packages/server/src/server/agent/agent-manager.ts`):
 
-1. Snapshot the current session into the registry
-2. Set `archivedAt` and normalize `lastStatus` away from `running`/`initializing`
-3. Notify subscribers
-4. Close the runtime (kills the process if still running)
-5. **Cascade-archive children** — any agent whose `paseo.parent-agent-id` label matches the archived agent gets archived too, recursively
+1. For a live agent, invoke the provider's native archive hook, close the
+   provider runtime, and persist its final `closed` snapshot; `archivedAt` is
+   not written while that runtime close is still in flight
+2. Discard retained timeline and provider-subagent runtime state
+3. Set `archivedAt` and notify subscribers; stored-only agents invoke the
+   provider's native archive hook here
+4. **Cascade-archive children** — any agent whose `paseo.parent-agent-id` label matches the archived agent gets archived too, recursively
 
 Cascade is what keeps subagent fleets from outliving their orchestrator.
 

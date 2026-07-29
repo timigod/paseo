@@ -16,7 +16,6 @@ export interface LifecycleAgentManager {
   cancelAgentRun(agentId: string): Promise<AgentRunCancellationResult>;
   clearAgentAttention(agentId: string): Promise<void>;
   archiveAgent(agentId: string): Promise<{ archivedAt: string }>;
-  archiveSnapshot(agentId: string, archivedAt: string): Promise<StoredAgentRecord>;
   closeAgent(agentId: string): Promise<void>;
   setLabels(agentId: string, labels: Record<string, string>): Promise<void>;
   detachAgent(agentId: string): Promise<{
@@ -120,16 +119,13 @@ export async function archiveAgentCommand(
   agentId: string,
 ): Promise<ArchiveAgentResult> {
   const liveAgent = dependencies.agentManager.getAgent(agentId);
-  let record: StoredAgentRecord | null;
   if (liveAgent) {
     await requestAgentRunCancellation(dependencies, agentId);
     await dependencies.agentManager.clearAgentAttention(agentId).catch(() => undefined);
-    await dependencies.agentManager.archiveAgent(agentId);
-    record = await dependencies.agentStorage.get(agentId);
-  } else {
-    record = await archiveStoredAgent(dependencies, agentId);
   }
 
+  await dependencies.agentManager.archiveAgent(agentId);
+  const record = await dependencies.agentStorage.get(agentId);
   if (!record) {
     throw new Error(`Agent not found in storage after archive: ${agentId}`);
   }
@@ -212,21 +208,4 @@ export async function setAgentModeCommand(
 ): Promise<{ modeId: string; notice: AgentProviderNotice | null }> {
   const notice = await dependencies.agentManager.setAgentMode(input.agentId, input.modeId);
   return { modeId: input.modeId, notice };
-}
-
-async function archiveStoredAgent(
-  dependencies: Pick<AgentLifecycleCommandDependencies, "agentManager" | "agentStorage">,
-  agentId: string,
-): Promise<StoredAgentRecord> {
-  const existing = await dependencies.agentStorage.get(agentId);
-  if (!existing) {
-    throw new Error(`Agent not found: ${agentId}`);
-  }
-
-  if (existing.archivedAt) {
-    return existing;
-  }
-
-  const archivedAt = new Date().toISOString();
-  return dependencies.agentManager.archiveSnapshot(agentId, archivedAt);
 }

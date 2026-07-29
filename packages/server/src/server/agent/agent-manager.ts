@@ -230,6 +230,7 @@ export interface CreateAgentOptions {
   env?: Record<string, string>;
   persistSession?: boolean;
   initialTitle?: string | null;
+  hydrateTimeline?: HydrateTimelineOptions;
   // undefined is an explicit decision: the agent never appears in the sidebar.
   workspaceId: string | undefined;
 }
@@ -386,6 +387,21 @@ export interface AgentMetricsSnapshot {
     totalItems: number;
     maxItemsPerAgent: number;
   };
+}
+
+export interface IdleAgentCollectionEntry {
+  agentId: string;
+  provider: AgentProvider;
+  sessionId?: string;
+}
+
+export interface IdleAgentCollectionFailure extends IdleAgentCollectionEntry {
+  error: unknown;
+}
+
+export interface IdleAgentCollectionResult {
+  collected: IdleAgentCollectionEntry[];
+  failures: IdleAgentCollectionFailure[];
 }
 
 type ActiveManagedAgent =
@@ -565,6 +581,11 @@ export class AgentManager {
   private readonly previousStatuses = new Map<string, AgentLifecycleStatus>();
   private readonly backgroundTasks = new Set<Promise<void>>();
   private readonly agentRegistrationTasks = new Set<Promise<void>>();
+  private readonly agentLifecycleTails = new Map<string, Promise<void>>();
+  private readonly inFlightAgentCloses = new Map<
+    string,
+    { result: Promise<void>; lifecycleTail: Promise<void> }
+  >();
   private readonly agentStreamCoalescer: AgentStreamCoalescer;
   private mcpBaseUrl: string | null;
   private readonly mcpAuthToken: string | null;
@@ -939,9 +960,38 @@ export class AgentManager {
     return agent ? { ...agent } : null;
   }
 
+  touchAgentActivity(id: string): ManagedAgent | null {
+    const agent = this.agents.get(id);
+    if (!agent) {
+      return null;
+    }
+    this.touchUpdatedAt(agent);
+    return { ...agent };
+  }
+
+  async waitForAgentLifecycleHandoff(agentId: string): Promise<void> {
+    await this.agentLifecycleTails.get(agentId);
+  }
+
   getTimeline(id: string): AgentTimelineItem[] {
     this.requireAgent(id);
     return this.timelineStore.getItems(id);
+  }
+
+  async getRetainedOrDurableTimeline(id: string): Promise<AgentTimelineItem[] | null> {
+    if (this.timelineStore.has(id)) {
+      return this.timelineStore.getItems(id);
+    }
+    if (!this.durableTimelineStore) {
+      return null;
+    }
+    try {
+      const rows = await this.durableTimelineStore.getCommittedRows(id);
+      return rows.length > 0 ? rows.map((row) => row.item) : null;
+    } catch (error) {
+      this.logger.warn({ err: error, agentId: id }, "Failed to read retained agent timeline");
+      return null;
+    }
   }
 
   async getTimelineRows(id: string): Promise<AgentTimelineRow[]> {
@@ -984,7 +1034,12 @@ export class AgentManager {
     agentId: string | undefined,
     options: CreateAgentOptions,
   ): Promise<ManagedAgent> {
-    return this.trackAgentRegistrationOperation(this.createAgentInternal(config, agentId, options));
+    const requestedAgentId = agentId ?? this.idFactory();
+    return this.trackAgentRegistrationOperation(
+      this.queueAgentLifecycleHandoff(requestedAgentId, () =>
+        this.createAgentInternal(config, requestedAgentId, options),
+      ),
+    );
   }
 
   private async createAgentInternal(
@@ -994,6 +1049,8 @@ export class AgentManager {
   ): Promise<ManagedAgent> {
     this.assertAcceptingAgentRegistrations();
     const resolvedAgentId = validateAgentId(agentId ?? this.idFactory(), "createAgent");
+    await this.assertAgentRecordIsNotArchived(resolvedAgentId);
+    await this.deleteAgentState(resolvedAgentId);
     const { storedConfig, launchConfig } = await this.prepareSessionConfig(config, resolvedAgentId);
     this.requireEnabledProvider(storedConfig.provider);
     const client = await this.requireAvailableClient({
@@ -1003,11 +1060,16 @@ export class AgentManager {
     const providerLaunchConfig = this.resolveProviderLaunchConfig(launchConfig, launchContext);
     const createOptions = this.buildCreateSessionOptions(options);
     const session = await client.createSession(providerLaunchConfig, launchContext, createOptions);
-    return this.registerSession(session, storedConfig, resolvedAgentId, {
+    const snapshot = await this.registerSession(session, storedConfig, resolvedAgentId, {
       labels: options.labels,
       initialTitle: options.initialTitle,
       workspaceId: options.workspaceId,
     });
+    if (options.hydrateTimeline) {
+      await this.hydrateTimelineFromProvider(resolvedAgentId, options.hydrateTimeline);
+      return this.getAgent(resolvedAgentId) ?? snapshot;
+    }
+    return snapshot;
   }
 
   private buildCreateSessionOptions(options?: {
@@ -1030,10 +1092,14 @@ export class AgentManager {
       lastUserMessageAt?: Date | null;
       labels?: Record<string, string>;
       workspaceId?: string;
+      hydrateTimeline?: HydrateTimelineOptions;
     },
   ): Promise<ManagedAgent> {
+    const requestedAgentId = agentId ?? this.idFactory();
     return this.trackAgentRegistrationOperation(
-      this.resumeAgentFromPersistenceInternal(handle, overrides, agentId, options),
+      this.queueAgentLifecycleHandoff(requestedAgentId, () =>
+        this.resumeAgentFromPersistenceInternal(handle, overrides, requestedAgentId, options),
+      ),
     );
   }
 
@@ -1047,6 +1113,7 @@ export class AgentManager {
       lastUserMessageAt?: Date | null;
       labels?: Record<string, string>;
       workspaceId?: string;
+      hydrateTimeline?: HydrateTimelineOptions;
     },
   ): Promise<ManagedAgent> {
     this.assertAcceptingAgentRegistrations();
@@ -1054,6 +1121,11 @@ export class AgentManager {
       agentId ?? this.idFactory(),
       "resumeAgentFromPersistence",
     );
+    await this.assertAgentRecordIsNotArchived(resolvedAgentId);
+    const existing = this.agents.get(resolvedAgentId);
+    if (existing) {
+      return { ...existing };
+    }
     const metadata = (handle.metadata ?? {}) as Partial<AgentSessionConfig>;
     const mergedConfig = {
       ...metadata,
@@ -1075,7 +1147,19 @@ export class AgentManager {
     const launchContext = await this.buildLaunchContext(resolvedAgentId, client);
     const providerLaunchConfig = this.resolveProviderLaunchConfig(launchConfig, launchContext);
     const session = await client.resumeSession(handle, providerLaunchConfig, launchContext);
-    return this.registerSession(session, storedConfig, resolvedAgentId, options);
+    const snapshot = await this.registerSession(session, storedConfig, resolvedAgentId, {
+      createdAt: options?.createdAt,
+      updatedAt: options?.updatedAt,
+      lastUserMessageAt: options?.lastUserMessageAt,
+      labels: options?.labels,
+      workspaceId: options?.workspaceId,
+      persistence: handle,
+    });
+    if (options?.hydrateTimeline) {
+      await this.hydrateTimelineFromProvider(resolvedAgentId, options.hydrateTimeline);
+      return this.getAgent(resolvedAgentId) ?? snapshot;
+    }
+    return snapshot;
   }
 
   importProviderSession(input: {
@@ -1160,19 +1244,31 @@ export class AgentManager {
   reloadAgentSession(
     agentId: string,
     overrides?: Partial<AgentSessionConfig>,
-    options?: { rehydrateFromDisk?: boolean },
+    options?: {
+      rehydrateFromDisk?: boolean;
+      hydrateTimeline?: HydrateTimelineOptions;
+    },
   ): Promise<ManagedAgent> {
     return this.trackAgentRegistrationOperation(
-      this.reloadAgentSessionInternal(agentId, overrides, options),
+      this.queueAgentLifecycleHandoff(agentId, () =>
+        this.reloadAgentSessionInternal(agentId, overrides, options),
+      ),
     );
   }
 
   private async reloadAgentSessionInternal(
     agentId: string,
     overrides?: Partial<AgentSessionConfig>,
-    options?: { rehydrateFromDisk?: boolean },
+    options?: {
+      rehydrateFromDisk?: boolean;
+      hydrateTimeline?: HydrateTimelineOptions;
+    },
   ): Promise<ManagedAgent> {
     this.assertAcceptingAgentRegistrations();
+    await this.assertAgentRecordIsNotArchived(agentId);
+    if (!this.agents.has(agentId)) {
+      return this.resumeStoredAgentForReload(agentId, options?.hydrateTimeline);
+    }
     let existing = this.requireSessionAgent(agentId);
     if (this.hasInFlightRun(agentId)) {
       await this.cancelAgentRunBefore(agentId, "reload");
@@ -1223,7 +1319,7 @@ export class AgentManager {
 
       // Preserve existing labels and timeline during reload.
       handedToRegistration = true;
-      return this.registerSession(session, storedConfig, agentId, {
+      const snapshot = await this.registerSession(session, storedConfig, agentId, {
         labels: existing.labels,
         workspaceId: existing.workspaceId,
         createdAt: existing.createdAt,
@@ -1234,11 +1330,45 @@ export class AgentManager {
         lastError: preservedLastError,
         attention: preservedAttention,
       });
+      if (options?.hydrateTimeline) {
+        await this.hydrateTimelineFromProvider(agentId, options.hydrateTimeline);
+        return this.getAgent(agentId) ?? snapshot;
+      }
+      return snapshot;
     } finally {
       if (!handedToRegistration) {
         await this.closeUnregisteredSession(session);
       }
     }
+  }
+
+  private async resumeStoredAgentForReload(
+    agentId: string,
+    hydrateTimeline?: HydrateTimelineOptions,
+  ): Promise<ManagedAgent> {
+    const record = await this.requireRegistry().get(agentId);
+    if (!record) {
+      throw new Error(`Agent not found: ${agentId}`);
+    }
+    if (!this.clients.has(record.provider)) {
+      throw new Error(`Agent ${agentId} references unavailable provider '${record.provider}'`);
+    }
+    if (!record.persistence) {
+      throw new Error(`Agent ${agentId} cannot be refreshed because it lacks persistence`);
+    }
+    const storedConfig = buildStoredAgentConfig(record);
+    const lastModeId = record.lastModeId ?? record.config?.modeId;
+    if (lastModeId != null) {
+      storedConfig.modeId = lastModeId;
+    }
+    return this.resumeAgentFromPersistenceInternal(record.persistence, storedConfig, agentId, {
+      createdAt: new Date(record.createdAt),
+      updatedAt: new Date(record.lastActivityAt ?? record.updatedAt),
+      lastUserMessageAt: record.lastUserMessageAt ? new Date(record.lastUserMessageAt) : null,
+      labels: record.labels,
+      workspaceId: record.workspaceId,
+      hydrateTimeline,
+    });
   }
 
   private async closeReloadedSession(session: AgentSession, agentId: string): Promise<void> {
@@ -1295,7 +1425,29 @@ export class AgentManager {
     }
   }
 
-  async closeAgent(agentId: string): Promise<void> {
+  closeAgent(agentId: string): Promise<void> {
+    const existing = this.inFlightAgentCloses.get(agentId);
+    if (existing && this.agentLifecycleTails.get(agentId) === existing.lifecycleTail) {
+      return existing.result;
+    }
+
+    const close = this.queueAgentLifecycleHandoff(agentId, () => this.closeAgentRuntime(agentId));
+    const lifecycleTail = this.agentLifecycleTails.get(agentId);
+    if (!lifecycleTail) {
+      throw new Error(`Agent ${agentId} close was not added to the lifecycle queue`);
+    }
+    const entry = { result: close, lifecycleTail };
+    this.inFlightAgentCloses.set(agentId, entry);
+    const clearClose = () => {
+      if (this.inFlightAgentCloses.get(agentId) === entry) {
+        this.inFlightAgentCloses.delete(agentId);
+      }
+    };
+    void close.then(clearClose, clearClose);
+    return close;
+  }
+
+  private async closeAgentRuntime(agentId: string): Promise<void> {
     const agent = this.requireAgent(agentId);
     this.logger.trace(
       {
@@ -1310,12 +1462,20 @@ export class AgentManager {
       "agent.manager.close.start",
     );
     const closedAgent = this.prepareAgentForClosure(agent, "agent closed");
-    await agent.session.close();
-    this.timelineStore.delete(agentId);
-    for (const event of this.providerSubagents.deleteParent(agentId)) {
-      this.dispatch({ type: "provider_subagent", event });
+    const timeline = this.timelineStore.getItems(agentId);
+    let closeError: unknown;
+    try {
+      await agent.session.close();
+    } catch (error) {
+      closeError = error;
     }
-    await this.persistSnapshot(closedAgent);
+
+    let persistError: unknown;
+    try {
+      await this.persistSnapshot(closedAgent, { timeline });
+    } catch (error) {
+      persistError = error;
+    }
     this.emitClosedAgent(closedAgent, { persist: false });
     this.logger.trace(
       {
@@ -1325,29 +1485,130 @@ export class AgentManager {
       },
       "agent.manager.close.complete",
     );
+
+    if (closeError !== undefined) {
+      throw closeError;
+    }
+    if (persistError !== undefined) {
+      throw persistError;
+    }
   }
 
-  async archiveAgent(agentId: string): Promise<{ archivedAt: string }> {
-    const agent = this.requireAgent(agentId);
-    if (!this.registry) {
-      throw new Error("Agent storage is not configured");
+  async collectIdleAgents(options: {
+    cutoff: Date;
+    protectedAgentIds: ReadonlySet<string>;
+  }): Promise<IdleAgentCollectionResult> {
+    const result: IdleAgentCollectionResult = { collected: [], failures: [] };
+
+    for (const snapshot of Array.from(this.agents.values())) {
+      const current = this.agents.get(snapshot.id);
+      if (!current || !this.isIdleAgentCollectable(current, options)) {
+        continue;
+      }
+
+      const entry: IdleAgentCollectionEntry = {
+        agentId: current.id,
+        provider: current.provider,
+        ...(current.persistence?.sessionId ? { sessionId: current.persistence.sessionId } : {}),
+      };
+      try {
+        await this.closeAgent(current.id);
+        result.collected.push(entry);
+      } catch (error) {
+        result.failures.push({ ...entry, error });
+      }
     }
 
-    await this.registry.applySnapshot(agent, {
-      internal: agent.internal,
+    return result;
+  }
+
+  private isIdleAgentCollectable(
+    agent: LiveManagedAgent,
+    options: { cutoff: Date; protectedAgentIds: ReadonlySet<string> },
+  ): agent is ManagedAgentIdle {
+    return (
+      agent.lifecycle === "idle" &&
+      agent.updatedAt.getTime() <= options.cutoff.getTime() &&
+      !agent.internal &&
+      !options.protectedAgentIds.has(agent.id) &&
+      agent.capabilities.supportsSessionPersistence &&
+      agent.persistence !== null &&
+      agent.activeForegroundTurnId === null &&
+      !this.runs.hasRun(agent.id) &&
+      !this.sessionEventTails.has(agent.id) &&
+      !agent.pendingReplacement &&
+      agent.pendingPermissions.size === 0 &&
+      agent.bufferedPermissionResolutions.size === 0 &&
+      agent.inFlightPermissionResponses.size === 0
+    );
+  }
+
+  archiveAgent(agentId: string): Promise<{ archivedAt: string }> {
+    return this.queueAgentLifecycleHandoff(agentId, async () => {
+      const record = await this.archiveAgentState(agentId);
+      return { archivedAt: record.archivedAt };
     });
-    const stored = await this.registry.get(agentId);
-    if (!stored) {
-      throw new Error(`Agent ${agentId} not found in storage after snapshot`);
+  }
+
+  private async archiveAgentState(
+    agentId: string,
+    requestedArchivedAt?: string,
+  ): Promise<ArchivedStoredAgentRecord> {
+    const registry = this.requireRegistry();
+    const liveAgent = this.agents.get(agentId);
+    const recordBeforeClose = await registry.get(agentId);
+    const shouldArchiveLiveNativeSession =
+      liveAgent !== undefined && !recordBeforeClose?.archivedAt;
+    if (shouldArchiveLiveNativeSession) {
+      await this.archiveNativeSessionBestEffort(liveAgent.provider, liveAgent.persistence);
     }
 
-    const { archivedAt } = await this.markRecordArchived(stored);
-    agent.updatedAt = new Date(archivedAt);
-    await this.closeAgent(agentId);
+    let closeError: unknown;
+    let retainedTimeline: AgentTimelineItem[] | null = null;
+    if (liveAgent) {
+      try {
+        await this.closeAgentRuntime(agentId);
+      } catch (error) {
+        closeError = error;
+      } finally {
+        retainedTimeline = await this.getRetainedOrDurableTimeline(agentId);
+        this.discardRetainedAgentState(agentId);
+      }
+    } else {
+      retainedTimeline = await this.getRetainedOrDurableTimeline(agentId);
+      this.discardRetainedAgentState(agentId);
+    }
+
+    let stored = await registry.get(agentId);
+    if (!stored) {
+      throw new Error(`Agent ${agentId} not found in storage`);
+    }
+    if (stored.timeline === undefined && retainedTimeline !== null) {
+      const updated = await registry.update(agentId, (latest) =>
+        latest.timeline === undefined ? { ...latest, timeline: retainedTimeline } : undefined,
+      );
+      if (!updated) {
+        throw new Error(`Agent ${agentId} not found in storage`);
+      }
+      stored = updated;
+    }
+
+    if (!stored.archivedAt) {
+      await this.markRecordArchived(stored, requestedArchivedAt ?? new Date().toISOString(), {
+        archiveNativeSession: !shouldArchiveLiveNativeSession,
+      });
+    }
 
     await this.cascadeArchiveChildren(agentId);
 
-    return { archivedAt };
+    const persisted = await registry.get(agentId);
+    if (!persisted?.archivedAt) {
+      throw new Error(`Agent ${agentId} missing archivedAt after archive`);
+    }
+    if (closeError !== undefined) {
+      throw closeError;
+    }
+    return { ...persisted, archivedAt: persisted.archivedAt };
   }
 
   // Children created via the MCP `create_agent` tool carry the parent-agent-id
@@ -1367,23 +1628,29 @@ export class AgentManager {
       if (record.labels?.[PARENT_AGENT_ID_LABEL] !== parentAgentId) {
         continue;
       }
-      if (this.agents.has(record.id)) {
-        await this.archiveAgent(record.id);
-      } else {
-        await this.markRecordArchived(record);
-        await this.cascadeArchiveChildren(record.id);
-      }
+      await this.archiveAgent(record.id);
     }
   }
 
-  private async markRecordArchived(record: StoredAgentRecord): Promise<ArchivedStoredAgentRecord> {
+  private async markRecordArchived(
+    record: StoredAgentRecord,
+    archivedAt: string,
+    options: { archiveNativeSession: boolean },
+  ): Promise<ArchivedStoredAgentRecord> {
     const registry = this.requireRegistry();
-    const archivedAt = new Date().toISOString();
-    const archivedRecord = buildArchivedAgentRecord(record, { archivedAt, updatedAt: archivedAt });
+    const archivedRecord = await registry.update(record.id, (latest) =>
+      buildArchivedAgentRecord(latest, { archivedAt, updatedAt: archivedAt }),
+    );
+    if (!archivedRecord?.archivedAt) {
+      throw new Error(`Agent ${record.id} not found in storage`);
+    }
 
-    await registry.upsert(archivedRecord);
-
-    await this.archiveNativeSessionBestEffort(record.provider, record.persistence);
+    if (options.archiveNativeSession) {
+      await this.archiveNativeSessionBestEffort(
+        archivedRecord.provider,
+        archivedRecord.persistence,
+      );
+    }
 
     if (this.agents.has(record.id)) {
       this.notifyAgentState(record.id);
@@ -1393,7 +1660,7 @@ export class AgentManager {
 
     await this.fireAgentArchived(record.id);
 
-    return archivedRecord;
+    return { ...archivedRecord, archivedAt: archivedRecord.archivedAt };
   }
 
   private async fireAgentArchived(agentId: string): Promise<void> {
@@ -1562,18 +1829,15 @@ export class AgentManager {
     patch: AgentMetadataPatch,
   ): Promise<StoredAgentRecord> {
     const registry = this.requireRegistry();
-    const record = await registry.get(agentId);
-    if (!record) {
-      throw new Error(`Agent not found: ${agentId}`);
-    }
-
-    const nextRecord = {
+    const nextRecord = await registry.update(agentId, (record) => ({
       ...record,
       ...(patch.title ? { title: patch.title } : {}),
       ...(patch.labels ? { labels: applyLabelPatch(record.labels, patch.labels) } : {}),
       updatedAt: this.nextStoredUpdatedAt(record),
-    };
-    await registry.upsert(nextRecord);
+    }));
+    if (!nextRecord) {
+      throw new Error(`Agent not found: ${agentId}`);
+    }
     return nextRecord;
   }
 
@@ -1636,37 +1900,17 @@ export class AgentManager {
     }
   }
 
-  async archiveSnapshot(agentId: string, archivedAt: string): Promise<StoredAgentRecord> {
-    const registry = this.requireRegistry();
-    const liveAgent = this.getAgent(agentId);
-    if (liveAgent) {
-      await this.persistSnapshot(liveAgent, {
-        internal: liveAgent.internal,
-      });
-    }
-
-    const record = await registry.get(agentId);
-    if (!record) {
-      throw new Error(`Agent not found: ${agentId}`);
-    }
-
-    const nextRecord = buildArchivedAgentRecord(record, { archivedAt });
-    await registry.upsert(nextRecord);
-
-    await this.archiveNativeSessionBestEffort(record.provider, record.persistence);
-
-    if (this.agents.has(agentId)) {
-      this.notifyAgentState(agentId);
-    } else if (!nextRecord.internal) {
-      this.dispatchArchivedStoredAgent(nextRecord);
-    }
-
-    await this.fireAgentArchived(agentId);
-
-    return nextRecord;
+  archiveSnapshot(agentId: string, archivedAt: string): Promise<StoredAgentRecord> {
+    return this.queueAgentLifecycleHandoff(agentId, () =>
+      this.archiveAgentState(agentId, archivedAt),
+    );
   }
 
-  async unarchiveSnapshot(agentId: string): Promise<boolean> {
+  unarchiveSnapshot(agentId: string): Promise<boolean> {
+    return this.queueAgentLifecycleHandoff(agentId, () => this.unarchiveSnapshotInternal(agentId));
+  }
+
+  private async unarchiveSnapshotInternal(agentId: string): Promise<boolean> {
     const registry = this.requireRegistry();
     const record = await registry.get(agentId);
     if (!record || !record.archivedAt) {
@@ -1675,11 +1919,14 @@ export class AgentManager {
 
     await this.unarchiveNativeSession(record.provider, record.persistence);
 
-    await registry.upsert({
-      ...record,
+    const unarchived = await registry.update(agentId, (latest) => ({
+      ...latest,
       archivedAt: null,
       updatedAt: new Date().toISOString(),
-    });
+    }));
+    if (!unarchived) {
+      throw new Error(`Agent not found: ${agentId}`);
+    }
 
     if (this.getAgent(agentId)) {
       this.notifyAgentState(agentId);
@@ -2307,6 +2554,11 @@ export class AgentManager {
     await this.durableTimelineStore.deleteAgent(agentId);
   }
 
+  async deleteAgentState(agentId: string): Promise<void> {
+    this.discardRetainedAgentState(agentId);
+    await this.deleteCommittedTimeline(agentId);
+  }
+
   async getLastAssistantMessage(agentId: string): Promise<string | null> {
     const agent = this.agents.get(agentId);
     if (!agent) {
@@ -2615,6 +2867,7 @@ export class AgentManager {
       await this.refreshSessionState(managed, { emit: false });
       this.assertAgentRegistrationActive(managed);
       managed.lifecycle = "idle";
+      this.touchUpdatedAt(managed);
       await this.persistSnapshot(managed);
       this.assertAgentRegistrationActive(managed);
       this.emitState(managed, { persist: false });
@@ -2663,6 +2916,7 @@ export class AgentManager {
       | undefined;
   }): Promise<{ durableTimelineHasRows: boolean }> {
     const { agentId, now, options } = params;
+    const timelineAlreadyPrimed = this.timelineStore.has(agentId);
     const explicitTimelineSeed = buildExplicitTimelineSeedForRegister(now, options);
     const shouldSeedFromDurable =
       !explicitTimelineSeed &&
@@ -2672,7 +2926,8 @@ export class AgentManager {
       ? await this.loadCommittedTimelineSeed(agentId, now)
       : null;
     const durableTimelineHasRows =
-      durableTimelineSeed != null && (durableTimelineSeed.nextSeq ?? 1) > 1;
+      timelineAlreadyPrimed ||
+      (durableTimelineSeed != null && (durableTimelineSeed.nextSeq ?? 1) > 1);
     const timelineSeed = explicitTimelineSeed ?? durableTimelineSeed;
     if (timelineSeed || !this.timelineStore.has(agentId)) {
       this.timelineStore.initialize(agentId, timelineSeed ?? { timestamp: now.toISOString() });
@@ -2778,7 +3033,21 @@ export class AgentManager {
       lifecycle: "closed",
       session: null,
       activeForegroundTurnId: null,
+      pendingPermissions: new Map(),
+      bufferedPermissionResolutions: new Map(),
+      inFlightPermissionResponses: new Set(),
+      pendingReplacement: false,
+      foregroundTurnWaiters: new Set(),
+      finalizedForegroundTurnIds: new Set(),
+      unsubscribeSession: null,
     };
+  }
+
+  private discardRetainedAgentState(agentId: string): void {
+    this.timelineStore.delete(agentId);
+    for (const event of this.providerSubagents.deleteParent(agentId)) {
+      this.dispatch({ type: "provider_subagent", event });
+    }
   }
 
   private emitClosedAgent(agent: ManagedAgentClosed, options?: { persist?: boolean }): void {
@@ -2910,7 +3179,11 @@ export class AgentManager {
 
   private async persistSnapshot(
     agent: ManagedAgent,
-    options?: { title?: string | null; internal?: boolean },
+    options?: {
+      title?: string | null;
+      internal?: boolean;
+      timeline?: readonly AgentTimelineItem[];
+    },
   ): Promise<void> {
     if (!this.registry) {
       return;
@@ -2927,6 +3200,13 @@ export class AgentManager {
       throw new Error("Agent storage unavailable");
     }
     return this.registry;
+  }
+
+  private async assertAgentRecordIsNotArchived(agentId: string): Promise<void> {
+    const record = await this.registry?.get(agentId);
+    if (record?.archivedAt) {
+      throw new Error(`Agent ${agentId} is archived`);
+    }
   }
 
   private async refreshSessionState(
@@ -3745,6 +4025,23 @@ export class AgentManager {
     });
   }
 
+  private queueAgentLifecycleHandoff<T>(agentId: string, operation: () => Promise<T>): Promise<T> {
+    const previous = this.agentLifecycleTails.get(agentId) ?? Promise.resolve();
+    const result = previous.then(operation);
+    const tail = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    this.agentLifecycleTails.set(agentId, tail);
+    void tail.then(() => {
+      if (this.agentLifecycleTails.get(agentId) === tail) {
+        this.agentLifecycleTails.delete(agentId);
+      }
+      return undefined;
+    });
+    return result;
+  }
+
   private trackAgentRegistrationOperation<T>(result: Promise<T>): Promise<T> {
     const settled = result.then(
       () => undefined,
@@ -3779,10 +4076,15 @@ export class AgentManager {
     // Drain tasks, including tasks spawned while awaiting.
     while (
       this.backgroundTasks.size > 0 ||
-      (options.includeAgentRegistrations && this.agentRegistrationTasks.size > 0)
+      (options.includeAgentRegistrations &&
+        (this.agentRegistrationTasks.size > 0 || this.agentLifecycleTails.size > 0))
     ) {
       const pending = options.includeAgentRegistrations
-        ? [...this.backgroundTasks, ...this.agentRegistrationTasks]
+        ? [
+            ...this.backgroundTasks,
+            ...this.agentRegistrationTasks,
+            ...this.agentLifecycleTails.values(),
+          ]
         : [...this.backgroundTasks];
       await Promise.allSettled(pending);
     }

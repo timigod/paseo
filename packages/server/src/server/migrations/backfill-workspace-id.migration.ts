@@ -73,19 +73,25 @@ export async function backfillWorkspaceIdForLegacyAgents(options: {
   let migrated = 0;
 
   for (const record of records) {
-    if (record.workspaceId) {
-      continue;
-    }
+    let didMigrate = false;
+    await options.agentStorage.update(record.id, (latest) => {
+      if (latest.workspaceId) {
+        return undefined;
+      }
 
-    const workspaceId = resolveLegacyWorkspaceOwner(record.cwd, workspaceRecords, {
-      includeArchived: record.archivedAt != null,
+      const workspaceId = resolveLegacyWorkspaceOwner(latest.cwd, workspaceRecords, {
+        includeArchived: latest.archivedAt != null,
+      });
+      if (!workspaceId) {
+        return undefined;
+      }
+
+      didMigrate = true;
+      return { ...latest, workspaceId };
     });
-    if (!workspaceId) {
-      continue;
+    if (didMigrate) {
+      migrated += 1;
     }
-
-    await options.agentStorage.upsert({ ...record, workspaceId });
-    migrated += 1;
   }
 
   if (migrated > 0) {
