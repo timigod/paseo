@@ -105,6 +105,9 @@ const OPENCODE_LEGACY_FULL_ACCESS_MODE_ID = "full-access";
 const OPENCODE_AUTO_ACCEPT_FEATURE_ID = "auto_accept";
 const OPENCODE_PERSISTED_SESSION_LIMIT = 200;
 const OPENCODE_PENDING_ABORT_START_TIMEOUT_MS = 10_000;
+// A provider abort is best-effort during lifecycle cleanup. It must not retain
+// the OpenCode server lease forever when the provider stops responding.
+const OPENCODE_SESSION_CLOSE_OPERATION_TIMEOUT_MS = 3_000;
 const OPENCODE_EVENT_STREAM_RECONNECT_DELAY_MS = 100;
 const OPENCODE_EVENT_STREAM_RECONNECT_MAX_DELAY_MS = 5000;
 const OPENCODE_MCP_OPERATION_RETRY_DELAYS_MS = [2_000, 5_000, 10_000];
@@ -506,10 +509,14 @@ async function abortOpenCodeSession(params: {
   const { client, sessionId, directory, logger } = params;
 
   try {
-    const response = await client.session.abort({
-      sessionID: sessionId,
-      directory,
-    });
+    const response = await withTimeout(
+      client.session.abort({
+        sessionID: sessionId,
+        directory,
+      }),
+      OPENCODE_SESSION_CLOSE_OPERATION_TIMEOUT_MS,
+      "OpenCode session.abort during close",
+    );
     if (response.error && !isOpenCodeNotFoundError(response.error)) {
       logger.warn(
         {
@@ -4741,10 +4748,14 @@ class OpenCodeAgentSession implements AgentSession {
     }
     this.deletedFromProvider = true;
     try {
-      const response = await this.client.session.delete({
-        sessionID: this.sessionId,
-        directory: this.config.cwd,
-      });
+      const response = await withTimeout(
+        this.client.session.delete({
+          sessionID: this.sessionId,
+          directory: this.config.cwd,
+        }),
+        OPENCODE_SESSION_CLOSE_OPERATION_TIMEOUT_MS,
+        "OpenCode session.delete during close",
+      );
       if (response.error) {
         throw new Error(`OpenCode session.delete failed: ${JSON.stringify(response.error)}`);
       }

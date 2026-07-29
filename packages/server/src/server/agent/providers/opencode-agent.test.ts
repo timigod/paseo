@@ -280,6 +280,38 @@ describe("OpenCodeAgentClient adapter smoke tests", () => {
     rmSync(cwd, { recursive: true, force: true });
   });
 
+  test("bounds a hanging abort during close and releases the server lease", async () => {
+    vi.useFakeTimers();
+    try {
+      const abort = deferred<{ error: null }>();
+      const release = vi.fn().mockResolvedValue(undefined);
+      const fakeClient = {
+        session: {
+          abort: vi.fn().mockReturnValue(abort.promise),
+          update: vi.fn().mockResolvedValue({ error: null }),
+        },
+      } as never;
+      const session = new __openCodeInternals.OpenCodeAgentSession(
+        { provider: "opencode", cwd: "/tmp/test" },
+        fakeClient,
+        "ses_unit_test",
+        createTestLogger(),
+        new Map(),
+        release,
+      );
+
+      const close = session.close();
+      await flushMicrotasks();
+      await vi.advanceTimersByTimeAsync(3_000);
+      await close;
+
+      expect(fakeClient.session.abort).toHaveBeenCalledOnce();
+      expect(release).toHaveBeenCalledOnce();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   test("archives and unarchives the durable native session only through client hooks", async () => {
     const cwd = tmpCwd();
     const runtime = new TestOpenCodeHarness();
