@@ -14,6 +14,9 @@ export const CLIENT_CAPS = {
   // COMPAT(providerSubagents): added in v0.1.107. The daemon emits provider-owned
   // child descriptors and timelines only to clients that understand the new messages.
   providerSubagents: "provider_subagents",
+  // The client keeps create-agent RPCs open for slow provider startup instead
+  // of relying on the legacy daemon-side 55-second containment budget.
+  extendedCreateAgentTimeout: "extended_create_agent_timeout",
   browserHost: "browser_host",
 } as const;
 

@@ -73,6 +73,16 @@ function createFinishNotificationScenario(
     }
     return null;
   });
+  Reflect.set(agentManager, "waitForAgentLifecycleHandoff", async () => undefined);
+  Reflect.set(agentManager, "activateAgentRuntime", async (agentId: string) => {
+    if (agentId === "child-agent") {
+      return childAgent;
+    }
+    if (agentId === "caller-agent") {
+      return callerAgent;
+    }
+    return null;
+  });
   Reflect.set(agentManager, "subscribe", (callback: (event: AgentManagerEvent) => void) => {
     subscriber = callback;
     return () => {
@@ -82,8 +92,9 @@ function createFinishNotificationScenario(
   Reflect.set(agentManager, "getLastAssistantMessage", async () => {
     return options?.childLastAssistantMessage ?? null;
   });
-  Reflect.set(agentManager, "tryRunOutOfBand", () => false);
+  Reflect.set(agentManager, "tryRunOutOfBand", async () => false);
   Reflect.set(agentManager, "hasInFlightRun", () => Boolean(options?.parentPromptError));
+  Reflect.set(agentManager, "isAgentRunStarting", () => false);
   Reflect.set(agentManager, "streamAgent", (_agentId: string, prompt: string) => {
     resolveParentPrompt?.(prompt);
     return (async function* noop() {})();
@@ -150,7 +161,9 @@ test("sendPromptToAgent forwards the client message id as run options", async ()
     "getAgent",
     vi.fn(() => agent),
   );
-  Reflect.set(agentManager, "tryRunOutOfBand", vi.fn().mockReturnValue(false));
+  Reflect.set(agentManager, "waitForAgentLifecycleHandoff", async () => undefined);
+  Reflect.set(agentManager, "activateAgentRuntime", async () => agent);
+  Reflect.set(agentManager, "tryRunOutOfBand", vi.fn().mockResolvedValue(false));
   Reflect.set(agentManager, "hasInFlightRun", vi.fn().mockReturnValue(false));
   Reflect.set(agentManager, "streamAgent", streamAgentSpy);
 

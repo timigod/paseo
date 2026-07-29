@@ -55,6 +55,16 @@ export class AgentRunState {
     return this.getPendingRun(agentId) !== null;
   }
 
+  isPendingRunStarting(agentId: string): boolean {
+    const run = this.getPendingRun(agentId);
+    return run !== null && !run.started;
+  }
+
+  isCurrentForegroundRun(agentId: string, token: string): boolean {
+    const run = this.getPendingRun(agentId);
+    return run?.token === token && !run.settled;
+  }
+
   getRun(agentId: string): TrackedAgentRun | null {
     return this.runs.get(agentId) ?? null;
   }

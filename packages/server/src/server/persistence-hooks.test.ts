@@ -3,6 +3,7 @@ import type { StoredAgentRecord } from "./agent/agent-storage.js";
 import {
   buildConfigOverrides,
   buildSessionConfig,
+  extractTimestamps,
   toAgentPersistenceHandle,
 } from "./persistence-hooks.js";
 
@@ -27,6 +28,19 @@ function createRecord(overrides?: Partial<StoredAgentRecord>): StoredAgentRecord
 }
 
 describe("persistence hooks", () => {
+  test("extractTimestamps keeps runtime activity separate from metadata activity", () => {
+    const record = createRecord({
+      updatedAt: "2026-07-29T12:00:00.000Z",
+      lastActivityAt: "2026-07-29T11:00:00.000Z",
+      lastRuntimeActivityAt: "2026-07-29T09:00:00.000Z",
+    });
+
+    expect(extractTimestamps(record)).toMatchObject({
+      updatedAt: new Date("2026-07-29T11:00:00.000Z"),
+      lastRuntimeActivityAt: new Date("2026-07-29T09:00:00.000Z"),
+    });
+  });
+
   test("buildConfigOverrides carries systemPrompt and mcpServers", () => {
     const record = createRecord({
       title: "Voice agent (current)",

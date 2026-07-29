@@ -72,6 +72,7 @@ function createManagedAgent(overrides: ManagedAgentOverrides = {}): ManagedAgent
     lifecycle,
     createdAt: now,
     updatedAt: now,
+    lastRuntimeActivityAt: now,
     availableModes: [
       { id: "plan", label: "Planning" },
       { id: "build", label: "Building", description: "Detailed" },
@@ -154,6 +155,7 @@ describe("toStoredAgentRecord", () => {
     expect(record.createdAt).toBe(agent.createdAt.toISOString());
     expect(record.updatedAt).toBe(agent.updatedAt.toISOString());
     expect(record.lastActivityAt).toBe(agent.updatedAt.toISOString());
+    expect(record.lastRuntimeActivityAt).toBe(agent.lastRuntimeActivityAt.toISOString());
     expect(record.lastUserMessageAt).toBe(agent.lastUserMessageAt?.toISOString());
     expect(record.persistence).toEqual({
       provider: "claude",

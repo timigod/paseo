@@ -45,6 +45,10 @@ export interface AgentUpdatesService {
   clearSubscription(subscriptionId: string): void;
   hasSubscription(): boolean;
   forwardLiveAgent(agent: ManagedAgent): Promise<void>;
+  forwardLiveAgentWithBarrier(
+    agent: ManagedAgent,
+    afterForward: () => Promise<void> | void,
+  ): Promise<void>;
   emitStoredRecord(record: StoredAgentRecord): Promise<AgentSnapshotPayload>;
   removeAgent(agentId: string): void;
   dispose(): void;
@@ -150,6 +154,7 @@ function agentUpdateTargetId(update: AgentUpdatePayload): string {
 
 export function createAgentUpdatesService(deps: AgentUpdatesServiceDeps): AgentUpdatesService {
   let subscription: AgentUpdatesSubscriptionState | null = null;
+  const liveForwardTails = new Map<string, Promise<void>>();
 
   function bufferOrEmit(sub: AgentUpdatesSubscriptionState, payload: AgentUpdatePayload): void {
     if (payload.kind === "upsert" && !deps.isProviderVisibleToClient(payload.agent.provider)) {
@@ -264,7 +269,7 @@ export function createAgentUpdatesService(deps: AgentUpdatesServiceDeps): AgentU
     return payload;
   }
 
-  async function forwardLiveAgent(agent: ManagedAgent): Promise<void> {
+  async function forwardLiveAgentNow(agent: ManagedAgent): Promise<void> {
     try {
       const sub = subscription;
       const payload = await deps.buildAgentPayload(agent);
@@ -309,8 +314,40 @@ export function createAgentUpdatesService(deps: AgentUpdatesServiceDeps): AgentU
     }
   }
 
+  function enqueueLiveForward(agentId: string, operation: () => Promise<void>): Promise<void> {
+    const previous = liveForwardTails.get(agentId) ?? Promise.resolve();
+    const result = previous.then(operation);
+    const tail = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    liveForwardTails.set(agentId, tail);
+    void tail.then(() => {
+      if (liveForwardTails.get(agentId) === tail) {
+        liveForwardTails.delete(agentId);
+      }
+      return undefined;
+    });
+    return result;
+  }
+
+  function forwardLiveAgent(agent: ManagedAgent): Promise<void> {
+    return enqueueLiveForward(agent.id, () => forwardLiveAgentNow(agent));
+  }
+
+  function forwardLiveAgentWithBarrier(
+    agent: ManagedAgent,
+    afterForward: () => Promise<void> | void,
+  ): Promise<void> {
+    return enqueueLiveForward(agent.id, async () => {
+      await forwardLiveAgentNow(agent);
+      await afterForward();
+    });
+  }
+
   function dispose(): void {
     subscription = null;
+    liveForwardTails.clear();
   }
 
   return {
@@ -319,6 +356,7 @@ export function createAgentUpdatesService(deps: AgentUpdatesServiceDeps): AgentU
     clearSubscription,
     hasSubscription,
     forwardLiveAgent,
+    forwardLiveAgentWithBarrier,
     emitStoredRecord,
     removeAgent,
     dispose,

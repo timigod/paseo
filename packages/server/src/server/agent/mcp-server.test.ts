@@ -219,7 +219,7 @@ function buildAgentManagerSpies() {
     appendTimelineItem: vi.fn().mockResolvedValue(undefined),
     emitLiveTimelineItem: vi.fn().mockResolvedValue(undefined),
     hasInFlightRun: vi.fn().mockReturnValue(false),
-    tryRunOutOfBand: vi.fn().mockReturnValue(false),
+    tryRunOutOfBand: vi.fn().mockResolvedValue(false),
     subscribe: vi.fn().mockReturnValue(() => {}),
     streamAgent: vi.fn(() => (async function* noop() {})()),
     waitForAgentRunStart: vi.fn().mockResolvedValue(undefined),
@@ -518,6 +518,7 @@ function createManagedAgent(overrides: Partial<ManagedAgent> = {}): ManagedAgent
     runtimeInfo: undefined,
     createdAt: now,
     updatedAt: now,
+    lastRuntimeActivityAt: now,
     lastUserMessageAt: null,
     lifecycle: "idle",
     capabilities: {
@@ -5328,6 +5329,48 @@ describe("agent snapshot MCP serialization", () => {
         },
       },
     ]);
+  });
+
+  it("reads a collected unarchived agent activity without resuming a provider runtime", async () => {
+    const { agentManager, agentStorage, spies } = createTestDeps();
+    const record = createStoredRecord({
+      id: "collected-activity-agent",
+      archivedAt: null,
+      timeline: undefined,
+    });
+    const retainedTimeline: AgentTimelineItem[] = [
+      {
+        type: "assistant_message",
+        text: "Collected work remains readable",
+      },
+    ];
+    spies.agentStorage.get.mockResolvedValue(record);
+    spies.agentManager.getAgent.mockReturnValue(null);
+    spies.agentManager.getRetainedOrDurableTimeline.mockResolvedValue(retainedTimeline);
+
+    const server = await createAgentMcpServer({
+      agentManager,
+      agentStorage,
+      logger,
+      providerSnapshotManager: createClaudeOnlyManager(),
+    });
+    const tool = registeredTool(server, "get_agent_activity");
+    const response = await tool.handler({ agentId: record.id });
+
+    expect(response.structuredContent).toEqual(
+      expect.objectContaining({
+        agentId: record.id,
+        updateCount: 1,
+        currentModeId: "default",
+        content: expect.stringContaining("Collected work remains readable"),
+      }),
+    );
+    expect(spies.agentManager.waitForAgentLifecycleHandoff).toHaveBeenCalledWith(record.id);
+    expect(spies.agentManager.getRetainedOrDurableTimeline).toHaveBeenCalledWith(record.id);
+    expect(spies.agentManager.createAgent).not.toHaveBeenCalled();
+    expect(spies.agentManager.resumeAgentFromPersistence).not.toHaveBeenCalled();
+    expect(spies.agentManager.hydrateTimelineFromProvider).not.toHaveBeenCalled();
+    expect(spies.agentManager.getTimeline).not.toHaveBeenCalled();
   });
 
   it("reads archived get_agent_activity from durable state without creating a runtime", async () => {

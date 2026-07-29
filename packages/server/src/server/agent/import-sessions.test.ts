@@ -72,6 +72,7 @@ function makeManagedAgent(args: {
     config: { provider, cwd: args.cwd, title: args.title },
     createdAt: new Date("2026-04-30T00:00:00.000Z"),
     updatedAt: new Date("2026-04-30T00:00:00.000Z"),
+    lastRuntimeActivityAt: new Date("2026-04-30T00:00:00.000Z"),
     availableModes: [],
     currentModeId: null,
     pendingPermissions: new Map(),

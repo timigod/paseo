@@ -555,6 +555,7 @@ test("advertises client capabilities in hello", async () => {
     protocolVersion: 1,
     capabilities: {
       custom_mode_icons: true,
+      extended_create_agent_timeout: true,
       provider_subagents: true,
       reasoning_merge_enum: true,
       terminal_reflowable_snapshot: true,
@@ -1900,6 +1901,51 @@ test("sends create_agent_request with string workspace ids", async () => {
   );
 
   await expect(createPromise).rejects.toThrow("compat test sentinel");
+});
+
+test("keeps capable create-agent RPCs pending past the legacy 60s timeout", async () => {
+  const logger = createMockLogger();
+  const mock = createMockTransport();
+
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "clsk_extended_create_timeout_test",
+    logger,
+    reconnect: { enabled: false },
+    transportFactory: () => mock.transport,
+  });
+  clients.push(client);
+
+  const connectPromise = client.connect();
+  mock.triggerOpen();
+  await connectPromise;
+  vi.useFakeTimers();
+
+  let settled = false;
+  const createResult = client
+    .createAgent({
+      provider: "codex",
+      cwd: "/tmp/project",
+      workspaceId: "ws-extended-create-timeout",
+    })
+    .then(
+      () => {
+        settled = true;
+        return null;
+      },
+      (error: unknown) => {
+        settled = true;
+        return error;
+      },
+    );
+
+  await vi.advanceTimersByTimeAsync(60_001);
+  expect(settled).toBe(false);
+
+  await vi.advanceTimersByTimeAsync(119_999);
+  const error = await createResult;
+  expect(error).toBeInstanceOf(Error);
+  expect((error as Error).message).toMatch(/timeout.*180000ms/i);
 });
 
 test("sends worktree target and autoArchive in create_agent_request", async () => {

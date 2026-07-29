@@ -12,6 +12,10 @@ import {
 import { toStoredAgentRecord } from "./agent-projections.js";
 import type { ManagedAgent } from "./agent-manager.js";
 import type { AgentSessionConfig, AgentTimelineItem } from "./agent-sdk-types.js";
+import type { ProviderSubagentSnapshot } from "./provider-subagents/store.js";
+
+export const AGENT_START_INTERRUPTED_ERROR =
+  "Agent startup was interrupted by a server restart. Create a new agent to retry.";
 
 const SERIALIZABLE_CONFIG_SCHEMA = z
   .object({
@@ -36,6 +40,32 @@ const PERSISTENCE_HANDLE_SCHEMA = z
   .nullable()
   .optional();
 
+const PROVIDER_SUBAGENT_SNAPSHOT_SCHEMA = z.object({
+  descriptor: z.object({
+    id: z.string(),
+    parentAgentId: z.string(),
+    provider: z.string(),
+    title: z.string().nullable(),
+    description: z.string().nullable(),
+    status: z.enum(["running", "completed", "failed", "canceled"]),
+    createdAt: z.string(),
+    updatedAt: z.string(),
+    toolCallId: z.string().nullable(),
+    cwd: z.string().nullable(),
+  }),
+  timeline: z.object({
+    epoch: z.string(),
+    nextSeq: z.number().int().positive(),
+    rows: z.array(
+      z.object({
+        seq: z.number().int().positive(),
+        timestamp: z.string(),
+        item: AgentTimelineItemPayloadSchema,
+      }),
+    ),
+  }),
+});
+
 const STORED_AGENT_SCHEMA = z.object({
   id: z.string(),
   provider: z.string(),
@@ -44,9 +74,11 @@ const STORED_AGENT_SCHEMA = z.object({
   createdAt: z.string(),
   updatedAt: z.string(),
   lastActivityAt: z.string().optional(),
+  lastRuntimeActivityAt: z.string().optional(),
   lastUserMessageAt: z.string().nullable().optional(),
   title: z.string().nullable().optional(),
   labels: z.record(z.string(), z.string()).default({}),
+  createRequestFingerprint: z.string().optional(),
   lastStatus: AgentStatusSchema.default("closed"),
   lastModeId: z.string().nullable().optional(),
   config: SERIALIZABLE_CONFIG_SCHEMA,
@@ -69,6 +101,7 @@ const STORED_AGENT_SCHEMA = z.object({
   internal: z.boolean().optional(),
   archivedAt: z.string().nullable().optional(),
   timeline: z.array(AgentTimelineItemPayloadSchema).optional(),
+  providerSubagents: z.array(PROVIDER_SUBAGENT_SNAPSHOT_SCHEMA).optional(),
 });
 
 export type SerializableAgentConfig = Pick<
@@ -91,6 +124,48 @@ export type AgentRecordUpdater = (
   record: Readonly<StoredAgentRecord>,
 ) => StoredAgentRecord | undefined;
 
+function preserveCreateRequestFingerprint(
+  record: StoredAgentRecord,
+  existing: StoredAgentRecord | null | undefined,
+): void {
+  if (
+    record.createRequestFingerprint === undefined &&
+    existing?.createRequestFingerprint !== undefined
+  ) {
+    record.createRequestFingerprint = existing.createRequestFingerprint;
+  }
+}
+
+interface AgentSnapshotStorageOptions {
+  title?: string | null;
+  internal?: boolean;
+  timeline?: readonly AgentTimelineItem[];
+  providerSubagents?: readonly ProviderSubagentSnapshot[];
+}
+
+function buildSnapshotCarriedFields(
+  existing: StoredAgentRecord | null,
+  options?: AgentSnapshotStorageOptions,
+): Pick<StoredAgentRecord, "archivedAt" | "timeline" | "providerSubagents"> {
+  const fields: Pick<StoredAgentRecord, "archivedAt" | "timeline" | "providerSubagents"> = {};
+  // Preserve soft-delete/archive status across snapshot flushes.
+  // `archivedAt` is not part of the ManagedAgent snapshot.
+  if (existing?.archivedAt !== undefined) {
+    fields.archivedAt = existing.archivedAt;
+  }
+  if (options?.timeline !== undefined) {
+    fields.timeline = [...options.timeline];
+  } else if (existing?.timeline !== undefined) {
+    fields.timeline = existing.timeline;
+  }
+  if (options?.providerSubagents !== undefined) {
+    fields.providerSubagents = [...options.providerSubagents];
+  } else if (existing?.providerSubagents !== undefined) {
+    fields.providerSubagents = existing.providerSubagents;
+  }
+  return fields;
+}
+
 export class AgentStorage {
   private cache: Map<string, StoredAgentRecord> = new Map();
   private pathById: Map<string, string> = new Map();
@@ -108,7 +183,29 @@ export class AgentStorage {
   }
 
   async initialize(): Promise<void> {
-    await this.load();
+    const records = await this.load();
+    const interruptedAt = new Date().toISOString();
+    await Promise.all(
+      records
+        .filter((record) => record.lastStatus === "initializing" && !record.archivedAt)
+        .map((record) =>
+          this.update(record.id, (latest) => {
+            if (latest.lastStatus !== "initializing" || latest.archivedAt) {
+              return undefined;
+            }
+            return {
+              ...latest,
+              updatedAt: interruptedAt,
+              lastActivityAt: interruptedAt,
+              lastStatus: "error",
+              lastError: AGENT_START_INTERRUPTED_ERROR,
+              requiresAttention: true,
+              attentionReason: "error",
+              attentionTimestamp: interruptedAt,
+            };
+          }),
+        ),
+    );
   }
 
   async list(): Promise<StoredAgentRecord[]> {
@@ -233,14 +330,7 @@ export class AgentStorage {
     this.pathsById.delete(agentId);
   }
 
-  async applySnapshot(
-    agent: ManagedAgent,
-    options?: {
-      title?: string | null;
-      internal?: boolean;
-      timeline?: readonly AgentTimelineItem[];
-    },
-  ): Promise<void> {
+  async applySnapshot(agent: ManagedAgent, options?: AgentSnapshotStorageOptions): Promise<void> {
     await this.load();
     await this.queueRecordMutation(agent.id, (existing) => {
       const hasTitleOverride =
@@ -253,18 +343,9 @@ export class AgentStorage {
         internal: hasInternalOverride ? options?.internal : (agent.internal ?? existing?.internal),
       });
 
-      // Preserve soft-delete/archive status across snapshot flushes.
-      // `archivedAt` is not part of the ManagedAgent snapshot, so a naive projection
-      // would wipe it during normal persistence (including on daemon restart).
-      if (existing?.archivedAt !== undefined) {
-        record.archivedAt = existing.archivedAt;
-      }
-      if (options?.timeline !== undefined) {
-        record.timeline = [...options.timeline];
-      } else if (existing?.timeline !== undefined) {
-        record.timeline = existing.timeline;
-      }
-      return record;
+      const snapshot = { ...record, ...buildSnapshotCarriedFields(existing, options) };
+      preserveCreateRequestFingerprint(snapshot, existing);
+      return snapshot;
     });
   }
 

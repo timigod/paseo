@@ -1,5 +1,6 @@
 import equal from "fast-deep-equal";
 import { v4 as uuidv4 } from "uuid";
+import { createHash } from "node:crypto";
 import { lstat, mkdir, mkdtemp, rename, rm, stat } from "node:fs/promises";
 import { basename, normalize, resolve, sep } from "path";
 import { homedir } from "node:os";
@@ -35,7 +36,6 @@ import { ensureAgentLoaded } from "./agent/agent-loading.js";
 import {
   formatSystemNotificationPrompt,
   sendPromptToAgent,
-  waitForAgentRunStartWithTimeout,
   unarchiveAgentState,
 } from "./agent/agent-prompt.js";
 import {
@@ -64,13 +64,14 @@ import {
 import { AgentManager, AgentRunCancellationError } from "./agent/agent-manager.js";
 import { ProviderSnapshotManager } from "./agent/provider-snapshot-manager.js";
 import type {
+  AgentCreateRequestOutcome,
   AgentManagerEvent,
   AgentTimelineCursor,
   AgentTimelineFetchDirection,
   AgentTimelineFetchResult,
   ManagedAgent,
 } from "./agent/agent-manager.js";
-import { createAgentCommand } from "./agent/create-agent/create.js";
+import { beginCreateAgentCommand } from "./agent/create-agent/create.js";
 import {
   archiveAgentCommand,
   cancelAgentRunCommand,
@@ -231,10 +232,47 @@ import { CreateAgentLifecycleDispatch } from "./agent/create-agent-lifecycle-dis
 // the entire session message if they encounter an unknown provider.
 const LEGACY_PROVIDER_IDS = new Set(["claude", "codex", "opencode"]);
 const MIN_VERSION_ALL_PROVIDERS = "0.1.45";
-// Must stay under the 60s session RPC timeout shipped in 0.1.110 clients so
-// they always see a definitive create_agent outcome instead of timing out on a
-// creation that later succeeds unseen (which shows up as a duplicate thread).
-const CREATE_AGENT_RESPONSE_BUDGET_MS = 55_000;
+function deriveCreateAgentId(clientId: string, requestId: string): string {
+  const bytes = createHash("sha256")
+    .update("paseo:create-agent:v1\0")
+    .update(clientId)
+    .update("\0")
+    .update(requestId)
+    .digest()
+    .subarray(0, 16);
+  bytes[6] = (bytes[6]! & 0x0f) | 0x50;
+  bytes[8] = (bytes[8]! & 0x3f) | 0x80;
+  const hex = bytes.toString("hex");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(
+    16,
+    20,
+  )}-${hex.slice(20)}`;
+}
+
+function canonicalizeCreateRequestValue(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map(canonicalizeCreateRequestValue);
+  }
+  if (value !== null && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value)
+        .filter(([, entryValue]) => entryValue !== undefined)
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([key, entryValue]) => [key, canonicalizeCreateRequestValue(entryValue)]),
+    );
+  }
+  return value;
+}
+
+function deriveCreateAgentRequestFingerprint(
+  msg: Extract<SessionInboundMessage, { type: "create_agent_request" }>,
+): string {
+  return createHash("sha256")
+    .update("paseo:create-agent-request:v1\0")
+    .update(JSON.stringify(canonicalizeCreateRequestValue(msg)))
+    .digest("hex");
+}
+
 function errorToFriendlyMessage(error: unknown): string {
   if (error instanceof Error) return error.message;
   if (typeof error === "string") return error;
@@ -448,9 +486,6 @@ export interface SessionOptions {
   terminalManager: TerminalManager | null;
   providerSnapshotManager: ProviderSnapshotManager;
   providerUsageService: ProviderUsageService;
-  // Test seam: overrides the create_agent response budget (defaults to
-  // CREATE_AGENT_RESPONSE_BUDGET_MS).
-  createAgentResponseBudgetMs?: number;
   serviceProxy?: ServiceProxySubsystem;
   scriptRuntimeStore?: WorkspaceScriptRuntimeStore;
   workspaceSetupSnapshots?: Map<string, WorkspaceSetupSnapshot>;
@@ -529,6 +564,10 @@ interface ArchivedRecordSnapshot {
   archivedAt?: string | null;
 }
 
+interface AgentOutboundVisibilityGate {
+  bufferedEvents: AgentManagerEvent[];
+}
+
 function describeRegistryTransition(record: ArchivedRecordSnapshot | null): RegistryTransition {
   if (!record) {
     return "created";
@@ -570,6 +609,8 @@ export class Session {
   private unsubscribeAgentEvents: (() => void) | null = null;
   private unsubscribeTerminalWorkspaceContributionEvents: (() => void) | null = null;
   private readonly agentUpdates: AgentUpdatesService;
+  private readonly agentOutboundVisibilityGates = new Map<string, AgentOutboundVisibilityGate>();
+  private readonly agentOutboundTails = new Map<string, Promise<void>>();
   private workspaceUpdatesSubscription: WorkspaceUpdatesSubscriptionState | null = null;
   private clientActivity: {
     deviceType: "web" | "mobile";
@@ -581,7 +622,6 @@ export class Session {
   } | null = null;
   private readonly terminalManager: TerminalManager | null;
   private readonly providerSnapshotManager: ProviderSnapshotManager;
-  private readonly createAgentResponseBudgetMs: number;
   private readonly serviceProxy: ServiceProxySubsystem | null;
   private readonly scriptRuntimeStore: WorkspaceScriptRuntimeStore | null;
   private readonly getDaemonTcpPort: (() => number | null) | null;
@@ -860,8 +900,6 @@ export class Session {
       logger: this.sessionLogger,
     });
     this.providerSnapshotManager = providerSnapshotManager;
-    this.createAgentResponseBudgetMs =
-      options.createAgentResponseBudgetMs ?? CREATE_AGENT_RESPONSE_BUDGET_MS;
     this.serviceProxy = serviceProxy ?? null;
     this.scriptRuntimeStore = scriptRuntimeStore ?? null;
     this.workspaceSetupSnapshots = workspaceSetupSnapshots ?? new Map();
@@ -1136,125 +1174,190 @@ export class Session {
     }
 
     this.unsubscribeAgentEvents = this.agentManager.subscribe(
-      (event) => {
-        if (event.type === "agent_state") {
-          this.sessionLogger.trace(
-            {
-              agentId: event.agent.id,
-              provider: event.agent.provider,
-              providerSessionId: event.agent.persistence?.sessionId ?? undefined,
-              turnId: event.agent.activeForegroundTurnId ?? undefined,
-              lifecycle: event.agent.lifecycle,
-            },
-            "agent.session.forward_update",
-          );
-          void this.agentUpdates.forwardLiveAgent(event.agent);
-          return;
-        }
-
-        if (event.type === "provider_subagent") {
-          if (!this.supports(CLIENT_CAPS.providerSubagents)) {
-            return;
-          }
-          const update = event.event;
-          if (update.type === "upsert") {
-            this.emit({
-              type: "agent.provider_subagents.update",
-              payload: { kind: "upsert", subagent: update.subagent },
-            });
-          } else if (update.type === "timeline") {
-            this.emit({
-              type: "agent.provider_subagents.update",
-              payload: {
-                kind: "timeline",
-                parentAgentId: update.parentAgentId,
-                subagentId: update.subagentId,
-                provider: update.provider,
-                item: update.row.item,
-                timestamp: update.row.timestamp,
-                seq: update.row.seq,
-                epoch: update.epoch,
-              },
-            });
-          } else {
-            this.emit({
-              type: "agent.provider_subagents.update",
-              payload: {
-                kind: "remove",
-                parentAgentId: update.parentAgentId,
-                subagentId: update.subagentId,
-              },
-            });
-          }
-          return;
-        }
-
-        if (
-          this.voiceSession.isActiveForAgent(event.agentId) &&
-          event.event.type === "permission_requested" &&
-          isVoicePermissionAllowed(event.event.request)
-        ) {
-          const requestId = event.event.request.id;
-          void this.agentManager
-            .respondToPermission(event.agentId, requestId, {
-              behavior: "allow",
-            })
-            .catch((error) => {
-              this.sessionLogger.warn(
-                {
-                  err: error,
-                  agentId: event.agentId,
-                  requestId,
-                },
-                "Failed to auto-allow speak tool permission in voice mode",
-              );
-            });
-        }
-
-        const serializedEvent = serializeAgentStreamEvent(event.event);
-        if (!serializedEvent) {
-          return;
-        }
-        this.sessionLogger.trace(
-          {
-            agentId: event.agentId,
-            provider: event.event.provider,
-            turnId: getAgentStreamEventTurnId(event.event),
-            seq: event.seq,
-            epoch: event.epoch,
-            event: event.event,
-          },
-          "agent.session.forward_stream",
-        );
-
-        this.emit({
-          type: "agent_stream",
-          payload: this.buildAgentStreamPayload(event, serializedEvent),
-        });
-
-        if (event.event.type === "permission_requested") {
-          this.emit({
-            type: "agent_permission_request",
-            payload: {
-              agentId: event.agentId,
-              request: event.event.request,
-            },
-          });
-        } else if (event.event.type === "permission_resolved") {
-          this.emit({
-            type: "agent_permission_resolved",
-            payload: {
-              agentId: event.agentId,
-              requestId: event.event.requestId,
-              resolution: event.event.resolution,
-            },
-          });
-        }
-
-        // Title updates may be applied asynchronously after agent creation.
-      },
+      (event) => this.enqueueAgentManagerEvent(event),
       { replayState: false },
     );
+  }
+
+  private enqueueAgentManagerEvent(event: AgentManagerEvent): void {
+    const agentId = this.resolveAgentManagerEventAgentId(event);
+    const visibilityGate = this.agentOutboundVisibilityGates.get(agentId);
+    if (visibilityGate) {
+      visibilityGate.bufferedEvents.push(event);
+      return;
+    }
+
+    const previous = this.agentOutboundTails.get(agentId) ?? Promise.resolve();
+    const result = previous.then(() => this.forwardAgentManagerEvent(event));
+    const tail = result.catch((error) => {
+      this.sessionLogger.error(
+        { err: error, agentId, eventType: event.type },
+        "Failed to forward ordered agent event",
+      );
+    });
+    this.agentOutboundTails.set(agentId, tail);
+    void tail.finally(() => {
+      if (this.agentOutboundTails.get(agentId) === tail) {
+        this.agentOutboundTails.delete(agentId);
+      }
+    });
+  }
+
+  private resolveAgentManagerEventAgentId(event: AgentManagerEvent): string {
+    if (event.type === "agent_state") {
+      return event.agent.id;
+    }
+    if (event.type === "agent_stream") {
+      return event.agentId;
+    }
+    return event.event.type === "upsert"
+      ? event.event.subagent.parentAgentId
+      : event.event.parentAgentId;
+  }
+
+  private beginAgentOutboundVisibilityGate(agentId: string): boolean {
+    if (this.agentOutboundVisibilityGates.has(agentId)) {
+      return false;
+    }
+    this.agentOutboundVisibilityGates.set(agentId, { bufferedEvents: [] });
+    return true;
+  }
+
+  private releaseAgentOutboundVisibilityGate(agentId: string): void {
+    const visibilityGate = this.agentOutboundVisibilityGates.get(agentId);
+    if (!visibilityGate) {
+      return;
+    }
+    this.agentOutboundVisibilityGates.delete(agentId);
+    for (const event of visibilityGate.bufferedEvents) {
+      this.enqueueAgentManagerEvent(event);
+    }
+  }
+
+  private discardAgentOutboundVisibilityGate(agentId: string): void {
+    this.agentOutboundVisibilityGates.delete(agentId);
+  }
+
+  private async forwardAgentManagerEvent(event: AgentManagerEvent): Promise<void> {
+    if (event.type === "agent_state") {
+      this.sessionLogger.trace(
+        {
+          agentId: event.agent.id,
+          provider: event.agent.provider,
+          providerSessionId: event.agent.persistence?.sessionId ?? undefined,
+          turnId: event.agent.activeForegroundTurnId ?? undefined,
+          lifecycle: event.agent.lifecycle,
+        },
+        "agent.session.forward_update",
+      );
+      await this.agentUpdates.forwardLiveAgent(event.agent);
+      return;
+    }
+
+    if (event.type === "provider_subagent") {
+      this.forwardProviderSubagentEvent(event);
+      return;
+    }
+
+    if (
+      this.voiceSession.isActiveForAgent(event.agentId) &&
+      event.event.type === "permission_requested" &&
+      isVoicePermissionAllowed(event.event.request)
+    ) {
+      const requestId = event.event.request.id;
+      void this.agentManager
+        .respondToPermission(event.agentId, requestId, {
+          behavior: "allow",
+        })
+        .catch((error) => {
+          this.sessionLogger.warn(
+            {
+              err: error,
+              agentId: event.agentId,
+              requestId,
+            },
+            "Failed to auto-allow speak tool permission in voice mode",
+          );
+        });
+    }
+
+    const serializedEvent = serializeAgentStreamEvent(event.event);
+    if (!serializedEvent) {
+      return;
+    }
+    this.sessionLogger.trace(
+      {
+        agentId: event.agentId,
+        provider: event.event.provider,
+        turnId: getAgentStreamEventTurnId(event.event),
+        seq: event.seq,
+        epoch: event.epoch,
+        event: event.event,
+      },
+      "agent.session.forward_stream",
+    );
+
+    this.emit({
+      type: "agent_stream",
+      payload: this.buildAgentStreamPayload(event, serializedEvent),
+    });
+
+    if (event.event.type === "permission_requested") {
+      this.emit({
+        type: "agent_permission_request",
+        payload: {
+          agentId: event.agentId,
+          request: event.event.request,
+        },
+      });
+    } else if (event.event.type === "permission_resolved") {
+      this.emit({
+        type: "agent_permission_resolved",
+        payload: {
+          agentId: event.agentId,
+          requestId: event.event.requestId,
+          resolution: event.event.resolution,
+        },
+      });
+    }
+  }
+
+  private forwardProviderSubagentEvent(
+    event: Extract<AgentManagerEvent, { type: "provider_subagent" }>,
+  ): void {
+    if (!this.supports(CLIENT_CAPS.providerSubagents)) {
+      return;
+    }
+    const update = event.event;
+    if (update.type === "upsert") {
+      this.emit({
+        type: "agent.provider_subagents.update",
+        payload: { kind: "upsert", subagent: update.subagent },
+      });
+    } else if (update.type === "timeline") {
+      this.emit({
+        type: "agent.provider_subagents.update",
+        payload: {
+          kind: "timeline",
+          parentAgentId: update.parentAgentId,
+          subagentId: update.subagentId,
+          provider: update.provider,
+          item: update.row.item,
+          timestamp: update.row.timestamp,
+          seq: update.row.seq,
+          epoch: update.epoch,
+        },
+      });
+    } else {
+      this.emit({
+        type: "agent.provider_subagents.update",
+        payload: {
+          kind: "remove",
+          parentAgentId: update.parentAgentId,
+          subagentId: update.subagentId,
+        },
+      });
+    }
   }
 
   private buildAgentStreamPayload(
@@ -1936,37 +2039,73 @@ export class Session {
     return { agentId, archivedAt };
   }
 
-  private async awaitCreateAgentWithinResponseBudget<
-    T extends { snapshot: { id: string; provider: string } },
-  >(createPromise: Promise<T>): Promise<T> {
-    let budgetTimer: NodeJS.Timeout | undefined;
-    const budgetExceeded = Symbol("create-agent-budget-exceeded");
-    const raced = await Promise.race([
-      createPromise,
-      new Promise<typeof budgetExceeded>((resolveBudget) => {
-        budgetTimer = setTimeout(
-          () => resolveBudget(budgetExceeded),
-          this.createAgentResponseBudgetMs,
-        );
-        budgetTimer.unref?.();
-      }),
-    ]).finally(() => clearTimeout(budgetTimer));
-    if (raced !== budgetExceeded) {
-      return raced;
+  private emitCreateAgentRequestOutcome(
+    requestId: string,
+    outcome: AgentCreateRequestOutcome,
+  ): void {
+    if (outcome.status !== "failed") {
+      return;
     }
-    void createPromise
-      .then(({ snapshot }) => {
-        this.sessionLogger.warn(
-          { agentId: snapshot.id, provider: snapshot.provider },
-          "Agent creation completed after the response budget; archiving the orphan agent",
-        );
-        return this.archiveAgentForClose(snapshot.id);
-      })
-      .catch(() => undefined);
-    throw new Error(
-      `Agent creation timed out after ${Math.round(this.createAgentResponseBudgetMs / 1000)}s while the provider runtime was starting. ` +
-        "No agent was left behind from this attempt. The runtime keeps warming up in the background - retrying in a moment should succeed quickly.",
+    this.emit({
+      type: "status",
+      payload: {
+        status: "agent_create_failed",
+        requestId,
+        error: outcome.error ?? "Failed to create agent",
+        ...(outcome.errorCode ? { errorCode: outcome.errorCode } : {}),
+      },
+    });
+  }
+
+  private async replayCreateAgentRequest(
+    agentId: string,
+    requestId: string,
+    createRequestFingerprint: string,
+  ): Promise<AgentCreateRequestOutcome | null> {
+    const liveAgent = this.agentManager.getAgent(agentId);
+    const storedAgent = await this.agentStorage.get(agentId);
+    if (!liveAgent && !storedAgent) {
+      return null;
+    }
+
+    const durableFingerprint =
+      liveAgent?.createRequestFingerprint ?? storedAgent?.createRequestFingerprint;
+    if (durableFingerprint && durableFingerprint !== createRequestFingerprint) {
+      const outcome: AgentCreateRequestOutcome = {
+        status: "failed",
+        error: "This requestId was already used with different create-agent input.",
+      };
+      this.emitCreateAgentRequestOutcome(requestId, outcome);
+      return outcome;
+    }
+
+    if (storedAgent?.archivedAt) {
+      const outcome: AgentCreateRequestOutcome = {
+        status: "failed",
+        error: `The agent from this create request was archived at ${storedAgent.archivedAt}.`,
+      };
+      this.emitCreateAgentRequestOutcome(requestId, outcome);
+      return outcome;
+    }
+
+    const agent = liveAgent
+      ? await this.buildAgentPayload(liveAgent)
+      : this.buildStoredAgentPayload(storedAgent!);
+    this.emit({
+      type: "status",
+      payload: {
+        status: "agent_created",
+        agentId,
+        requestId,
+        agent,
+      },
+    });
+    this.releaseAgentOutboundVisibilityGate(agentId);
+    this.sessionLogger.info(
+      { agentId, requestId, status: agent.status },
+      "Replayed durable create-agent result",
     );
+    return { status: "created" };
   }
 
   private async handleDetachAgentRequest(agentId: string, requestId: string): Promise<void> {
@@ -2495,6 +2634,72 @@ export class Session {
   private async handleCreateAgentRequest(
     msg: Extract<SessionInboundMessage, { type: "create_agent_request" }>,
   ): Promise<void> {
+    const requestedAgentId = deriveCreateAgentId(this.clientId, msg.requestId);
+    const createRequestFingerprint = deriveCreateAgentRequestFingerprint(msg);
+    const claim = this.agentManager.claimCreateRequest(requestedAgentId, createRequestFingerprint);
+    if (claim.kind === "mismatch") {
+      this.emitCreateAgentRequestOutcome(msg.requestId, {
+        status: "failed",
+        error: "This requestId was already used with different create-agent input.",
+      });
+      return;
+    }
+    const ownsVisibilityGate = this.beginAgentOutboundVisibilityGate(requestedAgentId);
+    try {
+      if (claim.kind === "follower") {
+        const outcome = await claim.outcome;
+        if (outcome.status === "created") {
+          const replayed = await this.replayCreateAgentRequest(
+            requestedAgentId,
+            msg.requestId,
+            createRequestFingerprint,
+          );
+          if (replayed) {
+            return;
+          }
+          this.emitCreateAgentRequestOutcome(msg.requestId, {
+            status: "failed",
+            error: "The durable agent record for this create request is unavailable.",
+          });
+          return;
+        }
+        this.emitCreateAgentRequestOutcome(msg.requestId, outcome);
+        return;
+      }
+
+      let outcome: AgentCreateRequestOutcome;
+      try {
+        outcome = await this.performCreateAgentRequest(
+          msg,
+          requestedAgentId,
+          createRequestFingerprint,
+        );
+      } catch (error) {
+        const wireError = toWorktreeWireError(error);
+        outcome = {
+          status: "failed",
+          error: wireError.message,
+          errorCode: wireError.code,
+        };
+        this.emitCreateAgentRequestOutcome(msg.requestId, outcome);
+        this.sessionLogger.error(
+          { err: error, agentId: requestedAgentId },
+          "Create-agent owner failed before publishing its durable outcome",
+        );
+      }
+      claim.finish(outcome);
+    } finally {
+      if (ownsVisibilityGate) {
+        this.discardAgentOutboundVisibilityGate(requestedAgentId);
+      }
+    }
+  }
+
+  private async performCreateAgentRequest(
+    msg: Extract<SessionInboundMessage, { type: "create_agent_request" }>,
+    requestedAgentId: string,
+    createRequestFingerprint: string,
+  ): Promise<AgentCreateRequestOutcome> {
     const {
       config,
       worktreeName,
@@ -2520,6 +2725,15 @@ export class Session {
     let createdWorktreeForCleanup: CreatePaseoWorktreeWorkflowResult | null = null;
     let createdAgentId: string | null = null;
     try {
+      const replayed = await this.replayCreateAgentRequest(
+        requestedAgentId,
+        requestId,
+        createRequestFingerprint,
+      );
+      if (replayed) {
+        return replayed;
+      }
+
       const trimmedPrompt = initialPrompt?.trim();
       const { provisionalTitle } = resolveCreateAgentTitles({
         configTitle: config.title,
@@ -2551,7 +2765,7 @@ export class Session {
       );
       const createdDirectoryWorkspaceForAgent = !createdWorktree && !msg.workspaceId;
 
-      const createPromise = createAgentCommand(
+      const creation = await beginCreateAgentCommand(
         {
           agentManager: this.agentManager,
           agentStorage: this.agentStorage,
@@ -2562,6 +2776,8 @@ export class Session {
         },
         {
           kind: "session",
+          agentId: requestedAgentId,
+          createRequestFingerprint,
           config: createAgentConfig,
           workspaceId,
           worktreeName,
@@ -2579,51 +2795,67 @@ export class Session {
             this.buildAgentSessionConfig(sessionConfig, gitOptions, legacyWorktreeName, ctx),
         },
       );
-      // Shipped 0.1.110 clients give up on this RPC after 60s. A creation that
-      // succeeds after the client stopped listening becomes an orphan thread the
-      // user never saw succeed, so they retry and end up with duplicates.
-      // Answer inside the client's window: fail cleanly at the budget, and if
-      // the creation still completes later, archive the orphan. The provider
-      // runtime warmed up by the slow attempt survives, so a retry is fast.
-      // Worktree creates are exempt: their catch-path cleanup would remove the
-      // worktree while the in-flight creation is still using it.
-      const { snapshot, liveSnapshot } = createdWorktree
-        ? await createPromise
-        : await this.awaitCreateAgentWithinResponseBudget(createPromise);
+      const snapshot = creation.snapshot;
       createdAgentId = snapshot.id;
-      await this.agentUpdates.forwardLiveAgent(snapshot);
-      if (createdDirectoryWorkspaceForAgent && trimmedPrompt) {
-        this.workspaceAutoName.scheduleForDirectory(
-          {
-            workspaceId,
-            cwd: createAgentConfig.cwd,
-            firstAgentContext,
-          },
-          { currentSelection: this.getFocusedAgentSelectionForCwd(createAgentConfig.cwd) },
-        );
-      }
-      this.createAgentLifecycleDispatch.registerAutoArchiveIfRequested({
-        autoArchive,
-        agentId: snapshot.id,
-        createdWorktree,
-      });
-      if (requestId) {
-        const agentPayload = await this.buildAgentPayload(liveSnapshot);
+      void creation.completion.then(
+        ({ liveSnapshot }) => {
+          this.sessionLogger.info(
+            { agentId: liveSnapshot.id, provider: liveSnapshot.provider },
+            `Created agent ${liveSnapshot.id} (${liveSnapshot.provider})`,
+          );
+          return undefined;
+        },
+        (error: unknown) => {
+          this.sessionLogger.error(
+            { err: error, agentId: snapshot.id, provider: snapshot.provider },
+            "Agent startup failed after the initializing record was acknowledged",
+          );
+          return undefined;
+        },
+      );
+      try {
+        if (createdDirectoryWorkspaceForAgent && trimmedPrompt) {
+          this.workspaceAutoName.scheduleForDirectory(
+            {
+              workspaceId,
+              cwd: createAgentConfig.cwd,
+              firstAgentContext,
+            },
+            { currentSelection: this.getFocusedAgentSelectionForCwd(createAgentConfig.cwd) },
+          );
+        }
+        this.createAgentLifecycleDispatch.registerAutoArchiveIfRequested({
+          autoArchive,
+          agentId: snapshot.id,
+          createdWorktree,
+        });
+        const agentPayload = await this.buildAgentPayload(snapshot);
         this.emit({
           type: "status",
           payload: {
             status: "agent_created",
-            agentId: liveSnapshot.id,
+            agentId: snapshot.id,
             requestId,
             agent: agentPayload,
           },
         });
+        this.releaseAgentOutboundVisibilityGate(snapshot.id);
+        creation.releaseAfterAcknowledgement();
+      } catch (error) {
+        try {
+          await creation.abortBeforeAcknowledgement(error);
+        } finally {
+          this.discardAgentOutboundVisibilityGate(snapshot.id);
+          createdAgentId = null;
+        }
+        throw error;
       }
 
       this.sessionLogger.info(
         { agentId: snapshot.id, provider: snapshot.provider },
-        `Created agent ${snapshot.id} (${snapshot.provider})`,
+        `Persisted initializing agent ${snapshot.id} (${snapshot.provider})`,
       );
+      return { status: "created" };
     } catch (error) {
       await this.createAgentLifecycleDispatch.cleanupCreatedWorktreeAfterFailedAgentCreate({
         createdWorktree: createdWorktreeForCleanup,
@@ -2631,17 +2863,12 @@ export class Session {
       });
       const wireError = toWorktreeWireError(error);
       this.sessionLogger.error({ err: error }, "Failed to create agent");
-      if (requestId) {
-        this.emit({
-          type: "status",
-          payload: {
-            status: "agent_create_failed",
-            requestId,
-            error: wireError.message,
-            errorCode: wireError.code,
-          },
-        });
-      }
+      const outcome: AgentCreateRequestOutcome = {
+        status: "failed",
+        error: wireError.message,
+        errorCode: wireError.code,
+      };
+      this.emitCreateAgentRequestOutcome(requestId, outcome);
       this.emit({
         type: "activity_log",
         payload: {
@@ -2651,6 +2878,7 @@ export class Session {
           content: `Failed to create agent: ${wireError.message}`,
         },
       });
+      return outcome;
     }
   }
 
@@ -2988,6 +3216,48 @@ export class Session {
   /**
    * Handle clearing agent attention flag
    */
+  private async clearAgentAttentionRuntimeNeutral(
+    agentId: string,
+  ): Promise<AgentSnapshotPayload | null> {
+    await this.agentManager.waitForAgentLifecycleHandoff(agentId);
+    const liveAgent = this.agentManager.getAgent(agentId);
+    if (liveAgent) {
+      await this.agentManager.clearAgentAttention(agentId);
+      const refreshed = this.agentManager.getAgent(agentId);
+      return refreshed ? await this.buildAgentPayload(refreshed) : null;
+    }
+
+    let didClear = false;
+    const record = await this.agentStorage.update(agentId, (current) => {
+      if (current.internal || current.archivedAt) {
+        return undefined;
+      }
+      if (current.requiresAttention !== true) {
+        return undefined;
+      }
+      didClear = true;
+      return {
+        ...current,
+        updatedAt: new Date().toISOString(),
+        requiresAttention: false,
+        attentionReason: null,
+        attentionTimestamp: null,
+      };
+    });
+    if (!record || record.internal || record.archivedAt) {
+      return null;
+    }
+
+    const payload = this.buildStoredAgentPayload(record);
+    if (didClear) {
+      this.emit({
+        type: "agent_update",
+        payload: { kind: "upsert", agent: payload, project: null },
+      });
+    }
+    return payload;
+  }
+
   private async handleClearAgentAttention(
     agentId: string | string[],
     requestId?: string,
@@ -2995,25 +3265,13 @@ export class Session {
     const agentIds = Array.isArray(agentId) ? agentId : [agentId];
 
     try {
-      await Promise.all(
-        agentIds.map((id) =>
-          ensureAgentLoaded(id, {
-            agentManager: this.agentManager,
-            agentStorage: this.agentStorage,
-            logger: this.sessionLogger,
-          }),
-        ),
+      const clearedAgents = await Promise.all(
+        agentIds.map((id) => this.clearAgentAttentionRuntimeNeutral(id)),
       );
-      await Promise.all(agentIds.map((id) => this.agentManager.clearAgentAttention(id)));
       if (requestId) {
-        const agents = (
-          await Promise.all(
-            agentIds.map(async (id) => {
-              const agent = this.agentManager.getAgent(id);
-              return agent ? this.buildAgentPayload(agent) : null;
-            }),
-          )
-        ).filter((payload): payload is NonNullable<typeof payload> => payload !== null);
+        const agents = clearedAgents.filter(
+          (payload): payload is NonNullable<typeof payload> => payload !== null,
+        );
         this.emit({
           type: "clear_agent_attention_response",
           payload: {
@@ -3090,17 +3348,7 @@ export class Session {
     );
 
     try {
-      const existing = this.agentManager.getAgent(agentId);
-      const stored = existing ? null : await this.agentStorage.get(agentId);
-      const agent =
-        existing || (stored && !stored.archivedAt)
-          ? await ensureAgentLoaded(agentId, {
-              agentManager: this.agentManager,
-              agentStorage: this.agentStorage,
-              logger: this.sessionLogger,
-            })
-          : null;
-
+      const agent = this.agentManager.getAgent(agentId);
       if (agent?.session?.listCommands) {
         const commands = await agent.session.listCommands();
         this.emit({
@@ -3115,7 +3363,21 @@ export class Session {
         return;
       }
 
-      if (!agent && draftConfig) {
+      const stored = agent ? null : await this.agentStorage.get(agentId);
+      if (stored && !stored.archivedAt) {
+        this.emit({
+          type: "list_commands_response",
+          payload: {
+            agentId,
+            commands: [],
+            error: "Agent is not active; slash-command autocomplete is unavailable",
+            requestId,
+          },
+        });
+        return;
+      }
+
+      if (!stored && draftConfig) {
         const sessionConfig: AgentSessionConfig = {
           provider: draftConfig.provider,
           cwd: expandTilde(draftConfig.cwd),
@@ -5413,17 +5675,13 @@ export class Session {
   }
 
   private selectProjectedTimelineProjection(input: {
-    agentId: string;
     controlTimeline: AgentTimelineFetchResult;
+    projectionTimeline?: AgentTimelineFetchResult;
     direction: AgentTimelineFetchDirection;
     cursor?: AgentTimelineCursor;
     pageLimit: number;
   }): AgentTimelineProjectionSelection {
-    const timeline = this.shouldUseFullTimelineForProjectedPage({
-      timeline: input.controlTimeline,
-    })
-      ? this.agentManager.fetchTimeline(input.agentId, { direction: "tail", limit: 0 })
-      : input.controlTimeline;
+    const timeline = input.projectionTimeline ?? input.controlTimeline;
     const page = selectProjectedTimelinePage({
       rows: timeline.rows,
       bounds: timeline.window,
@@ -5443,9 +5701,9 @@ export class Session {
   }
 
   private selectTimelineProjection(input: {
-    agentId: string;
     projection: TimelineProjectionMode;
     controlTimeline: AgentTimelineFetchResult;
+    projectionTimeline?: AgentTimelineFetchResult;
     direction: AgentTimelineFetchDirection;
     cursor?: AgentTimelineCursor;
     pageLimit: number;
@@ -5455,6 +5713,28 @@ export class Session {
     }
 
     return this.selectProjectedTimelineProjection(input);
+  }
+
+  private async fetchProjectedTimelineContext(
+    agentId: string,
+    projection: TimelineProjectionMode,
+    controlTimeline: AgentTimelineFetchResult,
+  ): Promise<AgentTimelineFetchResult | undefined> {
+    if (
+      projection !== "projected" ||
+      !this.shouldUseFullTimelineForProjectedPage({ timeline: controlTimeline })
+    ) {
+      return undefined;
+    }
+
+    const projectionTimeline = await this.agentManager.fetchRetainedOrDurableTimeline(agentId, {
+      direction: "tail",
+      limit: 0,
+    });
+    if (!projectionTimeline) {
+      throw new Error(`Agent ${agentId} projection timeline is unavailable`);
+    }
+    return projectionTimeline;
   }
 
   private async handleFetchAgentTimelineRequest(
@@ -5472,22 +5752,33 @@ export class Session {
       : undefined;
 
     try {
-      const snapshot = await ensureAgentLoaded(msg.agentId, {
-        agentManager: this.agentManager,
-        agentStorage: this.agentStorage,
-        logger: this.sessionLogger,
-      });
-      const agentPayload = await this.buildAgentPayload(snapshot);
+      await this.agentManager.waitForAgentLifecycleHandoff(msg.agentId);
+      const stored = await this.agentStorage.get(msg.agentId);
+      if (stored?.archivedAt) {
+        throw new Error(`Agent ${msg.agentId} is archived`);
+      }
+      const agentPayload = await this.getAgentPayloadById(msg.agentId);
+      if (!agentPayload) {
+        throw new Error(`Agent not found: ${msg.agentId}`);
+      }
 
-      const controlTimeline = this.agentManager.fetchTimeline(msg.agentId, {
+      const controlTimeline = await this.agentManager.fetchRetainedOrDurableTimeline(msg.agentId, {
         direction,
         cursor,
         limit: pageLimit,
       });
-      const selectedTimeline = this.selectTimelineProjection({
-        agentId: msg.agentId,
+      if (!controlTimeline) {
+        throw new Error(`Agent ${msg.agentId} timeline is unavailable`);
+      }
+      const projectionTimeline = await this.fetchProjectedTimelineContext(
+        msg.agentId,
         projection,
         controlTimeline,
+      );
+      const selectedTimeline = this.selectTimelineProjection({
+        projection,
+        controlTimeline,
+        ...(projectionTimeline ? { projectionTimeline } : {}),
         direction,
         ...(cursor ? { cursor } : {}),
         pageLimit,
@@ -5519,7 +5810,7 @@ export class Session {
           hasOlder: selectedTimeline.hasOlder,
           hasNewer: selectedTimeline.hasNewer,
           entries: selectedTimeline.entries.map((entry) => ({
-            provider: snapshot.provider,
+            provider: agentPayload.provider,
             item: entry.item,
             timestamp: entry.timestamp,
             seqStart: entry.seqStart,
@@ -5565,11 +5856,18 @@ export class Session {
     msg: Extract<SessionInboundMessage, { type: "agent.provider_subagents.list.request" }>,
   ): Promise<void> {
     try {
-      await ensureAgentLoaded(msg.parentAgentId, {
-        agentManager: this.agentManager,
-        agentStorage: this.agentStorage,
-        logger: this.sessionLogger,
-      });
+      await this.agentManager.waitForAgentLifecycleHandoff(msg.parentAgentId);
+      const parent = await this.getAgentPayloadById(msg.parentAgentId);
+      if (!parent || parent.archivedAt) {
+        throw new Error(`Agent not found: ${msg.parentAgentId}`);
+      }
+      if (!this.agentManager.getAgent(msg.parentAgentId)) {
+        const record = await this.agentStorage.get(msg.parentAgentId);
+        this.agentManager.restoreProviderSubagents(
+          msg.parentAgentId,
+          record?.providerSubagents ?? [],
+        );
+      }
       this.emit({
         type: "agent.provider_subagents.list.response",
         payload: {
@@ -5597,11 +5895,18 @@ export class Session {
   ): Promise<void> {
     const direction: AgentTimelineFetchDirection = msg.direction ?? (msg.cursor ? "after" : "tail");
     try {
-      await ensureAgentLoaded(msg.parentAgentId, {
-        agentManager: this.agentManager,
-        agentStorage: this.agentStorage,
-        logger: this.sessionLogger,
-      });
+      await this.agentManager.waitForAgentLifecycleHandoff(msg.parentAgentId);
+      const parent = await this.getAgentPayloadById(msg.parentAgentId);
+      if (!parent || parent.archivedAt) {
+        throw new Error(`Agent not found: ${msg.parentAgentId}`);
+      }
+      if (!this.agentManager.getAgent(msg.parentAgentId)) {
+        const record = await this.agentStorage.get(msg.parentAgentId);
+        this.agentManager.restoreProviderSubagents(
+          msg.parentAgentId,
+          record?.providerSubagents ?? [],
+        );
+      }
       const descriptor = this.agentManager.getProviderSubagent(msg.parentAgentId, msg.subagentId);
       if (!descriptor) {
         throw new Error("Provider subagent not found");
@@ -5665,16 +5970,22 @@ export class Session {
     msg: Extract<SessionInboundMessage, { type: "agent.fork_context.request" }>,
   ): Promise<void> {
     try {
-      const snapshot = await ensureAgentLoaded(msg.agentId, {
-        agentManager: this.agentManager,
-        agentStorage: this.agentStorage,
-        logger: this.sessionLogger,
-      });
-      const agentPayload = await this.buildAgentPayload(snapshot);
-      const timeline = this.agentManager.fetchTimeline(msg.agentId, {
+      await this.agentManager.waitForAgentLifecycleHandoff(msg.agentId);
+      const stored = await this.agentStorage.get(msg.agentId);
+      if (stored?.archivedAt) {
+        throw new Error(`Agent ${msg.agentId} is archived`);
+      }
+      const agentPayload = await this.getAgentPayloadById(msg.agentId);
+      if (!agentPayload) {
+        throw new Error(`Agent not found: ${msg.agentId}`);
+      }
+      const timeline = await this.agentManager.fetchRetainedOrDurableTimeline(msg.agentId, {
         direction: "tail",
         limit: 0,
       });
+      if (!timeline) {
+        throw new Error(`Agent ${msg.agentId} timeline is unavailable`);
+      }
       const forkContext = buildAgentForkContextAttachment({
         rows: timeline.rows,
         cursorBoundary: msg.boundaryCursor
@@ -5682,7 +5993,7 @@ export class Session {
           : null,
         boundaryMessageId: msg.boundaryMessageId,
         agentTitle: agentPayload.title,
-        cwd: snapshot.cwd,
+        cwd: agentPayload.cwd,
       });
 
       this.emit({
@@ -5746,9 +6057,8 @@ export class Session {
         },
         "agent.session.send_agent_message",
       );
-      let dispatchResult: { outOfBand: boolean };
       try {
-        dispatchResult = await sendPromptToAgent({
+        await sendPromptToAgent({
           agentManager: this.agentManager,
           agentStorage: this.agentStorage,
           agentId,
@@ -5771,34 +6081,10 @@ export class Session {
         return;
       }
 
-      if (dispatchResult.outOfBand) {
-        this.emit({
-          type: "send_agent_message_response",
-          payload: {
-            requestId: msg.requestId,
-            agentId,
-            accepted: true,
-            error: null,
-          },
-        });
-        return;
-      }
-
-      try {
-        await waitForAgentRunStartWithTimeout(this.agentManager, agentId);
-      } catch (error) {
-        this.emit({
-          type: "send_agent_message_response",
-          payload: {
-            requestId: msg.requestId,
-            agentId,
-            accepted: false,
-            error: errorToFriendlyMessage(error),
-          },
-        });
-        return;
-      }
-
+      // sendPromptToAgent returns only after Paseo has accepted the message and
+      // allocated its pending run. Provider startup remains observable through
+      // agent state/turn-failed events, but must not turn an accepted message
+      // into a false rejection that invites a duplicate client retry.
       this.emit({
         type: "send_agent_message_response",
         payload: {
@@ -5983,6 +6269,8 @@ export class Session {
       this.unsubscribeAgentEvents();
       this.unsubscribeAgentEvents = null;
     }
+    this.agentOutboundVisibilityGates.clear();
+    this.agentOutboundTails.clear();
     this.agentUpdates.dispose();
     if (this.unsubscribeTerminalWorkspaceContributionEvents) {
       this.unsubscribeTerminalWorkspaceContributionEvents();

@@ -103,4 +103,50 @@ describe("ProviderSubagentStore", () => {
     expect(page.rows.at(-1)?.seq).toBe(101);
     expect(page.hasOlder).toBe(false);
   });
+
+  test("snapshots and restores a parent timeline without replacing live state", () => {
+    const beforeRestart = new ProviderSubagentStore();
+    beforeRestart.apply("parent-a", "codex", {
+      type: "upsert",
+      id: "child-1",
+      title: "Durable child",
+      status: "running",
+      timestamp: "2026-07-12T10:00:00.000Z",
+    });
+    beforeRestart.apply("parent-a", "codex", {
+      type: "timeline",
+      id: "child-1",
+      item: { type: "assistant_message", text: "Persist me." },
+      timestamp: "2026-07-12T10:00:01.000Z",
+    });
+    const snapshots = beforeRestart.snapshotParent("parent-a");
+    expect(snapshots).toHaveLength(1);
+
+    const afterRestart = new ProviderSubagentStore();
+    expect(afterRestart.restoreParent("parent-a", snapshots ?? [])).toBe(true);
+    expect(afterRestart.list("parent-a")).toEqual([
+      expect.objectContaining({ id: "child-1", title: "Durable child", status: "running" }),
+    ]);
+    const timeline = afterRestart.fetchTimeline("parent-a", "child-1");
+    expect(timeline).toMatchObject({
+      epoch: snapshots?.[0]?.timeline.epoch,
+      window: { minSeq: 1, maxSeq: 1, nextSeq: 2 },
+      rows: [
+        {
+          seq: 1,
+          timestamp: "2026-07-12T10:00:01.000Z",
+          item: { type: "assistant_message", text: "Persist me." },
+        },
+      ],
+    });
+
+    afterRestart.apply("parent-a", "codex", {
+      type: "upsert",
+      id: "child-2",
+      title: "Current child",
+      status: "completed",
+    });
+    expect(afterRestart.restoreParent("parent-a", snapshots ?? [])).toBe(false);
+    expect(afterRestart.list("parent-a").map((entry) => entry.id)).toEqual(["child-1", "child-2"]);
+  });
 });

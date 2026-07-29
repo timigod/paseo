@@ -9,7 +9,7 @@ import { createProviderSnapshotManagerStub } from "../../test-utils/session-stub
 import { AgentManager } from "../agent-manager.js";
 import { AgentStorage } from "../agent-storage.js";
 import type { CreatePaseoWorktreeWorkflowResult } from "../../worktree-session.js";
-import { createAgentCommand } from "./create.js";
+import { beginCreateAgentCommand, createAgentCommand } from "./create.js";
 import type { ManagedAgent } from "../agent-manager.js";
 
 const logger = createTestLogger();
@@ -51,7 +51,7 @@ test("session create forwards clientMessageId to the initial prompt run options"
     agentManager: {
       createAgent: vi.fn(async () => snapshot),
       getAgent: vi.fn(() => snapshot),
-      tryRunOutOfBand: vi.fn(() => false),
+      tryRunOutOfBand: vi.fn(async () => false),
       hasInFlightRun: vi.fn(() => false),
       streamAgent,
       waitForAgentRunStart: vi.fn(async () => undefined),
@@ -76,6 +76,126 @@ test("session create forwards clientMessageId to the initial prompt run options"
   expect(streamAgent).toHaveBeenCalledWith("agent-1", "hello from create", {
     messageId: "msg-create-1",
   });
+});
+
+test("durable session create waits for provider startup before sending the initial prompt", async () => {
+  const pendingSnapshot = {
+    id: "agent-pending",
+    provider: "codex",
+    cwd: "/tmp/paseo-create-test",
+    lifecycle: "initializing",
+    session: null,
+  } as ManagedAgent;
+  const readySnapshot = {
+    ...pendingSnapshot,
+    lifecycle: "idle",
+    session: {},
+  } as ManagedAgent;
+  let finishProviderStartup: (snapshot: ManagedAgent) => void = () => {};
+  const providerStartup = new Promise<ManagedAgent>((resolve) => {
+    finishProviderStartup = resolve;
+  });
+  const startSetupContinuation = vi.fn();
+  const streamAgent = vi.fn(() => (async function* noop() {})());
+  const dependencies: Parameters<typeof beginCreateAgentCommand>[0] = {
+    agentManager: {
+      beginCreateAgent: vi.fn(async () => ({
+        snapshot: pendingSnapshot,
+        completion: providerStartup,
+      })),
+      getAgent: vi.fn(() => readySnapshot),
+      tryRunOutOfBand: vi.fn(() => false),
+      hasInFlightRun: vi.fn(() => false),
+      streamAgent,
+      waitForAgentRunStart: vi.fn(async () => undefined),
+    } as unknown as Parameters<typeof beginCreateAgentCommand>[0]["agentManager"],
+    agentStorage: {} as Parameters<typeof beginCreateAgentCommand>[0]["agentStorage"],
+    logger: createTestLogger(),
+    providerSnapshotManager: createProviderSnapshotManagerStub().manager,
+  };
+
+  const creation = await beginCreateAgentCommand(dependencies, {
+    kind: "session",
+    agentId: "00000000-0000-4000-8000-000000000201",
+    config: { provider: "codex", cwd: "/tmp/paseo-create-test" },
+    workspaceId: "ws-create-test",
+    initialPrompt: "continue after startup",
+    clientMessageId: "msg-create-pending",
+    labels: {},
+    provisionalTitle: null,
+    firstAgentContext: { attachments: [] },
+    buildSessionConfig: async (config) => ({
+      sessionConfig: config,
+      setupContinuation: {
+        kind: "agent",
+        startAfterAgentCreate: startSetupContinuation,
+      },
+      createdWorkspaceId: "ws-create-test",
+    }),
+  });
+
+  expect(creation.snapshot).toBe(pendingSnapshot);
+  expect(streamAgent).not.toHaveBeenCalled();
+  expect(startSetupContinuation).not.toHaveBeenCalled();
+
+  finishProviderStartup(readySnapshot);
+  await Promise.resolve();
+  expect(streamAgent).not.toHaveBeenCalled();
+  expect(startSetupContinuation).not.toHaveBeenCalled();
+
+  creation.releaseAfterAcknowledgement();
+  await creation.completion;
+  expect(startSetupContinuation).toHaveBeenCalledWith({ agentId: "agent-pending" });
+  expect(streamAgent).toHaveBeenCalledWith("agent-pending", "continue after startup", {
+    messageId: "msg-create-pending",
+  });
+});
+
+test("durable session create aborts its initial continuation when acknowledgement fails", async () => {
+  const pendingSnapshot = {
+    id: "agent-pending",
+    provider: "codex",
+    cwd: "/tmp/paseo-create-test",
+    lifecycle: "initializing",
+    session: null,
+  } as ManagedAgent;
+  const streamAgent = vi.fn(() => (async function* noop() {})());
+  const abortCreation = vi.fn(async () => undefined);
+  const dependencies: Parameters<typeof beginCreateAgentCommand>[0] = {
+    agentManager: {
+      beginCreateAgent: vi.fn(async () => ({
+        snapshot: pendingSnapshot,
+        completion: new Promise<ManagedAgent>(() => undefined),
+        abortCreation,
+      })),
+      getAgent: vi.fn(() => pendingSnapshot),
+      tryRunOutOfBand: vi.fn(() => false),
+      hasInFlightRun: vi.fn(() => false),
+      streamAgent,
+      waitForAgentRunStart: vi.fn(async () => undefined),
+    } as unknown as Parameters<typeof beginCreateAgentCommand>[0]["agentManager"],
+    agentStorage: {} as Parameters<typeof beginCreateAgentCommand>[0]["agentStorage"],
+    logger: createTestLogger(),
+    providerSnapshotManager: createProviderSnapshotManagerStub().manager,
+  };
+  const creation = await beginCreateAgentCommand(dependencies, {
+    kind: "session",
+    agentId: "00000000-0000-4000-8000-000000000202",
+    config: { provider: "codex", cwd: "/tmp/paseo-create-test" },
+    workspaceId: "ws-create-test",
+    initialPrompt: "must not start",
+    labels: {},
+    provisionalTitle: null,
+    firstAgentContext: { attachments: [] },
+    buildSessionConfig: async (config) => ({ sessionConfig: config }),
+  });
+  const acknowledgementError = new Error("initializing projection failed");
+
+  await creation.abortBeforeAcknowledgement(acknowledgementError);
+
+  await expect(creation.completion).rejects.toBe(acknowledgementError);
+  expect(abortCreation).toHaveBeenCalledWith(acknowledgementError);
+  expect(streamAgent).not.toHaveBeenCalled();
 });
 
 test("session create validates the requested mode against the provider's modes", async () => {

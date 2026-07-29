@@ -174,6 +174,107 @@ test("legacy cancel_agent_request reports refusal through the activity log", asy
   ]);
 });
 
+test("send_agent_message acknowledges dispatch without waiting for provider run start", async () => {
+  const agentId = "11111111-1111-4111-8111-111111111111";
+  const messages: SessionOutboundMessage[] = [];
+  const agent = {
+    id: agentId,
+    provider: "opencode" as const,
+    lifecycle: "idle" as const,
+    persistence: { provider: "opencode" as const, sessionId: "session-1" },
+  };
+  const streamAgent = vi.fn(() => (async function* noop() {})());
+  const waitForAgentRunStart = vi.fn(async () => {
+    throw new Error("provider runtime is still starting");
+  });
+  const session = createSessionForTest({
+    messages,
+    agentManager: {
+      listAgents: vi.fn(() => [agent]),
+      getAgent: vi.fn(() => agent),
+      touchAgentActivity: vi.fn(() => agent),
+      waitForAgentLifecycleHandoff: vi.fn(async () => {}),
+      tryRunOutOfBand: vi.fn(() => false),
+      hasInFlightRun: vi.fn(() => false),
+      streamAgent,
+      waitForAgentRunStart,
+    },
+    agentStorage: {
+      get: vi.fn(async () => null),
+    },
+  });
+
+  await session.handleMessage({
+    type: "send_agent_message_request",
+    requestId: "request-1",
+    agentId,
+    text: "Continue the investigation",
+    messageId: "message-1",
+  });
+
+  expect(messages).toEqual([
+    {
+      type: "send_agent_message_response",
+      payload: {
+        requestId: "request-1",
+        agentId,
+        accepted: true,
+        error: null,
+      },
+    },
+  ]);
+  expect(streamAgent).toHaveBeenCalledWith(agentId, "Continue the investigation", {
+    messageId: "message-1",
+  });
+  expect(waitForAgentRunStart).not.toHaveBeenCalled();
+});
+
+test("send_agent_message still reports a rejection before dispatch acceptance", async () => {
+  const agentId = "11111111-1111-4111-8111-111111111111";
+  const messages: SessionOutboundMessage[] = [];
+  const agent = {
+    id: agentId,
+    provider: "opencode" as const,
+    lifecycle: "idle" as const,
+    persistence: { provider: "opencode" as const, sessionId: "session-1" },
+  };
+  const session = createSessionForTest({
+    messages,
+    agentManager: {
+      listAgents: vi.fn(() => [agent]),
+      getAgent: vi.fn(() => agent),
+      touchAgentActivity: vi.fn(() => agent),
+      waitForAgentLifecycleHandoff: vi.fn(async () => {}),
+      tryRunOutOfBand: vi.fn(() => false),
+      hasInFlightRun: vi.fn(() => false),
+      streamAgent: vi.fn(() => {
+        throw new Error("provider rejected dispatch");
+      }),
+    },
+    agentStorage: {
+      get: vi.fn(async () => null),
+    },
+  });
+
+  await session.handleMessage({
+    type: "send_agent_message_request",
+    requestId: "request-1",
+    agentId,
+    text: "Continue the investigation",
+    messageId: "message-1",
+  });
+
+  expect(messages.at(-1)).toEqual({
+    type: "send_agent_message_response",
+    payload: {
+      requestId: "request-1",
+      agentId,
+      accepted: false,
+      error: "provider rejected dispatch",
+    },
+  });
+});
+
 const checkoutGitMocks = vi.hoisted(() => ({
   checkoutResolvedBranch: vi.fn(),
   commitChanges: vi.fn(),

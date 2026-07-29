@@ -23,6 +23,15 @@ export interface ProviderSubagentDescriptor {
   cwd: string | null;
 }
 
+export interface ProviderSubagentSnapshot {
+  descriptor: ProviderSubagentDescriptor;
+  timeline: {
+    epoch: string;
+    nextSeq: number;
+    rows: AgentTimelineRow[];
+  };
+}
+
 export type ProviderSubagentInputEvent =
   | {
       type: "upsert";
@@ -61,12 +70,14 @@ function storeKey(parentAgentId: string, subagentId: string): string {
 export class ProviderSubagentStore {
   private readonly descriptors = new Map<string, ProviderSubagentDescriptor>();
   private readonly timelines = new InMemoryAgentTimelineStore();
+  private readonly knownParents = new Set<string>();
 
   apply(
     parentAgentId: string,
     provider: AgentProvider,
     event: ProviderSubagentInputEvent,
   ): ProviderSubagentStoreEvent {
+    this.knownParents.add(parentAgentId);
     const key = storeKey(parentAgentId, event.id);
     if (event.type === "remove") {
       this.descriptors.delete(key);
@@ -124,6 +135,47 @@ export class ProviderSubagentStore {
     return this.descriptors.get(storeKey(parentAgentId, subagentId)) ?? null;
   }
 
+  restoreParent(parentAgentId: string, snapshots: readonly ProviderSubagentSnapshot[]): boolean {
+    if (this.knownParents.has(parentAgentId)) {
+      return false;
+    }
+
+    this.knownParents.add(parentAgentId);
+    for (const snapshot of snapshots) {
+      if (snapshot.descriptor.parentAgentId !== parentAgentId) {
+        continue;
+      }
+      const key = storeKey(parentAgentId, snapshot.descriptor.id);
+      this.descriptors.set(key, { ...snapshot.descriptor });
+      this.timelines.initialize(key, {
+        epoch: snapshot.timeline.epoch,
+        nextSeq: snapshot.timeline.nextSeq,
+        rows: snapshot.timeline.rows,
+      });
+    }
+    return true;
+  }
+
+  snapshotParent(parentAgentId: string): ProviderSubagentSnapshot[] | undefined {
+    if (!this.knownParents.has(parentAgentId)) {
+      return undefined;
+    }
+    return this.list(parentAgentId).map((descriptor) => {
+      const timeline = this.timelines.fetch(storeKey(parentAgentId, descriptor.id), {
+        direction: "tail",
+        limit: 0,
+      });
+      return {
+        descriptor: { ...descriptor },
+        timeline: {
+          epoch: timeline.epoch,
+          nextSeq: timeline.window.nextSeq,
+          rows: timeline.rows,
+        },
+      };
+    });
+  }
+
   fetchTimeline(
     parentAgentId: string,
     subagentId: string,
@@ -156,6 +208,7 @@ export class ProviderSubagentStore {
   }
 
   deleteParent(parentAgentId: string): ProviderSubagentStoreEvent[] {
+    this.knownParents.add(parentAgentId);
     const events: ProviderSubagentStoreEvent[] = [];
     for (const subagent of this.list(parentAgentId)) {
       const key = storeKey(parentAgentId, subagent.id);

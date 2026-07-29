@@ -17,7 +17,12 @@ type AgentLoaderManager = Pick<
   AgentManager,
   "createAgent" | "getAgent" | "getRegisteredProviderIds" | "resumeAgentFromPersistence"
 > &
-  Partial<Pick<AgentManager, "touchAgentActivity" | "waitForAgentLifecycleHandoff">>;
+  Partial<
+    Pick<
+      AgentManager,
+      "activateAgentRuntime" | "touchAgentActivity" | "waitForAgentLifecycleHandoff"
+    >
+  >;
 
 export interface EnsureAgentLoadedDeps {
   agentManager: AgentLoaderManager;
@@ -32,7 +37,9 @@ export async function ensureAgentLoaded(
 ): Promise<ManagedAgent> {
   await deps.agentManager.waitForAgentLifecycleHandoff?.(agentId);
   const existing =
-    deps.agentManager.touchAgentActivity?.(agentId) ?? deps.agentManager.getAgent(agentId);
+    (await deps.agentManager.activateAgentRuntime?.(agentId)) ??
+    deps.agentManager.touchAgentActivity?.(agentId) ??
+    deps.agentManager.getAgent(agentId);
   if (existing) {
     return existing;
   }
@@ -65,12 +72,17 @@ export async function ensureAgentLoaded(
 
     let snapshot: ManagedAgent;
     if (handle) {
+      const timestamps = extractTimestamps(record);
       snapshot = await deps.agentManager.resumeAgentFromPersistence(
         handle,
         buildConfigOverrides(record),
         agentId,
         {
-          ...extractTimestamps(record),
+          ...timestamps,
+          // Stamp successful activation inside the serialized resume
+          // operation so the collector cannot reclaim the runtime before the
+          // caller starts its command.
+          activateRuntime: true,
           hydrateTimeline: {},
         },
       );

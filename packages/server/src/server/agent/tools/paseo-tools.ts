@@ -3,7 +3,7 @@ import { ensureValidJson } from "../../json-utils.js";
 import type { Logger } from "pino";
 
 import type { AgentMode, AgentProvider, AgentTimelineItem } from "../agent-sdk-types.js";
-import type { AgentManager } from "../agent-manager.js";
+import type { AgentManager, ManagedAgent } from "../agent-manager.js";
 import {
   AgentFeatureSchema,
   AgentPermissionRequestPayloadSchema,
@@ -19,8 +19,7 @@ import {
 } from "../agent-projections.js";
 import { curateAgentActivity } from "../activity-curator.js";
 import { selectItemsByProjectedLimit } from "../timeline-projection.js";
-import type { AgentStorage } from "../agent-storage.js";
-import { ensureAgentLoaded } from "../agent-loading.js";
+import type { AgentStorage, StoredAgentRecord } from "../agent-storage.js";
 import { isStoredAgentProviderAvailable } from "../../persistence-hooks.js";
 import {
   killTerminalsForWorkspace,
@@ -420,6 +419,87 @@ function resolveTerminalKeyToken(key: string, literal: boolean): string {
     default:
       return key;
   }
+}
+
+interface LoadedAgentActivityState {
+  timeline: AgentTimelineItem[];
+  currentModeId: string | null;
+  archivedActivityUnavailable: boolean;
+}
+
+function resolveActivityMode(
+  stored: StoredAgentRecord | null,
+  live: ManagedAgent | null,
+): string | null {
+  return live?.currentModeId ?? stored?.lastModeId ?? stored?.config?.modeId ?? null;
+}
+
+async function loadUnarchivedAgentActivity(params: {
+  agentManager: AgentManager;
+  agentId: string;
+  stored: StoredAgentRecord | null;
+  live: ManagedAgent | null;
+}): Promise<LoadedAgentActivityState> {
+  const { agentManager, agentId, stored, live } = params;
+  const timeline = live
+    ? agentManager.getTimeline(agentId)
+    : ((await agentManager.getRetainedOrDurableTimeline(agentId)) ?? stored?.timeline ?? []);
+  return {
+    timeline,
+    currentModeId: resolveActivityMode(stored, live),
+    archivedActivityUnavailable: false,
+  };
+}
+
+async function loadArchivedAgentActivity(params: {
+  agentManager: AgentManager;
+  agentStorage: AgentStorage;
+  agentId: string;
+  stored: StoredAgentRecord;
+}): Promise<LoadedAgentActivityState> {
+  const { agentManager, agentStorage, agentId, stored } = params;
+  const currentModeId = resolveActivityMode(stored, null);
+  if (stored.timeline !== undefined) {
+    return {
+      timeline: stored.timeline,
+      currentModeId,
+      archivedActivityUnavailable: false,
+    };
+  }
+
+  const retainedTimeline = await agentManager.getRetainedOrDurableTimeline(agentId);
+  if (retainedTimeline === null) {
+    return { timeline: [], currentModeId, archivedActivityUnavailable: true };
+  }
+
+  const latest = await agentStorage.update(agentId, (record) =>
+    record.timeline === undefined ? { ...record, timeline: retainedTimeline } : undefined,
+  );
+  return {
+    timeline: latest?.timeline ?? retainedTimeline,
+    currentModeId,
+    archivedActivityUnavailable: false,
+  };
+}
+
+async function loadAgentActivityState(params: {
+  agentManager: AgentManager;
+  agentStorage: AgentStorage;
+  agentId: string;
+}): Promise<LoadedAgentActivityState> {
+  const { agentManager, agentStorage, agentId } = params;
+  await agentManager.waitForAgentLifecycleHandoff(agentId);
+  const stored = await agentStorage.get(agentId);
+  const live = agentManager.getAgent(agentId);
+  if (!stored && !live) {
+    throw new Error(`Agent not found: ${agentId}`);
+  }
+
+  if (!stored?.archivedAt) {
+    return await loadUnarchivedAgentActivity({ agentManager, agentId, stored, live });
+  }
+
+  return await loadArchivedAgentActivity({ agentManager, agentStorage, agentId, stored });
 }
 
 export function createPaseoToolCatalog(options: PaseoToolHostDependencies): PaseoToolCatalog {
@@ -2567,37 +2647,9 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
       },
     },
     async ({ agentId, limit }) => {
-      await agentManager.waitForAgentLifecycleHandoff(agentId);
-      const stored = await agentStorage.get(agentId);
-      let timeline: AgentTimelineItem[];
-      let currentModeId: string | null;
-      let archivedActivityUnavailable = false;
-      if (stored?.archivedAt) {
-        if (stored.timeline !== undefined) {
-          timeline = stored.timeline;
-        } else {
-          const retainedTimeline = await agentManager.getRetainedOrDurableTimeline(agentId);
-          if (retainedTimeline === null) {
-            timeline = [];
-            archivedActivityUnavailable = true;
-          } else {
-            timeline = retainedTimeline;
-            const latest = await agentStorage.update(agentId, (record) =>
-              record.timeline === undefined ? { ...record, timeline: retainedTimeline } : undefined,
-            );
-            timeline = latest?.timeline ?? retainedTimeline;
-          }
-        }
-        currentModeId = stored.lastModeId ?? stored.config?.modeId ?? null;
-      } else {
-        const snapshot = await ensureAgentLoaded(agentId, {
-          agentManager,
-          agentStorage,
-          logger: childLogger,
-        });
-        timeline = agentManager.getTimeline(agentId);
-        currentModeId = snapshot.currentModeId;
-      }
+      const { timeline, currentModeId, archivedActivityUnavailable } = await loadAgentActivityState(
+        { agentManager, agentStorage, agentId },
+      );
 
       const selection = selectItemsByProjectedLimit({
         items: timeline,

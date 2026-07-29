@@ -1,18 +1,45 @@
 import type { Logger } from "pino";
 
-import type { AgentPromptInput, AgentRunOptions } from "./agent-sdk-types.js";
+import type { AgentPromptInput, AgentRunOptions, AgentStreamEvent } from "./agent-sdk-types.js";
 import type { AgentManager, ManagedAgent } from "./agent-manager.js";
 import type { AgentStorage } from "./agent-storage.js";
 import { ensureAgentLoaded } from "./agent-loading.js";
 
 export type AgentRunController = Pick<
   AgentManager,
-  "getAgent" | "tryRunOutOfBand" | "hasInFlightRun" | "replaceAgentRun" | "streamAgent"
+  | "getAgent"
+  | "tryRunOutOfBand"
+  | "hasInFlightRun"
+  | "isAgentRunStarting"
+  | "replaceAgentRun"
+  | "streamAgent"
 >;
 
 export interface StartAgentRunOptions {
   replaceRunning?: boolean;
+  replaceStartingRun?: boolean;
   runOptions?: AgentRunOptions;
+}
+
+async function createAgentRunIterator(params: {
+  agentManager: AgentRunController;
+  agentId: string;
+  prompt: AgentPromptInput;
+  options: StartAgentRunOptions | undefined;
+}): Promise<{ iterator: AsyncGenerator<AgentStreamEvent>; shouldReplace: boolean }> {
+  const { agentManager, agentId, prompt, options } = params;
+  const shouldReplace = Boolean(options?.replaceRunning && agentManager.hasInFlightRun(agentId));
+  if (
+    shouldReplace &&
+    options?.replaceStartingRun === false &&
+    agentManager.isAgentRunStarting(agentId)
+  ) {
+    throw new Error(`Agent ${agentId} is still starting its previous message`);
+  }
+  const iterator = shouldReplace
+    ? await agentManager.replaceAgentRun(agentId, prompt, options?.runOptions)
+    : agentManager.streamAgent(agentId, prompt, options?.runOptions);
+  return { iterator, shouldReplace };
 }
 
 export async function startAgentRun(
@@ -38,14 +65,15 @@ export async function startAgentRun(
   // Out-of-band commands (e.g. /goal pause) must run WITHOUT canceling an
   // in-flight turn — replaceAgentRun would interrupt the running turn. The
   // intercept lives at this layer so it covers every prompt entrypoint.
-  if (agentManager.tryRunOutOfBand(agentId, prompt)) {
+  if (await agentManager.tryRunOutOfBand(agentId, prompt)) {
     return { outOfBand: true };
   }
-  const shouldReplace = Boolean(options?.replaceRunning && agentManager.hasInFlightRun(agentId));
-  const runOptions = options?.runOptions;
-  const iterator = shouldReplace
-    ? await agentManager.replaceAgentRun(agentId, prompt, runOptions)
-    : agentManager.streamAgent(agentId, prompt, runOptions);
+  const { iterator, shouldReplace } = await createAgentRunIterator({
+    agentManager,
+    agentId,
+    prompt,
+    options,
+  });
   logger.trace(
     {
       agentId,
@@ -199,6 +227,11 @@ export async function sendPromptToAgent(
 
   return await startAgentRun(params.agentManager, params.agentId, params.prompt, params.logger, {
     replaceRunning: true,
+    // A normal follow-up may intentionally replace an active turn, but it
+    // must not displace a message that Paseo has accepted and is still
+    // handing to the provider. Explicit manager replacement remains available
+    // to lifecycle controls.
+    replaceStartingRun: false,
     runOptions,
   });
 }

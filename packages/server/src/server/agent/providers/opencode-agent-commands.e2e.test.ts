@@ -37,7 +37,7 @@ describe("opencode agent commands E2E", () => {
     }
   }, 60_000);
 
-  test("listing commands resumes an idle-collected agent", async () => {
+  test("listing commands does not resume an idle-collected agent", async () => {
     const agent = await ctx.client.createAgent({
       ...getFullAccessConfig("opencode"),
       cwd: "/tmp",
@@ -51,12 +51,16 @@ describe("opencode agent commands E2E", () => {
     expect(collection.failures).toEqual([]);
     expect(collection.collected.map((entry) => entry.agentId)).toContain(agent.id);
     expect(ctx.daemon.daemon.agentManager.getAgent(agent.id)).toBeNull();
+    const before = await ctx.daemon.daemon.agentStorage.get(agent.id);
 
     const result = await ctx.client.listCommands({ agentId: agent.id });
 
-    expect(result.error).toBeNull();
-    expect(result.commands.length).toBeGreaterThan(0);
-    expect(ctx.daemon.daemon.agentManager.getAgent(agent.id)?.id).toBe(agent.id);
+    expect(result.error).toBe("Agent is not active; slash-command autocomplete is unavailable");
+    expect(result.commands).toEqual([]);
+    expect(ctx.daemon.daemon.agentManager.getAgent(agent.id)).toBeNull();
+    const after = await ctx.daemon.daemon.agentStorage.get(agent.id);
+    expect(after?.lastRuntimeActivityAt).toBe(before?.lastRuntimeActivityAt);
+    expect(after?.updatedAt).toBe(before?.updatedAt);
   }, 60_000);
 
   test("sendMessage executes a slash command without arguments", async () => {

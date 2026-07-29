@@ -106,6 +106,7 @@ function createManagedAgent(overrides: ManagedAgentOverrides = {}): ManagedAgent
     lifecycle: core.lifecycle,
     createdAt: overrides.createdAt ?? core.now,
     updatedAt: overrides.updatedAt ?? core.now,
+    lastRuntimeActivityAt: overrides.lastRuntimeActivityAt ?? core.now,
     availableModes: overrides.availableModes ?? [],
     currentModeId: overrides.currentModeId ?? core.config.modeId ?? null,
     pendingPermissions: overrides.pendingPermissions ?? new Map<string, AgentPermissionRequest>(),
@@ -150,6 +151,7 @@ describe("AgentStorage", () => {
       createManagedAgent({
         id: "agent-1",
         cwd: "/tmp/project",
+        lastRuntimeActivityAt: new Date("2024-12-31T23:00:00.000Z"),
         currentModeId: "coding",
         lifecycle: "idle",
         config: {
@@ -185,11 +187,32 @@ describe("AgentStorage", () => {
     });
     expect(record.lastModeId).toBe("coding");
     expect(record.lastStatus).toBe("idle");
+    expect(record.lastRuntimeActivityAt).toBe("2024-12-31T23:00:00.000Z");
 
     const reloaded = new AgentStorage(storagePath, logger);
     const [persisted] = await reloaded.list();
     expect(persisted.cwd).toBe("/tmp/project");
+    expect(persisted.lastRuntimeActivityAt).toBe("2024-12-31T23:00:00.000Z");
     expect(persisted.config?.extra?.claude).toMatchObject({ maxThinkingTokens: 1024 });
+  });
+
+  test("initialize recovers an interrupted initializing record to a retryable error", async () => {
+    const agent = createManagedAgent({
+      id: "agent-interrupted-startup",
+      lifecycle: "initializing",
+    });
+    await storage.applySnapshot(agent);
+    await storage.flush();
+
+    const reloaded = new AgentStorage(storagePath, logger);
+    await reloaded.initialize();
+
+    expect(await reloaded.get(agent.id)).toMatchObject({
+      lastStatus: "error",
+      lastError: expect.stringMatching(/interrupted by a server restart/i),
+      requiresAttention: true,
+      attentionReason: "error",
+    });
   });
 
   test("applySnapshot stores and preserves a durable timeline snapshot", async () => {

@@ -90,10 +90,15 @@ function buildHarness() {
   const projectByWorkspaceId = new Map<string, ProjectPlacementPayload | null>();
   let providerVisible: (provider: string) => boolean = () => true;
   let buildAgentPayloadError: Error | null = null;
+  let buildAgentPayloadOverride: ((agent: ManagedAgent) => Promise<AgentSnapshotPayload>) | null =
+    null;
 
   const service = createAgentUpdatesService({
     emit: (message) => emitted.push(message),
     buildAgentPayload: async (agent) => {
+      if (buildAgentPayloadOverride) {
+        return await buildAgentPayloadOverride(agent);
+      }
       if (buildAgentPayloadError) {
         throw buildAgentPayloadError;
       }
@@ -142,6 +147,9 @@ function buildHarness() {
     failBuildAgentPayload(error: Error) {
       buildAgentPayloadError = error;
     },
+    setBuildAgentPayload(fn: (agent: ManagedAgent) => Promise<AgentSnapshotPayload>) {
+      buildAgentPayloadOverride = fn;
+    },
     agentUpdates(): AgentUpdatePayload[] {
       return emitted
         .filter((message) => message.type === "agent_update")
@@ -150,8 +158,8 @@ function buildHarness() {
             (message as Extract<SessionOutboundMessage, { type: "agent_update" }>).payload,
         );
     },
-    managed(id: string): ManagedAgent {
-      return { id } as unknown as ManagedAgent;
+    managed(id: string, lifecycle?: ManagedAgent["lifecycle"]): ManagedAgent {
+      return { id, lifecycle } as unknown as ManagedAgent;
     },
     stored(id: string): StoredAgentRecord {
       return { id } as unknown as StoredAgentRecord;
@@ -307,6 +315,50 @@ describe("forwardLiveAgent", () => {
     await expect(h.service.forwardLiveAgent(h.managed("a"))).resolves.toBeUndefined();
     expect(h.loggedErrors).toHaveLength(1);
     expect(h.agentUpdates()).toEqual([]);
+  });
+
+  test("serializes live forwards and holds terminal state behind the create acknowledgement barrier", async () => {
+    const h = buildHarness();
+    h.service.beginSubscription({ subscriptionId: "sub", filter: {} });
+    h.service.flushBootstrapped("sub");
+    let releaseInitializingPayload!: () => void;
+    const initializingPayloadGate = new Promise<void>((resolve) => {
+      releaseInitializingPayload = resolve;
+    });
+    h.setBuildAgentPayload(async (agent) => {
+      if (agent.lifecycle === "initializing") {
+        await initializingPayloadGate;
+      }
+      return makeAgentPayload({
+        id: agent.id,
+        workspaceId: "ws-1",
+        status: agent.lifecycle,
+      });
+    });
+    h.register(makeAgentPayload({ id: "a", workspaceId: "ws-1" }));
+    let updatesSeenAtBarrier = -1;
+
+    const managerInitializingForward = h.service.forwardLiveAgent(h.managed("a", "initializing"));
+    const acknowledgementForward = h.service.forwardLiveAgentWithBarrier(
+      h.managed("a", "initializing"),
+      () => {
+        updatesSeenAtBarrier = h.agentUpdates().length;
+      },
+    );
+    const terminalForward = h.service.forwardLiveAgent(h.managed("a", "idle"));
+
+    await Promise.resolve();
+    expect(h.agentUpdates()).toEqual([]);
+    releaseInitializingPayload();
+    await Promise.all([managerInitializingForward, acknowledgementForward, terminalForward]);
+
+    expect(updatesSeenAtBarrier).toBe(2);
+    expect(
+      h
+        .agentUpdates()
+        .filter((update) => update.kind === "upsert")
+        .map((update) => update.agent.status),
+    ).toEqual(["initializing", "initializing", "idle"]);
   });
 });
 
