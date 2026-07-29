@@ -128,15 +128,16 @@ function peerCommand(root, expected, setupOnly) {
     'test "$(git -C "$repo" remote get-url --push --all "$remote")" = "$remote_url"',
     'git -C "$repo" fetch "$remote" "$branch"',
     merge,
-    'git -C "$repo" rev-parse FETCH_HEAD',
+    'printf "paseo_runtime_commit=%s\\n" "$(git -C "$repo" rev-parse FETCH_HEAD)"',
   ]
     .filter(Boolean)
     .join("\n");
 }
 
 function peerSsh(kind, command) {
+  let output;
   if (kind === "macbook") {
-    return run("ssh", [
+    output = run("ssh", [
       "-o",
       "BatchMode=yes",
       "-o",
@@ -146,21 +147,25 @@ function peerSsh(kind, command) {
       "-lc",
       command,
     ]);
+  } else {
+    output = run("ssh", [
+      "-i",
+      "/Users/timi/.ssh/broker-imac-macbook",
+      "-o",
+      "BatchMode=yes",
+      "-o",
+      "IdentitiesOnly=yes",
+      "-o",
+      "ConnectTimeout=10",
+      "timiajiboye@timis-macbook-pro.tail24bbb3.ts.net",
+      "zsh",
+      "-lc",
+      command,
+    ]);
   }
-  return run("ssh", [
-    "-i",
-    "/Users/timi/.ssh/broker-imac-macbook",
-    "-o",
-    "BatchMode=yes",
-    "-o",
-    "IdentitiesOnly=yes",
-    "-o",
-    "ConnectTimeout=10",
-    "timiajiboye@timis-macbook-pro.tail24bbb3.ts.net",
-    "zsh",
-    "-lc",
-    command,
-  ]);
+  const match = output.match(/(?:^|\n)paseo_runtime_commit=([0-9a-f]{40})\s*$/u);
+  if (!match) fail("the peer did not attest its fetched canonical commit");
+  return match[1];
 }
 
 function parseArguments(args) {
