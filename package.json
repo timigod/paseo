@@ -87,6 +87,7 @@
     "build:desktop": "npm run build:app-deps:clean && cd packages/app && cross-env PASEO_WEB_PLATFORM=electron npx expo export --platform web && cd ../.. && npm run build --workspace=@getpaseo/desktop --",
     "db:query": "npm run db:query --workspace=@getpaseo/server --",
     "cli": "./scripts/dev-home.sh npx tsx packages/cli/src/index.js",
+    "runtime:converge": "node scripts/converge-runtime-source.mjs",
     "version": "npm run version:sync-internal && npm run release:prepare && git add -A",
     "version:sync-internal": "node scripts/sync-workspace-versions.mjs",
     "release:prepare": "npm install --workspaces --include-workspace-root",

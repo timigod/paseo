@@ -1,0 +1,35 @@
+{
+  "schemaVersion": 1,
+  "remote": "paseo-runtime",
+  "branch": "v0.1.110-eof-fix",
+  "steps": [
+    {
+      "cwd": ".",
+      "argv": ["npm", "ci"]
+    },
+    {
+      "cwd": ".",
+      "argv": ["npm", "run", "build:server"]
+    },
+    {
+      "cwd": ".",
+      "argv": ["npm", "run", "typecheck:server"]
+    },
+    {
+      "cwd": ".",
+      "argv": ["npm", "run", "lint"]
+    },
+    {
+      "cwd": ".",
+      "argv": [
+        "npx",
+        "vitest",
+        "run",
+        "packages/server/src/server/agent/agent-manager.test.ts",
+        "packages/server/src/server/agent/agent-loading.test.ts",
+        "packages/server/src/server/agent/providers/opencode-server-manager.test.ts",
+        "--bail=1"
+      ]
+    }
+  ]
+}

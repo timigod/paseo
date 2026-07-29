@@ -2,6 +2,37 @@
 
 All workspaces share one version and release together.
 
+## Timi two-Mac runtime branch
+
+The iMac’s running Paseo daemon is intentionally held on the supported
+`v0.1.110-eof-fix` branch, not on an npm or desktop-app release. Its canonical
+source is the `v0.1.110-eof-fix` branch of `https://github.com/timigod/paseo.git`.
+Both Macs use the identical `paseo-runtime` Git remote for that branch.
+
+Land a committed candidate from an isolated feature worktree with:
+
+```bash
+safe-land --config .safe-land.json
+```
+
+Then, from the clean primary source checkout on the Mac that landed it, run:
+
+```bash
+npm run runtime:converge
+```
+
+The convergence command fast-forwards the two clean primary source checkouts to
+the exact remote commit over the established MacBook/iMac SSH route. It refuses
+to overwrite a dirty or divergent checkout and it does not build or restart the
+daemon. Building a release and restarting the live daemon remain explicit,
+separate activation steps.
+
+For a fresh primary checkout, configure the matching remote on both Macs first:
+
+```bash
+npm run runtime:converge -- --setup-only
+```
+
 ## Two steps
 
 A release has exactly two steps. The agent does the first, the user authorizes the second.
