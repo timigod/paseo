@@ -826,6 +826,12 @@ export async function createPaseoDaemon(
     agentManager,
     agentStorage,
   );
+  // Do not make the first control-plane status request wait for an executable
+  // probe. Populate the status cache in the background while bootstrap keeps
+  // progressing; launches still perform their own fresh availability checks.
+  void agentManager.listProviderAvailability().catch((error) => {
+    logger.warn({ err: error }, "Initial provider availability probe failed");
+  });
   await agentStorage.initialize();
   logger.info({ elapsed: elapsed() }, "Agent storage initialized");
   await bootstrapWorkspaceRegistries({

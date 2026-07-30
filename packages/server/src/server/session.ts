@@ -914,7 +914,8 @@ export class Session {
       daemonVersion,
       daemonRuntimeConfig,
       getWebSocketRuntimeMetrics,
-      listProviderAvailability: () => this.agentManager.listProviderAvailability(),
+      listProviderAvailability: () =>
+        this.agentManager.listProviderAvailability({ allowStale: true }),
       listAgents: () => this.agentManager.listAgents(),
       listProjects: () => this.projectRegistry.list(),
       listWorkspaces: () => this.workspaceRegistry.list(),

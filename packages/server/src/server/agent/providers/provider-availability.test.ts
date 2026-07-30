@@ -1,7 +1,7 @@
 import { copyFileSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, test } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 
 import { createTestLogger } from "../../../test-utils/test-logger.js";
 import type { AgentProvider } from "../agent-sdk-types.js";
@@ -135,6 +135,42 @@ describe("default provider availability", () => {
         available: false,
         error: null,
       },
+    ]);
+  });
+
+  test("AgentManager returns immediately from status reads while an availability probe is slow", async () => {
+    const workdir = makeTempDir("provider-availability-manager-status-");
+    const storage = new AgentStorage(join(workdir, "agents"), createTestLogger());
+    let resolveAvailability: ((value: boolean) => void) | null = null;
+    const availability = new Promise<boolean>((resolve) => {
+      resolveAvailability = resolve;
+    });
+    const manager = new AgentManager({
+      clients: {
+        opencode: {
+          provider: "opencode",
+          capabilities: {},
+          isAvailable: vi.fn(() => availability),
+        } as unknown as OpenCodeAgentClient,
+      },
+      registry: storage,
+      logger: createTestLogger(),
+    });
+
+    await expect(manager.listProviderAvailability({ allowStale: true })).resolves.toEqual([
+      {
+        provider: "opencode",
+        available: false,
+        error: "Provider availability check is in progress",
+      },
+    ]);
+
+    resolveAvailability?.(true);
+    await availability;
+    await Promise.resolve();
+
+    await expect(manager.listProviderAvailability({ allowStale: true })).resolves.toEqual([
+      { provider: "opencode", available: true, error: null },
     ]);
   });
 

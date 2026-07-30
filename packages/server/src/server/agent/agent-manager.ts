@@ -217,6 +217,23 @@ export interface ProviderAvailability {
   error: string | null;
 }
 
+interface ListProviderAvailabilityOptions {
+  /**
+   * Return the most recent probe result immediately and refresh it in the
+   * background. This keeps control-plane status independent of a slow
+   * provider executable while creation paths still perform a fresh probe.
+   */
+  allowStale?: boolean;
+}
+
+interface CachedProviderAvailability {
+  value: ProviderAvailability;
+  checkedAt: number;
+}
+
+const PROVIDER_AVAILABILITY_CACHE_TTL_MS = 15_000;
+const PROVIDER_AVAILABILITY_PENDING_ERROR = "Provider availability check is in progress";
+
 interface AgentManagerRescueTimeouts {
   reloadSessionCloseMs?: number;
   interruptSessionMs?: number;
@@ -629,6 +646,12 @@ function getFirstUserMessageTextFromRows(rows: readonly AgentTimelineRow[]): str
 export class AgentManager {
   private readonly clients = new Map<AgentProvider, AgentClient>();
   private readonly providerEnabled = new Map<AgentProvider, boolean>();
+  private readonly providerAvailabilityCache = new Map<AgentProvider, CachedProviderAvailability>();
+  private readonly providerAvailabilityRefreshes = new Map<
+    AgentProvider,
+    Promise<ProviderAvailability>
+  >();
+  private providerAvailabilityGeneration = 0;
   private readonly agents = new Map<string, LiveManagedAgent>();
   private readonly timelineStore = new InMemoryAgentTimelineStore();
   private readonly providerSubagents = new ProviderSubagentStore();
@@ -698,12 +721,18 @@ export class AgentManager {
 
   registerClient(provider: AgentProvider, client: AgentClient): void {
     this.clients.set(provider, client);
+    this.providerAvailabilityGeneration += 1;
+    this.providerAvailabilityCache.delete(provider);
+    this.providerAvailabilityRefreshes.delete(provider);
   }
 
   updateProviderRegistry(input: {
     providerDefinitions: ProviderEnabledMap;
     clients: ProviderClientMap;
   }): void {
+    this.providerAvailabilityGeneration += 1;
+    this.providerAvailabilityCache.clear();
+    this.providerAvailabilityRefreshes.clear();
     this.providerEnabled.clear();
     for (const [provider, definition] of Object.entries(input.providerDefinitions)) {
       if (definition) {
@@ -979,19 +1008,68 @@ export class AgentManager {
     return true;
   }
 
-  async listProviderAvailability(): Promise<ProviderAvailability[]> {
-    return Promise.all(
-      Array.from(this.clients.keys()).map((provider) => {
-        if (this.providerEnabled.get(provider) === false) {
-          return {
-            provider,
-            available: false,
-            error: "Provider is disabled",
-          };
-        }
-        return this.getProviderAvailability(provider);
-      }),
+  async listProviderAvailability(
+    options: ListProviderAvailabilityOptions = {},
+  ): Promise<ProviderAvailability[]> {
+    const providers = Array.from(this.clients.keys());
+    if (options.allowStale) {
+      return providers.map((provider) => this.getStaleTolerantProviderAvailability(provider));
+    }
+    return Promise.all(providers.map((provider) => this.refreshProviderAvailability(provider)));
+  }
+
+  private getStaleTolerantProviderAvailability(provider: AgentProvider): ProviderAvailability {
+    if (this.providerEnabled.get(provider) === false) {
+      return {
+        provider,
+        available: false,
+        error: "Provider is disabled",
+      };
+    }
+
+    const cached = this.providerAvailabilityCache.get(provider);
+    if (!cached || Date.now() - cached.checkedAt >= PROVIDER_AVAILABILITY_CACHE_TTL_MS) {
+      void this.refreshProviderAvailability(provider);
+    }
+    return (
+      cached?.value ?? {
+        provider,
+        available: false,
+        error: PROVIDER_AVAILABILITY_PENDING_ERROR,
+      }
     );
+  }
+
+  private refreshProviderAvailability(provider: AgentProvider): Promise<ProviderAvailability> {
+    if (this.providerEnabled.get(provider) === false) {
+      return Promise.resolve({
+        provider,
+        available: false,
+        error: "Provider is disabled",
+      });
+    }
+
+    const inFlight = this.providerAvailabilityRefreshes.get(provider);
+    if (inFlight) {
+      return inFlight;
+    }
+
+    const generation = this.providerAvailabilityGeneration;
+    let refresh: Promise<ProviderAvailability>;
+    refresh = this.getProviderAvailability(provider)
+      .then((value) => {
+        if (this.providerAvailabilityGeneration === generation) {
+          this.providerAvailabilityCache.set(provider, { value, checkedAt: Date.now() });
+        }
+        return value;
+      })
+      .finally(() => {
+        if (this.providerAvailabilityRefreshes.get(provider) === refresh) {
+          this.providerAvailabilityRefreshes.delete(provider);
+        }
+      });
+    this.providerAvailabilityRefreshes.set(provider, refresh);
+    return refresh;
   }
 
   async getProviderAvailability(provider: AgentProvider): Promise<ProviderAvailability> {
