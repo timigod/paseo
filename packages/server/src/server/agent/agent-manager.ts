@@ -133,6 +133,16 @@ function formatProviderList(providers: readonly string[]): string {
   return providers.length > 0 ? providers.join(", ") : "none";
 }
 
+function isRecoverableOpenCodeStopBoundaryError(provider: AgentProvider, error: unknown): boolean {
+  if (provider !== "opencode" || !(error instanceof Error)) {
+    return false;
+  }
+  return (
+    error.message === "OpenCode previous turn to stop" ||
+    error.message === "OpenCode is still stopping the previous turn"
+  );
+}
+
 function buildStoredAgentConfig(record: StoredAgentRecord): AgentSessionConfig {
   const config: AgentSessionConfig = {
     provider: record.provider,
@@ -2504,18 +2514,47 @@ export class AgentManager {
       throw new Error(`Agent ${agentId} already has an active run`);
     }
 
-    const agent = existingAgent;
-    const isReplacement = agent.pendingReplacement;
+    let agent = existingAgent;
+    let isReplacement = agent.pendingReplacement;
     agent.lastError = undefined;
 
-    const pendingRun = this.runs.createPendingRun(agentId);
+    let pendingRun = this.runs.createPendingRun(agentId);
 
     const streamForwarder = async function* streamForwarder(this: AgentManager) {
       let turnId: string;
       let turnStream: ReturnType<AgentRunState["createTurnStream"]> | null = null;
       try {
-        const result = await agent.session.startTurn(prompt, options);
-        turnId = result.turnId;
+        try {
+          const result = await agent.session.startTurn(prompt, options);
+          turnId = result.turnId;
+        } catch (initialError) {
+          if (!isRecoverableOpenCodeStopBoundaryError(agent.provider, initialError)) {
+            throw initialError;
+          }
+
+          // OpenCode can leave a dedicated runtime's single-session runner busy
+          // after an abort has timed out. startTurn fails before submitting the
+          // new prompt, so it is safe to reattach the same persisted session to
+          // a fresh dedicated runtime and retry that unsent prompt exactly once.
+          // This is the per-agent recovery equivalent of the user-facing reload
+          // action; it must not require a daemon or fleet restart.
+          this.runs.settleForegroundRun(agentId, pendingRun.token);
+          this.logger.warn(
+            {
+              err: initialError,
+              agentId,
+              provider: agent.provider,
+              sessionId: agent.persistence?.sessionId ?? undefined,
+            },
+            "OpenCode stop boundary did not settle; reloading the agent session before retry",
+          );
+          await this.reloadAgentSession(agentId);
+          agent = this.requireSessionAgent(agentId);
+          isReplacement = agent.pendingReplacement;
+          pendingRun = this.runs.createPendingRun(agentId);
+          const result = await agent.session.startTurn(prompt, options);
+          turnId = result.turnId;
+        }
       } catch (error) {
         agent.pendingReplacement = false;
         const errorMsg = error instanceof Error ? error.message : "Failed to start turn";

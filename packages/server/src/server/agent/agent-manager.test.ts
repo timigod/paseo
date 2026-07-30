@@ -342,7 +342,7 @@ class EnvProbeAgentClient extends TestAgentClient {
 }
 
 class TestAgentSession implements AgentSession {
-  readonly provider = "codex" as const;
+  readonly provider: AgentProvider;
   readonly capabilities = TEST_CAPABILITIES;
   readonly id = randomUUID();
   private runtimeModel: string | null = null;
@@ -350,7 +350,9 @@ class TestAgentSession implements AgentSession {
   private turnIdCounter = 0;
   private interrupted = false;
 
-  constructor(private readonly config: AgentSessionConfig) {}
+  constructor(private readonly config: AgentSessionConfig) {
+    this.provider = config.provider;
+  }
 
   async run(): Promise<AgentRunResult> {
     return {
@@ -1491,6 +1493,83 @@ test("reloadAgentSession completes when the previous session close hangs", async
     expect(reloaded.id).toBe(snapshot.id);
     expect(client.firstSession.closeCalled).toBe(true);
     expect(client.resumeSessionCalls).toBe(1);
+  } finally {
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("streamAgent reloads one stuck OpenCode runtime and retries the unsent prompt once", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-opencode-stop-recovery-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+
+  class StuckOpenCodeSession extends TestAgentSession {
+    readonly prompts: AgentPromptInput[] = [];
+
+    override async startTurn(prompt: AgentPromptInput): Promise<{ turnId: string }> {
+      this.prompts.push(prompt);
+      throw new Error("OpenCode previous turn to stop");
+    }
+  }
+
+  class RecoveredOpenCodeSession extends TestAgentSession {
+    readonly prompts: AgentPromptInput[] = [];
+
+    override async startTurn(prompt: AgentPromptInput): Promise<{ turnId: string }> {
+      this.prompts.push(prompt);
+      return await super.startTurn();
+    }
+  }
+
+  class RecoveringOpenCodeClient extends TestAgentClient {
+    readonly stuckSession = new StuckOpenCodeSession({
+      provider: "opencode",
+      cwd: workdir,
+    });
+    readonly recoveredSession = new RecoveredOpenCodeSession({
+      provider: "opencode",
+      cwd: workdir,
+    });
+    resumeSessionCalls = 0;
+
+    constructor() {
+      super("opencode");
+    }
+
+    override async createSession(): Promise<AgentSession> {
+      return this.stuckSession;
+    }
+
+    override async resumeSession(): Promise<AgentSession> {
+      this.resumeSessionCalls += 1;
+      return this.recoveredSession;
+    }
+  }
+
+  const client = new RecoveringOpenCodeClient();
+  const manager = new AgentManager({
+    clients: { opencode: client },
+    registry: storage,
+    logger,
+    idFactory: () => "00000000-0000-4000-8000-000000000304",
+  });
+
+  try {
+    const snapshot = await manager.createAgent({ provider: "opencode", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+
+    const stream = manager.streamAgent(snapshot.id, "continue preserved work");
+    for await (const _event of stream) {
+      // Drain the recovered turn to its terminal event.
+    }
+
+    expect(client.stuckSession.prompts).toEqual(["continue preserved work"]);
+    expect(client.resumeSessionCalls).toBe(1);
+    expect(client.recoveredSession.prompts).toEqual(["continue preserved work"]);
+    expect(manager.getAgent(snapshot.id)).toMatchObject({
+      lifecycle: "idle",
+      lastError: undefined,
+    });
   } finally {
     rmSync(workdir, { recursive: true, force: true });
   }
