@@ -1162,6 +1162,66 @@ export class Session {
     }
   }
 
+  private forwardProviderSubagentUpdate(
+    update: Extract<AgentManagerEvent, { type: "provider_subagent" }>["event"],
+  ): void {
+    const parentAgentId =
+      update.type === "upsert" ? update.subagent.parentAgentId : update.parentAgentId;
+    let message: Extract<SessionOutboundMessage, { type: "agent.provider_subagents.update" }>;
+    if (update.type === "upsert") {
+      message = {
+        type: "agent.provider_subagents.update",
+        payload: { kind: "upsert", subagent: update.subagent },
+      };
+    } else if (update.type === "timeline") {
+      message = {
+        type: "agent.provider_subagents.update",
+        payload: {
+          kind: "timeline",
+          parentAgentId: update.parentAgentId,
+          subagentId: update.subagentId,
+          provider: update.provider,
+          item: update.row.item,
+          timestamp: update.row.timestamp,
+          seq: update.row.seq,
+          epoch: update.epoch,
+        },
+      };
+    } else {
+      message = {
+        type: "agent.provider_subagents.update",
+        payload: {
+          kind: "remove",
+          parentAgentId: update.parentAgentId,
+          subagentId: update.subagentId,
+        },
+      };
+    }
+
+    if (this.clientCapabilitiesBySource.size === 0 || !this.onMessageToSource) {
+      if (
+        this.supports(CLIENT_CAPS.providerSubagents) &&
+        (!this.usesSelectiveTimelineDelivery() || this.viewedTimelineAgentIds.has(parentAgentId))
+      ) {
+        this.emit(message);
+      }
+      return;
+    }
+
+    for (const [source, capabilities] of this.clientCapabilitiesBySource) {
+      if (!capabilities.has(CLIENT_CAPS.providerSubagents)) {
+        continue;
+      }
+      if (
+        capabilities.has(CLIENT_CAPS.selectiveAgentTimeline) &&
+        !this.viewedTimelineAgentIdsBySource.get(source)?.has(parentAgentId)
+      ) {
+        continue;
+      }
+      this.onMessageToSource(source, message);
+    }
+  }
+
   supports(capability: ClientCapability): boolean {
     return this.clientCapabilities.has(capability);
   }
@@ -1746,39 +1806,7 @@ export class Session {
     }
 
     if (event.type === "provider_subagent") {
-      if (!this.supports(CLIENT_CAPS.providerSubagents)) {
-        return;
-      }
-      const update = event.event;
-      if (update.type === "upsert") {
-        this.emit({
-          type: "agent.provider_subagents.update",
-          payload: { kind: "upsert", subagent: update.subagent },
-        });
-      } else if (update.type === "timeline") {
-        this.emit({
-          type: "agent.provider_subagents.update",
-          payload: {
-            kind: "timeline",
-            parentAgentId: update.parentAgentId,
-            subagentId: update.subagentId,
-            provider: update.provider,
-            item: update.row.item,
-            timestamp: update.row.timestamp,
-            seq: update.row.seq,
-            epoch: update.epoch,
-          },
-        });
-      } else {
-        this.emit({
-          type: "agent.provider_subagents.update",
-          payload: {
-            kind: "remove",
-            parentAgentId: update.parentAgentId,
-            subagentId: update.subagentId,
-          },
-        });
-      }
+      this.forwardProviderSubagentUpdate(event.event);
       return;
     }
 

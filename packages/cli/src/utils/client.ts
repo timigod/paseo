@@ -11,6 +11,7 @@ import {
   parseConnectionOfferFromUrl,
   type ConnectionOffer,
 } from "@getpaseo/protocol/connection-offer";
+import { CLIENT_CAPS } from "@getpaseo/protocol/client-capabilities";
 import { DaemonClient, type WebSocketLike } from "@getpaseo/client/internal/daemon-client";
 import path from "node:path";
 import { WebSocket } from "ws";
@@ -278,6 +279,9 @@ async function tryConnectHost(
     clientType: "cli",
     appVersion: resolveCliVersion(),
     password,
+    // The CLI is request/response only. It does not render nested provider-agent
+    // streams, so opting out keeps high-volume child updates out of control calls.
+    capabilities: { [CLIENT_CAPS.providerSubagents]: false },
     connectTimeoutMs: timeout,
     webSocketFactory: (
       url: string,
@@ -318,6 +322,7 @@ async function connectViaRelayOffer(
     clientId,
     clientType: "cli",
     appVersion: resolveCliVersion(),
+    capabilities: { [CLIENT_CAPS.providerSubagents]: false },
     connectTimeoutMs: timeout,
     webSocketFactory: (
       target: string,

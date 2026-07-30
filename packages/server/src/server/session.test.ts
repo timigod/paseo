@@ -4875,6 +4875,88 @@ test("keeps selective delivery scoped per socket when a retained session also ha
   });
 });
 
+test("scopes provider-subagent updates to viewed parents for selective sockets", async () => {
+  const messages: SessionOutboundMessage[] = [];
+  const targetedMessages: Array<{ source: object; message: SessionOutboundMessage }> = [];
+  const agentEventListeners: Array<(event: AgentManagerEvent) => void> = [];
+  const session = createSessionForTest({
+    messages,
+    targetedMessages,
+    agentManager: {
+      subscribe: vi.fn((listener: (event: AgentManagerEvent) => void) => {
+        agentEventListeners.push(listener);
+        return () => {};
+      }),
+    },
+  });
+  const legacySocket = {};
+  const selectiveSocket = {};
+  session.updateClientCapabilities({ [CLIENT_CAPS.providerSubagents]: true }, legacySocket);
+  session.updateClientCapabilities(
+    {
+      [CLIENT_CAPS.providerSubagents]: true,
+      [CLIENT_CAPS.selectiveAgentTimeline]: true,
+    },
+    selectiveSocket,
+  );
+  await session.handleMessage(
+    {
+      type: "agent.timeline.set_subscription.request",
+      agentIds: ["viewed-parent"],
+      requestId: "provider-subagent-subscription",
+    },
+    selectiveSocket,
+  );
+  targetedMessages.length = 0;
+
+  const listener = agentEventListeners[0];
+  if (!listener) throw new Error("Agent event listener was not installed");
+  listener({
+    type: "provider_subagent",
+    event: {
+      type: "upsert",
+      subagent: {
+        id: "child-not-viewed",
+        parentAgentId: "not-viewed-parent",
+        provider: "opencode",
+        title: "Not viewed child",
+        status: "running",
+      },
+    },
+  });
+
+  await vi.waitFor(() => {
+    expect(targetedMessages).toEqual([
+      {
+        source: legacySocket,
+        message: expect.objectContaining({ type: "agent.provider_subagents.update" }),
+      },
+    ]);
+  });
+
+  targetedMessages.length = 0;
+  listener({
+    type: "provider_subagent",
+    event: {
+      type: "timeline",
+      parentAgentId: "viewed-parent",
+      subagentId: "child-viewed",
+      provider: "opencode",
+      row: {
+        item: { type: "assistant_message", text: "visible update" },
+        timestamp: "2026-07-30T00:00:00.000Z",
+        seq: 1,
+      },
+      epoch: "provider-epoch",
+    },
+  });
+
+  await vi.waitFor(() => {
+    expect(targetedMessages.map((entry) => entry.source)).toEqual([legacySocket, selectiveSocket]);
+  });
+  expect(messages).toEqual([]);
+});
+
 test("sends project updates only to capable sockets in a retained session", () => {
   const messages: SessionOutboundMessage[] = [];
   const targetedMessages: Array<{ source: object; message: SessionOutboundMessage }> = [];
