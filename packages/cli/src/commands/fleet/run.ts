@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import os from "node:os";
 import type { Command } from "commander";
 import type { CommandError, OutputSchema, SingleResult } from "../../output/index.js";
@@ -59,6 +60,40 @@ function hasAmbientWorkspaceContext(options: FleetRunOptions): boolean {
   return Boolean(options.workspace || process.env.PASEO_WORKSPACE_ID || process.env.PASEO_AGENT_ID);
 }
 
+function createsBranchOffWorktree(options: FleetRunOptions): boolean {
+  const newWorkspace = options.newWorkspace ?? (options.worktree ? "worktree" : undefined);
+  return newWorkspace === "worktree" && (options.worktreeMode ?? "branch-off") === "branch-off";
+}
+
+function readGitHead(cwd: string): string {
+  return execFileSync("git", ["-C", cwd, "rev-parse", "--verify", "HEAD"], {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+  }).trim();
+}
+
+export function resolveFleetWorktreeBase(
+  options: FleetRunOptions,
+  cwd: string,
+  readHead: (cwd: string) => string = readGitHead,
+): string | undefined {
+  if (!createsBranchOffWorktree(options) || options.base) return options.base;
+
+  try {
+    const base = readHead(cwd).trim();
+    if (!/^[0-9a-f]{40}$/u.test(base)) {
+      throw new Error("Git did not return a full commit id");
+    }
+    return base;
+  } catch {
+    throw toFleetError(
+      "FLEET_WORKTREE_BASE_UNRESOLVED",
+      "Cannot resolve the caller's Git commit for fleet worktree creation",
+      "Run from a Git checkout or pass --base <ref> explicitly.",
+    );
+  }
+}
+
 export async function runFleetRunCommand(
   prompt: string,
   options: FleetRunOptions,
@@ -112,6 +147,7 @@ export async function runFleetRunCommand(
   const effectiveProvider = options.provider ?? FLEET_DEFAULT_PROVIDER;
   const effectiveModel = options.model ?? FLEET_DEFAULT_MODEL;
   const effectiveThinking = options.thinking ?? FLEET_DEFAULT_THINKING;
+  const effectiveBase = resolveFleetWorktreeBase(options, cwd);
   const result = await runRunCommand(
     prompt,
     {
@@ -121,6 +157,7 @@ export async function runFleetRunCommand(
       provider: effectiveProvider,
       model: effectiveModel,
       thinking: effectiveThinking,
+      base: effectiveBase,
     },
     command,
   );
