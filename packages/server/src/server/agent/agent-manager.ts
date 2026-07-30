@@ -981,7 +981,16 @@ export class AgentManager {
 
   async listProviderAvailability(): Promise<ProviderAvailability[]> {
     return Promise.all(
-      Array.from(this.clients.keys()).map((provider) => this.getProviderAvailability(provider)),
+      Array.from(this.clients.keys()).map((provider) => {
+        if (this.providerEnabled.get(provider) === false) {
+          return {
+            provider,
+            available: false,
+            error: "Provider is disabled",
+          };
+        }
+        return this.getProviderAvailability(provider);
+      }),
     );
   }
 

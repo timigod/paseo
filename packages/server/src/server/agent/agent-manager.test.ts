@@ -1648,6 +1648,35 @@ test("listProviderAvailability uses registered client keys, including custom pro
   ]);
 });
 
+test("listProviderAvailability does not execute disabled provider probes", async () => {
+  const isAvailable = vi.fn().mockRejectedValue(new Error("disabled probe must not run"));
+  const disabledClient: AgentClient = {
+    provider: "codex",
+    capabilities: TEST_CAPABILITIES,
+    isAvailable,
+    async createSession() {
+      throw new Error("not implemented");
+    },
+    async resumeSession() {
+      throw new Error("not implemented");
+    },
+  };
+  const manager = new AgentManager({
+    clients: { codex: disabledClient },
+    providerDefinitions: { codex: { enabled: false } },
+    logger,
+  });
+
+  await expect(manager.listProviderAvailability()).resolves.toEqual([
+    {
+      provider: "codex",
+      available: false,
+      error: "Provider is disabled",
+    },
+  ]);
+  expect(isAvailable).not.toHaveBeenCalled();
+});
+
 test("createAgent passes daemon launch env through the provider launch context", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-test-"));
   const storagePath = join(workdir, "agents");
