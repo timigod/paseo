@@ -167,6 +167,97 @@ describe("managed process registry", () => {
     expect(await restartedRegistry.list()).toEqual([]);
   });
 
+  test("reaps an owned helper after an exec-style launcher changes the executable name", async () => {
+    tempHome = await mkdtemp(path.join(tmpdir(), "paseo-managed-processes-"));
+    const terminator = new FakeProcessTerminator();
+    const registry = createManagedProcessRegistry({
+      paseoHome: tempHome,
+      processTable: new FakeProcessTable([
+        {
+          pid: 4106,
+          commandLine: "/bin/zsh /opt/paseo/opencode serve --port 4106",
+          startedAt: "process-start-token",
+        },
+      ]),
+      terminateProcess: terminator.terminate,
+      logger: createTestLogger(),
+    });
+    await registry.record({
+      owner: { provider: "opencode", kind: "helper-server" },
+      pid: 4106,
+      command: "/opt/paseo/opencode",
+      args: ["serve", "--port", "4106"],
+      metadata: { port: 4106 },
+    });
+
+    const restartedRegistry = createManagedProcessRegistry({
+      paseoHome: tempHome,
+      processTable: new FakeProcessTable([
+        {
+          pid: 4106,
+          commandLine: "/opt/paseo/opencode.real serve --port 4106",
+          startedAt: "process-start-token",
+        },
+      ]),
+      terminateProcess: terminator.terminate,
+      logger: createTestLogger(),
+    });
+    const result = await restartedRegistry.reapStale();
+
+    expect(result).toEqual({
+      checked: 1,
+      dead: 0,
+      mismatched: 0,
+      removed: 1,
+      terminated: 1,
+      errors: [],
+    });
+    expect(terminator.terminatedPids).toEqual([4106]);
+    expect(await restartedRegistry.list()).toEqual([]);
+  });
+
+  test("does not accept an exec-style process with different launch arguments", async () => {
+    tempHome = await mkdtemp(path.join(tmpdir(), "paseo-managed-processes-"));
+    const terminator = new FakeProcessTerminator();
+    const registry = createManagedProcessRegistry({
+      paseoHome: tempHome,
+      processTable: new FakeProcessTable([
+        {
+          pid: 4107,
+          commandLine: "/bin/zsh /opt/paseo/opencode serve --port 4107",
+          startedAt: "process-start-token",
+        },
+      ]),
+      terminateProcess: terminator.terminate,
+      logger: createTestLogger(),
+    });
+    await registry.record({
+      owner: { provider: "opencode", kind: "helper-server" },
+      pid: 4107,
+      command: "/opt/paseo/opencode",
+      args: ["serve", "--port", "4107"],
+      metadata: { port: 4107 },
+    });
+
+    const restartedRegistry = createManagedProcessRegistry({
+      paseoHome: tempHome,
+      processTable: new FakeProcessTable([
+        {
+          pid: 4107,
+          commandLine: "/opt/paseo/opencode.real serve --port 41070",
+          startedAt: "process-start-token",
+        },
+      ]),
+      terminateProcess: terminator.terminate,
+      logger: createTestLogger(),
+    });
+    const result = await restartedRegistry.reapStale();
+
+    expect(result).toMatchObject({ mismatched: 1, terminated: 0, removed: 1 });
+    expect(terminator.terminatedPids).toEqual([]);
+    expect(await restartedRegistry.list()).toEqual([]);
+  });
+
   test("keeps a helper record when inspection fails instead of orphaning a live process", async () => {
     tempHome = await mkdtemp(path.join(tmpdir(), "paseo-managed-processes-"));
     const terminator = new FakeProcessTerminator();

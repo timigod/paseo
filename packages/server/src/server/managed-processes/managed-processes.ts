@@ -376,7 +376,22 @@ function processIdentityMatches(
     if (record.identity.startedAt !== snapshot.startedAt) {
       return false;
     }
-    return snapshot.commandLine ? commandLineMatchesRecord(record, snapshot.commandLine) : true;
+    if (!snapshot.commandLine) {
+      return true;
+    }
+    if (
+      record.identity.commandLine &&
+      normalizeCommandLine(record.identity.commandLine) ===
+        normalizeCommandLine(snapshot.commandLine)
+    ) {
+      return true;
+    }
+    // A launcher may intentionally `exec` the owned helper after the record is
+    // written. The PID and start time remain the same while the executable name
+    // changes (for example `opencode` -> `opencode.real`). In that exact-identity
+    // case, require the full launch argument run so the startup reaper can still
+    // recognize the owned helper without weakening PID-reuse protection.
+    return commandArgsMatchRecord(record, snapshot.commandLine);
   }
 
   if (record.identity.commandLine && snapshot.commandLine) {
@@ -387,6 +402,15 @@ function processIdentityMatches(
   }
 
   return snapshot.commandLine ? commandLineMatchesRecord(record, snapshot.commandLine) : false;
+}
+
+function commandArgsMatchRecord(record: ManagedProcessRecord, commandLine: string): boolean {
+  if (record.args.length === 0) {
+    return false;
+  }
+  const normalized = normalizeCommandLine(commandLine);
+  const signature = record.args.map((token) => token.toLowerCase()).join(" ");
+  return normalized === signature || normalized.endsWith(` ${signature}`);
 }
 
 function commandLineMatchesRecord(record: ManagedProcessRecord, commandLine: string): boolean {
