@@ -961,6 +961,19 @@ export async function createPaseoDaemon(
     },
     logger,
   });
+  const workspaceSetupTasks = new Map<string, Promise<void>>();
+  const trackWorkspaceSetup = (workspaceId: string, setup: Promise<void>): void => {
+    const tracked = setup
+      .catch((error) => {
+        logger.warn({ err: error, workspaceId }, "Background worktree setup task rejected");
+      })
+      .finally(() => {
+        if (workspaceSetupTasks.get(workspaceId) === tracked) {
+          workspaceSetupTasks.delete(workspaceId);
+        }
+      });
+    workspaceSetupTasks.set(workspaceId, tracked);
+  };
 
   setupAutoArchiveOnMerge({
     paseoHome: config.paseoHome,
@@ -1013,6 +1026,7 @@ export async function createPaseoDaemon(
           await emitWorkspaceUpdatesExternal([workspaceId]);
         },
         cacheWorkspaceSetupSnapshot: () => {},
+        trackWorkspaceSetup,
         emit: emitExternalSessionMessage,
         sessionLogger: logger,
         terminalManager,
@@ -1054,6 +1068,9 @@ export async function createPaseoDaemon(
       archiveAgentCommand({ agentManager, agentStorage, logger }, agentId),
     findWorkspaceIdForCwd: findWorkspaceIdForCwdExternal,
     listActiveWorkspaces: listActiveWorkspacesExternal,
+    waitForWorkspaceSetup: async (workspaceId) => {
+      await workspaceSetupTasks.get(workspaceId);
+    },
     archiveWorkspaceRecord: archiveWorkspaceRecordExternal,
     emit: emitExternalSessionMessage,
     emitAgentRemove: () => undefined,

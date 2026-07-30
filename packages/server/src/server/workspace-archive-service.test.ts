@@ -187,6 +187,63 @@ function assertArchiveResult(
 }
 
 describe("archiveByScope", () => {
+  test("waits for background setup before archiving records or removing the worktree", async () => {
+    const { tempDir, repoDir } = createGitRepo();
+    const paseoHome = path.join(tempDir, ".paseo");
+    const worktree = await createPaseoOwnedWorktree(repoDir, paseoHome, "setup-before-archive");
+    const workspaceId = "ws-setup-before-archive";
+    const events: string[] = [];
+    let releaseSetup: (() => void) | undefined;
+    const setup = new Promise<void>((resolve) => {
+      releaseSetup = resolve;
+    });
+    const dependencies = createArchiveDeps({
+      paseoHome,
+      activeWorkspaces: [
+        {
+          workspaceId,
+          cwd: worktree.worktreePath,
+          kind: "worktree",
+          worktreeRoot: worktree.worktreePath,
+          isPaseoOwnedWorktree: true,
+          mainRepoRoot: repoDir,
+        },
+      ],
+    });
+    dependencies.waitForWorkspaceSetup = async (id) => {
+      events.push(`wait:${id}`);
+      await setup;
+      events.push(`setup-finished:${id}`);
+    };
+    const archiveWorkspaceRecord = dependencies.archiveWorkspaceRecord;
+    dependencies.archiveWorkspaceRecord = async (id) => {
+      events.push(`archive:${id}`);
+      await archiveWorkspaceRecord(id);
+    };
+
+    const archive = archiveByScope(dependencies, {
+      scope: { kind: "workspace", workspaceId },
+      requestId: "req-setup-before-archive",
+    });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(events).toEqual([`wait:${workspaceId}`]);
+    expect(existsSync(worktree.worktreePath)).toBe(true);
+
+    releaseSetup?.();
+    const result = await archive;
+
+    expect(events).toEqual([
+      `wait:${workspaceId}`,
+      `setup-finished:${workspaceId}`,
+      `archive:${workspaceId}`,
+    ]);
+    assertArchiveResult(result, {
+      archivedWorkspaceIds: [workspaceId],
+      removedDirectory: true,
+    });
+    expect(existsSync(worktree.worktreePath)).toBe(false);
+  });
+
   test("workspace scope archives the record and removes the directory on last reference", async () => {
     const { tempDir, repoDir } = createGitRepo();
     const paseoHome = path.join(tempDir, ".paseo");

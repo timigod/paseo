@@ -511,6 +511,7 @@ export class VoiceAssistantWebSocketServer {
   private readonly voiceSpeakHandlers = new Map<string, VoiceSpeakHandler>();
   private readonly voiceCallerContexts = new Map<string, VoiceCallerContext>();
   private readonly workspaceSetupSnapshots = new Map<string, WorkspaceSetupSnapshot>();
+  private readonly workspaceSetupTasks = new Map<string, Promise<void>>();
   private readonly providerSnapshotManager: ProviderSnapshotManager;
   private onLifecycleIntent!: ((intent: SessionLifecycleIntent) => void) | null;
   private onBranchChanged!:
@@ -1209,6 +1210,7 @@ export class VoiceAssistantWebSocketServer {
       serviceProxy: this.serviceProxy ?? undefined,
       scriptRuntimeStore: this.scriptRuntimeStore ?? undefined,
       workspaceSetupSnapshots: this.workspaceSetupSnapshots,
+      workspaceSetupTasks: this.workspaceSetupTasks,
       onBranchChanged: this.onBranchChanged ?? undefined,
       getDaemonTcpPort: this.getDaemonTcpPort ?? undefined,
       getDaemonTcpHost: this.getDaemonTcpHost ?? undefined,

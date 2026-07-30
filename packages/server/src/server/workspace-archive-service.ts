@@ -38,6 +38,11 @@ export interface ArchiveDependencies {
   // break a same-cwd tie in favor of the worktree-kind record when archiving by
   // path (no explicit workspaceId).
   listActiveWorkspaces: () => Promise<ActiveWorkspaceRef[]>;
+  // Worktree setup is intentionally asynchronous. Archive must join that owner
+  // before tearing down the agent record and backing directory, otherwise a
+  // still-running setup command can recreate files after deletion and leave a
+  // half-archived worktree behind.
+  waitForWorkspaceSetup?: (workspaceId: string) => Promise<void>;
   archiveWorkspaceRecord: (workspaceId: string) => Promise<void>;
   emitWorkspaceUpdatesForWorkspaceIds: (workspaceIds: Iterable<string>) => Promise<void>;
   markWorkspaceArchiving: (workspaceIds: Iterable<string>, archivingAt: string) => void;
@@ -126,6 +131,9 @@ export async function archiveByScope(
   try {
     if (targetWorkspaceIds.length > 0) {
       await dependencies.emitWorkspaceUpdatesForWorkspaceIds(targetWorkspaceIds);
+      await Promise.all(
+        targetWorkspaceIds.map((workspaceId) => dependencies.waitForWorkspaceSetup?.(workspaceId)),
+      );
     }
 
     const { archivedAgents, archivedWorkspaceIds } = await archiveTargetRecords(

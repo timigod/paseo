@@ -99,6 +99,7 @@ interface CreatePaseoWorktreeInBackgroundDependencies {
   worktreesRoot?: string;
   emitWorkspaceUpdateForWorkspaceId: (workspaceId: string) => Promise<void>;
   cacheWorkspaceSetupSnapshot: (workspaceId: string, snapshot: WorkspaceSetupSnapshot) => void;
+  trackWorkspaceSetup?: (workspaceId: string, setup: Promise<void>) => void;
   emit: EmitSessionMessage;
   sessionLogger: Logger;
   terminalManager: TerminalManager | null;
@@ -605,6 +606,18 @@ export async function createPaseoWorktreeWorkflow(
   const workspace = createdWorktree.workspace;
   const setupContinuation = options?.setupContinuation ?? { kind: "workspace" };
 
+  let finishTrackedSetup: (() => void) | null = null;
+  let failTrackedSetup: ((error: unknown) => void) | null = null;
+  if (setupContinuation.kind === "workspace") {
+    const trackedSetup = new Promise<void>((resolve, reject) => {
+      finishTrackedSetup = resolve;
+      failTrackedSetup = reject;
+    });
+    // Register synchronously with workspace creation. An immediate archive can
+    // now observe the pending setup even before the background timer fires.
+    dependencies.trackWorkspaceSetup?.(workspace.workspaceId, trackedSetup);
+  }
+
   setTimeout(() => {
     if (input.firstAgentContext) {
       dependencies.autoNameWorkspaceBranchForFirstAgent({
@@ -619,7 +632,7 @@ export async function createPaseoWorktreeWorkflow(
       );
     });
     if (setupContinuation.kind === "workspace") {
-      void runWorktreeSetupInBackground(dependencies, {
+      const setup = runWorktreeSetupInBackground(dependencies, {
         requestCwd: input.cwd,
         repoRoot: createdWorktree.repoRoot,
         workspaceId: workspace.workspaceId,
@@ -629,6 +642,10 @@ export async function createPaseoWorktreeWorkflow(
         worktreePath: createdWorktree.worktree.worktreePath,
         workspaceCwd: workspace.cwd,
       });
+      void setup.then(
+        () => finishTrackedSetup?.(),
+        (error) => failTrackedSetup?.(error),
+      );
     }
   }, 0);
 
@@ -638,7 +655,7 @@ export async function createPaseoWorktreeWorkflow(
       setupContinuation: {
         kind: "agent",
         startAfterAgentCreate: ({ agentId }) => {
-          void runAsyncWorktreeBootstrap({
+          const setup = runAsyncWorktreeBootstrap({
             agentId,
             workspaceId: workspace.workspaceId,
             worktree: createdWorktree.worktree,
@@ -650,6 +667,7 @@ export async function createPaseoWorktreeWorkflow(
               setupContinuation.emitLiveTimelineItem({ agentId, item }),
             logger: setupContinuation.logger,
           });
+          dependencies.trackWorkspaceSetup?.(workspace.workspaceId, setup);
         },
       },
     };

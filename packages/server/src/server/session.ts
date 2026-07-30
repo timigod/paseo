@@ -481,6 +481,7 @@ export interface SessionOptions {
   serviceProxy?: ServiceProxySubsystem;
   scriptRuntimeStore?: WorkspaceScriptRuntimeStore;
   workspaceSetupSnapshots?: Map<string, WorkspaceSetupSnapshot>;
+  workspaceSetupTasks?: Map<string, Promise<void>>;
   onBranchChanged?: (
     workspaceId: string,
     oldBranch: string | null,
@@ -668,6 +669,7 @@ export class Session {
   private inflightRequests = 0;
   private peakInflightRequests = 0;
   private readonly workspaceSetupSnapshots: Map<string, WorkspaceSetupSnapshot>;
+  private readonly workspaceSetupTasks: Map<string, Promise<void>>;
   private readonly workspaceGitObserver: WorkspaceGitObserverService;
   // A workspace record is durable history; a Git watcher is not. Keep the
   // observer proportional to live agent work rather than every historical
@@ -729,6 +731,7 @@ export class Session {
       serviceProxy,
       scriptRuntimeStore,
       workspaceSetupSnapshots,
+      workspaceSetupTasks,
       onBranchChanged,
       getDaemonTcpPort,
       getDaemonTcpHost,
@@ -961,6 +964,9 @@ export class Session {
       archiveAgentForClose: (agentId) => this.archiveAgentForClose(agentId),
       findWorkspaceIdForCwd: (cwd) => this.findWorkspaceIdForCwd(cwd),
       listActiveWorkspaces: () => this.listActiveWorkspaceRefs(),
+      waitForWorkspaceSetup: async (workspaceId) => {
+        await this.workspaceSetupTasks.get(workspaceId);
+      },
       archiveWorkspaceRecord: (workspaceId) => this.archiveWorkspaceRecord(workspaceId),
       emit: (message) => this.emit(message),
       emitAgentRemove: (agentId) => this.agentUpdates.removeAgent(agentId),
@@ -977,6 +983,7 @@ export class Session {
     this.serviceProxy = serviceProxy ?? null;
     this.scriptRuntimeStore = scriptRuntimeStore ?? null;
     this.workspaceSetupSnapshots = workspaceSetupSnapshots ?? new Map();
+    this.workspaceSetupTasks = workspaceSetupTasks ?? new Map();
     this.getDaemonTcpPort = getDaemonTcpPort ?? null;
     this.getDaemonTcpHost = getDaemonTcpHost ?? null;
     this.serviceProxyPublicBaseUrl = serviceProxyPublicBaseUrl ?? null;
@@ -5947,6 +5954,21 @@ export class Session {
         cacheWorkspaceSetupSnapshot: (workspaceId, snapshot) => {
           this.workspaceSetupSnapshots.set(workspaceId, snapshot);
         },
+        trackWorkspaceSetup: (workspaceId, setup) => {
+          const tracked = setup
+            .catch((error) => {
+              this.sessionLogger.warn(
+                { err: error, workspaceId },
+                "Background worktree setup task rejected",
+              );
+            })
+            .finally(() => {
+              if (this.workspaceSetupTasks.get(workspaceId) === tracked) {
+                this.workspaceSetupTasks.delete(workspaceId);
+              }
+            });
+          this.workspaceSetupTasks.set(workspaceId, tracked);
+        },
         emit: (message) => this.emit(message),
         sessionLogger: this.sessionLogger,
         terminalManager: this.terminalManager,
@@ -5996,6 +6018,9 @@ export class Session {
           agentStorage: this.agentStorage,
           findWorkspaceIdForCwd: (cwd) => this.findWorkspaceIdForCwd(cwd),
           listActiveWorkspaces: () => this.listActiveWorkspaceRefs(),
+          waitForWorkspaceSetup: async (workspaceId) => {
+            await this.workspaceSetupTasks.get(workspaceId);
+          },
           archiveWorkspaceRecord: (workspaceId) => this.archiveWorkspaceRecord(workspaceId),
           emitWorkspaceUpdatesForWorkspaceIds: (workspaceIds) =>
             this.emitWorkspaceUpdatesForWorkspaceIds(workspaceIds),
