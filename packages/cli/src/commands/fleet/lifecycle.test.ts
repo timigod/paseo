@@ -72,6 +72,16 @@ describe("fleet lifecycle lookup", () => {
       { host: imac, agentId: "agent", archived: false },
     ]);
   });
+
+  it("preserves archived state for the existing recovery path", () => {
+    const agents = [
+      { id: "agent-1", archivedAt: "2026-07-30T00:00:00.000Z" },
+    ] as AgentSnapshotPayload[];
+
+    expect(findFleetAgentMatches("agent-1", imac, agents)).toEqual([
+      { host: imac, agentId: "agent-1", archived: true },
+    ]);
+  });
 });
 
 describe("fleet continuation", () => {

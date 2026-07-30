@@ -73,11 +73,7 @@ function isOwnedDescendant(
 
 function assertFinishable(agent: AgentSnapshotPayload, force: boolean): void {
   if (agent.archivedAt) {
-    throw {
-      code: "AGENT_ALREADY_ARCHIVED",
-      message: `Agent ${agent.id.slice(0, 7)} is already archived`,
-      details: "Recover it with: paseo agent recover <id>",
-    } satisfies CommandError;
+    return;
   }
   if (agent.status === "running" && !force) {
     throw {
@@ -203,7 +199,9 @@ export async function runFinishCommand(
     assertFinishable(agent, options.force === true);
     const disposition = await determineWorktreeDisposition(client, agent, options);
 
-    await archiveAgentOrConfirmArchived(client, agent.id);
+    if (!agent.archivedAt) {
+      await archiveAgentOrConfirmArchived(client, agent.id);
+    }
     if (disposition.worktree === "released" && disposition.path) {
       const archived = await client.archivePaseoWorktree({
         worktreePath: disposition.path,
@@ -213,7 +211,7 @@ export async function runFinishCommand(
         throw {
           code: "WORKTREE_ARCHIVE_FAILED",
           message: `Agent was archived but its worktree could not be released: ${archived.error.message}`,
-          details: `Recover the agent with "paseo agent recover ${agent.id}" or inspect the managed worktree before retrying.`,
+          details: `Retry with "paseo agent finish ${agent.id}" after resolving the worktree error.`,
         } satisfies CommandError;
       }
     }

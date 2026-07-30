@@ -84,6 +84,44 @@ describe("runFinishCommand", () => {
     });
   });
 
+  it("retries worktree release after the agent was already archived", async () => {
+    const { connectToDaemon } = await import("../../utils/client.js");
+    const archivedAgent = { ...agent, archivedAt: "2026-07-30T00:00:00.000Z" };
+    const client = installClient({
+      fetchAgent: vi.fn().mockResolvedValue({ agent: archivedAgent }),
+      fetchAgents: vi.fn().mockResolvedValue({ entries: [{ agent: archivedAgent }] }),
+    });
+    vi.mocked(connectToDaemon).mockResolvedValue(client as never);
+
+    const result = await runFinishCommand("agent-1", {}, {} as never);
+
+    expect(result.data).toMatchObject({ status: "finished", worktree: "released" });
+    expect(client.archiveAgent).not.toHaveBeenCalled();
+    expect(client.archivePaseoWorktree).toHaveBeenCalledWith({
+      worktreePath: "/repo/.paseo/worktrees/task-a",
+      scope: "worktree",
+    });
+  });
+
+  it("keeps a shared worktree when retrying an already archived agent", async () => {
+    const { connectToDaemon } = await import("../../utils/client.js");
+    const archivedAgent = { ...agent, archivedAt: "2026-07-30T00:00:00.000Z" };
+    const other = { ...agent, id: "agent-2", cwd: "/repo/.paseo/worktrees/task-a/other" };
+    const client = installClient({
+      fetchAgent: vi.fn().mockResolvedValue({ agent: archivedAgent }),
+      fetchAgents: vi
+        .fn()
+        .mockResolvedValue({ entries: [{ agent: archivedAgent }, { agent: other }] }),
+    });
+    vi.mocked(connectToDaemon).mockResolvedValue(client as never);
+
+    const result = await runFinishCommand("agent-1", {}, {} as never);
+
+    expect(result.data.worktree).toBe("kept");
+    expect(client.archiveAgent).not.toHaveBeenCalled();
+    expect(client.archivePaseoWorktree).not.toHaveBeenCalled();
+  });
+
   it("does not finish a running task without an explicit force flag", async () => {
     const { connectToDaemon } = await import("../../utils/client.js");
     const client = installClient({
