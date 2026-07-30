@@ -1,5 +1,5 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { runRunCommand, type AgentRunOptions } from "./run";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { resolveRunWorkspace, runRunCommand, type AgentRunOptions } from "./run";
 
 // validateRunOptions runs before the CLI ever connects to a daemon, so these
 // invalid combinations reject without one running.
@@ -47,6 +47,16 @@ describe("runRunCommand option validation", () => {
     await expect(
       runRunCommand("do something", { worktree: "feat", provider: undefined }, {} as never),
     ).rejects.not.toMatchObject({ code: "INVALID_OPTIONS" });
+  });
+
+  it("lets the daemon atomically create a bare run workspace with its agent", async () => {
+    const createWorkspace = vi.fn();
+
+    await expect(
+      resolveRunWorkspace({ createWorkspace } as never, {}, "/tmp/paseo-bare-run"),
+    ).resolves.toEqual({ cwd: "/tmp/paseo-bare-run" });
+
+    expect(createWorkspace).not.toHaveBeenCalled();
   });
 
   it("rejects one-shot cleanup with structured output because structured runs can need retries", async () => {

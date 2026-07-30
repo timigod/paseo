@@ -7797,6 +7797,56 @@ test("failed local create_agent_request does not schedule workspace title genera
   }
 });
 
+test("failed bare create_agent_request archives its unowned local workspace", async () => {
+  const emitted: SessionOutboundMessage[] = [];
+  const workspaces = new Map<string, PersistedWorkspaceRecord>();
+  const workspaceRegistry: SessionOptions["workspaceRegistry"] = {
+    initialize: async () => {},
+    existsOnDisk: async () => true,
+    list: async () => [...workspaces.values()],
+    get: async (workspaceId) => workspaces.get(workspaceId) ?? null,
+    update: async (workspaceId, updater) => {
+      const existing = workspaces.get(workspaceId);
+      if (!existing) return null;
+      const updated = updater(existing);
+      workspaces.set(workspaceId, updated);
+      return updated;
+    },
+    upsert: async (workspace) => {
+      workspaces.set(workspace.workspaceId, workspace);
+    },
+    archive: async (workspaceId, archivedAt) => {
+      const existing = workspaces.get(workspaceId);
+      if (existing) workspaces.set(workspaceId, { ...existing, archivedAt, updatedAt: archivedAt });
+    },
+    remove: async (workspaceId) => {
+      workspaces.delete(workspaceId);
+    },
+  };
+  const session = createSessionForWorkspaceTests({
+    onMessage: (message) => emitted.push(message),
+    workspaceRegistry,
+  });
+
+  await session.handleMessage({
+    type: "create_agent_request",
+    requestId: "req-failed-bare-workspace",
+    config: { provider: "codex", cwd: REPO_CWD },
+    initialPrompt: "This create will fail before an agent exists",
+    attachments: [],
+  });
+
+  expect(findByType(emitted, "status")?.payload).toMatchObject({
+    status: "agent_create_failed",
+    requestId: "req-failed-bare-workspace",
+  });
+  expect(workspaces.size).toBe(1);
+  expect([...workspaces.values()][0]).toMatchObject({
+    cwd: REPO_CWD,
+    archivedAt: expect.any(String),
+  });
+});
+
 test("workspace auto-name keeps a manual title written before the scheduled title lands", async () => {
   vi.useFakeTimers();
   const workspace = createPersistedWorkspaceRecord({

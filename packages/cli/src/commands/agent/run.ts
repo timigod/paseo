@@ -422,10 +422,10 @@ async function connectToDaemonOrThrow(
 }
 
 // A workspace is the explicit home of a run: it owns the directory the agent
-// runs in. The CLI resolves one before creating any agent, so no run leans on
-// createAgent's legacy cwd->workspace fallback.
+// runs in. Explicit and worktree-backed runs resolve it before creation; a
+// bare run delegates both records to the daemon as one lifecycle operation.
 interface RunWorkspace {
-  id: string;
+  id?: string;
   cwd: string;
 }
 
@@ -433,11 +433,12 @@ interface RunWorkspace {
 //   1. --workspace <id>            -> run in that existing workspace
 //   2. $PASEO_WORKSPACE_ID         -> exported by workspace terminals
 //   3. --worktree <name>           -> mint a new worktree-backed workspace
-//   4. bare run                    -> mint a new local-backed workspace for cwd
+//   4. bare run                    -> let the daemon atomically create the
+//                                    local workspace with the agent record
 // --worktree is rejected alongside both --workspace and an ambient
 // $PASEO_WORKSPACE_ID (validateRunOptions), so worktree resolution here never
 // races an existing-workspace selection.
-async function resolveRunWorkspace(
+export async function resolveRunWorkspace(
   client: ConnectedDaemonClient,
   options: AgentRunOptions,
   cwd: string,
@@ -452,18 +453,23 @@ async function resolveRunWorkspace(
     return { id: explicit, cwd };
   }
 
+  // A bare run must not perform a separate workspace RPC before create-agent.
+  // The daemon owns both records and can roll the workspace back if creation
+  // fails before an agent has been durably acknowledged.
+  if (!options.worktree) {
+    return { cwd };
+  }
+
   // TODO: thread the run `prompt` as firstAgentContext so workspace-level
   // title/branch generation picks up the task description (U8/U6 deferred).
-  const result = options.worktree
-    ? await client.createWorkspace({
-        source: {
-          kind: "worktree",
-          cwd,
-          worktreeSlug: options.worktree,
-          baseBranch: options.base,
-        },
-      })
-    : await client.createWorkspace({ source: { kind: "directory", path: cwd } });
+  const result = await client.createWorkspace({
+    source: {
+      kind: "worktree",
+      cwd,
+      worktreeSlug: options.worktree,
+      baseBranch: options.base,
+    },
+  });
 
   if (!result.workspace) {
     throw {

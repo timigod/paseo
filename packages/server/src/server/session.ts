@@ -2724,6 +2724,8 @@ export class Session {
 
     let createdWorktreeForCleanup: CreatePaseoWorktreeWorkflowResult | null = null;
     let createdAgentId: string | null = null;
+    let createdDirectoryWorkspaceForAgent = false;
+    let createdWorkspaceId: string | null = null;
     try {
       const replayed = await this.replayCreateAgentRequest(
         requestedAgentId,
@@ -2763,7 +2765,8 @@ export class Session {
           initialTitle: workspacePromptTitle,
         },
       );
-      const createdDirectoryWorkspaceForAgent = !createdWorktree && !msg.workspaceId;
+      createdWorkspaceId = workspaceId;
+      createdDirectoryWorkspaceForAgent = !createdWorktree && !msg.workspaceId;
 
       const creation = await beginCreateAgentCommand(
         {
@@ -2861,6 +2864,21 @@ export class Session {
         createdWorktree: createdWorktreeForCleanup,
         createdAgentId,
       });
+      // A bare CLI run lets this request mint the local workspace. If creation
+      // failed before an agent record was acknowledged, the workspace has no
+      // owner and must not become a durable orphan. Explicit workspaces belong
+      // to their caller; worktree-backed workspaces are cleaned by the
+      // lifecycle dispatcher above.
+      if (createdDirectoryWorkspaceForAgent && createdWorkspaceId && createdAgentId === null) {
+        try {
+          await this.archiveWorkspaceRecord(createdWorkspaceId);
+        } catch (archiveError) {
+          this.sessionLogger.warn(
+            { err: archiveError, workspaceId: createdWorkspaceId },
+            "Failed to archive unowned workspace after failed agent creation",
+          );
+        }
+      }
       const wireError = toWorktreeWireError(error);
       this.sessionLogger.error({ err: error }, "Failed to create agent");
       const outcome: AgentCreateRequestOutcome = {
