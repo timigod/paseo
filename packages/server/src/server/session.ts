@@ -1,5 +1,6 @@
 import equal from "fast-deep-equal";
 import { v4 as uuidv4 } from "uuid";
+import { createHash } from "node:crypto";
 import { lstat, mkdir, mkdtemp, rename, rm, stat } from "node:fs/promises";
 import { resolve, sep } from "path";
 import { homedir } from "node:os";
@@ -67,13 +68,14 @@ import {
 import { AgentManager, AgentRunCancellationError } from "./agent/agent-manager.js";
 import { ProviderSnapshotManager } from "./agent/provider-snapshot-manager.js";
 import type {
+  AgentCreateRequestOutcome,
   AgentManagerEvent,
   AgentTimelineCursor,
   AgentTimelineFetchDirection,
   AgentTimelineFetchResult,
   ManagedAgent,
 } from "./agent/agent-manager.js";
-import { createAgentCommand } from "./agent/create-agent/create.js";
+import { beginCreateAgentCommand } from "./agent/create-agent/create.js";
 import { resolveCreateAgentIntent, type CreateAgentIntent } from "./agent/create-agent/intent.js";
 import {
   archiveAgentCommand,
@@ -243,6 +245,46 @@ import { resolveWorktreeSourceCwd } from "./workspace-source.js";
 const LEGACY_PROVIDER_IDS = new Set(["claude", "codex", "opencode"]);
 const MIN_VERSION_ALL_PROVIDERS = "0.1.45";
 const MIN_VERSION_EXPLICIT_WORKSPACE_RECOVERY = "0.1.105";
+
+function deriveCreateAgentId(clientId: string, requestId: string): string {
+  const bytes = createHash("sha256")
+    .update("paseo:create-agent:v1\0")
+    .update(clientId)
+    .update("\0")
+    .update(requestId)
+    .digest()
+    .subarray(0, 16);
+  bytes[6] = (bytes[6]! & 0x0f) | 0x50;
+  bytes[8] = (bytes[8]! & 0x3f) | 0x80;
+  const hex = bytes.toString("hex");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(
+    16,
+    20,
+  )}-${hex.slice(20)}`;
+}
+
+function canonicalizeCreateRequestValue(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map(canonicalizeCreateRequestValue);
+  }
+  if (value !== null && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value)
+        .filter(([, entryValue]) => entryValue !== undefined)
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([key, entryValue]) => [key, canonicalizeCreateRequestValue(entryValue)]),
+    );
+  }
+  return value;
+}
+
+function deriveCreateAgentRequestFingerprint(msg: CreateAgentRequestMessage): string {
+  return createHash("sha256")
+    .update("paseo:create-agent-request:v1\0")
+    .update(JSON.stringify(canonicalizeCreateRequestValue(msg)))
+    .digest("hex");
+}
+
 function errorToFriendlyMessage(error: unknown): string {
   if (error instanceof Error) return error.message;
   if (typeof error === "string") return error;
@@ -542,6 +584,10 @@ interface ArchivedRecordSnapshot {
   archivedAt?: string | null;
 }
 
+interface AgentOutboundVisibilityGate {
+  bufferedEvents: AgentManagerEvent[];
+}
+
 function describeRegistryTransition(record: ArchivedRecordSnapshot | null): RegistryTransition {
   if (!record) {
     return "created";
@@ -589,6 +635,8 @@ export class Session {
   private readonly daemonConfigStore: DaemonConfigStore;
   private readonly pushTokenStore: PushTokenStore;
   private unsubscribeAgentEvents: (() => void) | null = null;
+  private readonly agentOutboundVisibilityGates = new Map<string, AgentOutboundVisibilityGate>();
+  private readonly agentOutboundTails = new Map<string, Promise<void>>();
   private unsubscribeProjectMutations: (() => void) | null = null;
   private unsubscribeWorkspaceMutations: (() => void) | null = null;
   private registryMutationQueue: Promise<void> = Promise.resolve();
@@ -1601,130 +1649,189 @@ export class Session {
     }
 
     this.unsubscribeAgentEvents = this.agentManager.subscribe(
-      (event) => {
-        if (event.type === "agent_state") {
-          this.sessionLogger.trace(
-            {
-              agentId: event.agent.id,
-              provider: event.agent.provider,
-              providerSessionId: event.agent.persistence?.sessionId ?? undefined,
-              turnId: event.agent.activeForegroundTurnId ?? undefined,
-              lifecycle: event.agent.lifecycle,
-            },
-            "agent.session.forward_update",
-          );
-          if (event.agent.workspaceId) {
-            void this.reconcileLiveWorkspaceGitObserver(event.agent.workspaceId).catch((error) => {
-              this.sessionLogger.warn(
-                { err: error, workspaceId: event.agent.workspaceId, agentId: event.agent.id },
-                "Failed to reconcile live workspace Git observer after agent state change",
-              );
-            });
-          }
-          void this.agentUpdates.forwardLiveAgent(event.agent);
-          return;
-        }
-
-        if (event.type === "provider_subagent") {
-          if (!this.supports(CLIENT_CAPS.providerSubagents)) {
-            return;
-          }
-          const update = event.event;
-          if (update.type === "upsert") {
-            this.emit({
-              type: "agent.provider_subagents.update",
-              payload: { kind: "upsert", subagent: update.subagent },
-            });
-          } else if (update.type === "timeline") {
-            this.emit({
-              type: "agent.provider_subagents.update",
-              payload: {
-                kind: "timeline",
-                parentAgentId: update.parentAgentId,
-                subagentId: update.subagentId,
-                provider: update.provider,
-                item: update.row.item,
-                timestamp: update.row.timestamp,
-                seq: update.row.seq,
-                epoch: update.epoch,
-              },
-            });
-          } else {
-            this.emit({
-              type: "agent.provider_subagents.update",
-              payload: {
-                kind: "remove",
-                parentAgentId: update.parentAgentId,
-                subagentId: update.subagentId,
-              },
-            });
-          }
-          return;
-        }
-
-        if (
-          this.voiceSession.isActiveForAgent(event.agentId) &&
-          event.event.type === "permission_requested" &&
-          isVoicePermissionAllowed(event.event.request)
-        ) {
-          const requestId = event.event.request.id;
-          void this.agentManager
-            .respondToPermission(event.agentId, requestId, {
-              behavior: "allow",
-            })
-            .catch((error) => {
-              this.sessionLogger.warn(
-                {
-                  err: error,
-                  agentId: event.agentId,
-                  requestId,
-                },
-                "Failed to auto-allow speak tool permission in voice mode",
-              );
-            });
-        }
-
-        const serializedEvent = serializeAgentStreamEvent(event.event);
-        if (!serializedEvent) {
-          return;
-        }
-        this.sessionLogger.trace(
-          {
-            agentId: event.agentId,
-            provider: event.event.provider,
-            turnId: getAgentStreamEventTurnId(event.event),
-            seq: event.seq,
-            epoch: event.epoch,
-            event: event.event,
-          },
-          "agent.session.forward_stream",
-        );
-
-        this.forwardAgentStream(event, serializedEvent);
-
-        if (event.event.type === "permission_requested") {
-          this.emit({
-            type: "agent_permission_request",
-            payload: {
-              agentId: event.agentId,
-              request: event.event.request,
-            },
-          });
-        } else if (event.event.type === "permission_resolved") {
-          this.emit({
-            type: "agent_permission_resolved",
-            payload: {
-              agentId: event.agentId,
-              requestId: event.event.requestId,
-              resolution: event.event.resolution,
-            },
-          });
-        }
-
-        // Title updates may be applied asynchronously after agent creation.
-      },
+      (event) => this.enqueueAgentManagerEvent(event),
       { replayState: false },
     );
+  }
+
+  private enqueueAgentManagerEvent(event: AgentManagerEvent): void {
+    const agentId = this.resolveAgentManagerEventAgentId(event);
+    const visibilityGate = this.agentOutboundVisibilityGates.get(agentId);
+    if (visibilityGate) {
+      visibilityGate.bufferedEvents.push(event);
+      return;
+    }
+
+    const previous = this.agentOutboundTails.get(agentId) ?? Promise.resolve();
+    const result = previous.then(() => this.forwardAgentManagerEvent(event));
+    const tail = result.catch((error) => {
+      this.sessionLogger.error(
+        { err: error, agentId, eventType: event.type },
+        "Failed to forward ordered agent event",
+      );
+    });
+    this.agentOutboundTails.set(agentId, tail);
+    void tail.finally(() => {
+      if (this.agentOutboundTails.get(agentId) === tail) {
+        this.agentOutboundTails.delete(agentId);
+      }
+    });
+  }
+
+  private resolveAgentManagerEventAgentId(event: AgentManagerEvent): string {
+    if (event.type === "agent_state") {
+      return event.agent.id;
+    }
+    if (event.type === "agent_stream") {
+      return event.agentId;
+    }
+    return event.event.type === "upsert"
+      ? event.event.subagent.parentAgentId
+      : event.event.parentAgentId;
+  }
+
+  private beginAgentOutboundVisibilityGate(agentId: string): boolean {
+    if (this.agentOutboundVisibilityGates.has(agentId)) {
+      return false;
+    }
+    this.agentOutboundVisibilityGates.set(agentId, { bufferedEvents: [] });
+    return true;
+  }
+
+  private releaseAgentOutboundVisibilityGate(agentId: string): void {
+    const visibilityGate = this.agentOutboundVisibilityGates.get(agentId);
+    if (!visibilityGate) {
+      return;
+    }
+    this.agentOutboundVisibilityGates.delete(agentId);
+    for (const event of visibilityGate.bufferedEvents) {
+      this.enqueueAgentManagerEvent(event);
+    }
+  }
+
+  private discardAgentOutboundVisibilityGate(agentId: string): void {
+    this.agentOutboundVisibilityGates.delete(agentId);
+  }
+
+  private async forwardAgentManagerEvent(event: AgentManagerEvent): Promise<void> {
+    if (event.type === "agent_state") {
+      this.sessionLogger.trace(
+        {
+          agentId: event.agent.id,
+          provider: event.agent.provider,
+          providerSessionId: event.agent.persistence?.sessionId ?? undefined,
+          turnId: event.agent.activeForegroundTurnId ?? undefined,
+          lifecycle: event.agent.lifecycle,
+        },
+        "agent.session.forward_update",
+      );
+      if (event.agent.workspaceId) {
+        void this.reconcileLiveWorkspaceGitObserver(event.agent.workspaceId).catch((error) => {
+          this.sessionLogger.warn(
+            { err: error, workspaceId: event.agent.workspaceId, agentId: event.agent.id },
+            "Failed to reconcile live workspace Git observer after agent state change",
+          );
+        });
+      }
+      await this.agentUpdates.forwardLiveAgent(event.agent);
+      return;
+    }
+
+    if (event.type === "provider_subagent") {
+      if (!this.supports(CLIENT_CAPS.providerSubagents)) {
+        return;
+      }
+      const update = event.event;
+      if (update.type === "upsert") {
+        this.emit({
+          type: "agent.provider_subagents.update",
+          payload: { kind: "upsert", subagent: update.subagent },
+        });
+      } else if (update.type === "timeline") {
+        this.emit({
+          type: "agent.provider_subagents.update",
+          payload: {
+            kind: "timeline",
+            parentAgentId: update.parentAgentId,
+            subagentId: update.subagentId,
+            provider: update.provider,
+            item: update.row.item,
+            timestamp: update.row.timestamp,
+            seq: update.row.seq,
+            epoch: update.epoch,
+          },
+        });
+      } else {
+        this.emit({
+          type: "agent.provider_subagents.update",
+          payload: {
+            kind: "remove",
+            parentAgentId: update.parentAgentId,
+            subagentId: update.subagentId,
+          },
+        });
+      }
+      return;
+    }
+
+    if (
+      this.voiceSession.isActiveForAgent(event.agentId) &&
+      event.event.type === "permission_requested" &&
+      isVoicePermissionAllowed(event.event.request)
+    ) {
+      const requestId = event.event.request.id;
+      void this.agentManager
+        .respondToPermission(event.agentId, requestId, {
+          behavior: "allow",
+        })
+        .catch((error) => {
+          this.sessionLogger.warn(
+            {
+              err: error,
+              agentId: event.agentId,
+              requestId,
+            },
+            "Failed to auto-allow speak tool permission in voice mode",
+          );
+        });
+    }
+
+    const serializedEvent = serializeAgentStreamEvent(event.event);
+    if (!serializedEvent) {
+      return;
+    }
+    this.sessionLogger.trace(
+      {
+        agentId: event.agentId,
+        provider: event.event.provider,
+        turnId: getAgentStreamEventTurnId(event.event),
+        seq: event.seq,
+        epoch: event.epoch,
+        event: event.event,
+      },
+      "agent.session.forward_stream",
+    );
+
+    this.forwardAgentStream(event, serializedEvent);
+
+    if (event.event.type === "permission_requested") {
+      this.emit({
+        type: "agent_permission_request",
+        payload: {
+          agentId: event.agentId,
+          request: event.event.request,
+        },
+      });
+    } else if (event.event.type === "permission_resolved") {
+      this.emit({
+        type: "agent_permission_resolved",
+        payload: {
+          agentId: event.agentId,
+          requestId: event.event.requestId,
+          resolution: event.event.resolution,
+        },
+      });
+    }
   }
 
   private buildAgentStreamPayload(
@@ -3049,10 +3156,145 @@ export class Session {
     }
   }
 
+  private emitCreateAgentRequestOutcome(
+    requestId: string,
+    outcome: AgentCreateRequestOutcome,
+  ): void {
+    if (outcome.status !== "failed") {
+      return;
+    }
+    this.emit({
+      type: "status",
+      payload: {
+        status: "agent_create_failed",
+        requestId,
+        error: outcome.error ?? "Failed to create agent",
+        ...(outcome.errorCode ? { errorCode: outcome.errorCode } : {}),
+      },
+    });
+  }
+
+  private async replayCreateAgentRequest(
+    agentId: string,
+    requestId: string,
+    createRequestFingerprint: string,
+  ): Promise<AgentCreateRequestOutcome | null> {
+    const liveAgent = this.agentManager.getAgent(agentId);
+    const storedAgent = await this.agentStorage.get(agentId);
+    if (!liveAgent && !storedAgent) {
+      return null;
+    }
+
+    const durableFingerprint =
+      liveAgent?.createRequestFingerprint ?? storedAgent?.createRequestFingerprint;
+    if (durableFingerprint && durableFingerprint !== createRequestFingerprint) {
+      const outcome: AgentCreateRequestOutcome = {
+        status: "failed",
+        error: "This requestId was already used with different create-agent input.",
+      };
+      this.emitCreateAgentRequestOutcome(requestId, outcome);
+      return outcome;
+    }
+    if (storedAgent?.archivedAt) {
+      const outcome: AgentCreateRequestOutcome = {
+        status: "failed",
+        error: `The agent from this create request was archived at ${storedAgent.archivedAt}.`,
+      };
+      this.emitCreateAgentRequestOutcome(requestId, outcome);
+      return outcome;
+    }
+
+    const agent = liveAgent
+      ? await this.buildAgentPayload(liveAgent)
+      : this.buildStoredAgentPayload(storedAgent!);
+    this.emit({
+      type: "status",
+      payload: {
+        status: "agent_created",
+        agentId,
+        requestId,
+        agent,
+      },
+    });
+    this.releaseAgentOutboundVisibilityGate(agentId);
+    this.sessionLogger.info(
+      { agentId, requestId, status: agent.status },
+      "Replayed durable create-agent result",
+    );
+    return { status: "created" };
+  }
+
   /**
    * Handle create agent request
    */
   private async handleCreateAgentRequest(msg: CreateAgentRequestMessage): Promise<void> {
+    const requestedAgentId = deriveCreateAgentId(this.clientId, msg.requestId);
+    const createRequestFingerprint = deriveCreateAgentRequestFingerprint(msg);
+    const claim = this.agentManager.claimCreateRequest(requestedAgentId, createRequestFingerprint);
+    if (claim.kind === "mismatch") {
+      this.emitCreateAgentRequestOutcome(msg.requestId, {
+        status: "failed",
+        error: "This requestId was already used with different create-agent input.",
+      });
+      return;
+    }
+
+    const ownsVisibilityGate = this.beginAgentOutboundVisibilityGate(requestedAgentId);
+    try {
+      if (claim.kind === "follower") {
+        const outcome = await claim.outcome;
+        if (outcome.status === "created") {
+          const replayed = await this.replayCreateAgentRequest(
+            requestedAgentId,
+            msg.requestId,
+            createRequestFingerprint,
+          );
+          if (replayed) {
+            return;
+          }
+          this.emitCreateAgentRequestOutcome(msg.requestId, {
+            status: "failed",
+            error: "The durable agent record for this create request is unavailable.",
+          });
+          return;
+        }
+        this.emitCreateAgentRequestOutcome(msg.requestId, outcome);
+        return;
+      }
+
+      let outcome: AgentCreateRequestOutcome;
+      try {
+        outcome = await this.performCreateAgentRequest(
+          msg,
+          requestedAgentId,
+          createRequestFingerprint,
+        );
+      } catch (error) {
+        const wireError = toWorktreeWireError(error);
+        outcome = {
+          status: "failed",
+          error: wireError.message,
+          errorCode: wireError.code,
+        };
+        this.emitCreateAgentRequestOutcome(msg.requestId, outcome);
+        this.sessionLogger.error(
+          { err: error, agentId: requestedAgentId },
+          "Create-agent owner failed before publishing its durable outcome",
+        );
+      }
+      claim.finish(outcome);
+    } finally {
+      if (ownsVisibilityGate) {
+        this.discardAgentOutboundVisibilityGate(requestedAgentId);
+      }
+    }
+  }
+
+  private async performCreateAgentRequest(
+    msg: CreateAgentRequestMessage,
+    requestedAgentId: string,
+    createRequestFingerprint: string,
+  ): Promise<AgentCreateRequestOutcome> {
     const {
       config,
       worktreeName,
@@ -3077,6 +3319,15 @@ export class Session {
     let createdWorktreeForCleanup: CreatePaseoWorktreeWorkflowResult | null = null;
     let createdAgentId: string | null = null;
     try {
+      const replayed = await this.replayCreateAgentRequest(
+        requestedAgentId,
+        requestId,
+        createRequestFingerprint,
+      );
+      if (replayed) {
+        return replayed;
+      }
+
       const requestedCwd = resolve(config.cwd);
       const needsRequestedDirectory =
         Boolean(worktreeName || git || worktree) || (!msg.workspaceId && !msg.callerAgentId);
@@ -3111,7 +3362,7 @@ export class Session {
         throw new Error(`Working directory does not exist or is not a directory: ${resolvedCwd}`);
       }
 
-      const { snapshot, liveSnapshot } = await createAgentCommand(
+      const creation = await beginCreateAgentCommand(
         {
           agentManager: this.agentManager,
           agentStorage: this.agentStorage,
@@ -3122,6 +3373,8 @@ export class Session {
         },
         {
           kind: "session",
+          agentId: requestedAgentId,
+          createRequestFingerprint,
           config: resolvedIntent.config,
           workspaceId: resolvedIntent.intent.workspaceId,
           worktreeName,
@@ -3139,40 +3392,63 @@ export class Session {
             this.buildAgentSessionConfig(sessionConfig, gitOptions, legacyWorktreeName, ctx),
         },
       );
+      const snapshot = creation.snapshot;
       createdAgentId = snapshot.id;
-      await this.agentUpdates.forwardLiveAgent(snapshot);
-      if (resolvedIntent.createdDirectoryWorkspace && trimmedPrompt) {
-        this.workspaceAutoName.scheduleForDirectory(
-          {
-            workspaceId: resolvedIntent.intent.workspaceId,
-            cwd: resolvedIntent.config.cwd,
-            firstAgentContext,
-          },
-          { currentSelection: this.getFocusedAgentSelectionForCwd(resolvedIntent.config.cwd) },
-        );
-      }
-      this.createAgentLifecycleDispatch.registerAutoArchiveIfRequested({
-        autoArchive,
-        agentId: snapshot.id,
-        createdWorktree,
-      });
-      if (requestId) {
-        const agentPayload = await this.buildAgentPayload(liveSnapshot);
+      void creation.completion.then(
+        ({ liveSnapshot }) => {
+          this.sessionLogger.info(
+            { agentId: liveSnapshot.id, provider: liveSnapshot.provider },
+            `Created agent ${liveSnapshot.id} (${liveSnapshot.provider})`,
+          );
+          return undefined;
+        },
+        (error: unknown) => {
+          this.sessionLogger.error(
+            { err: error, agentId: snapshot.id, provider: snapshot.provider },
+            "Agent startup failed after its creation acknowledgement",
+          );
+          return undefined;
+        },
+      );
+      try {
+        if (resolvedIntent.createdDirectoryWorkspace && trimmedPrompt) {
+          this.workspaceAutoName.scheduleForDirectory(
+            {
+              workspaceId: resolvedIntent.intent.workspaceId,
+              cwd: resolvedIntent.config.cwd,
+              firstAgentContext,
+            },
+            { currentSelection: this.getFocusedAgentSelectionForCwd(resolvedIntent.config.cwd) },
+          );
+        }
+        this.createAgentLifecycleDispatch.registerAutoArchiveIfRequested({
+          autoArchive,
+          agentId: snapshot.id,
+          createdWorktree,
+        });
+        const agentPayload = await this.buildAgentPayload(snapshot);
         this.emit({
           type: "status",
           payload: {
             status: "agent_created",
-            agentId: liveSnapshot.id,
+            agentId: snapshot.id,
             requestId,
             agent: agentPayload,
           },
         });
+        this.releaseAgentOutboundVisibilityGate(snapshot.id);
+        creation.releaseAfterAcknowledgement();
+      } catch (error) {
+        try {
+          await creation.abortBeforeAcknowledgement(error);
+        } finally {
+          this.discardAgentOutboundVisibilityGate(snapshot.id);
+          createdAgentId = null;
+        }
+        throw error;
       }
 
-      this.sessionLogger.info(
-        { agentId: snapshot.id, provider: snapshot.provider },
-        `Created agent ${snapshot.id} (${snapshot.provider})`,
-      );
+      return { status: "created" };
     } catch (error) {
       await this.createAgentLifecycleDispatch.cleanupCreatedWorktreeAfterFailedAgentCreate({
         createdWorktree: createdWorktreeForCleanup,
@@ -3180,17 +3456,12 @@ export class Session {
       });
       const wireError = toWorktreeWireError(error);
       this.sessionLogger.error({ err: error }, "Failed to create agent");
-      if (requestId) {
-        this.emit({
-          type: "status",
-          payload: {
-            status: "agent_create_failed",
-            requestId,
-            error: wireError.message,
-            errorCode: wireError.code,
-          },
-        });
-      }
+      const outcome: AgentCreateRequestOutcome = {
+        status: "failed",
+        error: wireError.message,
+        errorCode: wireError.code,
+      };
+      this.emitCreateAgentRequestOutcome(requestId, outcome);
       this.emit({
         type: "activity_log",
         payload: {
@@ -3200,6 +3471,7 @@ export class Session {
           content: `Failed to create agent: ${wireError.message}`,
         },
       });
+      return outcome;
     }
   }
 
@@ -6557,6 +6829,8 @@ export class Session {
       this.unsubscribeAgentEvents();
       this.unsubscribeAgentEvents = null;
     }
+    this.agentOutboundVisibilityGates.clear();
+    this.agentOutboundTails.clear();
     this.unsubscribeProjectMutations?.();
     this.unsubscribeProjectMutations = null;
     this.unsubscribeWorkspaceMutations?.();

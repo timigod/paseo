@@ -133,6 +133,7 @@ interface SessionTestAccess {
     upsert(record: unknown): Promise<unknown>;
   };
   agentUpdates: AgentUpdatesService;
+  agentOutboundVisibilityGates: Map<string, unknown>;
   workspaceUpdatesSubscription: unknown;
   interruptAgentIfRunning(agentId: string): unknown;
   reconcileWorkspaceRecord(workspaceId: string): Promise<{
@@ -176,6 +177,25 @@ interface SessionTestAccess {
   filesystem: {
     isDirectory(cwd: string): Promise<boolean>;
   };
+  createAgentLifecycleDispatch: {
+    createWorktreeForRequest(input: unknown): Promise<unknown>;
+    registerAutoArchiveIfRequested(input: unknown): void;
+    cleanupCreatedWorktreeAfterFailedAgentCreate(input: unknown): Promise<void>;
+  };
+  workspaceProvisioning: {
+    resolveOrCreateWorkspaceIdForCreateAgent(input: unknown): Promise<string>;
+  };
+  buildAgentSessionConfig(
+    config: AgentSessionConfig,
+    gitOptions?: unknown,
+    legacyWorktreeName?: string,
+    firstAgentContext?: unknown,
+  ): Promise<{ sessionConfig: AgentSessionConfig }>;
+  buildAgentPayload(agent: {
+    id: string;
+    lifecycle: string;
+    [key: string]: unknown;
+  }): Promise<AgentSnapshotPayload>;
 }
 
 interface ListFetchResult {
@@ -529,6 +549,301 @@ class CreateAgentTestClient implements AgentClient {
   }
 }
 
+class InitialPromptEventTestClient extends CreateAgentTestClient {
+  createSessionCallCount = 0;
+  startTurnCallCount = 0;
+
+  constructor(private readonly beforeCreateSession?: () => Promise<void>) {
+    super();
+  }
+
+  override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+    await this.beforeCreateSession?.();
+    this.createSessionCallCount += 1;
+    const recordStartTurn = () => {
+      this.startTurnCallCount += 1;
+    };
+    return new (class extends CreateAgentTestSession {
+      private listener: ((event: AgentStreamEvent) => void) | null = null;
+
+      override subscribe(callback: (event: AgentStreamEvent) => void): () => void {
+        this.listener = callback;
+        callback({
+          type: "thread_started",
+          provider: "codex",
+          sessionId: "sync-thread-initial-order",
+        });
+        callback({
+          type: "provider_subagent",
+          provider: "codex",
+          event: {
+            type: "upsert",
+            id: "provider-child-sync-order",
+            title: "Synchronous child",
+            status: "running",
+          },
+        });
+        return () => {
+          this.listener = null;
+        };
+      }
+
+      override async startTurn(): Promise<{ turnId: string }> {
+        recordStartTurn();
+        const turnId = "turn-initial-order";
+        this.listener?.({ type: "turn_started", provider: "codex", turnId });
+        this.listener?.({
+          type: "timeline",
+          provider: "codex",
+          turnId,
+          item: { type: "assistant_message", text: "initial timeline output" },
+        });
+        this.listener?.({
+          type: "permission_requested",
+          provider: "codex",
+          turnId,
+          request: {
+            id: "permission-initial-order",
+            provider: "codex",
+            name: "shell",
+            kind: "tool",
+          },
+        });
+        this.listener?.({
+          type: "provider_subagent",
+          provider: "codex",
+          event: {
+            type: "upsert",
+            id: "provider-child-initial-order",
+            title: "Initial child",
+            status: "running",
+          },
+        });
+        this.listener?.({ type: "turn_completed", provider: "codex", turnId });
+        return { turnId };
+      }
+    })(config);
+  }
+}
+
+class InstalledHangingCloseTestClient extends CreateAgentTestClient {
+  private readonly subscriptionStarted: Promise<void>;
+  private readonly closeStarted: Promise<void>;
+  private resolveSubscriptionStarted: () => void = () => {};
+  private resolveCloseStarted: () => void = () => {};
+  private readonly neverClose = new Promise<void>(() => undefined);
+  createSessionCallCount = 0;
+  closeCallCount = 0;
+  startTurnCallCount = 0;
+  closeSettled = false;
+
+  constructor() {
+    super();
+    this.subscriptionStarted = new Promise<void>((resolve) => {
+      this.resolveSubscriptionStarted = resolve;
+    });
+    this.closeStarted = new Promise<void>((resolve) => {
+      this.resolveCloseStarted = resolve;
+    });
+  }
+
+  override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+    this.createSessionCallCount += 1;
+    const signalSubscriptionStarted = () => this.resolveSubscriptionStarted();
+    const signalCloseStarted = () => this.resolveCloseStarted();
+    const recordCloseCall = () => {
+      this.closeCallCount += 1;
+    };
+    const recordStartTurn = () => {
+      this.startTurnCallCount += 1;
+    };
+    const waitForever = () => this.neverClose;
+    const markCloseSettled = () => {
+      this.closeSettled = true;
+    };
+    return new (class extends CreateAgentTestSession {
+      override subscribe(callback: (event: AgentStreamEvent) => void): () => void {
+        const unsubscribe = super.subscribe(callback);
+        signalSubscriptionStarted();
+        return unsubscribe;
+      }
+
+      override async startTurn(): Promise<{ turnId: string }> {
+        recordStartTurn();
+        return await super.startTurn();
+      }
+
+      override async close(): Promise<void> {
+        recordCloseCall();
+        signalCloseStarted();
+        await waitForever();
+        markCloseSettled();
+      }
+    })(config);
+  }
+
+  waitForSubscription(): Promise<void> {
+    return this.subscriptionStarted;
+  }
+
+  waitForCloseStart(): Promise<void> {
+    return this.closeStarted;
+  }
+}
+
+function createDurableCreateAgentHarness(options: {
+  workdir: string;
+  cwd: string;
+  client: AgentClient;
+  agentStorage?: AgentStorage;
+  agentManager?: AgentManager;
+  clientCapabilities?: Record<string, unknown>;
+  onMessage?: (message: SessionOutboundMessage) => void;
+}): {
+  session: TestSession;
+  agentManager: AgentManager;
+  agentStorage: AgentStorage;
+  emitted: SessionOutboundMessage[];
+} {
+  const logger = {
+    child: () => logger,
+    trace: vi.fn(),
+    debug: vi.fn(),
+    info: vi.fn(),
+    warn: vi.fn(),
+    error: vi.fn(),
+  };
+  const agentStorage =
+    options.agentStorage ??
+    new AgentStorage(path.join(options.workdir, "agents"), asSessionLogger(logger));
+  const agentManager =
+    options.agentManager ??
+    new AgentManager({
+      clients: { codex: options.client },
+      registry: agentStorage,
+      logger: asSessionLogger(logger),
+    });
+  const projectRegistry = new FileBackedProjectRegistry(
+    path.join(options.workdir, "projects.json"),
+    asSessionLogger(logger),
+  );
+  const workspaceRegistry = new FileBackedWorkspaceRegistry(
+    path.join(options.workdir, "workspaces.json"),
+    asSessionLogger(logger),
+  );
+  const workspaceGitService = createNoopWorkspaceGitService({
+    getCheckout: async (checkoutCwd: string) => ({
+      cwd: checkoutCwd,
+      isGit: false,
+      currentBranch: null,
+      remoteUrl: null,
+      worktreeRoot: null,
+      isPaseoOwnedWorktree: false,
+      mainRepoRoot: null,
+    }),
+  });
+  const providerSnapshotManager = createProviderSnapshotManagerStub().manager;
+  const emitted: SessionOutboundMessage[] = [];
+  const session = asTestSession(
+    new Session({
+      clientId: "durable-create-test-client",
+      scopes: ["*"],
+      appVersion: null,
+      clientCapabilities: options.clientCapabilities ?? null,
+      onMessage: (message) => {
+        emitted.push(message);
+        options.onMessage?.(message);
+      },
+      logger: asSessionLogger(logger),
+      downloadTokenStore: asDownloadTokenStore(),
+      pushTokenStore: asPushTokenStore(),
+      paseoHome: path.join(options.workdir, "paseo-home"),
+      agentManager,
+      agentStorage,
+      projectRegistry,
+      workspaceRegistry,
+      filesystem: { isDirectory: async () => true },
+      chatService: asChatService(),
+      scheduleService: asScheduleService(),
+      loopService: asLoopService(),
+      checkoutDiffManager: asCheckoutDiffManager({
+        subscribe: async () => ({
+          initial: { cwd: options.cwd, files: [], error: null },
+          unsubscribe: () => {},
+        }),
+        scheduleRefreshForCwd: () => {},
+        onWorkspaceStateMayHaveChanged: () => {},
+        invalidateForge: () => {},
+        getMetrics: () => ({
+          checkoutDiffTargetCount: 0,
+          checkoutDiffSubscriptionCount: 0,
+          checkoutDiffWatcherCount: 0,
+          checkoutDiffFallbackRefreshTargetCount: 0,
+        }),
+        dispose: () => {},
+      }),
+      workspaceGitService,
+      workspaceAutoName: new WorkspaceAutoName({
+        agentManager,
+        workspaceRegistry,
+        workspaceGitService,
+        providerSnapshotManager,
+        readDaemonConfig: () => ({ metadataGeneration: { providers: [] } }),
+        gitMutation: { notifyGitMutation: async () => {} },
+        emitWorkspaceUpdateForCwd: async () => {},
+        emitWorkspaceUpdateForWorkspaceId: async () => {},
+        logger: asSessionLogger(logger),
+      }),
+      daemonConfigStore: asDaemonConfigStore({
+        get: () => ({ mcp: { injectIntoAgents: false }, providers: {} }),
+        onChange: () => () => {},
+      }),
+      mcpBaseUrl: null,
+      stt: null,
+      tts: null,
+      providerSnapshotManager,
+      providerUsageService: undefined as never,
+      terminalManager: null,
+    }),
+  );
+  return { session, agentManager, agentStorage, emitted };
+}
+
+function recordCreateVisibilityOrder(
+  order: string[],
+  requestId: string,
+  message: SessionOutboundMessage,
+): void {
+  if (
+    message.type === "status" &&
+    message.payload.status === "agent_created" &&
+    message.payload.requestId === requestId
+  ) {
+    order.push("agent_created");
+    return;
+  }
+  if (
+    message.type === "agent_stream" &&
+    ["thread_started", "turn_started", "timeline", "permission_requested"].includes(
+      message.payload.event.type,
+    )
+  ) {
+    order.push(`stream:${message.payload.event.type}`);
+    return;
+  }
+  if (message.type === "agent_update" && message.payload.kind === "upsert") {
+    order.push(`agent_update:${message.payload.agent.status}`);
+    return;
+  }
+  if (message.type === "agent_permission_request") {
+    order.push("permission_request");
+    return;
+  }
+  if (message.type === "agent.provider_subagents.update") {
+    order.push("provider_subagent");
+  }
+}
+
 function createSessionForWorkspaceTests(
   options: {
     appVersion?: string | null;
@@ -565,6 +880,7 @@ function createSessionForWorkspaceTests(
     unarchiveSnapshot: async () => true,
     clearAgentAttention: async () => {},
     notifyAgentState: () => {},
+    claimCreateRequest: () => ({ kind: "owner", finish: () => {} }),
   });
   const workspaceRegistry: SessionOptions["workspaceRegistry"] = options.workspaceRegistry ?? {
     initialize: async () => {},
@@ -881,6 +1197,76 @@ test("create_agent_request keeps requested child cwd when grouped under an exist
       agent: { cwd: child },
     });
   } finally {
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("concurrent create requests acknowledge each session before forwarding the shared agent", async () => {
+  const workdir = mkdtempSync(path.join(tmpdir(), "paseo-create-agent-ack-"));
+  let allowCreate!: () => void;
+  const createAllowed = new Promise<void>((resolve) => {
+    allowCreate = resolve;
+  });
+  let markCreateStarted!: () => void;
+  const createStarted = new Promise<void>((resolve) => {
+    markCreateStarted = resolve;
+  });
+  const client = new InitialPromptEventTestClient(async () => {
+    markCreateStarted();
+    await createAllowed;
+  });
+  const ownerOrder: string[] = [];
+  const followerOrder: string[] = [];
+  const owner = createDurableCreateAgentHarness({
+    workdir,
+    cwd: workdir,
+    client,
+    onMessage: (message) => recordCreateVisibilityOrder(ownerOrder, "req-create-owner", message),
+  });
+  const follower = createDurableCreateAgentHarness({
+    workdir,
+    cwd: workdir,
+    client,
+    agentManager: owner.agentManager,
+    agentStorage: owner.agentStorage,
+    onMessage: (message) => recordCreateVisibilityOrder(followerOrder, "req-create-owner", message),
+  });
+
+  try {
+    const request = {
+      type: "create_agent_request" as const,
+      requestId: "req-create-owner",
+      config: { provider: "codex", cwd: workdir },
+      initialPrompt: "Start the task",
+      attachments: [],
+    };
+
+    const ownerRequest = owner.session.handleMessage(request);
+    await createStarted;
+    const followerRequest = follower.session.handleMessage(request);
+    expect(owner.agentManager.listAgents()).toEqual([]);
+
+    allowCreate();
+    await Promise.all([ownerRequest, followerRequest]);
+
+    await vi.waitFor(() => {
+      for (const order of [ownerOrder, followerOrder]) {
+        expect(order).toContain("stream:thread_started");
+        expect(order).toContain("stream:turn_started");
+      }
+    });
+    for (const order of [ownerOrder, followerOrder]) {
+      expect(order[0]).toBe("agent_created");
+      expect(order).toContain("stream:thread_started");
+      expect(order).toContain("stream:turn_started");
+    }
+    expect(client.createSessionCallCount).toBe(1);
+    expect(owner.agentManager.listAgents()).toHaveLength(1);
+  } finally {
+    allowCreate();
+    await Promise.allSettled(
+      owner.agentManager.listAgents().map((agent) => owner.agentManager.closeAgent(agent.id)),
+    );
     rmSync(workdir, { recursive: true, force: true });
   }
 });
@@ -8403,6 +8789,297 @@ test("workspace.create worktree source checks out a GitHub PR from githubPrNumbe
 
 // Worktree-source forwarding for action/refName/worktreeSlug is also covered
 // end-to-end against a daemon in workspace-create-worktree-source.e2e.test.ts.
+
+test("a follower Session buffers owner events until its replayed agent_created acknowledgement", async () => {
+  const workdir = mkdtempSync(path.join(tmpdir(), "paseo-create-follower-output-ordering-"));
+  const cwd = path.join(workdir, "repo");
+  mkdirSync(cwd, { recursive: true });
+  const requestId = "req-follower-output-order";
+  const ownerOrder: string[] = [];
+  const followerOrder: string[] = [];
+  const client = new InitialPromptEventTestClient();
+  const ownerHarness = createDurableCreateAgentHarness({
+    workdir,
+    cwd,
+    client,
+    clientCapabilities: { [CLIENT_CAPS.providerSubagents]: true },
+    onMessage: (message) => recordCreateVisibilityOrder(ownerOrder, requestId, message),
+  });
+  const followerHarness = createDurableCreateAgentHarness({
+    workdir,
+    cwd,
+    client,
+    agentStorage: ownerHarness.agentStorage,
+    agentManager: ownerHarness.agentManager,
+    clientCapabilities: { [CLIENT_CAPS.providerSubagents]: true },
+    onMessage: (message) => recordCreateVisibilityOrder(followerOrder, requestId, message),
+  });
+  const ownerSession = ownerHarness.session;
+  const followerSession = followerHarness.session;
+  const ownerProvision = vi.fn(async () => null);
+  const followerProvision = vi.fn(async () => null);
+  ownerSession.createAgentLifecycleDispatch.createWorktreeForRequest = ownerProvision;
+  followerSession.createAgentLifecycleDispatch.createWorktreeForRequest = followerProvision;
+  ownerSession.workspaceProvisioning.resolveOrCreateWorkspaceIdForCreateAgent = async () =>
+    "ws-follower-output-order";
+  ownerSession.buildAgentSessionConfig = async (config) => ({ sessionConfig: config });
+  const project = createPersistedProjectRecord({
+    projectId: "proj-follower-output-order",
+    rootPath: cwd,
+    kind: "non_git",
+    displayName: "repo",
+    createdAt: "2026-07-29T00:00:00.000Z",
+    updatedAt: "2026-07-29T00:00:00.000Z",
+  });
+  const workspace = createPersistedWorkspaceRecord({
+    workspaceId: "ws-follower-output-order",
+    projectId: project.projectId,
+    cwd,
+    kind: "directory",
+    displayName: "repo",
+    createdAt: "2026-07-29T00:00:00.000Z",
+    updatedAt: "2026-07-29T00:00:00.000Z",
+  });
+  for (const session of [ownerSession, followerSession]) {
+    await session.projectRegistry.upsert(project);
+    await session.workspaceRegistry.upsert(workspace);
+  }
+  activateAgentUpdatesSubscription(ownerSession, "sub-owner-follower-output-order", {});
+  activateAgentUpdatesSubscription(followerSession, "sub-follower-output-order", {});
+  const originalOwnerBuildAgentPayload = ownerSession.buildAgentPayload.bind(ownerSession);
+  let releaseOwnerAcknowledgement!: () => void;
+  const ownerAcknowledgementGate = new Promise<void>((resolve) => {
+    releaseOwnerAcknowledgement = resolve;
+  });
+  ownerSession.buildAgentPayload = async (agent) => {
+    await ownerAcknowledgementGate;
+    return await originalOwnerBuildAgentPayload(agent);
+  };
+  const request = {
+    type: "create_agent_request" as const,
+    requestId,
+    config: { provider: "codex", cwd },
+    initialPrompt: "start the follower-visible eventful turn",
+    attachments: [],
+  };
+
+  try {
+    const ownerCreating = ownerSession.handleMessage(request);
+    const followerCreating = followerSession.handleMessage({ ...request });
+    await vi.waitFor(() => {
+      expect(ownerHarness.agentManager.listAgents()[0]?.lifecycle).toBe("idle");
+    });
+    await waitForImmediate();
+
+    expect(client.startTurnCallCount).toBe(0);
+    expect(ownerOrder).toEqual([]);
+    expect(followerOrder).toEqual([]);
+    expect(ownerProvision).toHaveBeenCalledTimes(1);
+    expect(followerProvision).not.toHaveBeenCalled();
+
+    releaseOwnerAcknowledgement();
+    await Promise.all([ownerCreating, followerCreating]);
+    await vi.waitFor(() => {
+      expect(client.startTurnCallCount).toBe(1);
+      expect(ownerOrder).toEqual(
+        expect.arrayContaining([
+          "agent_created",
+          "stream:thread_started",
+          "stream:turn_started",
+          "stream:permission_requested",
+          "permission_request",
+          "provider_subagent",
+        ]),
+      );
+      expect(followerOrder).toEqual(
+        expect.arrayContaining([
+          "agent_created",
+          "stream:thread_started",
+          "stream:turn_started",
+          "stream:permission_requested",
+          "permission_request",
+          "provider_subagent",
+        ]),
+      );
+    });
+
+    for (const order of [ownerOrder, followerOrder]) {
+      expect(order[0]).toBe("agent_created");
+      for (const output of [
+        "stream:thread_started",
+        "stream:turn_started",
+        "stream:permission_requested",
+        "permission_request",
+        "provider_subagent",
+      ]) {
+        expect(order.indexOf(output)).toBeGreaterThan(0);
+      }
+      expect(order.findIndex((output) => output.startsWith("agent_update:"))).toBeGreaterThan(0);
+    }
+    expect(ownerSession.agentOutboundVisibilityGates.size).toBe(0);
+    expect(followerSession.agentOutboundVisibilityGates.size).toBe(0);
+  } finally {
+    releaseOwnerAcknowledgement();
+    ownerHarness.agentManager.prepareForShutdown();
+    await Promise.all(
+      ownerHarness.agentManager
+        .listAgents()
+        .map((agent) => ownerHarness.agentManager.closeAgent(agent.id)),
+    );
+    await ownerHarness.agentManager.flushForShutdown();
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("installed-session acknowledgement failure settles owner and follower before hanging close", async () => {
+  const workdir = mkdtempSync(path.join(tmpdir(), "paseo-create-installed-close-failure-"));
+  const cwd = path.join(workdir, "repo");
+  const worktreeCwd = path.join(workdir, "generated-worktree");
+  mkdirSync(cwd, { recursive: true });
+  mkdirSync(worktreeCwd, { recursive: true });
+  const client = new InstalledHangingCloseTestClient();
+  const agentStorage = new AgentStorage(
+    path.join(workdir, "agents"),
+    asSessionLogger(createTestLogger()),
+  );
+  const agentManager = new AgentManager({
+    clients: { codex: client },
+    registry: agentStorage,
+    logger: asSessionLogger(createTestLogger()),
+    rescueTimeouts: { createAcknowledgementCloseMs: 10 },
+  });
+  const ownerHarness = createDurableCreateAgentHarness({
+    workdir,
+    cwd,
+    client,
+    agentStorage,
+    agentManager,
+  });
+  const followerHarness = createDurableCreateAgentHarness({
+    workdir,
+    cwd,
+    client,
+    agentStorage,
+    agentManager,
+  });
+  const ownerSession = ownerHarness.session;
+  const followerSession = followerHarness.session;
+  const createdWorktree = {
+    worktree: {
+      branchName: "installed-close-failure",
+      worktreePath: worktreeCwd,
+    },
+    intent: {
+      action: "branch-off",
+      branchName: "installed-close-failure",
+    },
+    workspace: createPersistedWorkspaceRecord({
+      workspaceId: "ws-installed-close-failure",
+      projectId: "proj-installed-close-failure",
+      cwd: worktreeCwd,
+      kind: "local_checkout",
+      displayName: "installed-close-failure",
+      createdAt: "2026-07-29T00:00:00.000Z",
+      updatedAt: "2026-07-29T00:00:00.000Z",
+    }),
+    repoRoot: cwd,
+    created: true,
+  };
+  const ownerProvision = vi.fn(async () => createdWorktree);
+  const followerProvision = vi.fn(async () => createdWorktree);
+  const ownerCleanup = vi.fn(async (_input: unknown) => undefined);
+  const followerCleanup = vi.fn(async (_input: unknown) => undefined);
+  ownerSession.createAgentLifecycleDispatch.createWorktreeForRequest = ownerProvision;
+  followerSession.createAgentLifecycleDispatch.createWorktreeForRequest = followerProvision;
+  ownerSession.createAgentLifecycleDispatch.cleanupCreatedWorktreeAfterFailedAgentCreate =
+    ownerCleanup;
+  followerSession.createAgentLifecycleDispatch.cleanupCreatedWorktreeAfterFailedAgentCreate =
+    followerCleanup;
+  ownerSession.workspaceProvisioning.resolveOrCreateWorkspaceIdForCreateAgent = async () =>
+    "ws-installed-close-failure";
+  ownerSession.buildAgentSessionConfig = async (config) => ({ sessionConfig: config });
+  let createdAgentId: string | null = null;
+  ownerSession.buildAgentPayload = async (agent) => {
+    await client.waitForSubscription();
+    createdAgentId = agent.id;
+    throw new Error("installed acknowledgement projection failed");
+  };
+  const request = {
+    type: "create_agent_request" as const,
+    requestId: "req-installed-close-failure",
+    config: { provider: "codex", cwd },
+    initialPrompt: "never send this installed-session prompt",
+    attachments: [],
+    worktree: {
+      mode: "branch-off" as const,
+      newBranch: "installed-close-failure",
+      base: "main",
+    },
+  };
+
+  try {
+    const ownerCreating = ownerSession.handleMessage(request);
+    const followerCreating = followerSession.handleMessage({ ...request });
+    await expect(Promise.all([ownerCreating, followerCreating])).resolves.toEqual([
+      undefined,
+      undefined,
+    ]);
+    await client.waitForCloseStart();
+
+    expect(createdAgentId).toEqual(expect.any(String));
+    if (!createdAgentId) {
+      throw new Error("Expected installed agent acknowledgement to receive an agent id");
+    }
+    expect(ownerProvision).toHaveBeenCalledTimes(1);
+    expect(followerProvision).not.toHaveBeenCalled();
+    expect(ownerCleanup).toHaveBeenCalledWith({
+      createdWorktree,
+      createdAgentId: null,
+    });
+    expect(followerCleanup).not.toHaveBeenCalled();
+    expect(client.createSessionCallCount).toBe(1);
+    expect(client.closeCallCount).toBe(1);
+    expect(client.closeSettled).toBe(false);
+    expect(client.startTurnCallCount).toBe(0);
+    expect(agentManager.listAgents()).toEqual([]);
+    expect(agentManager.getAgent(createdAgentId)).toBeNull();
+    expect(await agentStorage.get(createdAgentId)).toBeNull();
+    expect(ownerSession.agentOutboundVisibilityGates.size).toBe(0);
+    expect(followerSession.agentOutboundVisibilityGates.size).toBe(0);
+    expect(filterByType(ownerHarness.emitted, "agent_stream")).toEqual([]);
+    expect(filterByType(followerHarness.emitted, "agent_stream")).toEqual([]);
+    expect(filterByType(ownerHarness.emitted, "status").map((message) => message.payload)).toEqual([
+      expect.objectContaining({
+        status: "agent_create_failed",
+        requestId: request.requestId,
+        error: "installed acknowledgement projection failed",
+      }),
+    ]);
+    expect(
+      filterByType(followerHarness.emitted, "status").map((message) => message.payload),
+    ).toEqual([
+      expect.objectContaining({
+        status: "agent_create_failed",
+        requestId: request.requestId,
+        error: "installed acknowledgement projection failed",
+      }),
+    ]);
+
+    await followerSession.handleMessage({ ...request });
+    expect(followerProvision).not.toHaveBeenCalled();
+    expect(client.createSessionCallCount).toBe(1);
+    expect(client.closeCallCount).toBe(1);
+
+    agentManager.prepareForShutdown();
+    await agentManager.flushForShutdown();
+    expect(client.closeSettled).toBe(false);
+  } finally {
+    agentManager.prepareForShutdown();
+    await Promise.all(agentManager.listAgents().map((agent) => agentManager.closeAgent(agent.id)));
+    await agentManager.flushForShutdown();
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
 
 test("failed local create_agent_request does not schedule workspace title generation", async () => {
   vi.useFakeTimers();

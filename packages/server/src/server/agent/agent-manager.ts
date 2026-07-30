@@ -76,6 +76,8 @@ import {
 
 const RELOAD_SESSION_CLOSE_TIMEOUT_MS = 3_000;
 const INTERRUPT_SESSION_TIMEOUT_MS = 2_000;
+const CREATE_ACKNOWLEDGEMENT_CLOSE_TIMEOUT_MS = 3_000;
+const COMPLETED_CREATE_REQUEST_CLAIM_CACHE_MAX_ENTRIES = 256;
 const STORED_AGENT_CAPABILITIES: AgentCapabilityFlags = {
   supportsStreaming: false,
   supportsSessionPersistence: true,
@@ -218,6 +220,22 @@ export interface ProviderAvailability {
 interface AgentManagerRescueTimeouts {
   reloadSessionCloseMs?: number;
   interruptSessionMs?: number;
+  createAcknowledgementCloseMs?: number;
+}
+
+function resolveAgentManagerRescueTimeouts(
+  configured: AgentManagerRescueTimeouts | undefined,
+): Required<AgentManagerRescueTimeouts> {
+  return {
+    reloadSessionCloseMs: configured?.reloadSessionCloseMs ?? RELOAD_SESSION_CLOSE_TIMEOUT_MS,
+    interruptSessionMs: configured?.interruptSessionMs ?? INTERRUPT_SESSION_TIMEOUT_MS,
+    createAcknowledgementCloseMs:
+      configured?.createAcknowledgementCloseMs ?? CREATE_ACKNOWLEDGEMENT_CLOSE_TIMEOUT_MS,
+  };
+}
+
+function resolveCreateRequestClaimCacheMaxEntries(configured: number | undefined): number {
+  return Math.max(0, Math.trunc(configured ?? COMPLETED_CREATE_REQUEST_CLAIM_CACHE_MAX_ENTRIES));
 }
 
 interface ProviderEnabledFlag {
@@ -236,6 +254,32 @@ export interface CreateAgentOptions {
   // undefined is an explicit decision: the agent never appears in the sidebar.
   workspaceId: string | undefined;
   owner?: AgentOwner;
+  createRequestFingerprint?: string;
+}
+
+export interface AgentCreateRequestOutcome {
+  status: "created" | "failed";
+  error?: string;
+  errorCode?: string;
+}
+
+export type AgentCreateRequestClaim =
+  | {
+      kind: "owner";
+      finish: (outcome: AgentCreateRequestOutcome) => void;
+    }
+  | {
+      kind: "follower";
+      outcome: Promise<AgentCreateRequestOutcome>;
+    }
+  | {
+      kind: "mismatch";
+    };
+
+interface CreateRequestClaimEntry {
+  fingerprint: string;
+  outcome: Promise<AgentCreateRequestOutcome>;
+  settled: boolean;
 }
 
 export interface AgentManagerOptions {
@@ -253,6 +297,7 @@ export interface AgentManagerOptions {
   paseoToolCatalogFactory?: PaseoToolCatalogFactory;
   appendSystemPrompt?: string;
   agentStreamCoalesceWindowMs?: number;
+  createRequestClaimCacheMaxEntries?: number;
   rescueTimeouts?: AgentManagerRescueTimeouts;
   logger: Logger;
 }
@@ -311,6 +356,7 @@ interface ManagedAgentBase {
    */
   workspaceId?: string;
   owner?: AgentOwner;
+  createRequestFingerprint?: string;
   capabilities: AgentCapabilityFlags;
   config: AgentSessionConfig;
   runtimeInfo?: AgentRuntimeInfo;
@@ -591,6 +637,8 @@ export class AgentManager {
     string,
     { result: Promise<void>; lifecycleTail: Promise<void> }
   >();
+  private readonly createRequestClaims = new Map<string, CreateRequestClaimEntry>();
+  private readonly createRequestClaimCacheMaxEntries: number;
   private readonly agentStreamCoalescer: AgentStreamCoalescer;
   private mcpBaseUrl: string | null;
   private readonly mcpAuthToken: string | null;
@@ -615,12 +663,10 @@ export class AgentManager {
     this.configurePaseoTools(options);
     this.appendSystemPrompt = options.appendSystemPrompt ?? "";
     this.logger = options.logger.child({ module: "agent", component: "agent-manager" });
-    this.rescueTimeouts = {
-      reloadSessionCloseMs:
-        options.rescueTimeouts?.reloadSessionCloseMs ?? RELOAD_SESSION_CLOSE_TIMEOUT_MS,
-      interruptSessionMs:
-        options.rescueTimeouts?.interruptSessionMs ?? INTERRUPT_SESSION_TIMEOUT_MS,
-    };
+    this.createRequestClaimCacheMaxEntries = resolveCreateRequestClaimCacheMaxEntries(
+      options.createRequestClaimCacheMaxEntries,
+    );
+    this.rescueTimeouts = resolveAgentManagerRescueTimeouts(options.rescueTimeouts);
     this.agentStreamCoalescer = new AgentStreamCoalescer({
       windowMs: options.agentStreamCoalesceWindowMs ?? AGENT_STREAM_COALESCE_DEFAULT_WINDOW_MS,
       timers: { setTimeout, clearTimeout },
@@ -681,6 +727,64 @@ export class AgentManager {
 
   prepareForShutdown(): void {
     this.acceptingAgentRegistrations = false;
+  }
+
+  claimCreateRequest(agentId: string, fingerprint: string): AgentCreateRequestClaim {
+    const existing = this.createRequestClaims.get(agentId);
+    if (existing) {
+      return existing.fingerprint === fingerprint
+        ? { kind: "follower", outcome: existing.outcome }
+        : { kind: "mismatch" };
+    }
+
+    let resolveOutcome!: (outcome: AgentCreateRequestOutcome) => void;
+    const outcome = new Promise<AgentCreateRequestOutcome>((resolvePromise) => {
+      resolveOutcome = resolvePromise;
+    });
+    const entry: CreateRequestClaimEntry = {
+      fingerprint,
+      outcome,
+      settled: false,
+    };
+    const finish = (result: AgentCreateRequestOutcome): void => {
+      if (entry.settled) {
+        return;
+      }
+      entry.settled = true;
+      resolveOutcome(result);
+      if (this.createRequestClaims.get(agentId) !== entry) {
+        return;
+      }
+      this.createRequestClaims.delete(agentId);
+      if (result.status === "failed") {
+        this.createRequestClaims.set(agentId, entry);
+        this.trimCompletedCreateRequestClaims();
+      }
+    };
+    this.createRequestClaims.set(agentId, entry);
+    return { kind: "owner", finish };
+  }
+
+  private trimCompletedCreateRequestClaims(): void {
+    let completedCount = 0;
+    for (const entry of this.createRequestClaims.values()) {
+      if (entry.settled) {
+        completedCount += 1;
+      }
+    }
+    if (completedCount <= this.createRequestClaimCacheMaxEntries) {
+      return;
+    }
+    for (const [agentId, entry] of this.createRequestClaims) {
+      if (!entry.settled) {
+        continue;
+      }
+      this.createRequestClaims.delete(agentId);
+      completedCount -= 1;
+      if (completedCount <= this.createRequestClaimCacheMaxEntries) {
+        return;
+      }
+    }
   }
 
   setPaseoToolsEnabled(enabled: boolean): void {
@@ -1060,6 +1164,7 @@ export class AgentManager {
       initialTitle: options.initialTitle,
       workspaceId: options.workspaceId,
       owner: options.owner,
+      createRequestFingerprint: options.createRequestFingerprint,
     });
   }
 
@@ -1084,6 +1189,7 @@ export class AgentManager {
       labels?: Record<string, string>;
       workspaceId?: string;
       owner?: AgentOwner;
+      createRequestFingerprint?: string;
     },
     resumeOptions?: AgentResumeSessionOptions,
   ): Promise<ManagedAgent> {
@@ -1103,6 +1209,7 @@ export class AgentManager {
       labels?: Record<string, string>;
       workspaceId?: string;
       owner?: AgentOwner;
+      createRequestFingerprint?: string;
     },
     resumeOptions?: AgentResumeSessionOptions,
   ): Promise<ManagedAgent> {
@@ -1294,6 +1401,7 @@ export class AgentManager {
         labels: existing.labels,
         workspaceId: existing.workspaceId,
         owner: existing.owner,
+        createRequestFingerprint: existing.createRequestFingerprint,
         createdAt: existing.createdAt,
         updatedAt: existing.updatedAt,
         lastUserMessageAt: existing.lastUserMessageAt,
@@ -1383,6 +1491,55 @@ export class AgentManager {
     };
     void close.then(clearClose, clearClose);
     return close;
+  }
+
+  async abortCreatedAgentBeforeAcknowledgement(agentId: string, error: unknown): Promise<void> {
+    const detached = { session: null as AgentSession | null };
+
+    try {
+      await this.queueAgentLifecycleHandoff(agentId, async () => {
+        const agent = this.agents.get(agentId);
+        detached.session = agent?.session ?? null;
+        if (agent) {
+          this.prepareAgentForClosure(agent, "agent creation acknowledgement failed");
+        }
+        await this.deleteAgentState(agentId);
+        if (this.registry) {
+          await this.registry.remove(agentId);
+        }
+      });
+    } finally {
+      if (detached.session) {
+        this.trackCreateAcknowledgementClose(agentId, detached.session);
+      }
+    }
+
+    this.logger.warn(
+      { err: error, agentId },
+      "Aborted agent creation after acknowledgement failure",
+    );
+  }
+
+  private trackCreateAcknowledgementClose(agentId: string, session: AgentSession): void {
+    const cleanup = this.waitWithTimeout({
+      operation: this.closeUnregisteredSession(session),
+      timeoutMs: this.rescueTimeouts.createAcknowledgementCloseMs,
+      onLateError: (closeError) => {
+        this.logger.warn(
+          { err: closeError, agentId },
+          "Late provider session close failed after create acknowledgement failure",
+        );
+      },
+    }).then((result) => {
+      if (result === "timed_out") {
+        this.logger.warn(
+          { agentId, timeoutMs: this.rescueTimeouts.createAcknowledgementCloseMs },
+          "Timed out closing provider session after create acknowledgement failure",
+        );
+      }
+      return undefined;
+    });
+    void this.trackAgentRegistrationOperation(cleanup);
   }
 
   private async closeAgentRuntime(agentId: string): Promise<void> {
@@ -1584,6 +1741,7 @@ export class AgentManager {
         cwd: record.cwd,
         workspaceId: record.workspaceId,
         owner: record.owner,
+        createRequestFingerprint: record.createRequestFingerprint,
         session: null,
         capabilities: STORED_AGENT_CAPABILITIES,
         config: buildStoredAgentConfig(record),
@@ -2801,6 +2959,7 @@ export class AgentManager {
       publishWhenReady?: boolean;
       workspaceId?: string;
       owner?: AgentOwner;
+      createRequestFingerprint?: string;
     },
   ): Promise<ManagedAgent> {
     let registered = false;
@@ -2940,6 +3099,7 @@ export class AgentManager {
           persistence?: AgentPersistenceHandle;
           workspaceId?: string;
           owner?: AgentOwner;
+          createRequestFingerprint?: string;
         }
       | undefined;
   }): ActiveManagedAgent {
@@ -2950,6 +3110,7 @@ export class AgentManager {
       cwd: config.cwd,
       workspaceId: options?.workspaceId,
       owner: options?.owner,
+      createRequestFingerprint: options?.createRequestFingerprint,
       session,
       capabilities: session.capabilities,
       config,

@@ -55,6 +55,8 @@ export type EnsureWorkspaceForCreate = (
 
 export interface CreateAgentFromSessionInput {
   kind: "session";
+  agentId?: string;
+  createRequestFingerprint?: string;
   config: AgentSessionConfig;
   workspaceId: string;
   worktreeName?: string;
@@ -129,6 +131,13 @@ export interface CreateAgentCommandResult {
   createdWorktree?: CreatePaseoWorktreeWorkflowResult;
 }
 
+export interface CreateAgentCommandHandle {
+  snapshot: ManagedAgent;
+  completion: Promise<CreateAgentCommandResult>;
+  releaseAfterAcknowledgement: () => void;
+  abortBeforeAcknowledgement: (error: unknown) => Promise<void>;
+}
+
 export type BoundCreateAgentCommand = (
   input: CreateAgentCommandInput,
 ) => Promise<CreateAgentCommandResult>;
@@ -174,17 +183,78 @@ export async function createAgentCommand(
   dependencies: CreateAgentCommandDependencies,
   input: CreateAgentCommandInput,
 ): Promise<CreateAgentCommandResult> {
-  const resolved =
-    input.kind === "session"
-      ? await resolveSessionCreateAgent(dependencies, input)
-      : await resolveMcpCreateAgent(dependencies, input);
+  const resolved = await resolveCreateAgentCommand(dependencies, input);
 
   const snapshot = await dependencies.agentManager.createAgent(
     resolved.config,
-    undefined,
+    input.kind === "session" ? input.agentId : undefined,
     resolved.createOptions,
   );
+  return await completeCreateAgentCommand(dependencies, input, resolved, snapshot);
+}
 
+export async function beginCreateAgentCommand(
+  dependencies: CreateAgentCommandDependencies,
+  input: CreateAgentFromSessionInput,
+): Promise<CreateAgentCommandHandle> {
+  const resolved = await resolveSessionCreateAgent(dependencies, input);
+  const snapshot = await dependencies.agentManager.createAgent(
+    resolved.config,
+    input.agentId,
+    resolved.createOptions,
+  );
+  let releaseContinuation!: () => void;
+  let rejectContinuation!: (error: unknown) => void;
+  let continuationDecided = false;
+  const acknowledgement = new Promise<void>((resolve, reject) => {
+    releaseContinuation = resolve;
+    rejectContinuation = reject;
+  });
+  const decideOnce = (decision: "continue" | "abort", error?: unknown): boolean => {
+    if (continuationDecided) {
+      return false;
+    }
+    continuationDecided = true;
+    if (decision === "continue") {
+      releaseContinuation();
+    } else {
+      rejectContinuation(error);
+    }
+    return true;
+  };
+
+  return {
+    snapshot,
+    completion: acknowledgement.then(async () => {
+      return await completeCreateAgentCommand(dependencies, input, resolved, snapshot);
+    }),
+    releaseAfterAcknowledgement: () => {
+      decideOnce("continue");
+    },
+    abortBeforeAcknowledgement: async (error) => {
+      if (!decideOnce("abort", error)) {
+        return;
+      }
+      await dependencies.agentManager.abortCreatedAgentBeforeAcknowledgement(snapshot.id, error);
+    },
+  };
+}
+
+async function resolveCreateAgentCommand(
+  dependencies: CreateAgentCommandDependencies,
+  input: CreateAgentCommandInput,
+): Promise<ResolvedCreateAgent> {
+  return input.kind === "session"
+    ? await resolveSessionCreateAgent(dependencies, input)
+    : await resolveMcpCreateAgent(dependencies, input);
+}
+
+async function completeCreateAgentCommand(
+  dependencies: CreateAgentCommandDependencies,
+  input: CreateAgentCommandInput,
+  resolved: ResolvedCreateAgent,
+  snapshot: ManagedAgent,
+): Promise<CreateAgentCommandResult> {
   resolved.setupContinuation?.startAfterAgentCreate({
     agentId: snapshot.id,
   });
@@ -283,6 +353,7 @@ async function resolveSessionCreateAgent(
       initialPrompt: trimmedPrompt,
       env: input.env,
       initialTitle: input.provisionalTitle,
+      createRequestFingerprint: input.createRequestFingerprint,
       // A legacy git/worktreeName worktree creates a fresh workspace, so the
       // agent belongs to that workspace, not the source one. createdWorkspaceId
       // is the freshly created worktree's workspace.

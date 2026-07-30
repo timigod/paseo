@@ -38,6 +38,7 @@ const STORED_AGENT_SCHEMA = z.object({
   provider: z.string(),
   cwd: z.string(),
   workspaceId: z.string().optional(),
+  createRequestFingerprint: z.string().optional(),
   createdAt: z.string(),
   updatedAt: z.string(),
   lastActivityAt: z.string().optional(),
