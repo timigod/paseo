@@ -205,6 +205,16 @@ export function createWorkspaceProvisioningService(deps: {
     const repoRoot = resolve(input.repoRoot);
     const cwd = resolve(input.cwd);
     const worktreeRoot = resolve(input.worktreeRoot);
+    const existingWorkspace = (await workspaceRegistry.list())
+      .filter((workspace) => !workspace.archivedAt && areEquivalentPaths(workspace.cwd, cwd))
+      .sort(
+        (left, right) =>
+          Date.parse(left.createdAt) - Date.parse(right.createdAt) ||
+          left.workspaceId.localeCompare(right.workspaceId),
+      )[0];
+    if (existingWorkspace) {
+      return existingWorkspace;
+    }
     const project = await resolveSourceProjectForWorktree({
       sourceCwd,
       projectId: input.projectId,

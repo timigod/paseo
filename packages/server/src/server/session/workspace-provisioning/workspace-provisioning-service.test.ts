@@ -350,6 +350,27 @@ test("does not unarchive either record when checkout refresh fails", async () =>
   expect(await workspaceRegistry.get(created.workspaceId)).toEqual(archivedWorkspace);
 });
 
+test("reuses an active workspace when a worktree create request is retried", async () => {
+  const repo = path.join(tmpDir, "repo");
+  const worktree = path.join(tmpDir, "worktree");
+  gitRoots.add(repo);
+
+  const input = {
+    sourceCwd: repo,
+    repoRoot: repo,
+    cwd: worktree,
+    worktreeRoot: worktree,
+    branch: "fix/retry-safe-worktree",
+    baseBranch: "main",
+  };
+
+  const first = await provisioning.createWorkspaceForWorktree(input);
+  const retry = await provisioning.createWorkspaceForWorktree(input);
+
+  expect(retry.workspaceId).toBe(first.workspaceId);
+  expect(await workspaceRegistry.list()).toEqual([first]);
+});
+
 test("resolveOrCreateWorkspaceIdForCreateAgent returns a created worktree's id without touching the registry", async () => {
   // The branch only reads workspace.workspaceId off the worktree result.
   const createdWorktree = {

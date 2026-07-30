@@ -1374,9 +1374,20 @@ export class Session {
       ) ?? null;
     this.unsubscribeWorkspaceMutations?.();
     this.unsubscribeWorkspaceMutations =
-      this.workspaceRegistry.subscribeToMutations?.((mutation) =>
-        this.enqueueRegistryMutation(() => this.handleWorkspaceMutation(mutation)),
-      ) ?? null;
+      this.workspaceRegistry.subscribeToMutations?.((mutation) => {
+        // Persisting a workspace is part of the command's durable success path.
+        // Observer setup and UI projection are deliberately asynchronous: a busy
+        // workspace observer queue must not hold a create/restore RPC open long
+        // enough for its caller to retry and create duplicate records.
+        void this.enqueueRegistryMutation(() => this.handleWorkspaceMutation(mutation)).catch(
+          (error) => {
+            this.sessionLogger.warn(
+              { err: error, workspaceId: mutation.workspaceId, mutationKind: mutation.kind },
+              "Failed to queue workspace mutation handling",
+            );
+          },
+        );
+      }) ?? null;
   }
 
   private enqueueRegistryMutation(handleMutation: () => Promise<void>): Promise<void> {

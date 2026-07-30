@@ -6973,8 +6973,7 @@ test("workspace mutation handling does not let a delayed upsert recreate an arch
     workspaceId: workspace.workspaceId,
     workspace,
   });
-  expect(upsertMutation).toBeDefined();
-  const upsertPromise = Promise.resolve(upsertMutation);
+  expect(upsertMutation).toBeUndefined();
   await describeStarted;
 
   const archivedWorkspace = { ...workspace, archivedAt: "2026-03-02T12:00:00.000Z" };
@@ -6990,11 +6989,11 @@ test("workspace mutation handling does not let a delayed upsert recreate an arch
   expect(unsubscribeCalls).toEqual([]);
 
   resumeDescribe();
-  await upsertPromise;
   await archivePromise;
-
-  expect(registerCalls).toEqual([REPO_CWD]);
-  expect(unsubscribeCalls).toEqual([REPO_CWD]);
+  await vi.waitFor(() => {
+    expect(registerCalls).toEqual([REPO_CWD]);
+    expect(unsubscribeCalls).toEqual([REPO_CWD]);
+  });
 });
 
 test("workspace mutations outside a filtered subscription neither watch nor emit", async () => {
@@ -7297,31 +7296,27 @@ test("workspace mutation handling drops queued observer sync after session clean
     };
   });
 
-  const firstMutationPromise = Promise.resolve(
-    mutationListener?.({
-      kind: "upsert",
-      workspaceId: firstWorkspace.workspaceId,
-      workspace: firstWorkspace,
-    }),
-  );
-  expect(firstMutationPromise).toBeDefined();
+  const firstMutation = mutationListener?.({
+    kind: "upsert",
+    workspaceId: firstWorkspace.workspaceId,
+    workspace: firstWorkspace,
+  });
+  expect(firstMutation).toBeUndefined();
   await firstEmitStarted;
 
-  const queuedMutationPromise = Promise.resolve(
-    mutationListener?.({
-      kind: "upsert",
-      workspaceId: queuedWorkspace.workspaceId,
-      workspace: queuedWorkspace,
-    }),
-  );
+  const queuedMutation = mutationListener?.({
+    kind: "upsert",
+    workspaceId: queuedWorkspace.workspaceId,
+    workspace: queuedWorkspace,
+  });
+  expect(queuedMutation).toBeUndefined();
 
   await session.cleanup();
   resumeFirstEmit();
-  await firstMutationPromise;
-  await queuedMutationPromise;
-
-  expect(registerCalls).toEqual([REPO_CWD]);
-  expect(unsubscribeCalls).toEqual([REPO_CWD]);
+  await vi.waitFor(() => {
+    expect(registerCalls).toEqual([REPO_CWD]);
+    expect(unsubscribeCalls).toEqual([REPO_CWD]);
+  });
 });
 
 test("a workspace leaving a filtered subscription after bootstrap emits a removal", async () => {
