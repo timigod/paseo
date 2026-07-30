@@ -64,6 +64,38 @@ releases the live runtime and writes `lastStatus: closed` on the still-active re
 
 `create_agent_request` can opt an agent into `autoArchive`. In that mode the daemon archives the agent after the first terminal turn event (`turn_completed`, `turn_failed`, or `turn_canceled`). When the agent owns an isolated workspace, auto-archive archives that workspace too; the managed worktree is removed when its final workspace reference is gone.
 
+### Fleet orchestration
+
+The canonical Plexer control surface is the `fleet` command group. Its source-owned topology
+contains the configured MacBook and iMac endpoints, source-root translation, per-host capacity,
+and the default OpenCode Plexer lane. The runtime-source convergence path keeps this topology
+identical on both hosts; credentials, running processes, and agent registries remain host-local.
+
+```sh
+paseo fleet doctor
+paseo fleet status
+paseo fleet run --new-workspace worktree "bounded task"
+paseo fleet finish <id>
+paseo fleet recover <id>
+```
+
+`fleet doctor` is read-only and names unreachable hosts, an unavailable OpenCode lane,
+over-capacity hosts, or differing reachable runtime versions. `fleet run` selects the
+least-loaded healthy host with a free slot and translates a cwd beneath a declared code root to
+that host's matching root. It defaults to `opencode` with
+`plexer-openai/gpt-5.6-terra` at `high` thinking. An explicit `--host macbook` or `--host imac`
+is a pin: it fails when ineligible rather than silently dispatching somewhere else. A command
+inside an existing agent or workspace stays on that agent's owning host so persisted state is
+never split across machines.
+
+`fleet recover` finds a persisted agent across the configured hosts and invokes the single
+daemon-owned reload path on its owner. It does not restart a daemon, invent a prompt replay, or
+replace an agent. `fleet finish` likewise locates the owner, archives only a terminal task, and
+releases its managed worktree only when there is no unrelated active agent inside it. A running
+task requires `--force`; shared and explicitly retained worktrees are preserved. For an actual
+one-shot task, `fleet run --auto-archive` opts into archive-on-terminal-turn. Do not use that
+option for a task expected to receive follow-ups.
+
 Archiving runs through `AgentManager.archiveAgent` (`packages/server/src/server/agent/agent-manager.ts`):
 
 1. Snapshot the current session into the registry

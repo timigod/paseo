@@ -92,6 +92,13 @@ describe("runRunCommand option validation", () => {
     await expectInvalidOptions({ newWorkspace: "container" }, /Unsupported new workspace kind/);
   });
 
+  it("rejects --auto-archive with structured output because structured runs can need retries", async () => {
+    await expectInvalidOptions(
+      { autoArchive: true, outputSchema: "{}" },
+      /--auto-archive cannot be used with --output-schema/,
+    );
+  });
+
   it("rejects two workspace creation flags", async () => {
     await expectInvalidOptions(
       { newWorkspace: "local", worktree: "legacy-slug" },

@@ -39,6 +39,10 @@ export function addRunOptions(cmd: Command): Command {
       )
       .option("--thinking <id>", "Thinking option ID to use for this run")
       .option("--mode <mode>", "Provider-specific mode (e.g., plan, default, bypass)")
+      .option(
+        "--auto-archive",
+        "Archive this one-shot task after its first terminal turn (including its Paseo-owned worktree)",
+      )
       .option("--new-workspace <local|worktree>", "Create a separate local or worktree workspace")
       .addOption(new Option("--worktree <name>", "Legacy workspace isolation alias").hideHelp())
       .option(
@@ -115,6 +119,7 @@ export interface AgentRunOptions extends CommandOptions {
   model?: string;
   thinking?: string;
   mode?: string;
+  autoArchive?: boolean;
   newWorkspace?: string;
   worktree?: string;
   worktreeMode?: string;
@@ -382,6 +387,15 @@ function validateRunOptions(prompt: string, options: AgentRunOptions, outputSche
     } satisfies CommandError;
   }
 
+  if (outputSchema && options.autoArchive) {
+    throw {
+      code: "INVALID_OPTIONS",
+      message: "--auto-archive cannot be used with --output-schema",
+      details:
+        "Structured output may need follow-up turns; finish it explicitly with paseo agent finish.",
+    } satisfies CommandError;
+  }
+
   validateRunWorkspaceOptions(options);
 
   if (outputSchema && runsInBackground(options)) {
@@ -638,6 +652,7 @@ export async function runRunCommand(
             thinkingOptionId,
             initialPrompt: structuredPrompt,
             outputSchema,
+            autoArchive: options.autoArchive,
             images,
             env: requestEnv,
             labels: Object.keys(labels).length > 0 ? labels : undefined,
@@ -708,6 +723,7 @@ export async function runRunCommand(
       model: resolvedProviderModel.model,
       thinkingOptionId,
       initialPrompt: prompt,
+      autoArchive: options.autoArchive,
       images,
       env: requestEnv,
       labels: Object.keys(labels).length > 0 ? labels : undefined,
