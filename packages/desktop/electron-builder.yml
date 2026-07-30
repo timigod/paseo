@@ -42,6 +42,8 @@ mac:
   extraResources:
     - from: bin/paseo
       to: bin/paseo
+    - from: bin/paseo-daemon-launcher
+      to: bin/paseo-daemon-launcher
   target:
     - dmg
     - zip
