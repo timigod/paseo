@@ -198,11 +198,12 @@ export async function beginCreateAgentCommand(
   input: CreateAgentFromSessionInput,
 ): Promise<CreateAgentCommandHandle> {
   const resolved = await resolveSessionCreateAgent(dependencies, input);
-  const snapshot = await dependencies.agentManager.createAgent(
+  const creation = await dependencies.agentManager.beginAgentCreation(
     resolved.config,
     input.agentId,
     resolved.createOptions,
   );
+  const snapshot = creation.snapshot;
   let releaseContinuation!: () => void;
   let rejectContinuation!: (error: unknown) => void;
   let continuationDecided = false;
@@ -225,9 +226,11 @@ export async function beginCreateAgentCommand(
 
   return {
     snapshot,
-    completion: acknowledgement.then(async () => {
-      return await completeCreateAgentCommand(dependencies, input, resolved, snapshot);
-    }),
+    completion: Promise.all([acknowledgement, creation.completion]).then(
+      async ([, liveSnapshot]) => {
+        return await completeCreateAgentCommand(dependencies, input, resolved, liveSnapshot);
+      },
+    ),
     releaseAfterAcknowledgement: () => {
       decideOnce("continue");
     },

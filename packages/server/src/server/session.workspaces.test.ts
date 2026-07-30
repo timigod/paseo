@@ -558,8 +558,8 @@ class InitialPromptEventTestClient extends CreateAgentTestClient {
   }
 
   override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
-    await this.beforeCreateSession?.();
     this.createSessionCallCount += 1;
+    await this.beforeCreateSession?.();
     const recordStartTurn = () => {
       this.startTurnCallCount += 1;
     };
@@ -1244,7 +1244,9 @@ test("concurrent create requests acknowledge each session before forwarding the 
     const ownerRequest = owner.session.handleMessage(request);
     await createStarted;
     const followerRequest = follower.session.handleMessage(request);
-    expect(owner.agentManager.listAgents()).toEqual([]);
+    expect(owner.agentManager.listAgents()).toMatchObject([
+      { lifecycle: "initializing", session: null },
+    ]);
 
     allowCreate();
     await Promise.all([ownerRequest, followerRequest]);
@@ -1262,6 +1264,83 @@ test("concurrent create requests acknowledge each session before forwarding the 
     }
     expect(client.createSessionCallCount).toBe(1);
     expect(owner.agentManager.listAgents()).toHaveLength(1);
+  } finally {
+    allowCreate();
+    await Promise.allSettled(
+      owner.agentManager.listAgents().map((agent) => owner.agentManager.closeAgent(agent.id)),
+    );
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("create retry survives owner disconnect while provider startup is still pending", async () => {
+  const workdir = mkdtempSync(path.join(tmpdir(), "paseo-create-agent-disconnect-retry-"));
+  let allowCreate!: () => void;
+  const createAllowed = new Promise<void>((resolve) => {
+    allowCreate = resolve;
+  });
+  let markCreateStarted!: () => void;
+  const createStarted = new Promise<void>((resolve) => {
+    markCreateStarted = resolve;
+  });
+  const client = new InitialPromptEventTestClient(async () => {
+    markCreateStarted();
+    await createAllowed;
+  });
+  const owner = createDurableCreateAgentHarness({ workdir, cwd: workdir, client });
+  const retry = createDurableCreateAgentHarness({
+    workdir,
+    cwd: workdir,
+    client,
+    agentManager: owner.agentManager,
+    agentStorage: owner.agentStorage,
+  });
+  const request = {
+    type: "create_agent_request" as const,
+    requestId: "req-create-disconnect-retry",
+    config: { provider: "codex", cwd: workdir },
+    attachments: [],
+  };
+
+  try {
+    const ownerRequest = owner.session.handleMessage(request);
+    await createStarted;
+    await owner.session.cleanup();
+
+    const retryRequest = retry.session.handleMessage(request);
+    await waitForImmediate();
+
+    const ownerCreated = filterByType(owner.emitted, "status").find(
+      (message) =>
+        message.payload.status === "agent_created" &&
+        message.payload.requestId === request.requestId,
+    );
+    const retryCreated = filterByType(retry.emitted, "status").find(
+      (message) =>
+        message.payload.status === "agent_created" &&
+        message.payload.requestId === request.requestId,
+    );
+    expect(ownerCreated?.payload).toMatchObject({
+      status: "agent_created",
+      agent: { status: "initializing" },
+    });
+    expect(retryCreated?.payload).toMatchObject({
+      status: "agent_created",
+      agentId: ownerCreated?.payload.agentId,
+      agent: { status: "initializing" },
+    });
+    expect(await owner.agentStorage.get(ownerCreated!.payload.agentId!)).toMatchObject({
+      lastStatus: "initializing",
+      persistence: null,
+    });
+    expect(client.createSessionCallCount).toBe(1);
+
+    allowCreate();
+    await Promise.all([ownerRequest, retryRequest]);
+    await vi.waitFor(() => {
+      expect(owner.agentManager.getAgent(ownerCreated!.payload.agentId!)?.lifecycle).toBe("idle");
+    });
+    expect(client.createSessionCallCount).toBe(1);
   } finally {
     allowCreate();
     await Promise.allSettled(
