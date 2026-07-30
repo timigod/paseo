@@ -53,7 +53,7 @@ test("does not fail an active OpenCode provider retry before the advertised retr
       req.resume();
       res.writeHead(503, {
         "content-type": "application/json",
-        "retry-after-ms": "15000",
+        "retry-after": "15",
       });
       res.end(
         JSON.stringify({
