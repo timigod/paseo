@@ -107,7 +107,7 @@ async function determineWorktreeDisposition(
   const agentsPayload = await client.fetchAgents({ filter: { includeArchived: true } });
   const agents = agentsPayload.entries.map((entry) => entry.agent);
   const byId = new Map(agents.map((entry) => [entry.id, entry]));
-  const worktreeResponse = await client.getPaseoWorktreeList({});
+  const worktreeResponse = await client.getPaseoWorktreeList({ cwd: agent.cwd });
   if (worktreeResponse.error) {
     throw {
       code: "WORKTREE_LIST_FAILED",
@@ -143,6 +143,25 @@ async function determineWorktreeDisposition(
     detail: `Archived agent and released Paseo worktree ${path.basename(worktree.worktreePath)}.`,
     path: worktree.worktreePath,
   };
+}
+
+async function archiveAgentOrConfirmArchived(
+  client: ConnectedDaemonClient,
+  agentId: string,
+): Promise<void> {
+  try {
+    await client.archiveAgent(agentId);
+    return;
+  } catch (archiveError) {
+    // A provider cancellation can finish the daemon-side archive just before
+    // its archive RPC resolves. Read the durable record before reporting that
+    // lifecycle race as a failure, so the owned worktree is still released.
+    const observed = await client.fetchAgent({ agentId }).catch(() => undefined);
+    if (observed?.agent.archivedAt) {
+      return;
+    }
+    throw archiveError;
+  }
 }
 
 export async function runFinishCommand(
@@ -184,7 +203,7 @@ export async function runFinishCommand(
     assertFinishable(agent, options.force === true);
     const disposition = await determineWorktreeDisposition(client, agent, options);
 
-    await client.archiveAgent(agent.id);
+    await archiveAgentOrConfirmArchived(client, agent.id);
     if (disposition.worktree === "released" && disposition.path) {
       const archived = await client.archivePaseoWorktree({
         worktreePath: disposition.path,

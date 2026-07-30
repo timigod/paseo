@@ -396,6 +396,15 @@ function validateRunOptions(prompt: string, options: AgentRunOptions, outputSche
     } satisfies CommandError;
   }
 
+  if (options.autoArchive && runsInBackground(options)) {
+    throw {
+      code: "INVALID_OPTIONS",
+      message: "--auto-archive cannot be used with --background",
+      details:
+        "Foreground completion lets Paseo archive the workspace it just created. Finish a background task explicitly with paseo agent finish.",
+    } satisfies CommandError;
+  }
+
   validateRunWorkspaceOptions(options);
 
   if (outputSchema && runsInBackground(options)) {
@@ -515,9 +524,10 @@ async function connectToDaemonOrThrow(
 // A workspace is the explicit home of a run: it owns the directory the agent
 // runs in. The CLI resolves one before creating any agent, so no run leans on
 // createAgent's legacy cwd->workspace fallback.
-interface RunWorkspace {
+export interface RunWorkspace {
   id?: string;
   cwd: string;
+  created: boolean;
 }
 
 export interface RunWorkspaceLookupClient {
@@ -537,7 +547,7 @@ export async function resolveExistingRunWorkspace(
   });
   const workspace = result.entries.find((entry) => entry.id === workspaceId);
   if (workspace) {
-    return { id: workspace.id, cwd: workspace.workspaceDirectory };
+    return { id: workspace.id, cwd: workspace.workspaceDirectory, created: false };
   }
 
   throw {
@@ -565,7 +575,7 @@ async function resolveRunWorkspace(
   }
 
   if (!newWorkspace && resolveRunCallerAgentId()) {
-    return { cwd };
+    return { cwd, created: false };
   }
 
   const ambientWorkspaceId = newWorkspace ? undefined : process.env.PASEO_WORKSPACE_ID?.trim();
@@ -592,7 +602,51 @@ async function resolveRunWorkspace(
   console.error(
     "Tip: pass --workspace <id> (or set PASEO_WORKSPACE_ID) to run in an existing workspace.",
   );
-  return { id: result.workspace.id, cwd: result.workspace.workspaceDirectory ?? cwd };
+  return {
+    id: result.workspace.id,
+    cwd: result.workspace.workspaceDirectory ?? cwd,
+    created: true,
+  };
+}
+
+export function shouldArchiveCreatedRunWorkspace(input: {
+  autoArchive: boolean | undefined;
+  workspace: RunWorkspace;
+  terminalStatus: AgentRunResult["status"];
+}): boolean {
+  return (
+    input.autoArchive === true &&
+    input.workspace.created &&
+    Boolean(input.workspace.id) &&
+    (input.terminalStatus === "completed" || input.terminalStatus === "error")
+  );
+}
+
+async function archiveCreatedRunWorkspaceIfNeeded(input: {
+  client: ConnectedDaemonClient;
+  autoArchive: boolean | undefined;
+  workspace: RunWorkspace;
+  terminalStatus: AgentRunResult["status"];
+}): Promise<void> {
+  if (
+    !shouldArchiveCreatedRunWorkspace({
+      autoArchive: input.autoArchive,
+      workspace: input.workspace,
+      terminalStatus: input.terminalStatus,
+    })
+  ) {
+    return;
+  }
+
+  try {
+    await input.client.archiveWorkspace(input.workspace.id!);
+  } catch (error) {
+    throw {
+      code: "AUTO_ARCHIVE_FAILED",
+      message: "Agent finished but its newly created workspace could not be archived",
+      details: error instanceof Error ? error.message : String(error),
+    } satisfies CommandError;
+  }
 }
 
 export async function runRunCommand(
@@ -635,6 +689,11 @@ export async function runRunCommand(
     const workspaceId = workspace.id;
     const callerAgentId = resolveRunCallerAgentId();
     const runCwd = workspace.cwd;
+    // AgentManager can auto-archive an agent it created directly, but this CLI
+    // has already minted a workspace. Keep that workspace ownership here so a
+    // one-shot run removes both records through archiveWorkspace after its
+    // terminal turn instead of leaking the managed worktree.
+    const daemonAutoArchive = options.autoArchive === true && !workspace.created;
 
     if (outputSchema) {
       let structuredAgent: AgentSnapshotPayload | null = null;
@@ -652,7 +711,7 @@ export async function runRunCommand(
             thinkingOptionId,
             initialPrompt: structuredPrompt,
             outputSchema,
-            autoArchive: options.autoArchive,
+            autoArchive: daemonAutoArchive,
             images,
             env: requestEnv,
             labels: Object.keys(labels).length > 0 ? labels : undefined,
@@ -723,7 +782,7 @@ export async function runRunCommand(
       model: resolvedProviderModel.model,
       thinkingOptionId,
       initialPrompt: prompt,
-      autoArchive: options.autoArchive,
+      autoArchive: daemonAutoArchive,
       images,
       env: requestEnv,
       labels: Object.keys(labels).length > 0 ? labels : undefined,
@@ -732,10 +791,15 @@ export async function runRunCommand(
     // Default run behavior is foreground: wait for completion unless background execution is set.
     if (!runsInBackground(options)) {
       const state = await client.waitForFinish(agent.id, waitTimeoutMs);
-      await client.close();
-
       const finalAgent = state.final ?? agent;
       const status: AgentRunResult["status"] = state.status === "idle" ? "completed" : state.status;
+      await archiveCreatedRunWorkspaceIfNeeded({
+        client,
+        autoArchive: options.autoArchive,
+        workspace,
+        terminalStatus: status,
+      });
+      await client.close();
 
       return {
         type: "single",

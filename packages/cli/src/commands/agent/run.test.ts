@@ -3,6 +3,7 @@ import {
   resolveExistingRunWorkspace,
   resolveRunCallerAgentId,
   runRunCommand,
+  shouldArchiveCreatedRunWorkspace,
   type AgentRunOptions,
 } from "./run";
 
@@ -26,6 +27,7 @@ describe("existing run workspace resolution", () => {
     await expect(resolveExistingRunWorkspace({ fetchWorkspaces }, "workspace-2")).resolves.toEqual({
       id: "workspace-2",
       cwd: "/workspace/two",
+      created: false,
     });
     expect(fetchWorkspaces).toHaveBeenCalledWith({
       filter: { query: "workspace-2" },
@@ -45,6 +47,32 @@ describe("existing run workspace resolution", () => {
         message: "Workspace not found: missing",
       },
     );
+  });
+});
+
+describe("one-shot workspace cleanup", () => {
+  it("archives only a terminal workspace that this run created", () => {
+    expect(
+      shouldArchiveCreatedRunWorkspace({
+        autoArchive: true,
+        workspace: { id: "workspace-1", cwd: "/workspace/one", created: true },
+        terminalStatus: "completed",
+      }),
+    ).toBe(true);
+    expect(
+      shouldArchiveCreatedRunWorkspace({
+        autoArchive: true,
+        workspace: { id: "workspace-1", cwd: "/workspace/one", created: false },
+        terminalStatus: "completed",
+      }),
+    ).toBe(false);
+    expect(
+      shouldArchiveCreatedRunWorkspace({
+        autoArchive: true,
+        workspace: { id: "workspace-1", cwd: "/workspace/one", created: true },
+        terminalStatus: "timeout",
+      }),
+    ).toBe(false);
   });
 });
 
@@ -96,6 +124,13 @@ describe("runRunCommand option validation", () => {
     await expectInvalidOptions(
       { autoArchive: true, outputSchema: "{}" },
       /--auto-archive cannot be used with --output-schema/,
+    );
+  });
+
+  it("rejects background auto-archive because the created workspace needs a terminal readback", async () => {
+    await expectInvalidOptions(
+      { autoArchive: true, background: true },
+      /--auto-archive cannot be used with --background/,
     );
   });
 

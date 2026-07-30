@@ -44,6 +44,9 @@ describe("runFinishCommand", () => {
       worktreePath: "/repo/.paseo/worktrees/task-a",
       scope: "worktree",
     });
+    expect(client.getPaseoWorktreeList).toHaveBeenCalledWith({
+      cwd: "/repo/.paseo/worktrees/task-a/src",
+    });
   });
 
   it("keeps a managed worktree when an unrelated active task shares it", async () => {
@@ -58,6 +61,27 @@ describe("runFinishCommand", () => {
 
     expect(result.data.worktree).toBe("kept");
     expect(client.archivePaseoWorktree).not.toHaveBeenCalled();
+  });
+
+  it("releases the worktree when the daemon archived the agent before returning an RPC error", async () => {
+    const { connectToDaemon } = await import("../../utils/client.js");
+    const archivedAgent = { ...agent, archivedAt: "2026-07-30T00:00:00.000Z" };
+    const client = installClient({
+      fetchAgent: vi
+        .fn()
+        .mockResolvedValueOnce({ agent })
+        .mockResolvedValueOnce({ agent: archivedAgent }),
+      archiveAgent: vi.fn().mockRejectedValue(new Error("handler_error")),
+    });
+    vi.mocked(connectToDaemon).mockResolvedValue(client as never);
+
+    const result = await runFinishCommand("agent-1", {}, {} as never);
+
+    expect(result.data).toMatchObject({ status: "finished", worktree: "released" });
+    expect(client.archivePaseoWorktree).toHaveBeenCalledWith({
+      worktreePath: "/repo/.paseo/worktrees/task-a",
+      scope: "worktree",
+    });
   });
 
   it("does not finish a running task without an explicit force flag", async () => {

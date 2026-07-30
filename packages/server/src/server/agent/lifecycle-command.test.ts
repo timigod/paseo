@@ -234,6 +234,28 @@ describe("agent lifecycle commands", () => {
     expect(manager.archivedAgentIds).toEqual(["agent-1"]);
   });
 
+  test("accepts an archive completed concurrently while provider cancellation settles", async () => {
+    const storage = new FakeLifecycleAgentStorage();
+    const manager = new FakeLifecycleAgentManager(storage);
+    manager.liveAgents.set("agent-1", managedAgent("agent-1", "running"));
+    storage.records.set("agent-1", storedAgent("agent-1"));
+    manager.archiveAgent = async (agentId: string) => {
+      manager.liveAgents.delete(agentId);
+      storage.records.set(agentId, {
+        ...storedAgent(agentId),
+        archivedAt: "2026-05-10T10:00:00.000Z",
+      });
+      throw new Error(`Unknown agent '${agentId}'`);
+    };
+
+    await expect(
+      archiveAgentCommand({ agentManager: manager, agentStorage: storage, logger }, "agent-1"),
+    ).resolves.toMatchObject({
+      agentId: "agent-1",
+      archivedAt: "2026-05-10T10:00:00.000Z",
+    });
+  });
+
   test("archives a stored agent when no live agent exists", async () => {
     const storage = new FakeLifecycleAgentStorage();
     const manager = new FakeLifecycleAgentManager(storage);

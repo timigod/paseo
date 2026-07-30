@@ -94,7 +94,12 @@ replace an agent. `fleet finish` likewise locates the owner, archives only a ter
 releases its managed worktree only when there is no unrelated active agent inside it. A running
 task requires `--force`; shared and explicitly retained worktrees are preserved. For an actual
 one-shot task, `fleet run --auto-archive` opts into archive-on-terminal-turn. Do not use that
-option for a task expected to receive follow-ups.
+option for a task expected to receive follow-ups. When the CLI created the worktree, the
+foreground CLI owns its terminal archive and reads back the archived agent before releasing that
+worktree; background auto-archive is rejected because it cannot make that ownership guarantee.
+Concurrent archive requests are idempotent: if another lifecycle path has already durably
+archived the agent while provider cancellation settles, the operation reports that completed
+state rather than failing or leaking the worktree.
 
 Archiving runs through `AgentManager.archiveAgent` (`packages/server/src/server/agent/agent-manager.ts`):
 

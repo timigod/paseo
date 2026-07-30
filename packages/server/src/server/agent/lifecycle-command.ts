@@ -124,7 +124,19 @@ export async function archiveAgentCommand(
   if (liveAgent) {
     await requestAgentRunCancellation(dependencies, agentId);
     await dependencies.agentManager.clearAgentAttention(agentId).catch(() => undefined);
-    await dependencies.agentManager.archiveAgent(agentId);
+    // Another lifecycle request can archive this agent while provider
+    // cancellation settles. Confirm the durable archive rather than turning
+    // that successful concurrent transition into a handler error.
+    if (dependencies.agentManager.getAgent(agentId)) {
+      try {
+        await dependencies.agentManager.archiveAgent(agentId);
+      } catch (archiveError) {
+        const concurrentRecord = await dependencies.agentStorage.get(agentId);
+        if (!concurrentRecord?.archivedAt) {
+          throw archiveError;
+        }
+      }
+    }
     record = await dependencies.agentStorage.get(agentId);
   } else {
     record = await archiveStoredAgent(dependencies, agentId);
