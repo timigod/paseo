@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 
 const scriptRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const remote = "paseo-runtime";
-const branch = "fix/paseo-021-control-plane";
+const branch = "fix/paseo-022-worktree-ack";
 const remoteUrl = "https://github.com/timigod/paseo.git";
 const macbookRoot = "/Users/timiajiboye/Code/paseo-0.1.110-eof-fix";
 const imacRoot = "/Users/timi/Code/paseo-0.1.110-eof-fix";
