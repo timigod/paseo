@@ -6,7 +6,11 @@ import type { CommandOptions, ListResult, OutputSchema } from "../../output/inde
 import { resolveLocalDaemonState, resolveTcpHostFromListen } from "./local-daemon.js";
 import { resolveNodePathFromPid } from "./runtime-toolchain.js";
 
-const DAEMON_STATUS_PROBE_TIMEOUT_MS = 1500;
+// A live fleet can be streaming several agent timelines while the daemon also
+// checks provider availability for this response. 1.5 seconds produced a
+// misleading unhealthy status on an otherwise responsive iMac control plane.
+// Keep this bounded, but allow one normal scheduling window under load.
+export const DAEMON_STATUS_PROBE_TIMEOUT_MS = 5_000;
 
 interface ProviderBinaryStatus {
   label: string;
