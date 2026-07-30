@@ -1084,7 +1084,7 @@ export class VoiceAssistantWebSocketServer {
     this.incrementRuntimeCounter("connectedAwaitingHello");
     this.bindSocketHandlers(ws);
 
-    pending.connectionLogger.info(
+    pending.connectionLogger.debug(
       {
         ...toConnectionLogFields(identity),
         totalPendingConnections: this.pendingConnections.size,
@@ -1332,7 +1332,7 @@ export class VoiceAssistantWebSocketServer {
       pending.identity.sessionId = existing.session.getSessionId();
       this.syncBrowserToolsClientRegistration(existing);
       this.sendToClient(ws, this.createServerInfoMessage());
-      pending.connectionLogger.info(
+      pending.connectionLogger.debug(
         {
           ...toConnectionLogFields(pending.identity),
           resumed: true,
@@ -1357,7 +1357,7 @@ export class VoiceAssistantWebSocketServer {
     pending.identity.sessionId = connection.session.getSessionId();
     this.syncBrowserToolsClientRegistration(connection);
     this.sendToClient(ws, this.createServerInfoMessage());
-    connection.connectionLogger.info(
+    connection.connectionLogger.debug(
       {
         ...toConnectionLogFields(pending.identity),
         resumed: false,
@@ -1557,7 +1557,7 @@ export class VoiceAssistantWebSocketServer {
     this.sessions.delete(ws);
     if (connection.kind === "hub") {
       this.socketIdentities.delete(ws);
-      connection.connectionLogger.info(
+      connection.connectionLogger.debug(
         { code: details.code, reason: stringifyCloseReason(details.reason) },
         "Hub session disconnected",
       );
@@ -1583,7 +1583,7 @@ export class VoiceAssistantWebSocketServer {
       }, EXTERNAL_SESSION_DISCONNECT_GRACE_MS);
       connection.externalDisconnectCleanupTimeout = timeout;
 
-      connection.connectionLogger.info(
+      connection.connectionLogger.debug(
         {
           ...identityFields,
           code: details.code,
@@ -1597,7 +1597,7 @@ export class VoiceAssistantWebSocketServer {
 
     if (connection.sockets.size > 0) {
       this.incrementRuntimeCounter("sessionSocketDisconnectedAttached");
-      connection.connectionLogger.info(
+      connection.connectionLogger.debug(
         {
           ...identityFields,
           remainingSockets: connection.sockets.size,
