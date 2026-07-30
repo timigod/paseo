@@ -89,7 +89,7 @@ async function readImageFiles(
   );
 }
 
-async function resolvePromptInput(options: {
+export async function resolveSendPromptInput(options: {
   promptArgument: string | undefined;
   promptOption: string | undefined;
   promptFile: string | undefined;
@@ -178,7 +178,7 @@ export async function runSendCommand(
     throw error;
   }
 
-  const promptInput = await resolvePromptInput({
+  const promptInput = await resolveSendPromptInput({
     promptArgument: prompt,
     promptOption: options.prompt,
     promptFile: options.promptFile,

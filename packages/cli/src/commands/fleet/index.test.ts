@@ -10,6 +10,7 @@ it("exposes a single fleet control surface with status, doctor, and run", () => 
     "run",
     "finish",
     "recover",
+    "continue",
   ]);
   expect(fleet?.commands.find((command) => command.name() === "run")?.helpInformation()).toContain(
     "--host <host>",

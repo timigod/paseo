@@ -3,8 +3,10 @@ import { withOutput } from "../../output/index.js";
 import { addJsonOption } from "../../utils/command-options.js";
 import { addFleetRunOptions, runFleetRunCommand } from "./run.js";
 import {
+  addFleetContinueOptions,
   addFleetFinishOptions,
   addFleetRecoverOptions,
+  runFleetContinueCommand,
   runFleetFinishCommand,
   runFleetRecoverCommand,
 } from "./lifecycle.js";
@@ -25,6 +27,9 @@ export function createFleetCommand(): Command {
   );
   addJsonOption(addFleetRecoverOptions(fleet.command("recover"))).action(
     withOutput(runFleetRecoverCommand),
+  );
+  addJsonOption(addFleetContinueOptions(fleet.command("continue"))).action(
+    withOutput(runFleetContinueCommand),
   );
 
   return fleet;

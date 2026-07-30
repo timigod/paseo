@@ -77,6 +77,7 @@ paseo fleet status
 paseo fleet run --new-workspace worktree "bounded task"
 paseo fleet finish <id>
 paseo fleet recover <id>
+paseo fleet continue <id-or-name> "next instruction"
 ```
 
 `fleet doctor` is read-only and names unreachable hosts, an unavailable OpenCode lane,
@@ -100,6 +101,20 @@ worktree; background auto-archive is rejected because it cannot make that owners
 Concurrent archive requests are idempotent: if another lifecycle path has already durably
 archived the agent while provider cancellation settles, the operation reports that completed
 state rather than failing or leaking the worktree.
+
+`fleet continue` searches active and archived records on every reachable topology host, using an
+exact ID, ID prefix, or exact agent name. It fails when no record matches, when lookup is incomplete, or
+when more than one record matches; it never guesses an owner. An archived match is recovered through
+the same daemon-owned recovery path before the prompt is sent. A closed but unarchived match needs no
+explicit recovery because normal send resumes its durable provider session. JSON output includes
+`fleetHost`, `fleetEndpoint`, `agentId`, and `restored` so an orchestrator can retain the resolved
+owner identity.
+
+The `packages/cli/src/commands/fleet` boundary is intentionally CLI-local while Paseo has no general
+third-party command loader. A future companion extension or library would need to extract the
+topology contract and configuration, host inspection and connection adapter, pure owner matching,
+and the run/finish/recover/continue orchestration functions. Direct agent commands and daemon RPCs
+stay in core Paseo; this fleet layer composes them and must not add a second lifecycle path.
 
 ### Persistent macOS host service
 
