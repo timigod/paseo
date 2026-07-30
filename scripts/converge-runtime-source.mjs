@@ -100,11 +100,18 @@ function fastForward(root, expected) {
   if (actual !== expected) fail(`${root} did not reach the expected canonical commit`);
 }
 
+function buildCliArtifacts(root) {
+  run("npm", ["run", "build:client"], { cwd: root });
+  run("npm", ["run", "build", "--workspace=@getpaseo/cli"], { cwd: root });
+  run("node", ["packages/cli/dist/index.js", "fleet", "--help"], { cwd: root });
+  assertCleanPrimary(root);
+}
+
 function shellQuote(value) {
   return `'${String(value).replace(/'/gu, "'\\''")}'`;
 }
 
-function peerCommand(root, expected, setupOnly) {
+function peerCommand(root, expected, setupOnly, buildCli) {
   const merge = setupOnly
     ? ""
     : [
@@ -113,6 +120,15 @@ function peerCommand(root, expected, setupOnly) {
         'git -C "$repo" merge --ff-only "$expected"',
         'test "$(git -C "$repo" rev-parse HEAD)" = "$expected"',
       ].join("\n");
+  const build = buildCli
+    ? [
+        'cd "$repo"',
+        "npm run build:client",
+        "npm run build --workspace=@getpaseo/cli",
+        "node packages/cli/dist/index.js fleet --help >/dev/null",
+        'test -z "$(git -C "$repo" status --porcelain=v1 --untracked-files=all)"',
+      ].join("\n")
+    : "";
   return [
     "set -eu",
     `repo=${shellQuote(root)}`,
@@ -128,6 +144,7 @@ function peerCommand(root, expected, setupOnly) {
     'test "$(git -C "$repo" remote get-url --push --all "$remote")" = "$remote_url"',
     'git -C "$repo" fetch "$remote" "$branch"',
     merge,
+    build,
     'printf "paseo_runtime_commit=%s\\n" "$(git -C "$repo" rev-parse FETCH_HEAD)"',
   ]
     .filter(Boolean)
@@ -186,7 +203,7 @@ function main() {
   const peerRoot = kind === "macbook" ? imacRoot : macbookRoot;
 
   if (setupOnly) {
-    peerSsh(kind, peerCommand(peerRoot, null, true));
+    peerSsh(kind, peerCommand(peerRoot, null, true, false));
     console.log(
       JSON.stringify({ status: "configured", remote, branch, local: scriptRoot, peer: peerRoot }),
     );
@@ -198,7 +215,8 @@ function main() {
     : canonicalHead(scriptRoot);
   if (!/^[0-9a-f]{40}$/u.test(expected)) fail("the canonical remote returned an invalid commit id");
   if (!dryRun) fastForward(scriptRoot, expected);
-  const peerHead = peerSsh(kind, peerCommand(peerRoot, expected, dryRun));
+  if (!dryRun) buildCliArtifacts(scriptRoot);
+  const peerHead = peerSsh(kind, peerCommand(peerRoot, expected, dryRun, !dryRun));
   if (peerHead !== expected)
     fail("the peer fetched a different canonical commit; no source tree was overwritten");
   console.log(
@@ -209,6 +227,7 @@ function main() {
       commit: expected,
       local: scriptRoot,
       peer: peerRoot,
+      ...(dryRun ? {} : { cliArtifacts: "built" }),
     }),
   );
 }
