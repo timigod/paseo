@@ -20,6 +20,7 @@ function fail(message) {
 function run(command, args, options = {}) {
   const result = spawnSync(command, args, {
     cwd: options.cwd,
+    env: { ...process.env, COREPACK_ENABLE_AUTO_PIN: "0" },
     encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -151,6 +152,7 @@ function peerCommand(root, expected, setupOnly, buildCli) {
     : "";
   return [
     "set -eu",
+    "export COREPACK_ENABLE_AUTO_PIN=0",
     `repo=${shellQuote(root)}`,
     `remote=${shellQuote(remote)}`,
     `branch=${shellQuote(branch)}`,
