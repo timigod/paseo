@@ -54,6 +54,21 @@ describe("desktop startup", () => {
     expect(calls).toEqual(["cli", "env", "gui", "skills"]);
   });
 
+  it("reconciles the owned launch agent after inheriting the login-shell environment", async () => {
+    const calls: string[] = [];
+    await runDesktopStartup({
+      hasPendingGuiLaunchRequest: false,
+      runCliPassthroughIfRequested: vi.fn(async () => false),
+      inheritLoginShellEnv: vi.fn(() => calls.push("env")),
+      reconcileLaunchAgent: vi.fn(() => calls.push("launch-agent")),
+      bootstrapGui: vi.fn(async () => {
+        calls.push("gui");
+      }),
+    });
+
+    expect(calls).toEqual(["env", "launch-agent", "gui"]);
+  });
+
   it("does not route open-project launches through CLI passthrough", async () => {
     const runCliPassthroughIfRequested = vi.fn(async () => true);
     const calls: string[] = [];
