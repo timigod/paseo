@@ -2989,8 +2989,14 @@ export class AgentManager {
       }
 
       let currentStatus: AgentLifecycleStatus = initialStatus;
+      // A newly acknowledged creation is intentionally visible as `initializing`
+      // before its provider session is ready. That is not a foreground turn: the
+      // create handoff emits `idle` before the caller starts the initial prompt.
+      // Treating `initializing` as started lets a foreground waiter resolve in that
+      // gap, which in turn lets `fleet run --auto-archive` archive the task before
+      // its first turn begins.
       let hasStarted =
-        isAgentBusy(initialStatus) ||
+        initialStatus === "running" ||
         Boolean(snapshot.activeForegroundTurnId) ||
         Boolean(pendingForegroundRun?.started);
       let terminalStatusOverride: AgentLifecycleStatus | null = null;
@@ -3061,8 +3067,18 @@ export class AgentManager {
               finish(pending);
               return;
             }
-            if (isAgentBusy(event.agent.lifecycle)) {
+            if (event.agent.lifecycle === "running") {
               hasStarted = true;
+              return;
+            }
+            if (event.agent.lifecycle === "initializing") {
+              return;
+            }
+            // A provider can fail while its initial session is being created.
+            // There will be no foreground turn in that case, so do not wait for
+            // one that can no longer start.
+            if (event.agent.lifecycle === "error" || event.agent.lifecycle === "closed") {
+              finish(null);
               return;
             }
             if (!waitForActive || hasStarted) {
@@ -3077,6 +3093,10 @@ export class AgentManager {
           if (event.type === "agent_stream") {
             if (event.event.type === "permission_requested") {
               finish(event.event.request);
+              return;
+            }
+            if (event.event.type === "turn_started") {
+              hasStarted = true;
               return;
             }
             if (event.event.type === "turn_failed") {

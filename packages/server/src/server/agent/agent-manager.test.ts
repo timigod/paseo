@@ -5029,6 +5029,58 @@ test("waitForAgentEvent waitForActive resolves for autonomous live-event run", a
   expect(result.status).toBe("idle");
 });
 
+test("waitForAgentEvent waitForActive does not finish in the creation-to-first-turn gap", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-initializing-wait-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const client = new HeldRuntimeInfoClient();
+  const manager = new AgentManager({
+    clients: { codex: client },
+    registry: storage,
+    logger,
+    idFactory: () => "00000000-0000-4000-8000-000000000127",
+  });
+
+  try {
+    const creation = await manager.beginAgentCreation(
+      {
+        provider: "codex",
+        cwd: workdir,
+      },
+      undefined,
+      { workspaceId: undefined },
+    );
+    expect(creation.snapshot.lifecycle).toBe("initializing");
+
+    const waitPromise = manager.waitForAgentEvent(creation.snapshot.id, {
+      waitForActive: true,
+    });
+    await client.waitForRuntimeInfo();
+    client.finishRuntimeInfo();
+    await creation.completion;
+    expect(manager.getAgent(creation.snapshot.id)?.lifecycle).toBe("idle");
+
+    let settled = false;
+    void waitPromise.then(() => {
+      settled = true;
+      return undefined;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(settled).toBe(false);
+
+    const stream = manager.streamAgent(creation.snapshot.id, "initial prompt");
+    for await (const _event of stream) {
+      // Drain the foreground stream until the test provider completes its turn.
+    }
+
+    await expect(waitPromise).resolves.toMatchObject({
+      status: "idle",
+      permission: null,
+    });
+  } finally {
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
 test("autonomous events arriving during foreground run are processed via subscribe", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-live-during-fg-"));
   const storagePath = join(workdir, "agents");
