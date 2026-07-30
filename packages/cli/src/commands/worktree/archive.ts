@@ -75,7 +75,7 @@ export async function runArchiveCommandWithDeps(
 
   try {
     // Get the list of worktrees first to resolve the name
-    const listResponse = await client.getPaseoWorktreeList({});
+    const listResponse = await client.getPaseoWorktreeList({ cwd: process.cwd() });
 
     if (listResponse.error) {
       const error: CommandError = {
