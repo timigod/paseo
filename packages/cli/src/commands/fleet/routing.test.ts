@@ -13,6 +13,7 @@ function observed(
     host,
     reachable: true,
     openCodeReady: true,
+    inventoryReady: true,
     activeAgents: 0,
     ...overrides,
   };
@@ -86,6 +87,22 @@ describe("fleet routing", () => {
         observations: [
           observed(macbook, { activeAgents: macbook.capacity }),
           observed(imac, { openCodeReady: false }),
+        ],
+        cwd: "/Users/timiajiboye/Code/paseo",
+        sourceHost: macbook,
+        localHost: macbook,
+        pinnedHost: null,
+        requiresLocalContext: false,
+      }),
+    ).toThrow(/No healthy fleet host has capacity/);
+  });
+
+  it("never dispatches to a reachable host whose inventory is still restoring", () => {
+    expect(() =>
+      selectFleetHost({
+        observations: [
+          observed(macbook, { inventoryReady: false }),
+          observed(imac, { reachable: false }),
         ],
         cwd: "/Users/timiajiboye/Code/paseo",
         sourceHost: macbook,

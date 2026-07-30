@@ -10,6 +10,8 @@ import type {
 import { FLEET_HOSTS, FLEET_TOPOLOGY_VERSION, type FleetHost } from "./topology.js";
 
 const ACTIVE_AGENT_STATUSES = new Set(["initializing", "running", "idle"]);
+const FLEET_CONNECT_TIMEOUT_MS = 1_500;
+const FLEET_READINESS_TIMEOUT_MS = 15_000;
 
 type FleetDaemonClient = Pick<
   Awaited<ReturnType<typeof connectToDaemon>>,
@@ -29,6 +31,7 @@ export interface FleetHostStatus {
   reachable: boolean;
   version: string | null;
   openCodeReady: boolean;
+  inventoryReady: boolean;
   activeAgents: number;
   freeSlots: number;
   statusCounts: Record<string, number>;
@@ -58,28 +61,7 @@ export async function inspectFleetHost(
 ): Promise<FleetHostStatus> {
   let client: FleetDaemonClient | null = null;
   try {
-    client = await connect({ host: host.endpoint, timeout: 1_500 });
-    const [daemonStatus, agents] = await Promise.all([
-      client.getDaemonStatus({ timeout: 5_000 }),
-      client.fetchAgents({ scope: "active" }),
-    ]);
-    const statuses = agents.entries.map((entry) => entry.agent.status);
-    const activeAgents = statuses.filter((status) => ACTIVE_AGENT_STATUSES.has(status)).length;
-    const openCode = daemonStatus.providers.find((provider) => provider.provider === "opencode");
-
-    return {
-      id: host.id,
-      name: host.name,
-      endpoint: host.endpoint,
-      capacity: host.capacity,
-      reachable: true,
-      version: daemonStatus.version ?? null,
-      openCodeReady: openCode?.available === true,
-      activeAgents,
-      freeSlots: Math.max(host.capacity - activeAgents, 0),
-      statusCounts: countStatuses(statuses),
-      issue: openCode?.available === true ? null : (openCode?.error ?? "OpenCode is unavailable"),
-    };
+    client = await connect({ host: host.endpoint, timeout: FLEET_CONNECT_TIMEOUT_MS });
   } catch (error) {
     return {
       id: host.id,
@@ -89,10 +71,47 @@ export async function inspectFleetHost(
       reachable: false,
       version: null,
       openCodeReady: false,
+      inventoryReady: false,
       activeAgents: 0,
       freeSlots: 0,
       statusCounts: {},
       issue: errorMessage(error),
+    };
+  }
+
+  try {
+    const [daemonResult, agentsResult] = await Promise.allSettled([
+      client.getDaemonStatus({ timeout: FLEET_READINESS_TIMEOUT_MS }),
+      client.fetchAgents({ scope: "active", timeout: FLEET_READINESS_TIMEOUT_MS }),
+    ]);
+    const daemonStatus = daemonResult.status === "fulfilled" ? daemonResult.value : null;
+    const agents = agentsResult.status === "fulfilled" ? agentsResult.value : null;
+    const statuses = agents?.entries.map((entry) => entry.agent.status) ?? [];
+    const activeAgents = statuses.filter((status) => ACTIVE_AGENT_STATUSES.has(status)).length;
+    const openCode = daemonStatus?.providers.find((provider) => provider.provider === "opencode");
+    const issues: string[] = [];
+    if (daemonResult.status === "rejected") {
+      issues.push(`readiness probe failed: ${errorMessage(daemonResult.reason)}`);
+    } else if (openCode?.available !== true) {
+      issues.push(openCode?.error ?? "OpenCode is unavailable");
+    }
+    if (agentsResult.status === "rejected") {
+      issues.push(`agent inventory probe failed: ${errorMessage(agentsResult.reason)}`);
+    }
+
+    return {
+      id: host.id,
+      name: host.name,
+      endpoint: host.endpoint,
+      capacity: host.capacity,
+      reachable: true,
+      version: daemonStatus?.version ?? null,
+      openCodeReady: openCode?.available === true,
+      inventoryReady: agents !== null,
+      activeAgents,
+      freeSlots: agents ? Math.max(host.capacity - activeAgents, 0) : 0,
+      statusCounts: countStatuses(statuses),
+      issue: issues.length > 0 ? issues.join("; ") : null,
     };
   } finally {
     await client?.close().catch(() => {});
@@ -139,6 +158,10 @@ function diagnoseFleet(hosts: readonly FleetHostStatus[]): string[] {
     }
     if (!host.openCodeReady) {
       issues.push(`${host.name} cannot serve OpenCode${host.issue ? `: ${host.issue}` : ""}`);
+    } else if (!host.inventoryReady) {
+      issues.push(
+        `${host.name} agent inventory is unavailable${host.issue ? `: ${host.issue}` : ""}`,
+      );
     }
     if (host.activeAgents > host.capacity) {
       issues.push(`${host.name} is over capacity (${host.activeAgents}/${host.capacity})`);

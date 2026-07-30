@@ -5,6 +5,7 @@ export interface FleetHostObservation {
   host: FleetHost;
   reachable: boolean;
   openCodeReady: boolean;
+  inventoryReady: boolean;
   activeAgents: number;
 }
 
@@ -25,12 +26,16 @@ export function selectFleetHost(input: {
   requiresLocalContext: boolean;
 }): FleetRunPlan {
   const { observations, cwd, sourceHost, localHost, pinnedHost, requiresLocalContext } = input;
-  const candidates = observations.filter(({ host, reachable, openCodeReady, activeAgents }) => {
-    if (!reachable || !openCodeReady || activeAgents >= host.capacity) return false;
-    if (requiresLocalContext && localHost && host.id !== localHost.id) return false;
-    if (!sourceHost && localHost && host.id !== localHost.id) return false;
-    return true;
-  });
+  const candidates = observations.filter(
+    ({ host, reachable, openCodeReady, inventoryReady, activeAgents }) => {
+      if (!reachable || !openCodeReady || !inventoryReady || activeAgents >= host.capacity) {
+        return false;
+      }
+      if (requiresLocalContext && localHost && host.id !== localHost.id) return false;
+      if (!sourceHost && localHost && host.id !== localHost.id) return false;
+      return true;
+    },
+  );
 
   if (pinnedHost) {
     const match = candidates.find(({ host }) => host.id === pinnedHost.id);

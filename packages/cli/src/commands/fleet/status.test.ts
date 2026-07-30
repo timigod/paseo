@@ -27,12 +27,15 @@ describe("fleet status", () => {
     await expect(inspectFleetHost(macbook, connect)).resolves.toMatchObject({
       reachable: true,
       openCodeReady: true,
+      inventoryReady: true,
       activeAgents: 3,
       freeSlots: 7,
       statusCounts: { initializing: 1, running: 1, idle: 1, completed: 1, archived: 1 },
       issue: null,
     });
     expect(close).toHaveBeenCalledOnce();
+    expect(connect).toHaveBeenCalledWith({ host: macbook.endpoint, timeout: 1_500 });
+    expect(connect.mock.results[0]?.value).toBeDefined();
   });
 
   it("returns a usable degraded status when a daemon cannot be reached", async () => {
@@ -41,8 +44,51 @@ describe("fleet status", () => {
     await expect(inspectFleetHost(macbook, connect)).resolves.toMatchObject({
       reachable: false,
       openCodeReady: false,
+      inventoryReady: false,
       activeAgents: 0,
       issue: "connection reset",
+    });
+  });
+
+  it("keeps a connected daemon reachable while a cold readiness probe is still unavailable", async () => {
+    const close = vi.fn().mockResolvedValue(undefined);
+    const getDaemonStatus = vi.fn().mockRejectedValue(new Error("provider still warming"));
+    const fetchAgents = vi.fn().mockResolvedValue({
+      entries: [{ agent: { status: "running" } }],
+    });
+    const connect = vi.fn().mockResolvedValue({ getDaemonStatus, fetchAgents, close });
+
+    await expect(inspectFleetHost(macbook, connect)).resolves.toMatchObject({
+      reachable: true,
+      openCodeReady: false,
+      inventoryReady: true,
+      activeAgents: 1,
+      freeSlots: 9,
+      issue: "readiness probe failed: provider still warming",
+    });
+    expect(getDaemonStatus).toHaveBeenCalledWith({ timeout: 15_000 });
+    expect(fetchAgents).toHaveBeenCalledWith({ scope: "active", timeout: 15_000 });
+    expect(close).toHaveBeenCalledOnce();
+  });
+
+  it("fails closed for dispatch when the connected daemon cannot inventory agents", async () => {
+    const close = vi.fn().mockResolvedValue(undefined);
+    const connect = vi.fn().mockResolvedValue({
+      getDaemonStatus: vi.fn().mockResolvedValue({
+        version: "0.2.8",
+        providers: [{ provider: "opencode", available: true }],
+      }),
+      fetchAgents: vi.fn().mockRejectedValue(new Error("inventory still restoring")),
+      close,
+    });
+
+    await expect(inspectFleetHost(macbook, connect)).resolves.toMatchObject({
+      reachable: true,
+      openCodeReady: true,
+      inventoryReady: false,
+      activeAgents: 0,
+      freeSlots: 0,
+      issue: "agent inventory probe failed: inventory still restoring",
     });
   });
 
@@ -56,6 +102,7 @@ describe("fleet status", () => {
         reachable: true,
         version: "0.2.8",
         openCodeReady: false,
+        inventoryReady: true,
         activeAgents: 11,
         freeSlots: 0,
         statusCounts: {},
@@ -69,6 +116,7 @@ describe("fleet status", () => {
         reachable: false,
         version: null,
         openCodeReady: false,
+        inventoryReady: false,
         activeAgents: 0,
         freeSlots: 0,
         statusCounts: {},
