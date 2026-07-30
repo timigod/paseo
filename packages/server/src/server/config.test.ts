@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -26,6 +26,17 @@ describe("server config", () => {
     expect(standaloneConfig.desktopManaged).toBe(false);
   });
 
+  test("loads the persisted per-host active-agent limit", async () => {
+    const paseoHome = await mkdtemp(path.join(os.tmpdir(), "paseo-config-agent-capacity-"));
+    roots.push(paseoHome);
+    await writeFile(
+      path.join(paseoHome, "config.json"),
+      JSON.stringify({ version: 1, daemon: { maxActiveAgents: 10 } }),
+    );
+
+    expect(loadConfig(paseoHome, { env: {} }).maxActiveAgents).toBe(10);
+  });
+
   test("resolves bundled web UI path from source-tree modules", () => {
     const root = path.parse(process.cwd()).root;
     expect(
@@ -40,7 +51,9 @@ describe("server config", () => {
   test("resolves bundled web UI path from globally installed compiled modules", async () => {
     const packageRoot = await mkdtemp(path.join(os.tmpdir(), "paseo-config-compiled-"));
     roots.push(packageRoot);
-    await mkdir(path.join(packageRoot, "dist", "server", "web-ui"), { recursive: true });
+    await mkdir(path.join(packageRoot, "dist", "server", "web-ui"), {
+      recursive: true,
+    });
 
     expect(
       resolveBundledWebUiDistDir({

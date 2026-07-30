@@ -46,6 +46,22 @@ describe("PersistedConfigSchema daemon append system prompt config", () => {
   });
 });
 
+describe("PersistedConfigSchema daemon agent capacity", () => {
+  test("accepts a positive per-host active-agent limit", () => {
+    const parsed = PersistedConfigSchema.parse({
+      daemon: { maxActiveAgents: 10 },
+    });
+    expect(parsed.daemon?.maxActiveAgents).toBe(10);
+  });
+
+  test("rejects zero or fractional limits", () => {
+    expect(PersistedConfigSchema.safeParse({ daemon: { maxActiveAgents: 0 } }).success).toBe(false);
+    expect(PersistedConfigSchema.safeParse({ daemon: { maxActiveAgents: 1.5 } }).success).toBe(
+      false,
+    );
+  });
+});
+
 describe("PersistedConfigSchema daemon browser tools config", () => {
   test("accepts optional browser tools opt-in", () => {
     const parsed = PersistedConfigSchema.parse({
@@ -238,7 +254,11 @@ describe("PersistedConfigSchema agent provider runtime settings", () => {
         metadataGeneration: {
           providers: [
             { provider: "claude", model: "haiku" },
-            { provider: "codex", model: "gpt-5.4-mini", thinkingOptionId: "low" },
+            {
+              provider: "codex",
+              model: "gpt-5.4-mini",
+              thinkingOptionId: "low",
+            },
           ],
         },
       },
@@ -691,7 +711,10 @@ describe("loadPersistedConfig", () => {
             providers: {
               openai: {
                 apiKey: "global-key",
-                voice: { apiKey: "voice-key", baseUrl: "https://voice.example.com/v1" },
+                voice: {
+                  apiKey: "voice-key",
+                  baseUrl: "https://voice.example.com/v1",
+                },
               },
             },
           },

@@ -79,6 +79,62 @@ test("session create forwards clientMessageId to the initial prompt run options"
   });
 });
 
+test("capacity rejection happens before session setup or worktree materialization", async () => {
+  const buildSessionConfig = vi.fn();
+  const dependencies: Parameters<typeof createAgentCommand>[0] = {
+    agentManager: {} as Parameters<typeof createAgentCommand>[0]["agentManager"],
+    agentStorage: {} as Parameters<typeof createAgentCommand>[0]["agentStorage"],
+    logger: createTestLogger(),
+    providerSnapshotManager: createProviderSnapshotManagerStub().manager,
+    agentCapacityGate: {
+      acquire: () => {
+        throw new Error("Agent capacity reached (10/10)");
+      },
+    },
+  };
+
+  await expect(
+    createAgentCommand(dependencies, {
+      kind: "session",
+      config: { provider: "opencode", cwd: "/tmp/paseo-capacity-test" },
+      workspaceId: "ws-capacity-test",
+      labels: {},
+      provisionalTitle: null,
+      firstAgentContext: { attachments: [] },
+      buildSessionConfig,
+    }),
+  ).rejects.toThrow("Agent capacity reached (10/10)");
+
+  expect(buildSessionConfig).not.toHaveBeenCalled();
+});
+
+test("releases a capacity reservation when session resolution fails", async () => {
+  const release = vi.fn();
+  const providerSnapshotManager = createProviderSnapshotManagerStub();
+  providerSnapshotManager.resolveCreateConfig.mockRejectedValue(new Error("invalid provider mode"));
+  const dependencies: Parameters<typeof createAgentCommand>[0] = {
+    agentManager: {} as Parameters<typeof createAgentCommand>[0]["agentManager"],
+    agentStorage: {} as Parameters<typeof createAgentCommand>[0]["agentStorage"],
+    logger: createTestLogger(),
+    providerSnapshotManager: providerSnapshotManager.manager,
+    agentCapacityGate: { acquire: () => release },
+  };
+
+  await expect(
+    createAgentCommand(dependencies, {
+      kind: "session",
+      config: { provider: "opencode", cwd: "/tmp/paseo-capacity-test" },
+      workspaceId: "ws-capacity-test",
+      labels: {},
+      provisionalTitle: null,
+      firstAgentContext: { attachments: [] },
+      buildSessionConfig: async (config) => ({ sessionConfig: config }),
+    }),
+  ).rejects.toThrow("invalid provider mode");
+
+  expect(release).toHaveBeenCalledOnce();
+});
+
 test("session create validates the requested mode against the provider's modes", async () => {
   const snapshot = {
     id: "agent-1",

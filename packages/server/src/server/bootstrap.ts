@@ -127,6 +127,7 @@ import type { LocalSpeechProviderConfig } from "./speech/providers/local/config.
 import type { RequestedSpeechProviders } from "./speech/speech-types.js";
 import { createSpeechService } from "./speech/speech-runtime.js";
 import { AgentManager } from "./agent/agent-manager.js";
+import { createAgentCapacityGate } from "./agent/agent-capacity-gate.js";
 import { AgentStorage } from "./agent/agent-storage.js";
 import { attachAgentStoragePersistence } from "./persistence-hooks.js";
 import { createAgentMcpServer } from "./agent/mcp-server.js";
@@ -386,6 +387,7 @@ export interface PaseoDaemonConfig {
   mcpInjectIntoAgents?: boolean;
   browserToolsEnabled?: boolean;
   autoArchiveAfterMerge?: boolean;
+  maxActiveAgents?: number;
   enableTerminalAgentHooks?: boolean;
   appendSystemPrompt?: string;
   terminalProfiles?: TerminalProfile[];
@@ -798,7 +800,9 @@ export async function createPaseoDaemon(
     workspaceGitService,
     logger,
   });
-  const providerSnapshotLogger = logger.child({ module: "provider-snapshot-manager" });
+  const providerSnapshotLogger = logger.child({
+    module: "provider-snapshot-manager",
+  });
   const providerSnapshotManager = new ProviderSnapshotManager({
     logger: providerSnapshotLogger,
     runtimeSettings: config.agentProviderSettings,
@@ -820,6 +824,7 @@ export async function createPaseoDaemon(
     mcpAuthToken: agentMcpAuthToken,
     logger,
   });
+  const agentCapacityGate = createAgentCapacityGate(agentManager, config.maxActiveAgents);
 
   const detachAgentStoragePersistence = attachAgentStoragePersistence(
     logger,
@@ -956,7 +961,9 @@ export async function createPaseoDaemon(
     workspaceRegistry,
     workspaceGitService,
     providerSnapshotManager,
-    readDaemonConfig: () => ({ metadataGeneration: daemonConfigStore.get().metadataGeneration }),
+    readDaemonConfig: () => ({
+      metadataGeneration: daemonConfigStore.get().metadataGeneration,
+    }),
     gitMutation: createGitMutationService({
       workspaceGitService,
       logger,
@@ -1059,6 +1066,7 @@ export async function createPaseoDaemon(
     providerSnapshotManager,
     createPaseoWorktree: createPaseoWorktreeForTools,
     ensureWorkspaceForCreate: ensureWorkspaceForCreateAndBroadcastExternal,
+    agentCapacityGate,
   };
   const createAgent = (input: Parameters<typeof createAgentCommand>[1]) =>
     createAgentCommand(createAgentCommandDependencies, input);
@@ -1199,7 +1207,10 @@ export async function createPaseoDaemon(
   const collectIdleAgentRuntimes = async () => {
     const protectedAgentIds = await scheduleService.listActiveAgentTargetIds();
     const cutoff = new Date(Date.now() - IDLE_AGENT_RUNTIME_TTL_MS);
-    const result = await agentManager.collectIdleAgents({ cutoff, protectedAgentIds });
+    const result = await agentManager.collectIdleAgents({
+      cutoff,
+      protectedAgentIds,
+    });
     for (const collected of result.collected) {
       logger.info(collected, "Collected idle agent runtime");
     }
@@ -1240,7 +1251,9 @@ export async function createPaseoDaemon(
   const persistedRecords = await agentStorage.list();
   logger.info(
     { elapsed: elapsed() },
-    `Agent registry loaded (${persistedRecords.length} record${persistedRecords.length === 1 ? "" : "s"}); agents will initialize on demand`,
+    `Agent registry loaded (${persistedRecords.length} record${
+      persistedRecords.length === 1 ? "" : "s"
+    }); agents will initialize on demand`,
   );
   logger.info(
     "Voice mode configured for agent-scoped resume flow (no dedicated voice assistant provider)",

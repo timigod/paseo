@@ -46,6 +46,7 @@ export interface CreateAgentCommandDependencies {
   createPaseoWorktree?: CreatePaseoWorktreeWorkflowFn;
   // Mints a fresh directory workspace for a cwd and returns its id.
   ensureWorkspaceForCreate?: EnsureWorkspaceForCreate;
+  agentCapacityGate?: { acquire(): () => void };
 }
 
 export type EnsureWorkspaceForCreate = (
@@ -183,13 +184,20 @@ export async function createAgentCommand(
   dependencies: CreateAgentCommandDependencies,
   input: CreateAgentCommandInput,
 ): Promise<CreateAgentCommandResult> {
-  const resolved = await resolveCreateAgentCommand(dependencies, input);
-
-  const snapshot = await dependencies.agentManager.createAgent(
-    resolved.config,
-    input.kind === "session" ? input.agentId : undefined,
-    resolved.createOptions,
-  );
+  const releaseCapacity = dependencies.agentCapacityGate?.acquire();
+  const { resolved, snapshot } = await (async () => {
+    try {
+      const createResolution = await resolveCreateAgentCommand(dependencies, input);
+      const createdSnapshot = await dependencies.agentManager.createAgent(
+        createResolution.config,
+        input.kind === "session" ? input.agentId : undefined,
+        createResolution.createOptions,
+      );
+      return { resolved: createResolution, snapshot: createdSnapshot };
+    } finally {
+      releaseCapacity?.();
+    }
+  })();
   return await completeCreateAgentCommand(dependencies, input, resolved, snapshot);
 }
 
@@ -197,12 +205,20 @@ export async function beginCreateAgentCommand(
   dependencies: CreateAgentCommandDependencies,
   input: CreateAgentFromSessionInput,
 ): Promise<CreateAgentCommandHandle> {
-  const resolved = await resolveSessionCreateAgent(dependencies, input);
-  const creation = await dependencies.agentManager.beginAgentCreation(
-    resolved.config,
-    input.agentId,
-    resolved.createOptions,
-  );
+  const releaseCapacity = dependencies.agentCapacityGate?.acquire();
+  const { resolved, creation } = await (async () => {
+    try {
+      const createResolution = await resolveSessionCreateAgent(dependencies, input);
+      const creationHandle = await dependencies.agentManager.beginAgentCreation(
+        createResolution.config,
+        input.agentId,
+        createResolution.createOptions,
+      );
+      return { resolved: createResolution, creation: creationHandle };
+    } finally {
+      releaseCapacity?.();
+    }
+  })();
   const snapshot = creation.snapshot;
   let releaseContinuation!: () => void;
   let rejectContinuation!: (error: unknown) => void;
@@ -266,7 +282,10 @@ async function completeCreateAgentCommand(
   let initialPromptStarted = false;
   let initialPromptError: unknown | null = null;
   if (input.kind === "mcp") {
-    input.onCreated?.({ agentId: snapshot.id, createdWorktree: resolved.createdWorktree ?? null });
+    input.onCreated?.({
+      agentId: snapshot.id,
+      createdWorktree: resolved.createdWorktree ?? null,
+    });
   }
   if (resolved.prompt !== undefined) {
     const sendResult = await sendInitialPrompt(dependencies, resolved, snapshot);
@@ -395,12 +414,19 @@ async function resolveMcpCreateAgent(
   const intent = await resolveCreateAgentIntent({
     explicitWorkspaceId: setupContinuation ? createdWorkspaceId : input.workspaceId,
     caller: parentAgent
-      ? { id: parentAgent.id, cwd: parentAgent.cwd, workspaceId: parentAgent.workspaceId }
+      ? {
+          id: parentAgent.id,
+          cwd: parentAgent.cwd,
+          workspaceId: parentAgent.workspaceId,
+        }
       : null,
     labels: input.labels,
     childAgentDefaultLabels: input.callerContext?.childAgentDefaultLabels,
     legacyDetached: input.detached ?? false,
-    resolveWorkspace: async (workspaceId) => ({ workspaceId, cwd: resolvedCwd }),
+    resolveWorkspace: async (workspaceId) => ({
+      workspaceId,
+      cwd: resolvedCwd,
+    }),
     createWorkspace: async () => ({
       workspaceId: requireResolvedWorkspaceId(
         await ensureWorkspaceForMcpCreate(dependencies, resolvedCwd, input.initialPrompt ?? ""),
