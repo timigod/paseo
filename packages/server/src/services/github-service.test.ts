@@ -9,6 +9,7 @@ import {
   GitHubCommandError,
   computeGithubNextInterval,
   createGitHubService,
+  isGitHubRateLimitError,
   resolveGitHubRepo,
   type GitHubCommandRunner,
   type GitHubCommandRunnerOptions,
@@ -19,6 +20,7 @@ import { CheckoutPrStatusResponseSchema } from "@getpaseo/protocol/messages";
 const EXPECTED_GITHUB_FAST_POLL_MS = 20_000;
 const EXPECTED_GITHUB_SLOW_POLL_MS = 120_000;
 const EXPECTED_GITHUB_ERROR_BACKOFF_CAP_MS = 300_000;
+const EXPECTED_GITHUB_RATE_LIMIT_COOLDOWN_MS = 300_000;
 const CURRENT_PR_STATUS_BASE_FIELDS =
   "number,url,title,state,isDraft,baseRefName,headRefName,mergedAt,reviewDecision,mergeable,headRepositoryOwner";
 const CURRENT_PR_STATUS_FIELDS = `${CURRENT_PR_STATUS_BASE_FIELDS},statusCheckRollup`;
@@ -216,6 +218,15 @@ function statusCheckRollupPermissionError(args: string[]): GitHubCommandError {
     exitCode: 1,
     stderr:
       "GraphQL: Resource not accessible by personal access token (repository.pullRequest.statusCheckRollup)",
+  });
+}
+
+function rateLimitError(args: string[] = ["pr", "view"]): GitHubCommandError {
+  return new GitHubCommandError({
+    args,
+    cwd: "/repo",
+    exitCode: 1,
+    stderr: "GraphQL: API rate limit already exceeded for user ID 1.",
   });
 }
 
@@ -600,6 +611,11 @@ describe("GitHubService", () => {
     expect(computeGithubNextInterval(stableStatus, 4)).toBe(EXPECTED_GITHUB_ERROR_BACKOFF_CAP_MS);
   });
 
+  it("recognizes GitHub API rate-limit failures without treating ordinary errors as rate limits", () => {
+    expect(isGitHubRateLimitError(rateLimitError())).toBe(true);
+    expect(isGitHubRateLimitError(new Error("network down"))).toBe(false);
+  });
+
   it("loads pull request checkout target details through GraphQL", async () => {
     const runner = createRunner([repoViewJson(), pullRequestCheckoutTargetJson()]);
     const service = createGitHubService({
@@ -789,6 +805,39 @@ describe("GitHubService", () => {
     ]);
 
     subscription?.unsubscribe();
+    service.dispose?.();
+  });
+
+  it("holds every retained PR poll behind one shared cooldown after an API rate limit", async () => {
+    let now = 0;
+    const runner = createScriptedRunner([{ error: rateLimitError() }]);
+    const service = createGitHubService({
+      ttlMs: 0,
+      runner: runner.runner,
+      resolveGhPath: async () => "/usr/bin/gh",
+      now: () => now,
+    });
+
+    const first = service.retainCurrentPullRequestStatusPoll?.({
+      cwd: "/repo-a",
+      headRef: "feature/a",
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(currentPullRequestStatusCalls(runner.calls)).toHaveLength(1);
+
+    const second = service.retainCurrentPullRequestStatusPoll?.({
+      cwd: "/repo-b",
+      headRef: "feature/b",
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(currentPullRequestStatusCalls(runner.calls)).toHaveLength(1);
+
+    now = EXPECTED_GITHUB_RATE_LIMIT_COOLDOWN_MS - 1;
+    await vi.advanceTimersByTimeAsync(EXPECTED_GITHUB_RATE_LIMIT_COOLDOWN_MS - 1);
+    expect(currentPullRequestStatusCalls(runner.calls)).toHaveLength(1);
+
+    first?.unsubscribe();
+    second?.unsubscribe();
     service.dispose?.();
   });
 
