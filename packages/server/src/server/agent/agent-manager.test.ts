@@ -7727,6 +7727,232 @@ test("load waits for an in-flight collection close and creates only one resumed 
   }
 });
 
+for (const mutation of ["mode", "model", "thinking", "feature"] as const) {
+  test(`a held live ${mutation} mutation leases runtime against idle collection`, async () => {
+    const workdir = mkdtempSync(join(tmpdir(), `agent-manager-${mutation}-mutation-lease-`));
+    const storage = new AgentStorage(join(workdir, "agents"), logger);
+    const mutationStarted = deferred<void>();
+    const mutationAllowed = deferred<void>();
+    let closeCount = 0;
+    const client = new (class extends TestAgentClient {
+      override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+        const waitForSelectedMutation = async (selected: typeof mutation): Promise<void> => {
+          if (selected !== mutation) {
+            return;
+          }
+          mutationStarted.resolve();
+          await mutationAllowed.promise;
+        };
+        return new (class extends TestAgentSession {
+          override async setMode(): Promise<void> {
+            await waitForSelectedMutation("mode");
+          }
+
+          override async getCurrentMode(): Promise<string | null> {
+            return "focus";
+          }
+
+          async setModel(): Promise<void> {
+            await waitForSelectedMutation("model");
+          }
+
+          async setThinkingOption(): Promise<void> {
+            await waitForSelectedMutation("thinking");
+          }
+
+          async setFeature(): Promise<void> {
+            await waitForSelectedMutation("feature");
+          }
+
+          override async close(): Promise<void> {
+            closeCount += 1;
+          }
+        })(config);
+      }
+    })();
+    const manager = new AgentManager({ clients: { codex: client }, registry: storage, logger });
+    const mutableAgents = (
+      manager as unknown as {
+        agents: Map<string, { updatedAt: Date }>;
+      }
+    ).agents;
+    const agentId = `00000000-0000-4000-8000-00000000022${String(
+      ["mode", "model", "thinking", "feature"].indexOf(mutation),
+    )}`;
+
+    try {
+      const created = await manager.createAgent({ provider: "codex", cwd: workdir }, agentId, {
+        workspaceId: undefined,
+      });
+      mutableAgents.get(created.id)!.updatedAt = new Date(0);
+      const cutoffBeforeMutation = new Date(Date.now() - 1);
+
+      let mutationPromise: Promise<unknown>;
+      if (mutation === "mode") {
+        mutationPromise = manager.setAgentMode(created.id, "focus");
+      } else if (mutation === "model") {
+        mutationPromise = manager.setAgentModel(created.id, "gpt-small");
+      } else if (mutation === "thinking") {
+        mutationPromise = manager.setAgentThinkingOption(created.id, "low");
+      } else {
+        mutationPromise = manager.setAgentFeature(created.id, "compact-output", true);
+      }
+      await mutationStarted.promise;
+
+      expect(manager.getAgent(created.id)?.updatedAt.getTime()).toBeGreaterThanOrEqual(
+        cutoffBeforeMutation.getTime(),
+      );
+      const collection = manager.collectIdleAgents({
+        cutoff: cutoffBeforeMutation,
+        protectedAgentIds: new Set(),
+      });
+      let collectionSettled = false;
+      void collection.finally(() => {
+        collectionSettled = true;
+      });
+      await Promise.resolve();
+      expect(collectionSettled).toBe(false);
+      expect(closeCount).toBe(0);
+
+      mutationAllowed.resolve();
+      await mutationPromise;
+      await expect(collection).resolves.toEqual({ collected: [], failures: [] });
+      expect(closeCount).toBe(0);
+      expect(manager.getAgent(created.id)).not.toBeNull();
+
+      const finalCollection = await manager.collectIdleAgents({
+        cutoff: new Date(Date.now() + 1_000),
+        protectedAgentIds: new Set(),
+      });
+      expect(finalCollection).toMatchObject({
+        collected: [expect.objectContaining({ agentId: created.id })],
+        failures: [],
+      });
+      await manager.flush();
+      await storage.flush();
+      expect(closeCount).toBe(1);
+      expect(manager.getAgent(created.id)).toBeNull();
+      const stored = await storage.get(created.id);
+      expect(stored?.lastStatus).toBe("closed");
+      if (mutation === "mode") {
+        expect(stored?.config?.modeId).toBe("focus");
+      } else if (mutation === "model") {
+        expect(stored?.config?.model).toBe("gpt-small");
+      } else if (mutation === "thinking") {
+        expect(stored?.config?.thinkingOptionId).toBe("low");
+      } else {
+        expect(stored?.config?.featureValues).toMatchObject({ "compact-output": true });
+      }
+    } finally {
+      mutationAllowed.resolve();
+      await manager.closeAgent(agentId).catch(() => undefined);
+      await storage.flush().catch(() => undefined);
+      rmSync(workdir, { recursive: true, force: true });
+    }
+  });
+}
+
+test("a held out-of-band handler leases runtime against idle collection", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-out-of-band-lease-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const handlerStarted = deferred<void>();
+  const handlerAllowed = deferred<void>();
+  let handlerCompleted = false;
+  let closeCount = 0;
+  const client = new (class extends TestAgentClient {
+    override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+      return new (class extends TestAgentSession {
+        tryHandleOutOfBand(prompt: AgentPromptInput) {
+          if (prompt !== "/goal pause") {
+            return null;
+          }
+          return {
+            run: async ({ emit }: { emit: (event: AgentStreamEvent) => void }) => {
+              handlerStarted.resolve();
+              await handlerAllowed.promise;
+              emit({
+                type: "timeline",
+                provider: "codex",
+                item: { type: "assistant_message", text: "Goal paused" },
+              });
+              handlerCompleted = true;
+            },
+          };
+        }
+
+        override async close(): Promise<void> {
+          closeCount += 1;
+        }
+      })(config);
+    }
+  })();
+  const manager = new AgentManager({ clients: { codex: client }, registry: storage, logger });
+  const mutableAgents = (
+    manager as unknown as {
+      agents: Map<string, { updatedAt: Date }>;
+    }
+  ).agents;
+  const agentId = "00000000-0000-4000-8000-000000000224";
+
+  try {
+    const created = await manager.createAgent({ provider: "codex", cwd: workdir }, agentId, {
+      workspaceId: undefined,
+    });
+    mutableAgents.get(created.id)!.updatedAt = new Date(0);
+    const cutoffBeforeHandler = new Date(Date.now() - 1);
+
+    await expect(manager.tryRunOutOfBand(created.id, "/goal pause")).resolves.toBe(true);
+    await handlerStarted.promise;
+    expect(handlerCompleted).toBe(false);
+    expect(manager.getAgent(created.id)?.updatedAt.getTime()).toBeGreaterThanOrEqual(
+      cutoffBeforeHandler.getTime(),
+    );
+
+    const collection = manager.collectIdleAgents({
+      cutoff: cutoffBeforeHandler,
+      protectedAgentIds: new Set(),
+    });
+    let collectionSettled = false;
+    void collection.finally(() => {
+      collectionSettled = true;
+    });
+    await Promise.resolve();
+    expect(collectionSettled).toBe(false);
+    expect(closeCount).toBe(0);
+
+    handlerAllowed.resolve();
+    await expect(collection).resolves.toEqual({ collected: [], failures: [] });
+    expect(handlerCompleted).toBe(true);
+    expect(closeCount).toBe(0);
+    expect(manager.getTimeline(created.id)).toContainEqual({
+      type: "assistant_message",
+      text: "Goal paused",
+    });
+
+    const finalCollection = await manager.collectIdleAgents({
+      cutoff: new Date(Date.now() + 1_000),
+      protectedAgentIds: new Set(),
+    });
+    expect(finalCollection).toMatchObject({
+      collected: [expect.objectContaining({ agentId: created.id })],
+      failures: [],
+    });
+    await manager.flush();
+    await storage.flush();
+    expect(closeCount).toBe(1);
+    expect(manager.getAgent(created.id)).toBeNull();
+    expect(await storage.get(created.id)).toMatchObject({
+      id: created.id,
+      lastStatus: "closed",
+    });
+  } finally {
+    handlerAllowed.resolve();
+    await manager.closeAgent(agentId).catch(() => undefined);
+    await storage.flush().catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
 test("provider close failure still persists and emits a resumable closed agent", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-close-failure-"));
   const storage = new AgentStorage(join(workdir, "agents"), logger);

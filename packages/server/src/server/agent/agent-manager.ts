@@ -586,7 +586,11 @@ export class AgentManager {
   private readonly previousStatuses = new Map<string, AgentLifecycleStatus>();
   private readonly backgroundTasks = new Set<Promise<void>>();
   private readonly agentRegistrationTasks = new Set<Promise<void>>();
-  private readonly inFlightAgentCloses = new Map<string, Promise<void>>();
+  private readonly agentLifecycleTails = new Map<string, Promise<void>>();
+  private readonly inFlightAgentCloses = new Map<
+    string,
+    { result: Promise<void>; lifecycleTail: Promise<void> }
+  >();
   private readonly agentStreamCoalescer: AgentStreamCoalescer;
   private mcpBaseUrl: string | null;
   private readonly mcpAuthToken: string | null;
@@ -979,7 +983,7 @@ export class AgentManager {
   }
 
   async waitForAgentClose(agentId: string): Promise<void> {
-    await this.inFlightAgentCloses?.get(agentId)?.catch(() => undefined);
+    await this.agentLifecycleTails?.get(agentId);
   }
 
   getTimeline(id: string): AgentTimelineItem[] {
@@ -1224,7 +1228,9 @@ export class AgentManager {
     options?: { rehydrateFromDisk?: boolean },
   ): Promise<ManagedAgent> {
     return this.trackAgentRegistrationOperation(
-      this.reloadAgentSessionInternal(agentId, overrides, options),
+      this.queueAgentLifecycleHandoff(agentId, () =>
+        this.reloadAgentSessionInternal(agentId, overrides, options),
+      ),
     );
   }
 
@@ -1359,14 +1365,19 @@ export class AgentManager {
 
   closeAgent(agentId: string): Promise<void> {
     const existing = this.inFlightAgentCloses.get(agentId);
-    if (existing) {
-      return existing;
+    if (existing && this.agentLifecycleTails.get(agentId) === existing.lifecycleTail) {
+      return existing.result;
     }
 
-    const close = this.closeAgentRuntime(agentId);
-    this.inFlightAgentCloses.set(agentId, close);
+    const close = this.queueAgentLifecycleHandoff(agentId, () => this.closeAgentRuntime(agentId));
+    const lifecycleTail = this.agentLifecycleTails.get(agentId);
+    if (!lifecycleTail) {
+      throw new Error(`Agent ${agentId} close was not added to the lifecycle queue`);
+    }
+    const entry = { result: close, lifecycleTail };
+    this.inFlightAgentCloses.set(agentId, entry);
     const clearClose = () => {
-      if (this.inFlightAgentCloses.get(agentId) === close) {
+      if (this.inFlightAgentCloses.get(agentId) === entry) {
         this.inFlightAgentCloses.delete(agentId);
       }
     };
@@ -1426,10 +1437,33 @@ export class AgentManager {
   }): Promise<IdleAgentCollectionResult> {
     const result: IdleAgentCollectionResult = { collected: [], failures: [] };
 
-    for (const agent of Array.from(this.agents.values())) {
-      const current = this.agents.get(agent.id);
+    for (const snapshot of Array.from(this.agents.values())) {
+      try {
+        const collected = await this.collectIdleAgentRuntime(snapshot.id, options);
+        if (collected) {
+          result.collected.push(collected);
+        }
+      } catch (error) {
+        result.failures.push({
+          agentId: snapshot.id,
+          provider: snapshot.provider,
+          ...(snapshot.persistence?.sessionId ? { sessionId: snapshot.persistence.sessionId } : {}),
+          error,
+        });
+      }
+    }
+
+    return result;
+  }
+
+  private collectIdleAgentRuntime(
+    agentId: string,
+    options: { cutoff: Date; protectedAgentIds: ReadonlySet<string> },
+  ): Promise<IdleAgentCollectionEntry | null> {
+    return this.queueAgentLifecycleHandoff(agentId, async () => {
+      const current = this.agents.get(agentId);
       if (!current || !this.isIdleAgentCollectable(current, options)) {
-        continue;
+        return null;
       }
 
       const entry: IdleAgentCollectionEntry = {
@@ -1437,15 +1471,9 @@ export class AgentManager {
         provider: current.provider,
         ...(current.persistence?.sessionId ? { sessionId: current.persistence.sessionId } : {}),
       };
-      try {
-        await this.closeAgent(current.id);
-        result.collected.push(entry);
-      } catch (error) {
-        result.failures.push({ ...entry, error });
-      }
-    }
-
-    return result;
+      await this.closeAgentRuntime(agentId);
+      return entry;
+    });
   }
 
   private isIdleAgentCollectable(
@@ -1587,79 +1615,100 @@ export class AgentManager {
   }
 
   async setAgentMode(agentId: string, modeId: string): Promise<AgentProviderNotice | null> {
-    const agent = this.requireSessionAgent(agentId);
-    const notice = (await agent.session.setMode(modeId)) ?? null;
-    await this.drainSessionEvents(agentId);
-    const currentMode = (await agent.session.getCurrentMode()) ?? modeId;
-    agent.config.modeId = currentMode ?? undefined;
-    agent.currentModeId = currentMode;
-    // Update runtimeInfo to reflect the new mode
-    if (agent.runtimeInfo) {
-      agent.runtimeInfo = { ...agent.runtimeInfo, modeId: currentMode };
-    }
-    this.touchUpdatedAt(agent);
-    this.emitState(agent);
-    return notice;
+    return this.mutateAgentRuntime(agentId, async (agent) => {
+      const notice = (await agent.session.setMode(modeId)) ?? null;
+      await this.drainSessionEvents(agentId);
+      const currentMode = (await agent.session.getCurrentMode()) ?? modeId;
+      agent.config.modeId = currentMode ?? undefined;
+      agent.currentModeId = currentMode;
+      // Update runtimeInfo to reflect the new mode
+      if (agent.runtimeInfo) {
+        agent.runtimeInfo = { ...agent.runtimeInfo, modeId: currentMode };
+      }
+      return notice;
+    });
   }
 
   async setAgentModel(agentId: string, modelId: string | null): Promise<void> {
-    const agent = this.requireSessionAgent(agentId);
     const normalizedModelId =
       typeof modelId === "string" && modelId.trim().length > 0 ? modelId : null;
 
-    if (agent.session.setModel) {
-      await agent.session.setModel(normalizedModelId);
-    }
-    await this.drainSessionEvents(agentId);
+    await this.mutateAgentRuntime(agentId, async (agent) => {
+      if (agent.session.setModel) {
+        await agent.session.setModel(normalizedModelId);
+      }
+      await this.drainSessionEvents(agentId);
 
-    agent.config.model = normalizedModelId ?? undefined;
-    if (agent.runtimeInfo) {
-      agent.runtimeInfo = { ...agent.runtimeInfo, model: normalizedModelId };
-    }
-    this.touchUpdatedAt(agent);
-    this.emitState(agent);
+      agent.config.model = normalizedModelId ?? undefined;
+      if (agent.runtimeInfo) {
+        agent.runtimeInfo = { ...agent.runtimeInfo, model: normalizedModelId };
+      }
+    });
   }
 
   async setAgentThinkingOption(
     agentId: string,
     thinkingOptionId: string | null,
   ): Promise<AgentProviderNotice | null> {
-    const agent = this.requireSessionAgent(agentId);
     const normalizedThinkingOptionId =
       typeof thinkingOptionId === "string" && thinkingOptionId.trim().length > 0
         ? thinkingOptionId
         : null;
 
-    let notice: AgentProviderNotice | null = null;
-    if (agent.session.setThinkingOption) {
-      notice = (await agent.session.setThinkingOption(normalizedThinkingOptionId)) ?? null;
-    }
-    await this.drainSessionEvents(agentId);
+    return this.mutateAgentRuntime(agentId, async (agent) => {
+      let notice: AgentProviderNotice | null = null;
+      if (agent.session.setThinkingOption) {
+        notice = (await agent.session.setThinkingOption(normalizedThinkingOptionId)) ?? null;
+      }
+      await this.drainSessionEvents(agentId);
 
-    agent.config.thinkingOptionId = normalizedThinkingOptionId ?? undefined;
-    if (agent.runtimeInfo) {
-      agent.runtimeInfo = {
-        ...agent.runtimeInfo,
-        thinkingOptionId: normalizedThinkingOptionId,
-      };
-    }
-    this.touchUpdatedAt(agent);
-    this.emitState(agent);
-    return notice;
+      agent.config.thinkingOptionId = normalizedThinkingOptionId ?? undefined;
+      if (agent.runtimeInfo) {
+        agent.runtimeInfo = {
+          ...agent.runtimeInfo,
+          thinkingOptionId: normalizedThinkingOptionId,
+        };
+      }
+      return notice;
+    });
   }
 
   async setAgentFeature(agentId: string, featureId: string, value: unknown): Promise<void> {
-    const agent = this.requireAgent(agentId);
+    await this.mutateAgentRuntime(agentId, async (agent) => {
+      if (!agent.session.setFeature) {
+        throw new Error("Agent session does not support setting features");
+      }
 
-    if (!agent.session.setFeature) {
-      throw new Error("Agent session does not support setting features");
-    }
+      await agent.session.setFeature(featureId, value);
+      await this.drainSessionEvents(agentId);
+      agent.config.featureValues = { ...agent.config.featureValues, [featureId]: value };
+    });
+  }
 
-    await agent.session.setFeature(featureId, value);
-    await this.drainSessionEvents(agentId);
-    agent.config.featureValues = { ...agent.config.featureValues, [featureId]: value };
-    this.touchUpdatedAt(agent);
-    this.emitState(agent);
+  private mutateAgentRuntime<T>(
+    agentId: string,
+    operation: (agent: ActiveManagedAgent) => Promise<T>,
+  ): Promise<T> {
+    return this.queueAgentLifecycleHandoff(agentId, async () => {
+      const agent = this.requireSessionAgent(agentId);
+      this.touchUpdatedAt(agent);
+      try {
+        const result = await operation(agent);
+        if (this.agents.get(agentId) !== agent) {
+          throw new Error(`Agent '${agentId}' detached during runtime mutation`);
+        }
+        this.touchUpdatedAt(agent);
+        this.syncFeaturesFromSession(agent);
+        await this.persistSnapshot(agent);
+        this.emitState(agent, { persist: false });
+        return result;
+      } catch (error) {
+        if (this.agents.get(agentId) === agent) {
+          this.touchUpdatedAt(agent);
+        }
+        throw error;
+      }
+    });
   }
 
   async setTitle(agentId: string, title: string): Promise<void> {
@@ -1921,28 +1970,42 @@ export class AgentManager {
    * emitted by the handler flow through dispatchStream so they persist and
    * broadcast like normal timeline events.
    */
-  tryRunOutOfBand(agentId: string, prompt: AgentPromptInput): boolean {
-    const agent = this.requireSessionAgent(agentId);
-    const handler = agent.session.tryHandleOutOfBand?.(prompt);
-    if (!handler) {
-      return false;
-    }
-    const dispatch = (event: AgentStreamEvent): void => {
-      // Persist timeline items so they show up in fetchAgentTimeline; broadcast
-      // for live subscribers. Other event types are broadcast only.
-      if (event.type === "timeline") {
-        this.touchUpdatedAt(agent);
-        const row = this.recordTimeline(agent.id, event.item);
-        this.dispatchStream(agent.id, event, {
-          seq: row.seq,
-          epoch: this.timelineStore.getEpoch(agent.id),
-          timestamp: row.timestamp,
-        });
+  async tryRunOutOfBand(agentId: string, prompt: AgentPromptInput): Promise<boolean> {
+    let settleAccepted!: (accepted: boolean) => void;
+    let rejectAccepted!: (error: unknown) => void;
+    let acceptedSettled = false;
+    const accepted = new Promise<boolean>((resolveAccepted, reject) => {
+      settleAccepted = resolveAccepted;
+      rejectAccepted = reject;
+    });
+
+    const operation = this.queueAgentLifecycleHandoff(agentId, async () => {
+      const agent = this.requireSessionAgent(agentId);
+      const handler = agent.session.tryHandleOutOfBand?.(prompt);
+      if (!handler) {
+        acceptedSettled = true;
+        settleAccepted(false);
         return;
       }
-      this.dispatchStream(agent.id, event, { timestamp: new Date().toISOString() });
-    };
-    void (async () => {
+
+      this.touchUpdatedAt(agent);
+      acceptedSettled = true;
+      settleAccepted(true);
+      const dispatch = (event: AgentStreamEvent): void => {
+        // Persist timeline items so they show up in fetchAgentTimeline; broadcast
+        // for live subscribers. Other event types are broadcast only.
+        if (event.type === "timeline") {
+          this.touchUpdatedAt(agent);
+          const row = this.recordTimeline(agent.id, event.item);
+          this.dispatchStream(agent.id, event, {
+            seq: row.seq,
+            epoch: this.timelineStore.getEpoch(agent.id),
+            timestamp: row.timestamp,
+          });
+          return;
+        }
+        this.dispatchStream(agent.id, event, { timestamp: new Date().toISOString() });
+      };
       try {
         await handler.run({ emit: dispatch });
       } catch (error) {
@@ -1953,8 +2016,22 @@ export class AgentManager {
           item: { type: "assistant_message", text: `[Error] ${text}` },
         });
       }
-    })();
-    return true;
+      if (this.agents.get(agentId) !== agent) {
+        throw new Error(`Agent '${agentId}' detached during out-of-band command`);
+      }
+      this.touchUpdatedAt(agent);
+      await this.persistSnapshot(agent);
+    });
+    void operation.catch((error: unknown) => {
+      if (!acceptedSettled) {
+        acceptedSettled = true;
+        rejectAccepted(error);
+        return;
+      }
+      this.logger.error({ err: error, agentId }, "Out-of-band agent command failed");
+    });
+
+    return await accepted;
   }
 
   async appendTimelineItem(agentId: string, item: AgentTimelineItem): Promise<void> {
@@ -3978,6 +4055,23 @@ export class AgentManager {
     });
   }
 
+  private queueAgentLifecycleHandoff<T>(agentId: string, operation: () => Promise<T>): Promise<T> {
+    const previous = this.agentLifecycleTails.get(agentId) ?? Promise.resolve();
+    const result = previous.then(operation);
+    const tail = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    this.agentLifecycleTails.set(agentId, tail);
+    void tail.then(() => {
+      if (this.agentLifecycleTails.get(agentId) === tail) {
+        this.agentLifecycleTails.delete(agentId);
+      }
+      return undefined;
+    });
+    return result;
+  }
+
   private trackAgentRegistrationOperation<T>(result: Promise<T>): Promise<T> {
     const settled = result.then(
       () => undefined,
@@ -4012,10 +4106,15 @@ export class AgentManager {
     // Drain tasks, including tasks spawned while awaiting.
     while (
       this.backgroundTasks.size > 0 ||
-      (options.includeAgentRegistrations && this.agentRegistrationTasks.size > 0)
+      (options.includeAgentRegistrations &&
+        (this.agentRegistrationTasks.size > 0 || this.agentLifecycleTails.size > 0))
     ) {
       const pending = options.includeAgentRegistrations
-        ? [...this.backgroundTasks, ...this.agentRegistrationTasks]
+        ? [
+            ...this.backgroundTasks,
+            ...this.agentRegistrationTasks,
+            ...this.agentLifecycleTails.values(),
+          ]
         : [...this.backgroundTasks];
       await Promise.allSettled(pending);
     }
