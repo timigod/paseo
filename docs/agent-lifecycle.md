@@ -62,6 +62,21 @@ children.
 
 `create_agent_request` can opt an agent into `autoArchive`. In that mode the daemon archives the agent after the first terminal turn event (`turn_completed`, `turn_failed`, or `turn_canceled`). When the agent owns an isolated workspace, auto-archive archives that workspace too; the managed worktree is removed when its final workspace reference is gone.
 
+### Persistent macOS host service
+
+The MacBook and iMac use the owned `com.timiaji.paseo` LaunchAgent to keep their local daemon
+available after the desktop window closes and after login. Its command is the bundled
+`Resources/bin/paseo-daemon-launcher`, not the Electron helper directly. The launcher adds stable
+system and Homebrew paths without running an interactive shell before it execs the packaged daemon.
+This keeps installed `npm`, OpenCode, and Git visible to managed worktree setup without copying a
+shell profile, provider configuration, credentials, or agent state into the service definition.
+
+The packaged app reconciles only that owned service file during normal GUI startup, atomically and
+without reloading it. A running daemon is therefore never interrupted merely because the desktop
+app was opened. When a service restart is already authorized, boot out and bootstrap that one
+LaunchAgent after the new app is installed, then use `fleet recover` for any task that was running
+at the captured restart boundary. Do not restart the whole fleet or Synchronizer.
+
 Archiving runs through `AgentManager.archiveAgent` (`packages/server/src/server/agent/agent-manager.ts`):
 
 1. Snapshot the current session into the registry

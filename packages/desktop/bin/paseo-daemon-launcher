@@ -1,0 +1,22 @@
+#!/bin/zsh
+set -eu
+
+task_launcher_path="${0:A}"
+task_resources_path="${task_launcher_path:h:h}"
+task_login_path="$(/bin/zsh -ilc 'print -r -- "$PATH"' 2>/dev/null | /usr/bin/tail -n 1)"
+
+if [[ "$task_login_path" == /* && "$task_login_path" != *$'\n'* && "$task_login_path" != *$'\r'* ]]; then
+  export PATH="$task_login_path"
+else
+  export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+fi
+
+export ELECTRON_RUN_AS_NODE=1
+export PASEO_DESKTOP_MANAGED=1
+export PASEO_CLI="$task_resources_path/bin/paseo"
+export PASEO_WEB_UI_ENABLED=false
+
+exec "$task_resources_path/../Frameworks/Paseo Helper.app/Contents/MacOS/Paseo Helper" \
+  "$task_resources_path/app.asar.unpacked/dist/daemon/node-entrypoint-runner.js" \
+  node-script \
+  "$task_resources_path/app.asar/node_modules/@getpaseo/server/dist/scripts/supervisor-entrypoint.js"
