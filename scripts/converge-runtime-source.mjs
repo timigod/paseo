@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { spawnSync } from "node:child_process";
-import { existsSync, realpathSync } from "node:fs";
+import { existsSync, mkdirSync, realpathSync, rmSync, symlinkSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -12,6 +12,7 @@ const branch = "fix/paseo-027-control-lane";
 const remoteUrl = "https://github.com/timigod/paseo.git";
 const macbookRoot = "/Users/timiajiboye/Code/paseo-0.1.110-eof-fix";
 const imacRoot = "/Users/timi/Code/paseo-0.1.110-eof-fix";
+const installedCli = "/Applications/Paseo.app/Contents/Resources/bin/paseo";
 
 function fail(message) {
   throw new Error(`Paseo runtime source convergence refused: ${message}`);
@@ -107,20 +108,24 @@ function buildCliArtifacts(root) {
   run("npm", ["run", "build", "--workspace=@getpaseo/cli"], { cwd: root });
   run("node", ["packages/cli/dist/index.js", "fleet", "--help"], { cwd: root });
   run("node", ["packages/cli/dist/index.js", "fleet", "continue", "--help"], { cwd: root });
-  activateCli(root);
+  activateInstalledCli();
   assertCleanPrimary(root);
 }
 
-function activateCli(root) {
-  const cliRoot = path.join(root, "packages", "cli");
-  run("npm", ["link"], { cwd: cliRoot });
-  const globalNodeModules = run("npm", ["root", "--global"]);
-  const linkedCliRoot = path.join(globalNodeModules, "@getpaseo", "cli");
-  if (!existsSync(linkedCliRoot) || realpathSync(linkedCliRoot) !== realpathSync(cliRoot)) {
-    fail("the active global @getpaseo/cli is not linked to the converged source checkout");
+function activateInstalledCli() {
+  if (!existsSync(installedCli)) {
+    fail(`the installed Paseo app CLI is missing at ${installedCli}`);
   }
-  run("paseo", ["fleet", "--help"], { cwd: root });
-  run("paseo", ["fleet", "continue", "--help"], { cwd: root });
+  const shimDir = path.join(os.homedir(), ".local", "bin");
+  const shim = path.join(shimDir, "paseo");
+  mkdirSync(shimDir, { recursive: true });
+  rmSync(shim, { force: true });
+  symlinkSync(installedCli, shim, "file");
+  if (realpathSync(shim) !== realpathSync(installedCli)) {
+    fail("the bare paseo command does not resolve to the installed app CLI");
+  }
+  run(installedCli, ["fleet", "--help"]);
+  run(installedCli, ["fleet", "continue", "--help"]);
 }
 
 function shellQuote(value) {
@@ -143,14 +148,13 @@ function peerCommand(root, expected, setupOnly, buildCli) {
         "npm run build --workspace=@getpaseo/cli",
         "node packages/cli/dist/index.js fleet --help >/dev/null",
         "node packages/cli/dist/index.js fleet continue --help >/dev/null",
-        'cd "$repo/packages/cli"',
-        "npm link >/dev/null",
-        'global_node_modules="$(npm root --global)"',
-        `node -e ${shellQuote(
-          'const fs = require("node:fs"); if (!fs.existsSync(process.argv[2]) || fs.realpathSync(process.argv[1]) !== fs.realpathSync(process.argv[2])) process.exit(1);',
-        )} "$repo/packages/cli" "$global_node_modules/@getpaseo/cli"`,
-        "paseo fleet --help >/dev/null",
-        "paseo fleet continue --help >/dev/null",
+        `installed_cli=${shellQuote(installedCli)}`,
+        'test -x "$installed_cli"',
+        'mkdir -p "$HOME/.local/bin"',
+        'ln -sfn "$installed_cli" "$HOME/.local/bin/paseo"',
+        'test "$(readlink "$HOME/.local/bin/paseo")" = "$installed_cli"',
+        '"$installed_cli" fleet --help >/dev/null',
+        '"$installed_cli" fleet continue --help >/dev/null',
         'test -z "$(git -C "$repo" status --porcelain=v1 --untracked-files=all)"',
       ].join("\n")
     : "";
