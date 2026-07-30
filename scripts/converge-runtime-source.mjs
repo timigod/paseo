@@ -106,6 +106,7 @@ function buildCliArtifacts(root) {
   run("npm", ["run", "build:client"], { cwd: root });
   run("npm", ["run", "build", "--workspace=@getpaseo/cli"], { cwd: root });
   run("node", ["packages/cli/dist/index.js", "fleet", "--help"], { cwd: root });
+  run("node", ["packages/cli/dist/index.js", "fleet", "continue", "--help"], { cwd: root });
   activateCli(root);
   assertCleanPrimary(root);
 }
@@ -119,6 +120,7 @@ function activateCli(root) {
     fail("the active global @getpaseo/cli is not linked to the converged source checkout");
   }
   run("paseo", ["fleet", "--help"], { cwd: root });
+  run("paseo", ["fleet", "continue", "--help"], { cwd: root });
 }
 
 function shellQuote(value) {
@@ -140,6 +142,7 @@ function peerCommand(root, expected, setupOnly, buildCli) {
         "npm run build:client",
         "npm run build --workspace=@getpaseo/cli",
         "node packages/cli/dist/index.js fleet --help >/dev/null",
+        "node packages/cli/dist/index.js fleet continue --help >/dev/null",
         'cd "$repo/packages/cli"',
         "npm link >/dev/null",
         'global_node_modules="$(npm root --global)"',
@@ -147,6 +150,7 @@ function peerCommand(root, expected, setupOnly, buildCli) {
           'const fs = require("node:fs"); if (!fs.existsSync(process.argv[2]) || fs.realpathSync(process.argv[1]) !== fs.realpathSync(process.argv[2])) process.exit(1);',
         )} "$repo/packages/cli" "$global_node_modules/@getpaseo/cli"`,
         "paseo fleet --help >/dev/null",
+        "paseo fleet continue --help >/dev/null",
         'test -z "$(git -C "$repo" status --porcelain=v1 --untracked-files=all)"',
       ].join("\n")
     : "";
