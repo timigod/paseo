@@ -107,6 +107,10 @@ const FAILED_CHECK_JOB_LIMIT = 5;
 export const GITHUB_POLL_FAST_INTERVAL_MS = 20_000;
 export const GITHUB_POLL_SLOW_INTERVAL_MS = 120_000;
 export const GITHUB_POLL_ERROR_BACKOFF_CAP_MS = 300_000;
+// GitHub limits are shared by every retained worktree. Once the API reports
+// exhaustion, keep all poll targets quiet for one bounded window instead of
+// having each target independently retry and prolong the outage.
+export const GITHUB_RATE_LIMIT_COOLDOWN_MS = GITHUB_POLL_ERROR_BACKOFF_CAP_MS;
 const GITHUB_ENV = {
   GIT_TERMINAL_PROMPT: "0",
 } as const;
@@ -752,6 +756,7 @@ export function createGitHubService(options: CreateGitHubServiceOptions = {}): G
   const inFlight = new Map<string, InFlightCacheEntry>();
   const pollTargets = new Map<string, GitHubPollTarget>();
   const checkLogTailCache = new Map<string, { logTail: string; logTruncated: boolean }>();
+  let githubRateLimitedUntil = 0;
   let api!: GitHubService;
 
   async function cached<T>(params: {
@@ -927,13 +932,23 @@ export function createGitHubService(options: CreateGitHubServiceOptions = {}): G
       clearTimeout(target.timer);
     }
 
-    target.timer = setTimeout(() => {
-      target.timer = null;
-      void runGitHubPoll(target);
-    }, delayMs);
+    const sharedCooldownDelay = Math.max(0, githubRateLimitedUntil - deps.now());
+    target.timer = setTimeout(
+      () => {
+        target.timer = null;
+        void runGitHubPoll(target);
+      },
+      Math.max(delayMs, sharedCooldownDelay),
+    );
   }
 
   async function runGitHubPoll(target: GitHubPollTarget): Promise<void> {
+    // Timers scheduled just before another target discovers rate limiting
+    // must also stand down; clamping only when scheduling is not enough.
+    if (githubRateLimitedUntil > deps.now()) {
+      scheduleGitHubPollAfter(target, 0);
+      return;
+    }
     try {
       await api.getCurrentPullRequestStatus({
         cwd: target.cwd,
@@ -944,6 +959,12 @@ export function createGitHubService(options: CreateGitHubServiceOptions = {}): G
       });
     } catch (error) {
       target.consecutiveErrors += 1;
+      if (isGitHubRateLimitError(error)) {
+        githubRateLimitedUntil = Math.max(
+          githubRateLimitedUntil,
+          deps.now() + GITHUB_RATE_LIMIT_COOLDOWN_MS,
+        );
+      }
       for (const callback of target.errorCallbacks) {
         callback(error);
       }
@@ -1697,6 +1718,15 @@ export function computeGithubNextInterval(
   }
 
   return Math.min(baseInterval * 2 ** (consecutiveErrors - 1), GITHUB_POLL_ERROR_BACKOFF_CAP_MS);
+}
+
+export function isGitHubRateLimitError(error: unknown): boolean {
+  if (!(error instanceof GitHubCommandError)) {
+    return false;
+  }
+  return /(?:api |graphql: )?rate limit(?: already)? exceeded|rate limit reached|secondary rate limit/i.test(
+    error.stderr,
+  );
 }
 
 function isGitHubStatusPending(status: CurrentPullRequestStatus | null): boolean {
