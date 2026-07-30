@@ -621,6 +621,13 @@ export class Session {
   private peakInflightRequests = 0;
   private readonly workspaceSetupSnapshots: Map<string, WorkspaceSetupSnapshot>;
   private readonly workspaceGitObserver: WorkspaceGitObserverService;
+  // A workspace record is durable history; a Git watcher is not. Keep the
+  // observer proportional to live agent work rather than every historical
+  // workspace that happens to be visible in the directory.
+  private readonly observedLiveWorkspaceGitIds = new Set<string>();
+  // Explicit workspace actions (open/create/mutation) are bounded user intent,
+  // so retain their observer for this session even before an agent is started.
+  private readonly explicitlyObservedWorkspaceGitIds = new Set<string>();
   private readonly workspaceDirectory: WorkspaceDirectory;
   private readonly voiceSession: VoiceSession;
   private readonly checkoutSession: CheckoutSession;
@@ -1129,7 +1136,10 @@ export class Session {
   }
 
   async syncWorkspaceGitObserverForWorkspace(workspace: PersistedWorkspaceRecord): Promise<void> {
-    await this.workspaceGitObserver.syncObserverForWorkspace(workspace);
+    await this.reconcileLiveWorkspaceGitObserver(workspace.workspaceId, {
+      refresh: true,
+      explicitlyRequested: true,
+    });
   }
 
   async emitWorkspaceUpdateForWorkspaceId(workspaceId: string): Promise<void> {
@@ -1178,23 +1188,24 @@ export class Session {
   ): Promise<void> {
     await Promise.all(
       Array.from(new Set(workspaceIds)).map(async (workspaceId) => {
-        const workspace = await this.workspaceRegistry.get(workspaceId);
-        if (workspace && !workspace.archivedAt) {
-          await this.workspaceGitObserver.syncObserverForWorkspace(workspace);
-        }
+        await this.reconcileLiveWorkspaceGitObserver(workspaceId, { refresh: true });
       }),
     );
   }
 
   async warmWorkspaceGitDataForWorkspace(workspace: PersistedWorkspaceRecord): Promise<void> {
-    await this.workspaceGitObserver.warmGitData(workspace);
+    await this.reconcileLiveWorkspaceGitObserver(workspace.workspaceId, {
+      refresh: true,
+      explicitlyRequested: true,
+    });
+    await this.emitWorkspaceUpdateForWorkspaceId(workspace.workspaceId);
   }
 
   async refreshRecoveredWorkspaceForExternalMutation(
     workspace: PersistedWorkspaceRecord,
   ): Promise<void> {
     try {
-      await this.workspaceGitObserver.warmGitData(workspace);
+      await this.warmWorkspaceGitDataForWorkspace(workspace);
     } catch (error) {
       this.sessionLogger.warn(
         { err: error, workspaceId: workspace.workspaceId },
@@ -1407,6 +1418,8 @@ export class Session {
         mutation.workspace?.archivedAt
       ) {
         this.workspaceGitObserver.removeForWorkspaceId(mutation.workspaceId);
+        this.observedLiveWorkspaceGitIds.delete(mutation.workspaceId);
+        this.explicitlyObservedWorkspaceGitIds.delete(mutation.workspaceId);
       } else {
         await this.syncWorkspaceMutationObserver(mutation);
       }
@@ -1439,7 +1452,7 @@ export class Session {
       !descriptor ||
       !this.matchesWorkspaceFilter({ workspace: descriptor, filter: subscription.filter })
     ) {
-      this.workspaceGitObserver.removeForWorkspaceId(mutation.workspaceId);
+      await this.reconcileLiveWorkspaceGitObserver(mutation.workspaceId);
       return;
     }
     const currentWorkspace = await this.workspaceRegistry.get(mutation.workspaceId);
@@ -1447,9 +1460,86 @@ export class Session {
       this.workspaceGitObserver.removeForWorkspaceId(mutation.workspaceId);
       return;
     }
-    await this.workspaceGitObserver.syncObserverForWorkspace(currentWorkspace);
+    await this.reconcileLiveWorkspaceGitObserver(currentWorkspace.workspaceId, {
+      refresh: true,
+      explicitlyRequested: true,
+    });
     if (this.isCleanedUp) {
       this.workspaceGitObserver.removeForWorkspaceId(mutation.workspaceId);
+      this.observedLiveWorkspaceGitIds.delete(mutation.workspaceId);
+      this.explicitlyObservedWorkspaceGitIds.delete(mutation.workspaceId);
+    }
+  }
+
+  private liveAgentWorkspaceIds(): Set<string> {
+    const workspaceIds = new Set<string>();
+    for (const agent of this.agentManager.listAgents()) {
+      if (agent.workspaceId) {
+        workspaceIds.add(agent.workspaceId);
+      }
+    }
+    return workspaceIds;
+  }
+
+  private async reconcileLiveWorkspaceGitObservers(): Promise<void> {
+    const liveWorkspaceIds = this.liveAgentWorkspaceIds();
+    const observedWorkspaceIds = new Set([
+      ...liveWorkspaceIds,
+      ...this.explicitlyObservedWorkspaceGitIds,
+    ]);
+    for (const workspaceId of this.observedLiveWorkspaceGitIds) {
+      if (!observedWorkspaceIds.has(workspaceId)) {
+        this.workspaceGitObserver.removeForWorkspaceId(workspaceId);
+        this.observedLiveWorkspaceGitIds.delete(workspaceId);
+      }
+    }
+    await Promise.all(
+      Array.from(observedWorkspaceIds, (workspaceId) =>
+        this.reconcileLiveWorkspaceGitObserver(workspaceId),
+      ),
+    );
+  }
+
+  private async reconcileLiveWorkspaceGitObserver(
+    workspaceId: string,
+    options?: { refresh?: boolean; explicitlyRequested?: boolean },
+  ): Promise<void> {
+    if (options?.explicitlyRequested) {
+      this.explicitlyObservedWorkspaceGitIds.add(workspaceId);
+    }
+    const shouldObserve = () =>
+      this.liveAgentWorkspaceIds().has(workspaceId) ||
+      this.explicitlyObservedWorkspaceGitIds.has(workspaceId);
+    if (!shouldObserve()) {
+      this.workspaceGitObserver.removeForWorkspaceId(workspaceId);
+      this.observedLiveWorkspaceGitIds.delete(workspaceId);
+      return;
+    }
+    if (options?.refresh) {
+      this.workspaceGitObserver.removeForWorkspaceId(workspaceId);
+      this.observedLiveWorkspaceGitIds.delete(workspaceId);
+    } else if (this.observedLiveWorkspaceGitIds.has(workspaceId)) {
+      return;
+    }
+
+    const workspace = await this.workspaceRegistry.get(workspaceId);
+    if (!workspace || workspace.archivedAt || !shouldObserve()) {
+      this.workspaceGitObserver.removeForWorkspaceId(workspaceId);
+      this.observedLiveWorkspaceGitIds.delete(workspaceId);
+      if (!workspace || workspace.archivedAt) {
+        this.explicitlyObservedWorkspaceGitIds.delete(workspaceId);
+      }
+      return;
+    }
+    await this.workspaceGitObserver.syncObserverForWorkspace(workspace);
+    if (shouldObserve() && !this.isCleanedUp) {
+      this.observedLiveWorkspaceGitIds.add(workspaceId);
+    } else {
+      this.workspaceGitObserver.removeForWorkspaceId(workspaceId);
+      this.observedLiveWorkspaceGitIds.delete(workspaceId);
+      if (this.isCleanedUp) {
+        this.explicitlyObservedWorkspaceGitIds.delete(workspaceId);
+      }
     }
   }
 
@@ -1523,6 +1613,14 @@ export class Session {
             },
             "agent.session.forward_update",
           );
+          if (event.agent.workspaceId) {
+            void this.reconcileLiveWorkspaceGitObserver(event.agent.workspaceId).catch((error) => {
+              this.sessionLogger.warn(
+                { err: error, workspaceId: event.agent.workspaceId, agentId: event.agent.id },
+                "Failed to reconcile live workspace Git observer after agent state change",
+              );
+            });
+          }
           void this.agentUpdates.forwardLiveAgent(event.agent);
           return;
         }
@@ -4871,7 +4969,12 @@ export class Session {
       }
 
       const payload = await this.listFetchWorkspacesEntries(request);
-      this.workspaceGitObserver.syncObservers(payload.entries);
+      // This is intentionally detached from the fetch response. A client can
+      // list historical workspaces without re-registering hundreds of Git
+      // watchers; only current agents receive live observer resources.
+      void this.reconcileLiveWorkspaceGitObservers().catch((error) => {
+        this.sessionLogger.warn({ err: error }, "Failed to reconcile live workspace Git observers");
+      });
       this.sessionLogger.debug(
         {
           requestId: request.requestId,

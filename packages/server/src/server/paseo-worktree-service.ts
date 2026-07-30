@@ -3,6 +3,7 @@ import { resolve } from "node:path";
 
 import type { WorkspaceGitService } from "./workspace-git-service.js";
 import { getRealpathAwareRelativePath } from "../utils/path.js";
+import { runWithGitCommandPriority } from "../utils/run-git-command.js";
 import type { PersistedWorkspaceRecord } from "./workspace-registry.js";
 import type { WorkspaceProvisioningService } from "./session/workspace-provisioning/workspace-provisioning-service.js";
 import {
@@ -61,6 +62,13 @@ export interface CreatePaseoWorktreeDeps extends CreateWorktreeCoreDeps {
 }
 
 export async function createPaseoWorktree(
+  input: CreatePaseoWorktreeInput,
+  deps: CreatePaseoWorktreeDeps,
+): Promise<CreatePaseoWorktreeResult> {
+  return runWithGitCommandPriority("control", () => createPaseoWorktreeInControlLane(input, deps));
+}
+
+async function createPaseoWorktreeInControlLane(
   input: CreatePaseoWorktreeInput,
   deps: CreatePaseoWorktreeDeps,
 ): Promise<CreatePaseoWorktreeResult> {

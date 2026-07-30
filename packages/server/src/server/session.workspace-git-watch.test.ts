@@ -484,7 +484,7 @@ describe("workspace git watch targets", () => {
       name: "old-branch",
     });
 
-    await session.syncWorkspaceGitObserversForExternalWorkspaceIds(["ws-10"]);
+    syncGitObserver(session, "/tmp/repo", "ws-10");
 
     subscriptions[0]?.listener(
       createWorkspaceRuntimeSnapshot("/tmp/repo", {

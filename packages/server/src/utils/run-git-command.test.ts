@@ -171,9 +171,10 @@ function enqueueSpawnBehaviors(...behaviors: FakeSpawnBehavior[]): void {
   fakeSpawnController.queue.push(...behaviors);
 }
 
-async function loadRunGitCommand(concurrency: number) {
+async function loadRunGitCommand(concurrency: number, controlConcurrency = 1) {
   vi.resetModules();
   vi.stubEnv("PASEO_GIT_CONCURRENCY", String(concurrency));
+  vi.stubEnv("PASEO_GIT_CONTROL_CONCURRENCY", String(controlConcurrency));
   return import("./run-git-command.js");
 }
 
@@ -203,6 +204,22 @@ describe("runGitCommand", () => {
 
     expect(fakeSpawnController.peakActiveCount).toBe(2);
     expect(fakeSpawnController.activeCount).toBe(0);
+  });
+
+  it("lets lifecycle Git work bypass a saturated background observer queue", async () => {
+    const { runGitCommand, runWithGitCommandPriority } = await loadRunGitCommand(1, 1);
+
+    enqueueSpawnBehaviors({ delayMs: 50 }, { delayMs: 0 });
+    const background = runGitCommand(["status"], { cwd: process.cwd() });
+    await Promise.resolve();
+
+    await runWithGitCommandPriority("control", () =>
+      runGitCommand(["worktree", "list", "--porcelain"], { cwd: process.cwd() }),
+    );
+
+    expect(fakeSpawnController.processes).toHaveLength(2);
+    expect(fakeSpawnController.peakActiveCount).toBe(2);
+    await background;
   });
 
   it("kills timed out processes and releases the limiter slot", async () => {

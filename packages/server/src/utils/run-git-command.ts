@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { existsSync } from "node:fs";
 import pLimit from "p-limit";
 import type { Logger } from "pino";
@@ -13,8 +14,13 @@ const DEFAULT_MAX_OUTPUT_BYTES = 20 * 1024 * 1024; // 20MB
 const DEFAULT_STDERR_LIMIT = 2048;
 
 const gitConcurrency = parseInt(process.env.PASEO_GIT_CONCURRENCY ?? "8", 10) || 8;
+const gitControlConcurrency = parseInt(process.env.PASEO_GIT_CONTROL_CONCURRENCY ?? "1", 10) || 1;
 const gitLimit = pLimit(gitConcurrency);
-const gitRuntimeMetrics = new GitCommandRuntimeMetricsWindow(gitConcurrency);
+const gitControlLimit = pLimit(gitControlConcurrency);
+const gitCommandPriority = new AsyncLocalStorage<"control">();
+const gitRuntimeMetrics = new GitCommandRuntimeMetricsWindow(
+  gitConcurrency + gitControlConcurrency,
+);
 
 export interface GitCommandOptions {
   cwd: string;
@@ -42,6 +48,19 @@ export interface GitCommandMetric {
   exitCode: number | null;
   signal: NodeJS.Signals | null;
   success: boolean;
+}
+
+/**
+ * Keep lifecycle-changing Git work (for example, worktree creation) out of
+ * the best-effort observer queue. The control lane is deliberately narrow and
+ * serial: it protects the action that creates or removes user workspaces
+ * without letting a burst of background status reads consume its deadline.
+ */
+export function runWithGitCommandPriority<T>(
+  priority: "control",
+  operation: () => Promise<T>,
+): Promise<T> {
+  return gitCommandPriority.run(priority, operation);
 }
 
 export interface GitCommandMetricsSnapshot {
@@ -88,8 +107,8 @@ export function stopGitCommandMetrics(): GitCommandMetricsSnapshot {
 
 export function snapshotGitCommandRuntimeMetrics(): GitCommandRuntimeMetricsSnapshot {
   return gitRuntimeMetrics.snapshotAndReset({
-    active: gitLimit.activeCount,
-    pending: gitLimit.pendingCount,
+    active: gitLimit.activeCount + gitControlLimit.activeCount,
+    pending: gitLimit.pendingCount + gitControlLimit.pendingCount,
   });
 }
 
@@ -136,7 +155,8 @@ export function runGitCommand(
   options: GitCommandOptions,
 ): Promise<GitCommandResult> {
   const runtimeMetric = gitRuntimeMetrics.submit(getGitOperation(args));
-  const promise = gitLimit(
+  const limiter = gitCommandPriority.getStore() === "control" ? gitControlLimit : gitLimit;
+  const promise = limiter(
     () =>
       new Promise<GitCommandResult>((resolve, reject) => {
         gitRuntimeMetrics.start(runtimeMetric);
@@ -336,7 +356,10 @@ export function runGitCommand(
         });
       }),
   );
-  gitRuntimeMetrics.observeLimiter(gitLimit.activeCount, gitLimit.pendingCount);
+  gitRuntimeMetrics.observeLimiter(
+    gitLimit.activeCount + gitControlLimit.activeCount,
+    gitLimit.pendingCount + gitControlLimit.pendingCount,
+  );
   return promise;
 }
 

@@ -6607,7 +6607,7 @@ test("fetch_workspaces_response reads runtime fields from passive workspace git 
   ]);
 });
 
-test("fetch_workspaces_response emits before cold registration-triggered git work starts", async () => {
+test("fetching historical workspaces does not register Git observers without a live agent", async () => {
   const events: string[] = [];
   const emitted: SessionOutboundMessage[] = [];
   const workspaceGitService = createNoopWorkspaceGitService();
@@ -6666,6 +6666,54 @@ test("fetch_workspaces_response emits before cold registration-triggered git wor
 
   expect(emitted.find((message) => message.type === "fetch_workspaces_response")).toBeDefined();
   expect(events[0]).toBe("response");
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  expect(workspaceGitService.registerWorkspace).not.toHaveBeenCalled();
+  expect(getSnapshot).not.toHaveBeenCalled();
+});
+
+test("fetching a workspace with a live agent registers its Git observer after responding", async () => {
+  const emitted: SessionOutboundMessage[] = [];
+  const workspaceGitService = createNoopWorkspaceGitService();
+  workspaceGitService.registerWorkspace = vi.fn(() => ({ unsubscribe: () => {} }));
+  const session = asTestSession(createSessionForWorkspaceTests({ workspaceGitService }));
+  const project = createPersistedProjectRecord({
+    projectId: "proj-live-fetch",
+    rootPath: REPO_CWD,
+    kind: "git",
+    displayName: "repo",
+    createdAt: "2026-03-01T12:00:00.000Z",
+    updatedAt: "2026-03-01T12:00:00.000Z",
+  });
+  const workspace = createPersistedWorkspaceRecord({
+    workspaceId: "ws-live-fetch",
+    projectId: project.projectId,
+    cwd: REPO_CWD,
+    kind: "local_checkout",
+    displayName: "main",
+    createdAt: "2026-03-01T12:00:00.000Z",
+    updatedAt: "2026-03-01T12:00:00.000Z",
+  });
+  session.emit = (message: unknown) => {
+    if (isSessionOutboundMessage(message)) emitted.push(message);
+  };
+  session.listAgentPayloads = async () => [];
+  session.projectRegistry.list = async () => [project];
+  session.workspaceRegistry.list = async () => [workspace];
+  session.workspaceRegistry.get = async (workspaceId: string) =>
+    workspaceId === workspace.workspaceId ? workspace : null;
+  session.agentManager.listAgents = () => [{ workspaceId: workspace.workspaceId }];
+
+  await session.handleMessage({
+    type: "fetch_workspaces_request",
+    requestId: "req-fetch-live-workspace",
+  });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  expect(emitted.find((message) => message.type === "fetch_workspaces_response")).toBeDefined();
+  expect(workspaceGitService.registerWorkspace).toHaveBeenCalledWith(
+    { cwd: REPO_CWD },
+    expect.any(Function),
+  );
 });
 
 test("workspace_update includes updated runtime fields", async () => {
