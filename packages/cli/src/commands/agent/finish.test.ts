@@ -47,6 +47,7 @@ describe("runFinishCommand", () => {
     expect(client.getPaseoWorktreeList).toHaveBeenCalledWith({
       cwd: "/repo/.paseo/worktrees/task-a/src",
     });
+    expect(client.fetchAgents).toHaveBeenCalledWith({ filter: { includeArchived: false } });
   });
 
   it("keeps a managed worktree when an unrelated active task shares it", async () => {

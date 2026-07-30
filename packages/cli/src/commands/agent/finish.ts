@@ -100,7 +100,9 @@ async function determineWorktreeDisposition(
     };
   }
 
-  const agentsPayload = await client.fetchAgents({ filter: { includeArchived: true } });
+  // Only active agents can retain this worktree.  Pulling every archived
+  // snapshot makes routine cleanup scale with all historical fleet activity.
+  const agentsPayload = await client.fetchAgents({ filter: { includeArchived: false } });
   const agents = agentsPayload.entries.map((entry) => entry.agent);
   const byId = new Map(agents.map((entry) => [entry.id, entry]));
   const worktreeResponse = await client.getPaseoWorktreeList({ cwd: agent.cwd });

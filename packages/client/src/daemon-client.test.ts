@@ -940,6 +940,50 @@ test("defaults session RPC waiters to sixty seconds", async () => {
   await expect(responsePromise).rejects.toThrow("Timeout waiting for message (60000ms)");
 });
 
+test("allows workspace archive cleanup to outlive the normal session RPC timeout", async () => {
+  useHeartbeatClock();
+  const logger = createMockLogger();
+  const mock = createMockTransport();
+
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "clsk_unit_test",
+    logger,
+    reconnect: { enabled: false },
+    transportFactory: () => mock.transport,
+  });
+  clients.push(client);
+
+  const connectPromise = client.connect();
+  mock.triggerOpen();
+  await connectPromise;
+
+  const responsePromise = client.archiveWorkspace("workspace-1", "req-workspace-archive-1");
+  let settled = false;
+  void responsePromise.then(
+    () => {
+      settled = true;
+      return undefined;
+    },
+    () => {
+      settled = true;
+      return undefined;
+    },
+  );
+
+  expect(parseSentFrame(mock.sent[0])).toEqual({
+    type: "archive_workspace_request",
+    requestId: "req-workspace-archive-1",
+    workspaceId: "workspace-1",
+  });
+
+  await vi.advanceTimersByTimeAsync(60_000);
+  expect(settled).toBe(false);
+
+  await vi.advanceTimersByTimeAsync(90_000);
+  await expect(responsePromise).rejects.toThrow("Timeout waiting for message (150000ms)");
+});
+
 test("honors explicit fetchAgent timeout below the session RPC default", async () => {
   useHeartbeatClock();
   const logger = createMockLogger();

@@ -14,7 +14,7 @@ import {
 } from "../utils/worktree.js";
 import type { TerminalManager } from "../terminal/terminal-manager.js";
 import type { PersistedWorkspaceRecord, WorkspaceRegistry } from "./workspace-registry.js";
-import { createRealpathAwarePathMatcher } from "../utils/path.js";
+import { createRealpathAwarePathMatcher, isRealpathInsideRoot } from "../utils/path.js";
 
 export type ActiveWorkspaceRef = Pick<
   PersistedWorkspaceRecord,
@@ -203,14 +203,14 @@ async function resolveArchiveTarget(
 
   const backing = await resolveBackingDirectory(scope.targetPath, dependencies);
   const matchesBackingDirectory = createRealpathAwarePathMatcher(backing.path);
-  const targetWorkspaces = (
-    await Promise.all(
-      activeWorkspaces.map(async (workspace) => {
-        const backingDirectory = await resolveWorkspaceBackingDirectory(workspace, dependencies);
-        return matchesBackingDirectory(backingDirectory.path) ? workspace : null;
-      }),
-    )
-  ).filter((workspace): workspace is ActiveWorkspaceRef => workspace !== null);
+  // Do not resolve every historic worktree through Git just to determine
+  // whether it belongs to this backing directory.  Legacy workspace records
+  // lack durable placement metadata, but their cwd still proves membership
+  // when it is inside the target worktree.  Resolving every unrelated legacy
+  // record here creates an unbounded Git-command fan-out during cleanup.
+  const targetWorkspaces = activeWorkspaces.filter((workspace) =>
+    workspaceReferencesBackingDirectory(workspace, backing.path, matchesBackingDirectory),
+  );
   const persistedMainRepoRoot = targetWorkspaces.find(
     (workspace) => workspace.mainRepoRoot,
   )?.mainRepoRoot;
@@ -353,12 +353,7 @@ async function maybeRemoveDirectory(
 
   const remainingActive = await dependencies.listActiveWorkspaces();
   if (
-    !(await isDirectoryUnreferenced(
-      remainingActive,
-      backing.path,
-      new Set(archivedWorkspaceIds),
-      dependencies,
-    ))
+    !(await isDirectoryUnreferenced(remainingActive, backing.path, new Set(archivedWorkspaceIds)))
   ) {
     return false;
   }
@@ -463,16 +458,33 @@ async function isDirectoryUnreferenced(
   activeWorkspaces: ActiveWorkspaceRef[],
   targetDir: string,
   archivedWorkspaceIds: ReadonlySet<string>,
-  dependencies: Pick<ArchiveDependencies, "paseoHome" | "paseoWorktreesBaseRoot">,
 ): Promise<boolean> {
   const target = resolve(targetDir);
   const matchesTarget = createRealpathAwarePathMatcher(target);
   for (const workspace of activeWorkspaces) {
     if (archivedWorkspaceIds.has(workspace.workspaceId)) continue;
-    const backingDirectory = await resolveWorkspaceBackingDirectory(workspace, dependencies);
-    if (matchesTarget(backingDirectory.path)) return false;
+    if (workspaceReferencesBackingDirectory(workspace, target, matchesTarget)) return false;
   }
   return true;
+}
+
+function workspaceReferencesBackingDirectory(
+  workspace: ActiveWorkspaceRef,
+  backingPath: string,
+  matchesBackingDirectory: (candidate: string) => boolean,
+): boolean {
+  if (workspace.kind !== "worktree") {
+    return matchesBackingDirectory(workspace.cwd);
+  }
+
+  if (workspace.isPaseoOwnedWorktree && workspace.worktreeRoot) {
+    return matchesBackingDirectory(workspace.worktreeRoot);
+  }
+
+  // COMPAT(archiveMissingWorkspacePlacement): older worktree records can be
+  // rooted at a subdirectory.  Containment is sufficient to retain or archive
+  // safely and avoids a Git probe for every unrelated historical record.
+  return isRealpathInsideRoot(backingPath, workspace.cwd);
 }
 
 export async function killTerminalsForWorkspace(

@@ -949,6 +949,11 @@ function toTimeoutError(error: unknown, label: string, timeoutMs: number): Error
 const DEFAULT_RECONNECT_BASE_DELAY_MS = 1500;
 const DEFAULT_RECONNECT_MAX_DELAY_MS = 30000;
 const DEFAULT_SESSION_RPC_TIMEOUT_MS = 60_000;
+// Worktree teardown can legitimately include a bounded `git worktree remove`
+// operation (120 seconds server-side).  Its client waiter must outlive that
+// bound so a completed archive is not reported as failed midway through disk
+// cleanup.
+const WORKTREE_ARCHIVE_RPC_TIMEOUT_MS = 150_000;
 const DEFAULT_CONNECT_TIMEOUT_MS = 15_000;
 const DEFAULT_LIVENESS_TIMEOUT_MS = 5000;
 const LIVENESS_HEARTBEAT_INTERVAL_MS = 10_000;
@@ -2190,6 +2195,7 @@ export class DaemonClient {
         workspaceId,
       },
       responseType: "archive_workspace_response",
+      timeout: WORKTREE_ARCHIVE_RPC_TIMEOUT_MS,
     });
   }
 
@@ -3896,6 +3902,7 @@ export class DaemonClient {
         ...(input.scope !== undefined ? { scope: input.scope } : {}),
       },
       responseType: "paseo_worktree_archive_response",
+      timeout: WORKTREE_ARCHIVE_RPC_TIMEOUT_MS,
     });
   }
 
