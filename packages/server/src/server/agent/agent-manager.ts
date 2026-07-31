@@ -154,6 +154,55 @@ function currentContinuationRows(rows: readonly AgentTimelineRow[]): AgentTimeli
   return [...rows];
 }
 
+function getTimelineItemIdentity(item: AgentTimelineItem): string | null {
+  if (item.type === "tool_call") {
+    return `tool_call:${item.callId}`;
+  }
+  if (item.type === "user_message") {
+    if (item.messageId) return `user_message:${item.messageId}`;
+    if (item.clientMessageId) return `user_message:client:${item.clientMessageId}`;
+  }
+  if (item.type === "assistant_message" && item.messageId) {
+    return `assistant_message:${item.messageId}`;
+  }
+  return null;
+}
+
+function timelineItemsRepresentSameEvent(
+  historyItem: AgentTimelineItem,
+  suffixItem: AgentTimelineItem,
+): boolean {
+  const historyIdentity = getTimelineItemIdentity(historyItem);
+  const suffixIdentity = getTimelineItemIdentity(suffixItem);
+  if (historyIdentity !== null || suffixIdentity !== null) {
+    return (
+      historyIdentity !== null &&
+      historyIdentity === suffixIdentity &&
+      equal(historyItem, suffixItem)
+    );
+  }
+  return equal(historyItem, suffixItem);
+}
+
+function getTimelineBoundaryOverlapLength(
+  historyRows: readonly AgentTimelineRow[],
+  suffixRows: readonly AgentTimelineRow[],
+): number {
+  const maxOverlap = Math.min(historyRows.length, suffixRows.length);
+  for (let overlap = maxOverlap; overlap > 0; overlap -= 1) {
+    const historyStart = historyRows.length - overlap;
+    const matches = suffixRows
+      .slice(0, overlap)
+      .every((suffixRow, index) =>
+        timelineItemsRepresentSameEvent(historyRows[historyStart + index]!.item, suffixRow.item),
+      );
+    if (matches) {
+      return overlap;
+    }
+  }
+  return 0;
+}
+
 async function pageMaterialProgressRows(
   initialPage: AgentTimelineFetchResult,
   fetchOlder: FetchOlderMaterialProgressRows,
@@ -2034,27 +2083,29 @@ export class AgentManager {
   }
 
   async appendTimelineItem(agentId: string, item: AgentTimelineItem): Promise<void> {
-    const agent = this.requireAgent(agentId);
-    item = limitAgentTimelineItemContent(item);
-    if (item.type === "user_message" && !isSystemInjectedEnvelope(item.text)) {
-      this.trustTimelineContinuation(agentId);
-    }
-    this.touchUpdatedAt(agent);
-    const row = this.recordTimeline(agentId, item);
-    this.dispatchStream(
-      agentId,
-      {
-        type: "timeline",
-        item,
-        provider: agent.provider,
-      },
-      {
-        seq: row.seq,
-        epoch: this.timelineStore.getEpoch(agentId),
-        timestamp: row.timestamp,
-      },
-    );
-    await this.persistSnapshot(agent);
+    await this.withAgentLifecycleGate(agentId, async () => {
+      const agent = this.requireAgent(agentId);
+      item = limitAgentTimelineItemContent(item);
+      if (item.type === "user_message" && !isSystemInjectedEnvelope(item.text)) {
+        this.trustTimelineContinuation(agentId);
+      }
+      this.touchUpdatedAt(agent);
+      const row = this.recordTimeline(agentId, item);
+      this.dispatchStream(
+        agentId,
+        {
+          type: "timeline",
+          item,
+          provider: agent.provider,
+        },
+        {
+          seq: row.seq,
+          epoch: this.timelineStore.getEpoch(agentId),
+          timestamp: row.timestamp,
+        },
+      );
+      await this.persistSnapshot(agent);
+    });
   }
 
   async emitLiveTimelineItem(agentId: string, item: AgentTimelineItem): Promise<void> {
@@ -3603,13 +3654,8 @@ export class AgentManager {
       suffixRows = [...rowsBySeq.values()].sort((left, right) => left.seq - right.seq);
     }
 
-    const unmatchedHistoryItems = historyRows.map((row) => row.item);
-    const deduplicatedSuffixRows = suffixRows.filter((row) => {
-      const duplicateIndex = unmatchedHistoryItems.findIndex((item) => equal(item, row.item));
-      if (duplicateIndex < 0) return true;
-      unmatchedHistoryItems.splice(duplicateIndex, 1);
-      return false;
-    });
+    const overlapLength = getTimelineBoundaryOverlapLength(historyRows, suffixRows);
+    const deduplicatedSuffixRows = suffixRows.slice(overlapLength);
     const rows = [...historyRows, ...deduplicatedSuffixRows].map((row, index) => ({
       seq: index + 1,
       timestamp: row.timestamp,

@@ -77,6 +77,7 @@ class TestDurableTimelineStore implements AgentTimelineStore {
   private readonly historyQuarantineStartSeqs = new Map<string, number>();
   afterNextFetch: (() => Promise<void>) | null = null;
   beforeNextBulkInsert: (() => Promise<void>) | null = null;
+  beforeNextReplaceCommitted: (() => Promise<void>) | null = null;
 
   async appendCommitted(
     agentId: string,
@@ -139,6 +140,9 @@ class TestDurableTimelineStore implements AgentTimelineStore {
   }
 
   async replaceCommitted(agentId: string, rows: readonly AgentTimelineRow[]): Promise<void> {
+    const beforeReplace = this.beforeNextReplaceCommitted;
+    this.beforeNextReplaceCommitted = null;
+    await beforeReplace?.();
     this.store.initialize(agentId, {
       rows,
       nextSeq: (rows.at(-1)?.seq ?? 0) + 1,
@@ -4651,7 +4655,11 @@ test("successful history retry merges and deduplicates the quarantined live suff
       yield {
         type: "timeline",
         provider: "codex",
-        item: { type: "assistant_message", text: "live answer recovered by history" },
+        item: {
+          type: "assistant_message",
+          text: "live answer recovered by history",
+          messageId: "msg-recovered-live-answer",
+        },
       };
     }
   }
@@ -4678,7 +4686,11 @@ test("successful history retry merges and deduplicates the quarantined live suff
     session?.pushEvent({
       type: "timeline",
       provider: "codex",
-      item: { type: "assistant_message", text: "live answer recovered by history" },
+      item: {
+        type: "assistant_message",
+        text: "live answer recovered by history",
+        messageId: "msg-recovered-live-answer",
+      },
     });
     session?.pushEvent({
       type: "timeline",
@@ -4700,7 +4712,11 @@ test("successful history retry merges and deduplicates the quarantined live suff
     const expectedItems: AgentTimelineItem[] = [
       { type: "user_message", text: "historical request" },
       { type: "assistant_message", text: "historical answer" },
-      { type: "assistant_message", text: "live answer recovered by history" },
+      {
+        type: "assistant_message",
+        text: "live answer recovered by history",
+        messageId: "msg-recovered-live-answer",
+      },
       {
         type: "tool_call",
         callId: "tool-only-in-live-suffix",
@@ -4716,6 +4732,149 @@ test("successful history retry merges and deduplicates the quarantined live suff
     );
     expect(manager.getAgent(created.id)?.historyPrimed).toBe(true);
   } finally {
+    await manager.closeAgent(agentId).catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("history retry preserves a distinct repeated message outside the reconciliation boundary", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-history-repeated-content-"));
+  const durableTimelineStore = new TestDurableTimelineStore();
+  const agentId = "00000000-0000-4000-8000-000000000160";
+  let session: TestAgentSession | null = null;
+  let historyCalls = 0;
+
+  class RepeatedContentHistorySession extends TestAgentSession {
+    override async *streamHistory(): AsyncGenerator<AgentStreamEvent> {
+      historyCalls += 1;
+      if (historyCalls === 1) {
+        throw new Error("provider history unavailable");
+      }
+      yield {
+        type: "timeline",
+        provider: "codex",
+        item: { type: "assistant_message", text: "same content, separate events" },
+      };
+      yield {
+        type: "timeline",
+        provider: "codex",
+        item: { type: "user_message", text: "later historical boundary" },
+      };
+    }
+  }
+
+  class RepeatedContentHistoryClient extends TestAgentClient {
+    override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+      session = new RepeatedContentHistorySession(config);
+      return session;
+    }
+  }
+
+  const manager = new AgentManager({
+    clients: { codex: new RepeatedContentHistoryClient() },
+    durableTimelineStore,
+    logger,
+    idFactory: () => agentId,
+  });
+
+  try {
+    const created = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+    await manager.hydrateTimelineFromProvider(created.id);
+    session?.pushEvent({
+      type: "timeline",
+      provider: "codex",
+      item: { type: "assistant_message", text: "same content, separate events" },
+    });
+    await manager.flush();
+
+    await manager.hydrateTimelineFromProvider(created.id);
+    await manager.flush();
+
+    const expectedItems: AgentTimelineItem[] = [
+      { type: "assistant_message", text: "same content, separate events" },
+      { type: "user_message", text: "later historical boundary" },
+      { type: "assistant_message", text: "same content, separate events" },
+    ];
+    expect(manager.getTimeline(created.id)).toEqual(expectedItems);
+    expect((await manager.getTimelineRows(created.id)).map((row) => row.item)).toEqual(
+      expectedItems,
+    );
+  } finally {
+    await manager.closeAgent(agentId).catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("direct timeline append waits for history replacement in memory and durable storage", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-history-direct-append-order-"));
+  const durableTimelineStore = new TestDurableTimelineStore();
+  const replaceStarted = deferred<void>();
+  const replaceAllowed = deferred<void>();
+  const agentId = "00000000-0000-4000-8000-000000000161";
+
+  class DirectAppendHistorySession extends TestAgentSession {
+    override async *streamHistory(): AsyncGenerator<AgentStreamEvent> {
+      yield {
+        type: "timeline",
+        provider: "codex",
+        item: { type: "user_message", text: "replacement history" },
+      };
+    }
+  }
+
+  class DirectAppendHistoryClient extends TestAgentClient {
+    override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+      return new DirectAppendHistorySession(config);
+    }
+  }
+
+  const manager = new AgentManager({
+    clients: { codex: new DirectAppendHistoryClient() },
+    durableTimelineStore,
+    logger,
+    idFactory: () => agentId,
+  });
+
+  try {
+    const created = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+    durableTimelineStore.beforeNextReplaceCommitted = async () => {
+      replaceStarted.resolve();
+      await replaceAllowed.promise;
+    };
+
+    const hydration = manager.hydrateTimelineFromProvider(created.id);
+    await replaceStarted.promise;
+    let appendFinished = false;
+    const append = manager
+      .appendTimelineItem(created.id, {
+        type: "assistant_message",
+        text: "direct append during replacement",
+      })
+      .then(() => {
+        appendFinished = true;
+        return undefined;
+      });
+    await Promise.resolve();
+    expect(appendFinished).toBe(false);
+
+    replaceAllowed.resolve();
+    await Promise.all([hydration, append]);
+    await manager.flush();
+
+    const expectedItems: AgentTimelineItem[] = [
+      { type: "user_message", text: "replacement history" },
+      { type: "assistant_message", text: "direct append during replacement" },
+    ];
+    expect(manager.getTimeline(created.id)).toEqual(expectedItems);
+    expect(
+      (await durableTimelineStore.getCommittedRows(created.id)).map((row) => row.item),
+    ).toEqual(expectedItems);
+  } finally {
+    replaceAllowed.resolve();
     await manager.closeAgent(agentId).catch(() => undefined);
     rmSync(workdir, { recursive: true, force: true });
   }
