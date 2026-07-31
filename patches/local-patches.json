@@ -14,6 +14,17 @@
         "packages/server/src/server/material-progress.e2e.test.ts",
         "packages/cli/src/commands/agent/inspect.test.ts"
       ],
+      "sources": [
+        "packages/cli/src/commands/agent/inspect.ts",
+        "packages/protocol/src/messages.ts",
+        "packages/server/src/server/agent/agent-manager.ts",
+        "packages/server/src/server/agent/agent-projections.ts",
+        "packages/server/src/server/agent/agent-storage.ts",
+        "packages/server/src/server/agent/material-progress.ts",
+        "packages/server/src/server/persistence-hooks.ts",
+        "packages/server/src/server/session.ts"
+      ],
+      "docs": ["docs/data-model.md"],
       "testCases": [
         "material progress analysis remains bounded and persisted",
         "agent inspect returns singular persisted terminal-turn semantics"
@@ -32,10 +43,20 @@
         "commit": "6fc491e6220fba6543bbbe4bf1b1f58cfe59228b"
       },
       "tests": ["packages/server/src/server/agent/agent-manager.test.ts"],
+      "sources": [
+        "packages/server/src/server/agent/agent-manager.ts",
+        "packages/server/src/server/agent/agent-timeline-store-types.ts"
+      ],
+      "docs": ["docs/timeline-sync.md"],
       "testCases": [
         "history replacement flushes a pre-buffered coalescer delta before taking the live suffix",
         "out-of-band timeline events wait behind a blocked history replacement",
-        "direct timeline append waits for history replacement in memory and durable storage"
+        "direct timeline append waits for history replacement in memory and durable storage",
+        "startTurn failure is serialized after a blocked history replacement",
+        "history timeout aborts while waiting for a pre-existing durable timeline tail",
+        "history timeout aborts a blocked durable committed-row read",
+        "history timeout rejects a queued replacement that has not started",
+        "a canceled late replacement restores before a newer quarantined live mutation"
       ],
       "upstreamable": true,
       "upstreamCondition": "Submit independently while upstream provider-history replacement can race live, coalesced, direct, or out-of-band timeline persistence.",
@@ -54,9 +75,15 @@
         "packages/server/src/server/agent/agent-manager.test.ts",
         "packages/server/src/server/agent/agent-storage.test.ts"
       ],
+      "sources": [
+        "packages/server/src/server/agent/agent-manager.ts",
+        "packages/server/src/server/agent/agent-storage.ts"
+      ],
+      "docs": ["docs/timeline-sync.md"],
       "testCases": [
         "a failed partial history hydration preserves persisted material progress",
-        "successful history retry merges and deduplicates the quarantined live suffix"
+        "successful history retry merges and deduplicates the quarantined live suffix",
+        "failed history hydration preserves a quarantined live suffix across restart"
       ],
       "upstreamable": true,
       "upstreamCondition": "Submit independently while failed hydration can erase or overstate persisted material progress, trust, quarantine, or terminal-turn state.",
@@ -76,11 +103,24 @@
         "packages/server/src/server/agent/agent-manager-stream-coalescing.test.ts",
         "packages/server/src/server/agent/providers/opencode-agent.test.ts"
       ],
+      "sources": [
+        "packages/server/src/server/agent/agent-manager.ts",
+        "packages/server/src/server/agent/providers/opencode-agent.ts"
+      ],
+      "docs": ["docs/timeline-sync.md"],
       "testCases": [
         "history retry preserves a distinct unkeyed repeated message at the exact boundary",
         "history retry canonicalizes OpenCode text deltas and tool lifecycle rows",
         "streamHistory fails when OpenCode messages are unavailable",
-        "closing cancels a hung provider history iterator without permitting a late overwrite"
+        "closing cancels a hung provider history iterator without permitting a late overwrite",
+        "hydration queued during reload does not commit stale session history",
+        "archive waits for blocked history hydration before deriving material progress",
+        "archiving releases a blocked history replacement and restores its late write",
+        "closing releases a blocked durable history replacement and rolls back its late write",
+        "history timeout releases a blocked durable replacement and rejects its late write",
+        "history hydration timeout drains buffered live events and preserves the prior timeline",
+        "provider history event cap fails closed without replacing the live timeline",
+        "provider history byte cap fails closed without replacing the live timeline"
       ],
       "upstreamable": true,
       "upstreamCondition": "Submit independently while provider replay/live shapes require explicit identity reconciliation and unavailable history can be mistaken for a successful empty replay.",

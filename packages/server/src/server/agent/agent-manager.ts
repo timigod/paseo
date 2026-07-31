@@ -2231,11 +2231,16 @@ export class AgentManager {
       } catch (error) {
         agent.pendingReplacement = false;
         const errorMsg = error instanceof Error ? error.message : "Failed to start turn";
-        await this.handleStreamEvent(agent, {
+        const failureEvent: AgentStreamEvent = {
           type: "turn_failed",
           provider: agent.provider,
           error: errorMsg,
-        });
+        };
+        const bufferedByHydration = this.activeHistoryHydrationAgentIds.has(agent.id);
+        this.enqueueSessionEvent(agent.id, failureEvent);
+        if (!bufferedByHydration) {
+          await this.drainSessionEvents(agent.id);
+        }
         this.finalizeForegroundTurn(agent);
         this.runs.settleForegroundRun(agentId, pendingRun.token);
         throw error;

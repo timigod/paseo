@@ -77,6 +77,7 @@ class TestDurableTimelineStore implements AgentTimelineStore {
   private readonly historyQuarantineStartSeqs = new Map<string, number>();
   afterNextFetch: (() => Promise<void>) | null = null;
   beforeNextBulkInsert: (() => Promise<void>) | null = null;
+  beforeNextGetCommittedRows: (() => Promise<void>) | null = null;
   beforeNextReplaceCommitted: (() => Promise<void>) | null = null;
   afterReplaceCommitted: ((callCount: number) => void | Promise<void>) | null = null;
   replaceCommittedCallCount = 0;
@@ -109,6 +110,9 @@ class TestDurableTimelineStore implements AgentTimelineStore {
 
   async getCommittedRows(agentId: string): Promise<AgentTimelineRow[]> {
     this.ensure(agentId);
+    const beforeGet = this.beforeNextGetCommittedRows;
+    this.beforeNextGetCommittedRows = null;
+    await beforeGet?.();
     return this.store.getRows(agentId);
   }
 
@@ -5063,6 +5067,430 @@ test("out-of-band timeline events wait behind a blocked history replacement", as
     expect(
       (await durableTimelineStore.getCommittedRows(created.id)).map((row) => row.item),
     ).toEqual(expectedItems);
+  } finally {
+    replaceAllowed.resolve();
+    await manager.closeAgent(agentId).catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("startTurn failure is serialized after a blocked history replacement", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-history-start-failure-order-"));
+  const durableTimelineStore = new TestDurableTimelineStore();
+  const committedRowsStarted = deferred<void>();
+  const committedRowsAllowed = deferred<void>();
+  const agentId = "00000000-0000-4000-8000-000000000171";
+
+  class FailingStartHistorySession extends TestAgentSession {
+    override async *streamHistory(): AsyncGenerator<AgentStreamEvent> {
+      yield {
+        type: "timeline",
+        provider: "codex",
+        item: { type: "user_message", text: "recovered request" },
+      };
+    }
+
+    override async startTurn(): Promise<{ turnId: string }> {
+      throw new Error("start failed during hydration");
+    }
+  }
+
+  class FailingStartHistoryClient extends TestAgentClient {
+    override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+      return new FailingStartHistorySession(config);
+    }
+  }
+
+  const manager = new AgentManager({
+    clients: { codex: new FailingStartHistoryClient() },
+    durableTimelineStore,
+    logger,
+    idFactory: () => agentId,
+    historyHydrationLimits: { timeoutMs: 60_000 },
+  });
+
+  try {
+    const created = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+    durableTimelineStore.beforeNextGetCommittedRows = async () => {
+      committedRowsStarted.resolve();
+      await committedRowsAllowed.promise;
+    };
+
+    const hydration = manager.hydrateTimelineFromProvider(created.id);
+    await committedRowsStarted.promise;
+    await expect(manager.runAgent(created.id, "fail while history is blocked")).rejects.toThrow(
+      "start failed during hydration",
+    );
+
+    committedRowsAllowed.resolve();
+    await hydration;
+    await manager.flush();
+
+    const expectedItems: AgentTimelineItem[] = [
+      { type: "user_message", text: "recovered request" },
+      { type: "assistant_message", text: "[System Error] start failed during hydration" },
+    ];
+    expect(manager.getTimeline(created.id)).toEqual(expectedItems);
+    expect(
+      (await durableTimelineStore.getCommittedRows(created.id)).map((row) => row.item),
+    ).toEqual(expectedItems);
+  } finally {
+    committedRowsAllowed.resolve();
+    await manager.closeAgent(agentId).catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("history timeout aborts while waiting for a pre-existing durable timeline tail", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-history-tail-timeout-"));
+  const durableTimelineStore = new TestDurableTimelineStore();
+  const insertStarted = deferred<void>();
+  const insertAllowed = deferred<void>();
+  const agentId = "00000000-0000-4000-8000-000000000172";
+
+  class WaitingTailHistorySession extends TestAgentSession {
+    override async *streamHistory(): AsyncGenerator<AgentStreamEvent> {
+      yield {
+        type: "timeline",
+        provider: "codex",
+        item: { type: "assistant_message", text: "history must not replace a blocked tail" },
+      };
+    }
+  }
+
+  class WaitingTailHistoryClient extends TestAgentClient {
+    override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+      return new WaitingTailHistorySession(config);
+    }
+  }
+
+  const manager = new AgentManager({
+    clients: { codex: new WaitingTailHistoryClient() },
+    durableTimelineStore,
+    logger,
+    idFactory: () => agentId,
+    historyHydrationLimits: { timeoutMs: 10 },
+  });
+
+  try {
+    const created = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+    durableTimelineStore.beforeNextBulkInsert = async () => {
+      insertStarted.resolve();
+      await insertAllowed.promise;
+    };
+    await manager.appendTimelineItem(created.id, {
+      type: "assistant_message",
+      text: "pending durable live row",
+    });
+    await insertStarted.promise;
+
+    await manager.hydrateTimelineFromProvider(created.id);
+    expect(durableTimelineStore.replaceCommittedCallCount).toBe(0);
+    expect(manager.getAgent(created.id)?.historyPrimed).toBe(false);
+
+    insertAllowed.resolve();
+    await manager.flush();
+    const expectedItems = [{ type: "assistant_message", text: "pending durable live row" }];
+    expect(manager.getTimeline(created.id)).toEqual(expectedItems);
+    expect(
+      (await durableTimelineStore.getCommittedRows(created.id)).map((row) => row.item),
+    ).toEqual(expectedItems);
+  } finally {
+    insertAllowed.resolve();
+    await manager.closeAgent(agentId).catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("history timeout aborts a blocked durable committed-row read", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-history-read-timeout-"));
+  const durableTimelineStore = new TestDurableTimelineStore();
+  const readStarted = deferred<void>();
+  const readAllowed = deferred<void>();
+  const agentId = "00000000-0000-4000-8000-000000000173";
+
+  class BlockedReadHistorySession extends TestAgentSession {
+    override async *streamHistory(): AsyncGenerator<AgentStreamEvent> {
+      yield {
+        type: "timeline",
+        provider: "codex",
+        item: { type: "assistant_message", text: "history must not survive read timeout" },
+      };
+    }
+  }
+
+  class BlockedReadHistoryClient extends TestAgentClient {
+    override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+      return new BlockedReadHistorySession(config);
+    }
+  }
+
+  const manager = new AgentManager({
+    clients: { codex: new BlockedReadHistoryClient() },
+    durableTimelineStore,
+    logger,
+    idFactory: () => agentId,
+    historyHydrationLimits: { timeoutMs: 10 },
+  });
+
+  try {
+    const created = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+    durableTimelineStore.beforeNextGetCommittedRows = async () => {
+      readStarted.resolve();
+      await readAllowed.promise;
+    };
+
+    let hydrationSettled = false;
+    const hydration = manager.hydrateTimelineFromProvider(created.id).then(() => {
+      hydrationSettled = true;
+      return undefined;
+    });
+    await readStarted.promise;
+    await vi.waitFor(() => expect(hydrationSettled).toBe(true), { timeout: 250 });
+    await hydration;
+
+    expect(durableTimelineStore.replaceCommittedCallCount).toBe(0);
+    expect(manager.getAgent(created.id)?.historyPrimed).toBe(false);
+    expect(manager.getTimeline(created.id)).toEqual([]);
+
+    readAllowed.resolve();
+    await manager.flush();
+    expect(await durableTimelineStore.getCommittedRows(created.id)).toEqual([]);
+  } finally {
+    readAllowed.resolve();
+    await manager.closeAgent(agentId).catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("history timeout rejects a queued replacement that has not started", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-history-queued-timeout-"));
+  const durableTimelineStore = new TestDurableTimelineStore();
+  const readStarted = deferred<void>();
+  const readAllowed = deferred<void>();
+  const insertStarted = deferred<void>();
+  const insertAllowed = deferred<void>();
+  const agentId = "00000000-0000-4000-8000-000000000174";
+
+  class QueuedReplacementHistorySession extends TestAgentSession {
+    override async *streamHistory(): AsyncGenerator<AgentStreamEvent> {
+      yield {
+        type: "timeline",
+        provider: "codex",
+        item: { type: "assistant_message", text: "queued replacement must be canceled" },
+      };
+    }
+  }
+
+  class QueuedReplacementHistoryClient extends TestAgentClient {
+    override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+      return new QueuedReplacementHistorySession(config);
+    }
+  }
+
+  const manager = new AgentManager({
+    clients: { codex: new QueuedReplacementHistoryClient() },
+    durableTimelineStore,
+    logger,
+    idFactory: () => agentId,
+    historyHydrationLimits: { timeoutMs: 100 },
+  });
+
+  try {
+    const created = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+    durableTimelineStore.beforeNextGetCommittedRows = async () => {
+      readStarted.resolve();
+      await readAllowed.promise;
+    };
+    const hydration = manager.hydrateTimelineFromProvider(created.id);
+    await readStarted.promise;
+
+    durableTimelineStore.beforeNextBulkInsert = async () => {
+      insertStarted.resolve();
+      await insertAllowed.promise;
+    };
+    await manager.appendTimelineItem(created.id, {
+      type: "assistant_message",
+      text: "new live row ahead of queued replacement",
+    });
+    await insertStarted.promise;
+    readAllowed.resolve();
+
+    await hydration;
+    expect(durableTimelineStore.replaceCommittedCallCount).toBe(0);
+    expect(manager.getAgent(created.id)?.historyPrimed).toBe(false);
+
+    insertAllowed.resolve();
+    await manager.flush();
+    const expectedItems = [
+      { type: "assistant_message", text: "new live row ahead of queued replacement" },
+    ];
+    expect(manager.getTimeline(created.id)).toEqual(expectedItems);
+    expect(
+      (await durableTimelineStore.getCommittedRows(created.id)).map((row) => row.item),
+    ).toEqual(expectedItems);
+  } finally {
+    readAllowed.resolve();
+    insertAllowed.resolve();
+    await manager.closeAgent(agentId).catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("archiving releases a blocked history replacement and restores its late write", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-history-archive-replace-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const durableTimelineStore = new TestDurableTimelineStore();
+  const replaceStarted = deferred<void>();
+  const replaceAllowed = deferred<void>();
+  const replacementRestored = deferred<void>();
+  const agentId = "00000000-0000-4000-8000-000000000175";
+
+  class ArchivedReplacementHistorySession extends TestAgentSession {
+    override async *streamHistory(): AsyncGenerator<AgentStreamEvent> {
+      yield {
+        type: "timeline",
+        provider: "codex",
+        item: { type: "assistant_message", text: "late replacement after archive" },
+      };
+    }
+  }
+
+  class ArchivedReplacementHistoryClient extends TestAgentClient {
+    override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+      return new ArchivedReplacementHistorySession(config);
+    }
+  }
+
+  const manager = new AgentManager({
+    clients: { codex: new ArchivedReplacementHistoryClient() },
+    registry: storage,
+    durableTimelineStore,
+    logger,
+    idFactory: () => agentId,
+    historyHydrationLimits: { timeoutMs: 60_000 },
+  });
+
+  try {
+    const created = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+    await manager.appendTimelineItem(created.id, {
+      type: "assistant_message",
+      text: "timeline before archive",
+    });
+    await manager.flush();
+    durableTimelineStore.beforeNextReplaceCommitted = async () => {
+      replaceStarted.resolve();
+      await replaceAllowed.promise;
+    };
+    durableTimelineStore.afterReplaceCommitted = (callCount) => {
+      if (callCount === 2) replacementRestored.resolve();
+    };
+
+    const hydration = manager.hydrateTimelineFromProvider(created.id);
+    await replaceStarted.promise;
+    const archive = await manager.archiveAgent(created.id);
+    await hydration;
+    expect((await storage.get(created.id))?.archivedAt).toBe(archive.archivedAt);
+    expect(manager.getAgent(created.id)).toBeNull();
+    expect(durableTimelineStore.replaceCommittedCallCount).toBe(0);
+
+    replaceAllowed.resolve();
+    await replacementRestored.promise;
+    await manager.flush();
+    expect(
+      (await durableTimelineStore.getCommittedRows(created.id)).map((row) => row.item),
+    ).toEqual([{ type: "assistant_message", text: "timeline before archive" }]);
+  } finally {
+    replaceAllowed.resolve();
+    await manager.closeAgent(agentId).catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("a canceled late replacement restores before a newer quarantined live mutation", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-history-late-live-order-"));
+  const durableTimelineStore = new TestDurableTimelineStore();
+  const replaceStarted = deferred<void>();
+  const replaceAllowed = deferred<void>();
+  const replacementRestored = deferred<void>();
+  const agentId = "00000000-0000-4000-8000-000000000176";
+  let session: TestAgentSession | null = null;
+
+  class LateReplacementHistorySession extends TestAgentSession {
+    override async *streamHistory(): AsyncGenerator<AgentStreamEvent> {
+      yield {
+        type: "timeline",
+        provider: "codex",
+        item: { type: "assistant_message", text: "late canceled replacement" },
+      };
+    }
+  }
+
+  class LateReplacementHistoryClient extends TestAgentClient {
+    override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+      session = new LateReplacementHistorySession(config);
+      return session;
+    }
+  }
+
+  const manager = new AgentManager({
+    clients: { codex: new LateReplacementHistoryClient() },
+    durableTimelineStore,
+    logger,
+    idFactory: () => agentId,
+    historyHydrationLimits: { timeoutMs: 10 },
+  });
+
+  try {
+    const created = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+    await manager.appendTimelineItem(created.id, {
+      type: "assistant_message",
+      text: "timeline before late replacement",
+    });
+    await manager.flush();
+    durableTimelineStore.beforeNextReplaceCommitted = async () => {
+      replaceStarted.resolve();
+      await replaceAllowed.promise;
+    };
+    durableTimelineStore.afterReplaceCommitted = (callCount) => {
+      if (callCount === 2) replacementRestored.resolve();
+    };
+
+    const hydration = manager.hydrateTimelineFromProvider(created.id);
+    await replaceStarted.promise;
+    await hydration;
+    session?.pushEvent({
+      type: "timeline",
+      provider: "codex",
+      item: { type: "assistant_message", text: "newer quarantined live row" },
+    });
+
+    replaceAllowed.resolve();
+    await replacementRestored.promise;
+    await manager.flush();
+
+    const expectedItems = [
+      { type: "assistant_message", text: "timeline before late replacement" },
+      { type: "assistant_message", text: "newer quarantined live row" },
+    ];
+    expect(manager.getAgent(created.id)?.historyPrimed).toBe(false);
+    expect(manager.getTimeline(created.id)).toEqual(expectedItems);
+    expect(
+      (await durableTimelineStore.getCommittedRows(created.id)).map((row) => row.item),
+    ).toEqual(expectedItems);
+    expect(await durableTimelineStore.getHistoryQuarantineStartSeq(created.id)).toBe(2);
   } finally {
     replaceAllowed.resolve();
     await manager.closeAgent(agentId).catch(() => undefined);
