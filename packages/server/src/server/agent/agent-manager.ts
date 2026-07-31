@@ -76,6 +76,8 @@ import {
 
 const RELOAD_SESSION_CLOSE_TIMEOUT_MS = 3_000;
 const INTERRUPT_SESSION_TIMEOUT_MS = 2_000;
+const CREATE_ACKNOWLEDGEMENT_CLOSE_TIMEOUT_MS = 3_000;
+const COMPLETED_CREATE_REQUEST_CLAIM_CACHE_MAX_ENTRIES = 256;
 const STORED_AGENT_CAPABILITIES: AgentCapabilityFlags = {
   supportsStreaming: false,
   supportsSessionPersistence: true,
@@ -218,6 +220,7 @@ export interface ProviderAvailability {
 interface AgentManagerRescueTimeouts {
   reloadSessionCloseMs?: number;
   interruptSessionMs?: number;
+  createAcknowledgementCloseMs?: number;
 }
 
 interface ProviderEnabledFlag {
@@ -236,6 +239,37 @@ export interface CreateAgentOptions {
   // undefined is an explicit decision: the agent never appears in the sidebar.
   workspaceId: string | undefined;
   owner?: AgentOwner;
+  createRequestFingerprint?: string;
+}
+
+export interface AgentCreationHandle {
+  snapshot: ManagedAgent;
+  completion: Promise<ManagedAgent>;
+}
+
+export interface AgentCreateRequestOutcome {
+  status: "created" | "failed";
+  error?: string;
+  errorCode?: string;
+}
+
+export type AgentCreateRequestClaim =
+  | {
+      kind: "owner";
+      finish: (outcome: AgentCreateRequestOutcome) => void;
+    }
+  | {
+      kind: "follower";
+      outcome: Promise<AgentCreateRequestOutcome>;
+    }
+  | {
+      kind: "mismatch";
+    };
+
+interface CreateRequestClaimEntry {
+  fingerprint: string;
+  outcome: Promise<AgentCreateRequestOutcome>;
+  settled: boolean;
 }
 
 export interface AgentManagerOptions {
@@ -253,8 +287,31 @@ export interface AgentManagerOptions {
   paseoToolCatalogFactory?: PaseoToolCatalogFactory;
   appendSystemPrompt?: string;
   agentStreamCoalesceWindowMs?: number;
+  createRequestClaimCacheMaxEntries?: number;
   rescueTimeouts?: AgentManagerRescueTimeouts;
   logger: Logger;
+}
+
+function resolveCreateRequestClaimCacheMaxEntries(options: AgentManagerOptions): number {
+  return Math.max(
+    0,
+    Math.trunc(
+      options.createRequestClaimCacheMaxEntries ?? COMPLETED_CREATE_REQUEST_CLAIM_CACHE_MAX_ENTRIES,
+    ),
+  );
+}
+
+function resolveAgentManagerRescueTimeouts(
+  options: AgentManagerOptions,
+): Required<AgentManagerRescueTimeouts> {
+  return {
+    reloadSessionCloseMs:
+      options.rescueTimeouts?.reloadSessionCloseMs ?? RELOAD_SESSION_CLOSE_TIMEOUT_MS,
+    interruptSessionMs: options.rescueTimeouts?.interruptSessionMs ?? INTERRUPT_SESSION_TIMEOUT_MS,
+    createAcknowledgementCloseMs:
+      options.rescueTimeouts?.createAcknowledgementCloseMs ??
+      CREATE_ACKNOWLEDGEMENT_CLOSE_TIMEOUT_MS,
+  };
 }
 
 export interface WaitForAgentOptions {
@@ -311,6 +368,7 @@ interface ManagedAgentBase {
    */
   workspaceId?: string;
   owner?: AgentOwner;
+  createRequestFingerprint?: string;
   capabilities: AgentCapabilityFlags;
   config: AgentSessionConfig;
   runtimeInfo?: AgentRuntimeInfo;
@@ -349,7 +407,8 @@ type ManagedAgentWithSession = ManagedAgentBase & {
   session: AgentSession;
 };
 
-type ManagedAgentInitializing = ManagedAgentWithSession & {
+type ManagedAgentInitializing = ManagedAgentBase & {
+  session: AgentSession | null;
   lifecycle: "initializing";
   activeForegroundTurnId: null;
 };
@@ -395,12 +454,21 @@ export interface AgentMetricsSnapshot {
 }
 
 type ActiveManagedAgent =
+  | (ManagedAgentInitializing & ManagedAgentWithSession)
+  | ManagedAgentIdle
+  | ManagedAgentRunning
+  | ManagedAgentError;
+
+type LiveManagedAgent =
   | ManagedAgentInitializing
   | ManagedAgentIdle
   | ManagedAgentRunning
   | ManagedAgentError;
 
-type LiveManagedAgent = ActiveManagedAgent;
+function hasManagedSession(agent: LiveManagedAgent): agent is ActiveManagedAgent {
+  return agent.session !== null;
+}
+
 type AgentLabelPatch = Record<string, string | null>;
 
 interface WriteLabelsResult {
@@ -571,7 +639,13 @@ export class AgentManager {
   private readonly previousStatuses = new Map<string, AgentLifecycleStatus>();
   private readonly backgroundTasks = new Set<Promise<void>>();
   private readonly agentRegistrationTasks = new Set<Promise<void>>();
-  private readonly inFlightAgentCloses = new Map<string, Promise<void>>();
+  private readonly agentLifecycleTails = new Map<string, Promise<void>>();
+  private readonly inFlightAgentCloses = new Map<
+    string,
+    { result: Promise<void>; lifecycleTail: Promise<void> }
+  >();
+  private readonly createRequestClaims = new Map<string, CreateRequestClaimEntry>();
+  private readonly createRequestClaimCacheMaxEntries: number;
   private readonly agentStreamCoalescer: AgentStreamCoalescer;
   private mcpBaseUrl: string | null;
   private readonly mcpAuthToken: string | null;
@@ -596,12 +670,8 @@ export class AgentManager {
     this.configurePaseoTools(options);
     this.appendSystemPrompt = options.appendSystemPrompt ?? "";
     this.logger = options.logger.child({ module: "agent", component: "agent-manager" });
-    this.rescueTimeouts = {
-      reloadSessionCloseMs:
-        options.rescueTimeouts?.reloadSessionCloseMs ?? RELOAD_SESSION_CLOSE_TIMEOUT_MS,
-      interruptSessionMs:
-        options.rescueTimeouts?.interruptSessionMs ?? INTERRUPT_SESSION_TIMEOUT_MS,
-    };
+    this.createRequestClaimCacheMaxEntries = resolveCreateRequestClaimCacheMaxEntries(options);
+    this.rescueTimeouts = resolveAgentManagerRescueTimeouts(options);
     this.agentStreamCoalescer = new AgentStreamCoalescer({
       windowMs: options.agentStreamCoalesceWindowMs ?? AGENT_STREAM_COALESCE_DEFAULT_WINDOW_MS,
       timers: { setTimeout, clearTimeout },
@@ -662,6 +732,64 @@ export class AgentManager {
 
   prepareForShutdown(): void {
     this.acceptingAgentRegistrations = false;
+  }
+
+  claimCreateRequest(agentId: string, fingerprint: string): AgentCreateRequestClaim {
+    const existing = this.createRequestClaims.get(agentId);
+    if (existing) {
+      return existing.fingerprint === fingerprint
+        ? { kind: "follower", outcome: existing.outcome }
+        : { kind: "mismatch" };
+    }
+
+    let resolveOutcome!: (outcome: AgentCreateRequestOutcome) => void;
+    const outcome = new Promise<AgentCreateRequestOutcome>((resolvePromise) => {
+      resolveOutcome = resolvePromise;
+    });
+    const entry: CreateRequestClaimEntry = {
+      fingerprint,
+      outcome,
+      settled: false,
+    };
+    const finish = (result: AgentCreateRequestOutcome): void => {
+      if (entry.settled) {
+        return;
+      }
+      entry.settled = true;
+      resolveOutcome(result);
+      if (this.createRequestClaims.get(agentId) !== entry) {
+        return;
+      }
+      this.createRequestClaims.delete(agentId);
+      if (result.status === "failed") {
+        this.createRequestClaims.set(agentId, entry);
+        this.trimCompletedCreateRequestClaims();
+      }
+    };
+    this.createRequestClaims.set(agentId, entry);
+    return { kind: "owner", finish };
+  }
+
+  private trimCompletedCreateRequestClaims(): void {
+    let completedCount = 0;
+    for (const entry of this.createRequestClaims.values()) {
+      if (entry.settled) {
+        completedCount += 1;
+      }
+    }
+    if (completedCount <= this.createRequestClaimCacheMaxEntries) {
+      return;
+    }
+    for (const [agentId, entry] of this.createRequestClaims) {
+      if (!entry.settled) {
+        continue;
+      }
+      this.createRequestClaims.delete(agentId);
+      completedCount -= 1;
+      if (completedCount <= this.createRequestClaimCacheMaxEntries) {
+        return;
+      }
+    }
   }
 
   setPaseoToolsEnabled(enabled: boolean): void {
@@ -955,7 +1083,7 @@ export class AgentManager {
   }
 
   async waitForAgentClose(agentId: string): Promise<void> {
-    await this.inFlightAgentCloses?.get(agentId)?.catch(() => undefined);
+    await this.agentLifecycleTails.get(agentId);
   }
 
   getTimeline(id: string): AgentTimelineItem[] {
@@ -998,19 +1126,30 @@ export class AgentManager {
     return this.providerSubagents.fetchTimeline(parentAgentId, subagentId, options);
   }
 
-  createAgent(
+  async createAgent(
     config: AgentSessionConfig,
     agentId: string | undefined,
     options: CreateAgentOptions,
   ): Promise<ManagedAgent> {
-    return this.trackAgentRegistrationOperation(this.createAgentInternal(config, agentId, options));
+    const creation = await this.beginAgentCreation(config, agentId, options);
+    return await creation.completion;
   }
 
-  private async createAgentInternal(
+  beginAgentCreation(
     config: AgentSessionConfig,
     agentId: string | undefined,
     options: CreateAgentOptions,
-  ): Promise<ManagedAgent> {
+  ): Promise<AgentCreationHandle> {
+    return this.trackAgentRegistrationOperation(
+      this.beginAgentCreationInternal(config, agentId, options),
+    );
+  }
+
+  private async beginAgentCreationInternal(
+    config: AgentSessionConfig,
+    agentId: string | undefined,
+    options: CreateAgentOptions,
+  ): Promise<AgentCreationHandle> {
     this.assertAcceptingAgentRegistrations();
     const resolvedAgentId = validateAgentId(agentId ?? this.idFactory(), "createAgent");
     await this.deleteAgentState(resolvedAgentId);
@@ -1031,12 +1170,151 @@ export class AgentManager {
     );
     const providerLaunchConfig = this.resolveProviderLaunchConfig(launchConfig, launchContext);
     const createOptions = this.buildCreateSessionOptions(options);
-    const session = await client.createSession(providerLaunchConfig, launchContext, createOptions);
-    return this.registerSession(session, storedConfig, resolvedAgentId, {
-      labels: options.labels,
-      initialTitle: options.initialTitle,
+    const initialPersistedTitle = await this.resolveInitialPersistedTitle(
+      resolvedAgentId,
+      storedConfig,
+      options.initialTitle ?? null,
+    );
+    const now = new Date();
+    const { durableTimelineHasRows } = await this.initializeAgentTimelineForRegister({
+      agentId: resolvedAgentId,
+      now,
+      options: undefined,
+    });
+    const pending: ManagedAgentInitializing = {
+      id: resolvedAgentId,
+      provider: storedConfig.provider,
+      cwd: storedConfig.cwd,
       workspaceId: options.workspaceId,
       owner: options.owner,
+      createRequestFingerprint: options.createRequestFingerprint,
+      session: null,
+      capabilities: client.capabilities,
+      config: storedConfig,
+      runtimeInfo: undefined,
+      lifecycle: "initializing",
+      createdAt: now,
+      updatedAt: now,
+      availableModes: [],
+      currentModeId: null,
+      pendingPermissions: new Map<string, AgentPermissionRequest>(),
+      bufferedPermissionResolutions: new Map(),
+      inFlightPermissionResponses: new Set(),
+      pendingReplacement: false,
+      activeForegroundTurnId: null,
+      foregroundTurnWaiters: new Set<ForegroundTurnWaiter>(),
+      finalizedForegroundTurnIds: new Set<string>(),
+      unsubscribeSession: null,
+      persistence: null,
+      historyPrimed: durableTimelineHasRows,
+      lastUserMessageAt: null,
+      attention: { requiresAttention: false },
+      internal: storedConfig.internal ?? false,
+      labels: options.labels ?? {},
+    };
+
+    this.assertAcceptingAgentRegistrations();
+    if (this.agents.has(resolvedAgentId)) {
+      throw new Error(`Agent with id ${resolvedAgentId} already exists`);
+    }
+    this.agents.set(resolvedAgentId, pending);
+    this.previousStatuses.set(resolvedAgentId, pending.lifecycle);
+    try {
+      await this.persistSnapshot(pending, { title: initialPersistedTitle });
+      this.assertPendingAgentRegistrationActive(pending);
+      this.emitState(pending, { persist: false });
+    } catch (error) {
+      this.prepareAgentForClosure(pending, "agent creation registration failed");
+      await this.deleteAgentState(resolvedAgentId);
+      if (this.registry) {
+        await this.registry.remove(resolvedAgentId);
+      }
+      throw error;
+    }
+
+    const completion = this.trackAgentRegistrationOperation(
+      this.startPendingAgentSession({
+        pending,
+        client,
+        providerLaunchConfig,
+        launchContext,
+        createOptions,
+      }),
+    );
+    return { snapshot: { ...pending }, completion };
+  }
+
+  private async startPendingAgentSession(params: {
+    pending: ManagedAgentInitializing;
+    client: AgentClient;
+    providerLaunchConfig: AgentSessionConfig;
+    launchContext: AgentLaunchContext;
+    createOptions: AgentCreateSessionOptions | undefined;
+  }): Promise<ManagedAgent> {
+    const { pending, client, providerLaunchConfig, launchContext, createOptions } = params;
+    let session: AgentSession;
+    try {
+      session = await client.createSession(providerLaunchConfig, launchContext, createOptions);
+    } catch (error) {
+      await this.removeFailedPendingAgent(pending, "provider session creation failed");
+      throw error;
+    }
+
+    let installed = false;
+    try {
+      const snapshot = await this.queueAgentLifecycleHandoff(pending.id, async () => {
+        this.assertAcceptingAgentRegistrations();
+        const current = this.agents.get(pending.id);
+        if (
+          current !== pending ||
+          current.lifecycle !== "initializing" ||
+          current.session !== null
+        ) {
+          throw new Error(`Agent '${pending.id}' creation was canceled`);
+        }
+
+        current.session = session;
+        current.capabilities = session.capabilities;
+        current.persistence = attachPersistenceCwd(session.describePersistence(), current.cwd);
+        const active = current as ActiveManagedAgent;
+        await this.refreshRuntimeInfo(active, { emit: false });
+        this.assertAgentRegistrationActive(active);
+        await this.refreshSessionState(active, { emit: false });
+        this.assertAgentRegistrationActive(active);
+        active.lifecycle = "idle";
+        this.touchUpdatedAt(active);
+        await this.persistSnapshot(active);
+        this.assertAgentRegistrationActive(active);
+        this.emitState(active, { persist: false });
+        this.subscribeToSession(active);
+        installed = true;
+        return { ...active };
+      });
+      return snapshot;
+    } catch (error) {
+      await this.removeFailedPendingAgent(pending, "provider session registration failed");
+      throw error;
+    } finally {
+      if (!installed) {
+        await this.closeUnregisteredSession(session);
+      }
+    }
+  }
+
+  private async removeFailedPendingAgent(
+    pending: ManagedAgentInitializing,
+    reason: string,
+  ): Promise<void> {
+    await this.queueAgentLifecycleHandoff(pending.id, async () => {
+      if (this.agents.get(pending.id) !== pending) {
+        return;
+      }
+      const closed = this.prepareAgentForClosure(pending, reason);
+      await this.deleteAgentState(pending.id);
+      if (this.registry) {
+        await this.registry.remove(pending.id);
+      }
+      this.emitClosedAgent(closed, { persist: false });
     });
   }
 
@@ -1061,6 +1339,7 @@ export class AgentManager {
       labels?: Record<string, string>;
       workspaceId?: string;
       owner?: AgentOwner;
+      createRequestFingerprint?: string;
     },
     resumeOptions?: AgentResumeSessionOptions,
   ): Promise<ManagedAgent> {
@@ -1080,6 +1359,7 @@ export class AgentManager {
       labels?: Record<string, string>;
       workspaceId?: string;
       owner?: AgentOwner;
+      createRequestFingerprint?: string;
     },
     resumeOptions?: AgentResumeSessionOptions,
   ): Promise<ManagedAgent> {
@@ -1205,7 +1485,9 @@ export class AgentManager {
     options?: { rehydrateFromDisk?: boolean },
   ): Promise<ManagedAgent> {
     return this.trackAgentRegistrationOperation(
-      this.reloadAgentSessionInternal(agentId, overrides, options),
+      this.queueAgentLifecycleHandoff(agentId, () =>
+        this.reloadAgentSessionInternal(agentId, overrides, options),
+      ),
     );
   }
 
@@ -1269,6 +1551,7 @@ export class AgentManager {
         labels: existing.labels,
         workspaceId: existing.workspaceId,
         owner: existing.owner,
+        createRequestFingerprint: existing.createRequestFingerprint,
         createdAt: existing.createdAt,
         updatedAt: existing.updatedAt,
         lastUserMessageAt: existing.lastUserMessageAt,
@@ -1340,19 +1623,73 @@ export class AgentManager {
 
   closeAgent(agentId: string): Promise<void> {
     const existing = this.inFlightAgentCloses.get(agentId);
-    if (existing) {
-      return existing;
+    if (existing && this.agentLifecycleTails.get(agentId) === existing.lifecycleTail) {
+      return existing.result;
     }
 
-    const close = this.closeAgentRuntime(agentId);
-    this.inFlightAgentCloses.set(agentId, close);
+    const close = this.queueAgentLifecycleHandoff(agentId, () => this.closeAgentRuntime(agentId));
+    const lifecycleTail = this.agentLifecycleTails.get(agentId);
+    if (!lifecycleTail) {
+      throw new Error(`Agent ${agentId} close was not added to the lifecycle queue`);
+    }
+    const entry = { result: close, lifecycleTail };
+    this.inFlightAgentCloses.set(agentId, entry);
     const clearClose = () => {
-      if (this.inFlightAgentCloses.get(agentId) === close) {
+      if (this.inFlightAgentCloses.get(agentId) === entry) {
         this.inFlightAgentCloses.delete(agentId);
       }
     };
     void close.then(clearClose, clearClose);
     return close;
+  }
+
+  async abortCreatedAgentBeforeAcknowledgement(agentId: string, error: unknown): Promise<void> {
+    const detached = { session: null as AgentSession | null };
+
+    try {
+      await this.queueAgentLifecycleHandoff(agentId, async () => {
+        const agent = this.agents.get(agentId);
+        detached.session = agent?.session ?? null;
+        if (agent) {
+          this.prepareAgentForClosure(agent, "agent creation acknowledgement failed");
+        }
+        await this.deleteAgentState(agentId);
+        if (this.registry) {
+          await this.registry.remove(agentId);
+        }
+      });
+    } finally {
+      if (detached.session) {
+        this.trackCreateAcknowledgementClose(agentId, detached.session);
+      }
+    }
+
+    this.logger.warn(
+      { err: error, agentId },
+      "Aborted agent creation after acknowledgement failure",
+    );
+  }
+
+  private trackCreateAcknowledgementClose(agentId: string, session: AgentSession): void {
+    const cleanup = this.waitWithTimeout({
+      operation: this.closeUnregisteredSession(session),
+      timeoutMs: this.rescueTimeouts.createAcknowledgementCloseMs,
+      onLateError: (closeError) => {
+        this.logger.warn(
+          { err: closeError, agentId },
+          "Late provider session close failed after create acknowledgement failure",
+        );
+      },
+    }).then((result) => {
+      if (result === "timed_out") {
+        this.logger.warn(
+          { agentId, timeoutMs: this.rescueTimeouts.createAcknowledgementCloseMs },
+          "Timed out closing provider session after create acknowledgement failure",
+        );
+      }
+      return undefined;
+    });
+    void this.trackAgentRegistrationOperation(cleanup);
   }
 
   private async closeAgentRuntime(agentId: string): Promise<void> {
@@ -1374,7 +1711,7 @@ export class AgentManager {
     const closedAgent = this.prepareAgentForClosure(agent, "agent closed");
     let closeError: unknown;
     try {
-      await agent.session.close();
+      await agent.session?.close();
     } catch (error) {
       closeError = error;
     }
@@ -1508,6 +1845,7 @@ export class AgentManager {
         cwd: record.cwd,
         workspaceId: record.workspaceId,
         owner: record.owner,
+        createRequestFingerprint: record.createRequestFingerprint,
         session: null,
         capabilities: STORED_AGENT_CAPABILITIES,
         config: buildStoredAgentConfig(record),
@@ -1539,79 +1877,99 @@ export class AgentManager {
   }
 
   async setAgentMode(agentId: string, modeId: string): Promise<AgentProviderNotice | null> {
-    const agent = this.requireSessionAgent(agentId);
-    const notice = (await agent.session.setMode(modeId)) ?? null;
-    await this.drainSessionEvents(agentId);
-    const currentMode = (await agent.session.getCurrentMode()) ?? modeId;
-    agent.config.modeId = currentMode ?? undefined;
-    agent.currentModeId = currentMode;
-    // Update runtimeInfo to reflect the new mode
-    if (agent.runtimeInfo) {
-      agent.runtimeInfo = { ...agent.runtimeInfo, modeId: currentMode };
-    }
-    this.touchUpdatedAt(agent);
-    this.emitState(agent);
-    return notice;
+    return this.mutateAgentRuntime(agentId, async (agent) => {
+      const notice = (await agent.session.setMode(modeId)) ?? null;
+      await this.drainSessionEvents(agentId);
+      const currentMode = (await agent.session.getCurrentMode()) ?? modeId;
+      agent.config.modeId = currentMode ?? undefined;
+      agent.currentModeId = currentMode;
+      if (agent.runtimeInfo) {
+        agent.runtimeInfo = { ...agent.runtimeInfo, modeId: currentMode };
+      }
+      return notice;
+    });
   }
 
   async setAgentModel(agentId: string, modelId: string | null): Promise<void> {
-    const agent = this.requireSessionAgent(agentId);
     const normalizedModelId =
       typeof modelId === "string" && modelId.trim().length > 0 ? modelId : null;
 
-    if (agent.session.setModel) {
-      await agent.session.setModel(normalizedModelId);
-    }
-    await this.drainSessionEvents(agentId);
+    await this.mutateAgentRuntime(agentId, async (agent) => {
+      if (agent.session.setModel) {
+        await agent.session.setModel(normalizedModelId);
+      }
+      await this.drainSessionEvents(agentId);
 
-    agent.config.model = normalizedModelId ?? undefined;
-    if (agent.runtimeInfo) {
-      agent.runtimeInfo = { ...agent.runtimeInfo, model: normalizedModelId };
-    }
-    this.touchUpdatedAt(agent);
-    this.emitState(agent);
+      agent.config.model = normalizedModelId ?? undefined;
+      if (agent.runtimeInfo) {
+        agent.runtimeInfo = { ...agent.runtimeInfo, model: normalizedModelId };
+      }
+    });
   }
 
   async setAgentThinkingOption(
     agentId: string,
     thinkingOptionId: string | null,
   ): Promise<AgentProviderNotice | null> {
-    const agent = this.requireSessionAgent(agentId);
     const normalizedThinkingOptionId =
       typeof thinkingOptionId === "string" && thinkingOptionId.trim().length > 0
         ? thinkingOptionId
         : null;
 
-    let notice: AgentProviderNotice | null = null;
-    if (agent.session.setThinkingOption) {
-      notice = (await agent.session.setThinkingOption(normalizedThinkingOptionId)) ?? null;
-    }
-    await this.drainSessionEvents(agentId);
+    return this.mutateAgentRuntime(agentId, async (agent) => {
+      let notice: AgentProviderNotice | null = null;
+      if (agent.session.setThinkingOption) {
+        notice = (await agent.session.setThinkingOption(normalizedThinkingOptionId)) ?? null;
+      }
+      await this.drainSessionEvents(agentId);
 
-    agent.config.thinkingOptionId = normalizedThinkingOptionId ?? undefined;
-    if (agent.runtimeInfo) {
-      agent.runtimeInfo = {
-        ...agent.runtimeInfo,
-        thinkingOptionId: normalizedThinkingOptionId,
-      };
-    }
-    this.touchUpdatedAt(agent);
-    this.emitState(agent);
-    return notice;
+      agent.config.thinkingOptionId = normalizedThinkingOptionId ?? undefined;
+      if (agent.runtimeInfo) {
+        agent.runtimeInfo = {
+          ...agent.runtimeInfo,
+          thinkingOptionId: normalizedThinkingOptionId,
+        };
+      }
+      return notice;
+    });
   }
 
   async setAgentFeature(agentId: string, featureId: string, value: unknown): Promise<void> {
-    const agent = this.requireAgent(agentId);
+    await this.mutateAgentRuntime(agentId, async (agent) => {
+      if (!agent.session.setFeature) {
+        throw new Error("Agent session does not support setting features");
+      }
 
-    if (!agent.session.setFeature) {
-      throw new Error("Agent session does not support setting features");
-    }
+      await agent.session.setFeature(featureId, value);
+      await this.drainSessionEvents(agentId);
+      agent.config.featureValues = { ...agent.config.featureValues, [featureId]: value };
+    });
+  }
 
-    await agent.session.setFeature(featureId, value);
-    await this.drainSessionEvents(agentId);
-    agent.config.featureValues = { ...agent.config.featureValues, [featureId]: value };
-    this.touchUpdatedAt(agent);
-    this.emitState(agent);
+  private mutateAgentRuntime<T>(
+    agentId: string,
+    operation: (agent: ActiveManagedAgent) => Promise<T>,
+  ): Promise<T> {
+    return this.queueAgentLifecycleHandoff(agentId, async () => {
+      const agent = this.requireSessionAgent(agentId);
+      this.touchUpdatedAt(agent);
+      try {
+        const result = await operation(agent);
+        if (this.agents.get(agentId) !== agent) {
+          throw new Error(`Agent '${agentId}' detached during runtime mutation`);
+        }
+        this.touchUpdatedAt(agent);
+        this.syncFeaturesFromSession(agent);
+        await this.persistSnapshot(agent);
+        this.emitState(agent, { persist: false });
+        return result;
+      } catch (error) {
+        if (this.agents.get(agentId) === agent) {
+          this.touchUpdatedAt(agent);
+        }
+        throw error;
+      }
+    });
   }
 
   async setTitle(agentId: string, title: string): Promise<void> {
@@ -1873,28 +2231,42 @@ export class AgentManager {
    * emitted by the handler flow through dispatchStream so they persist and
    * broadcast like normal timeline events.
    */
-  tryRunOutOfBand(agentId: string, prompt: AgentPromptInput): boolean {
-    const agent = this.requireSessionAgent(agentId);
-    const handler = agent.session.tryHandleOutOfBand?.(prompt);
-    if (!handler) {
-      return false;
-    }
-    const dispatch = (event: AgentStreamEvent): void => {
-      // Persist timeline items so they show up in fetchAgentTimeline; broadcast
-      // for live subscribers. Other event types are broadcast only.
-      if (event.type === "timeline") {
-        this.touchUpdatedAt(agent);
-        const row = this.recordTimeline(agent.id, event.item);
-        this.dispatchStream(agent.id, event, {
-          seq: row.seq,
-          epoch: this.timelineStore.getEpoch(agent.id),
-          timestamp: row.timestamp,
-        });
+  async tryRunOutOfBand(agentId: string, prompt: AgentPromptInput): Promise<boolean> {
+    let settleAccepted!: (accepted: boolean) => void;
+    let rejectAccepted!: (error: unknown) => void;
+    let acceptedSettled = false;
+    const accepted = new Promise<boolean>((resolveAccepted, reject) => {
+      settleAccepted = resolveAccepted;
+      rejectAccepted = reject;
+    });
+
+    const operation = this.queueAgentLifecycleHandoff(agentId, async () => {
+      const agent = this.requireSessionAgent(agentId);
+      const handler = agent.session.tryHandleOutOfBand?.(prompt);
+      if (!handler) {
+        acceptedSettled = true;
+        settleAccepted(false);
         return;
       }
-      this.dispatchStream(agent.id, event, { timestamp: new Date().toISOString() });
-    };
-    void (async () => {
+
+      this.touchUpdatedAt(agent);
+      acceptedSettled = true;
+      settleAccepted(true);
+      const dispatch = (event: AgentStreamEvent): void => {
+        // Persist timeline items so they show up in fetchAgentTimeline; broadcast
+        // for live subscribers. Other event types are broadcast only.
+        if (event.type === "timeline") {
+          this.touchUpdatedAt(agent);
+          const row = this.recordTimeline(agent.id, event.item);
+          this.dispatchStream(agent.id, event, {
+            seq: row.seq,
+            epoch: this.timelineStore.getEpoch(agent.id),
+            timestamp: row.timestamp,
+          });
+          return;
+        }
+        this.dispatchStream(agent.id, event, { timestamp: new Date().toISOString() });
+      };
       try {
         await handler.run({ emit: dispatch });
       } catch (error) {
@@ -1905,8 +2277,22 @@ export class AgentManager {
           item: { type: "assistant_message", text: `[Error] ${text}` },
         });
       }
-    })();
-    return true;
+      if (this.agents.get(agentId) !== agent) {
+        throw new Error(`Agent '${agentId}' detached during out-of-band command`);
+      }
+      this.touchUpdatedAt(agent);
+      await this.persistSnapshot(agent);
+    });
+    void operation.catch((error: unknown) => {
+      if (!acceptedSettled) {
+        acceptedSettled = true;
+        rejectAccepted(error);
+        return;
+      }
+      this.logger.error({ err: error, agentId }, "Out-of-band agent command failed");
+    });
+
+    return await accepted;
   }
 
   async appendTimelineItem(agentId: string, item: AgentTimelineItem): Promise<void> {
@@ -2228,7 +2614,7 @@ export class AgentManager {
     requestId: string,
     response: AgentPermissionResponse,
   ): Promise<AgentPermissionResult | void> {
-    const agent = this.requireAgent(agentId);
+    const agent = this.requireSessionAgent(agentId);
     agent.inFlightPermissionResponses.add(requestId);
 
     try {
@@ -2547,8 +2933,10 @@ export class AgentManager {
       }
 
       let currentStatus: AgentLifecycleStatus = initialStatus;
+      // Initializing only means that durable ownership exists. The first foreground turn has not
+      // necessarily started yet, so waitForActive must not resolve in the create-to-prompt gap.
       let hasStarted =
-        isAgentBusy(initialStatus) ||
+        initialStatus === "running" ||
         Boolean(snapshot.activeForegroundTurnId) ||
         Boolean(pendingForegroundRun?.started);
       let terminalStatusOverride: AgentLifecycleStatus | null = null;
@@ -2619,8 +3007,15 @@ export class AgentManager {
               finish(pending);
               return;
             }
-            if (isAgentBusy(event.agent.lifecycle)) {
+            if (event.agent.lifecycle === "running") {
               hasStarted = true;
+              return;
+            }
+            if (event.agent.lifecycle === "initializing") {
+              return;
+            }
+            if (event.agent.lifecycle === "error" || event.agent.lifecycle === "closed") {
+              finish(null);
               return;
             }
             if (!waitForActive || hasStarted) {
@@ -2635,6 +3030,10 @@ export class AgentManager {
           if (event.type === "agent_stream") {
             if (event.event.type === "permission_requested") {
               finish(event.event.request);
+              return;
+            }
+            if (event.event.type === "turn_started") {
+              hasStarted = true;
               return;
             }
             if (event.event.type === "turn_failed") {
@@ -2676,6 +3075,7 @@ export class AgentManager {
       publishWhenReady?: boolean;
       workspaceId?: string;
       owner?: AgentOwner;
+      createRequestFingerprint?: string;
     },
   ): Promise<ManagedAgent> {
     let registered = false;
@@ -2741,6 +3141,12 @@ export class AgentManager {
 
   private assertAcceptingAgentRegistrations(): void {
     if (!this.acceptingAgentRegistrations) {
+      throw new AgentManagerShuttingDownError();
+    }
+  }
+
+  private assertPendingAgentRegistrationActive(agent: ManagedAgentInitializing): void {
+    if (!this.acceptingAgentRegistrations || this.agents.get(agent.id) !== agent) {
       throw new AgentManagerShuttingDownError();
     }
   }
@@ -2815,23 +3221,26 @@ export class AgentManager {
           persistence?: AgentPersistenceHandle;
           workspaceId?: string;
           owner?: AgentOwner;
+          createRequestFingerprint?: string;
         }
       | undefined;
   }): ActiveManagedAgent {
     const { resolvedAgentId, session, config, now, durableTimelineHasRows, options } = params;
+    const registration = options ?? {};
     return {
       id: resolvedAgentId,
       provider: config.provider,
       cwd: config.cwd,
-      workspaceId: options?.workspaceId,
-      owner: options?.owner,
+      workspaceId: registration.workspaceId,
+      owner: registration.owner,
+      createRequestFingerprint: registration.createRequestFingerprint,
       session,
       capabilities: session.capabilities,
       config,
       runtimeInfo: undefined,
       lifecycle: "initializing",
-      createdAt: options?.createdAt ?? now,
-      updatedAt: options?.updatedAt ?? now,
+      createdAt: registration.createdAt ?? now,
+      updatedAt: registration.updatedAt ?? now,
       availableModes: [],
       currentModeId: null,
       pendingPermissions: new Map<string, AgentPermissionRequest>(),
@@ -2843,16 +3252,16 @@ export class AgentManager {
       finalizedForegroundTurnIds: new Set<string>(),
       unsubscribeSession: null,
       persistence: attachPersistenceCwd(
-        options?.persistence ?? session.describePersistence(),
+        registration.persistence ?? session.describePersistence(),
         config.cwd,
       ),
-      historyPrimed: options?.historyPrimed ?? durableTimelineHasRows,
-      lastUserMessageAt: options?.lastUserMessageAt ?? null,
-      lastUsage: options?.lastUsage,
-      lastError: options?.lastError,
-      attention: resolveInitialAttention(options?.attention),
+      historyPrimed: registration.historyPrimed ?? durableTimelineHasRows,
+      lastUserMessageAt: registration.lastUserMessageAt ?? null,
+      lastUsage: registration.lastUsage,
+      lastError: registration.lastError,
+      attention: resolveInitialAttention(registration.attention),
       internal: config.internal ?? false,
-      labels: options?.labels ?? {},
+      labels: registration.labels ?? {},
     } as ActiveManagedAgent;
   }
 
@@ -2943,7 +3352,7 @@ export class AgentManager {
         if (!current) {
           return;
         }
-        if (current.session == null) {
+        if (!hasManagedSession(current)) {
           return;
         }
         this.logger.trace(
@@ -3935,6 +4344,23 @@ export class AgentManager {
     });
   }
 
+  private queueAgentLifecycleHandoff<T>(agentId: string, operation: () => Promise<T>): Promise<T> {
+    const previous = this.agentLifecycleTails.get(agentId) ?? Promise.resolve();
+    const result = previous.then(operation);
+    const tail = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    this.agentLifecycleTails.set(agentId, tail);
+    void tail.then(() => {
+      if (this.agentLifecycleTails.get(agentId) === tail) {
+        this.agentLifecycleTails.delete(agentId);
+      }
+      return undefined;
+    });
+    return result;
+  }
+
   private trackAgentRegistrationOperation<T>(result: Promise<T>): Promise<T> {
     const settled = result.then(
       () => undefined,
@@ -3969,10 +4395,15 @@ export class AgentManager {
     // Drain tasks, including tasks spawned while awaiting.
     while (
       this.backgroundTasks.size > 0 ||
-      (options.includeAgentRegistrations && this.agentRegistrationTasks.size > 0)
+      (options.includeAgentRegistrations &&
+        (this.agentRegistrationTasks.size > 0 || this.agentLifecycleTails.size > 0))
     ) {
       const pending = options.includeAgentRegistrations
-        ? [...this.backgroundTasks, ...this.agentRegistrationTasks]
+        ? [
+            ...this.backgroundTasks,
+            ...this.agentRegistrationTasks,
+            ...this.agentLifecycleTails.values(),
+          ]
         : [...this.backgroundTasks];
       await Promise.allSettled(pending);
     }
@@ -4294,7 +4725,7 @@ export class AgentManager {
 
   private requireSessionAgent(id: string): ActiveManagedAgent {
     const agent = this.requireAgent(id);
-    if (agent.session === null) {
+    if (!hasManagedSession(agent)) {
       throw new Error(`Agent '${agent.id}' has no managed session`);
     }
     return agent;
