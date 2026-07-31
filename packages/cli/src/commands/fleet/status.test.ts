@@ -14,11 +14,24 @@ describe("fleet status", () => {
       }),
       fetchAgents: vi.fn().mockResolvedValue({
         entries: [
-          { agent: { status: "initializing" } },
-          { agent: { status: "running" } },
-          { agent: { status: "idle" } },
-          { agent: { status: "completed" } },
-          { agent: { status: "archived" } },
+          { agent: { id: "init-agent", title: "Init", status: "initializing" } },
+          {
+            agent: {
+              id: "run-agent",
+              title: "Run",
+              status: "running",
+              materialProgress: {
+                state: "stalled",
+                completedCompactionsSinceMaterialProgress: 2,
+                lastMaterialProgressAt: null,
+                lastMaterialProgressKind: null,
+                reason: "Two compactions completed without later material progress.",
+              },
+            },
+          },
+          { agent: { id: "idle-agent", title: "Idle", status: "idle" } },
+          { agent: { id: "done-agent", title: "Done", status: "completed" } },
+          { agent: { id: "arch-agent", title: "Archived", status: "archived" } },
         ],
       }),
       close,
@@ -31,6 +44,15 @@ describe("fleet status", () => {
       activeAgents: 3,
       freeSlots: 7,
       statusCounts: { initializing: 1, running: 1, idle: 1, completed: 1, archived: 1 },
+      activeTasks: [
+        expect.objectContaining({ agentId: "init-agent", progressState: "unavailable" }),
+        expect.objectContaining({
+          agentId: "run-agent",
+          progressState: "stalled",
+          completedCompactionsSinceMaterialProgress: 2,
+        }),
+        expect.objectContaining({ agentId: "idle-agent", progressState: "unavailable" }),
+      ],
       issue: null,
     });
     expect(close).toHaveBeenCalledOnce();
@@ -54,7 +76,7 @@ describe("fleet status", () => {
     const close = vi.fn().mockResolvedValue(undefined);
     const getDaemonStatus = vi.fn().mockRejectedValue(new Error("provider still warming"));
     const fetchAgents = vi.fn().mockResolvedValue({
-      entries: [{ agent: { status: "running" } }],
+      entries: [{ agent: { id: "running-agent", title: null, status: "running" } }],
     });
     const connect = vi.fn().mockResolvedValue({ getDaemonStatus, fetchAgents, close });
 
@@ -67,7 +89,12 @@ describe("fleet status", () => {
       issue: "readiness probe failed: provider still warming",
     });
     expect(getDaemonStatus).toHaveBeenCalledWith({ timeout: 15_000 });
-    expect(fetchAgents).toHaveBeenCalledWith({ scope: "active", timeout: 15_000 });
+    expect(fetchAgents).toHaveBeenCalledWith({
+      scope: "active",
+      includeMaterialProgress: true,
+      filter: { statuses: ["initializing", "running", "idle"] },
+      timeout: 15_000,
+    });
     expect(close).toHaveBeenCalledOnce();
   });
 
@@ -106,6 +133,7 @@ describe("fleet status", () => {
         activeAgents: 11,
         freeSlots: 0,
         statusCounts: {},
+        activeTasks: [],
         issue: "provider overloaded",
       },
       {
@@ -120,6 +148,7 @@ describe("fleet status", () => {
         activeAgents: 0,
         freeSlots: 0,
         statusCounts: {},
+        activeTasks: [],
         issue: "connection reset",
       },
     ];

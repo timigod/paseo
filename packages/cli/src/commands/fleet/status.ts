@@ -23,6 +23,15 @@ export type FleetConnect = (options: {
   timeout?: number;
 }) => Promise<FleetDaemonClient>;
 
+export interface FleetActiveTask {
+  agentId: string;
+  name: string | null;
+  status: string;
+  progressState: "none" | "progressing" | "warning" | "stalled" | "unavailable";
+  completedCompactionsSinceMaterialProgress: number | null;
+  reason: string;
+}
+
 export interface FleetHostStatus {
   id: string;
   name: string;
@@ -35,6 +44,7 @@ export interface FleetHostStatus {
   activeAgents: number;
   freeSlots: number;
   statusCounts: Record<string, number>;
+  activeTasks: FleetActiveTask[];
   issue: string | null;
 }
 
@@ -53,6 +63,73 @@ function countStatuses(statuses: readonly string[]): Record<string, number> {
     counts[status] = (counts[status] ?? 0) + 1;
     return counts;
   }, {});
+}
+
+function collectActiveTasks(
+  entries:
+    | readonly {
+        agent: {
+          id: string;
+          title: string | null;
+          status: string;
+          materialProgress?: {
+            state: FleetActiveTask["progressState"];
+            completedCompactionsSinceMaterialProgress: number;
+            reason: string;
+          };
+        };
+      }[]
+    | undefined,
+): FleetActiveTask[] {
+  return (entries ?? [])
+    .filter((entry) => ACTIVE_AGENT_STATUSES.has(entry.agent.status))
+    .map((entry) => ({
+      agentId: entry.agent.id,
+      name: entry.agent.title,
+      status: entry.agent.status,
+      progressState: entry.agent.materialProgress?.state ?? "unavailable",
+      completedCompactionsSinceMaterialProgress:
+        entry.agent.materialProgress?.completedCompactionsSinceMaterialProgress ?? null,
+      reason: entry.agent.materialProgress?.reason ?? "Material progress is unavailable.",
+    }));
+}
+
+function buildReachableHostStatus(
+  host: FleetHost,
+  daemonResult: PromiseSettledResult<Awaited<ReturnType<FleetDaemonClient["getDaemonStatus"]>>>,
+  agentsResult: PromiseSettledResult<Awaited<ReturnType<FleetDaemonClient["fetchAgents"]>>>,
+): FleetHostStatus {
+  const daemonStatus = daemonResult.status === "fulfilled" ? daemonResult.value : null;
+  const agents = agentsResult.status === "fulfilled" ? agentsResult.value : null;
+  const statuses = agents?.entries.map((entry) => entry.agent.status) ?? [];
+  const activeTasks = collectActiveTasks(agents?.entries);
+  const activeAgents = statuses.filter((status) => ACTIVE_AGENT_STATUSES.has(status)).length;
+  const openCode = daemonStatus?.providers.find((provider) => provider.provider === "opencode");
+  const issues: string[] = [];
+  if (daemonResult.status === "rejected") {
+    issues.push(`readiness probe failed: ${errorMessage(daemonResult.reason)}`);
+  } else if (openCode?.available !== true) {
+    issues.push(openCode?.error ?? "OpenCode is unavailable");
+  }
+  if (agentsResult.status === "rejected") {
+    issues.push(`agent inventory probe failed: ${errorMessage(agentsResult.reason)}`);
+  }
+
+  return {
+    id: host.id,
+    name: host.name,
+    endpoint: host.endpoint,
+    capacity: host.capacity,
+    reachable: true,
+    version: daemonStatus?.version ?? null,
+    openCodeReady: openCode?.available === true,
+    inventoryReady: agents !== null,
+    activeAgents,
+    freeSlots: agents ? Math.max(host.capacity - activeAgents, 0) : 0,
+    statusCounts: countStatuses(statuses),
+    activeTasks,
+    issue: issues.length > 0 ? issues.join("; ") : null,
+  };
 }
 
 export async function inspectFleetHost(
@@ -75,6 +152,7 @@ export async function inspectFleetHost(
       activeAgents: 0,
       freeSlots: 0,
       statusCounts: {},
+      activeTasks: [],
       issue: errorMessage(error),
     };
   }
@@ -82,37 +160,14 @@ export async function inspectFleetHost(
   try {
     const [daemonResult, agentsResult] = await Promise.allSettled([
       client.getDaemonStatus({ timeout: FLEET_READINESS_TIMEOUT_MS }),
-      client.fetchAgents({ scope: "active", timeout: FLEET_READINESS_TIMEOUT_MS }),
+      client.fetchAgents({
+        scope: "active",
+        includeMaterialProgress: true,
+        filter: { statuses: ["initializing", "running", "idle"] },
+        timeout: FLEET_READINESS_TIMEOUT_MS,
+      }),
     ]);
-    const daemonStatus = daemonResult.status === "fulfilled" ? daemonResult.value : null;
-    const agents = agentsResult.status === "fulfilled" ? agentsResult.value : null;
-    const statuses = agents?.entries.map((entry) => entry.agent.status) ?? [];
-    const activeAgents = statuses.filter((status) => ACTIVE_AGENT_STATUSES.has(status)).length;
-    const openCode = daemonStatus?.providers.find((provider) => provider.provider === "opencode");
-    const issues: string[] = [];
-    if (daemonResult.status === "rejected") {
-      issues.push(`readiness probe failed: ${errorMessage(daemonResult.reason)}`);
-    } else if (openCode?.available !== true) {
-      issues.push(openCode?.error ?? "OpenCode is unavailable");
-    }
-    if (agentsResult.status === "rejected") {
-      issues.push(`agent inventory probe failed: ${errorMessage(agentsResult.reason)}`);
-    }
-
-    return {
-      id: host.id,
-      name: host.name,
-      endpoint: host.endpoint,
-      capacity: host.capacity,
-      reachable: true,
-      version: daemonStatus?.version ?? null,
-      openCodeReady: openCode?.available === true,
-      inventoryReady: agents !== null,
-      activeAgents,
-      freeSlots: agents ? Math.max(host.capacity - activeAgents, 0) : 0,
-      statusCounts: countStatuses(statuses),
-      issue: issues.length > 0 ? issues.join("; ") : null,
-    };
+    return buildReachableHostStatus(host, daemonResult, agentsResult);
   } finally {
     await client?.close().catch(() => {});
   }
@@ -138,6 +193,15 @@ const fleetStatusSchema: OutputSchema<FleetHostStatus> = {
     { header: "OPENCODE", field: (host) => (host.openCodeReady ? "ready" : "unavailable") },
     { header: "ACTIVE", field: "activeAgents", align: "right" },
     { header: "FREE", field: "freeSlots", align: "right" },
+    {
+      header: "PROGRESS",
+      field: (host) =>
+        host.activeTasks.length === 0
+          ? "no active tasks"
+          : host.activeTasks
+              .map((task) => `${task.agentId.slice(0, 7)}:${task.progressState}`)
+              .join(", "),
+    },
     { header: "DETAIL", field: (host) => host.issue ?? "healthy" },
   ],
 };

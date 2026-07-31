@@ -3921,6 +3921,61 @@ test("getTimelineRows falls back to the in-memory timeline when no durable store
       },
     },
   ]);
+
+  await manager.closeAgent(snapshot.id);
+  await expect(manager.getMaterialProgressTimelineRows(snapshot.id)).resolves.toHaveLength(2);
+});
+
+test("starting a foreground turn clears the persisted previous turn outcome", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-turn-outcome-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const session = new (class extends TestAgentSession {
+    override async startTurn(): Promise<{ turnId: string }> {
+      return { turnId: "held-turn" };
+    }
+  })({ provider: "codex", cwd: workdir });
+  const client = new (class extends TestAgentClient {
+    override async createSession(): Promise<AgentSession> {
+      return session;
+    }
+  })();
+  const manager = new AgentManager({
+    clients: { codex: client },
+    registry: storage,
+    logger,
+    idFactory: () => "00000000-0000-4000-8000-000000000139",
+  });
+
+  try {
+    const agent = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+    agent.lastTurnOutcome = "completed";
+
+    const running = waitForAgentLifecycle(manager, agent.id, "running");
+    const consume = (async () => {
+      for await (const _event of manager.streamAgent(agent.id, "continue")) {
+        // Consume through the terminal event so the managed run settles.
+      }
+    })();
+
+    await running;
+    expect(await manager.getLastTurnOutcome(agent.id)).toBeNull();
+    await manager.flush();
+    expect((await storage.get(agent.id))?.lastTurnOutcome ?? null).toBeNull();
+
+    session.pushEvent({
+      type: "turn_canceled",
+      provider: "codex",
+      turnId: "held-turn",
+      reason: "test interruption",
+    });
+    await consume;
+    expect(await manager.getLastTurnOutcome(agent.id)).toBe("canceled");
+  } finally {
+    await manager.flush().catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
 });
 
 test("getAgent does not expose committed history internals once manager owns the seam", async () => {

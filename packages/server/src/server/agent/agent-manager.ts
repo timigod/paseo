@@ -368,6 +368,16 @@ function resolveInitialAttention(input: AttentionState | undefined): AttentionSt
   };
 }
 
+function resolveLastTurnOutcome(
+  input:
+    | {
+        lastTurnOutcome?: "completed" | "failed" | "canceled" | null;
+      }
+    | undefined,
+): "completed" | "failed" | "canceled" | null | undefined {
+  return input?.lastTurnOutcome;
+}
+
 interface StreamEventFlags {
   shouldDispatchEvent: boolean;
   shouldNotifyWaiters: boolean;
@@ -409,6 +419,7 @@ interface ManagedAgentBase {
   lastUserMessageAt: Date | null;
   lastUsage?: AgentUsage;
   lastError?: string;
+  lastTurnOutcome?: "completed" | "failed" | "canceled" | null;
   attention: AttentionState;
   foregroundTurnWaiters: Set<ForegroundTurnWaiter>;
   finalizedForegroundTurnIds: Set<string>;
@@ -1210,6 +1221,32 @@ export class AgentManager {
     return this.timelineStore.getRows(id);
   }
 
+  async getMaterialProgressTimelineRows(
+    id: string,
+    limit = 1_000,
+  ): Promise<AgentTimelineRow[] | null> {
+    let timeline: AgentTimelineFetchResult | null = null;
+    if (this.durableTimelineStore) {
+      timeline = await this.durableTimelineStore.fetchCommitted(id, {
+        direction: "tail",
+        limit,
+      });
+    } else if (this.timelineStore.has(id)) {
+      timeline = this.timelineStore.fetch(id, { direction: "tail", limit });
+    }
+    if (timeline === null) return null;
+    if (timeline.hasOlder && !timeline.rows.some((row) => row.item.type === "user_message")) {
+      return null;
+    }
+    return timeline.rows;
+  }
+
+  async getLastTurnOutcome(id: string): Promise<"completed" | "failed" | "canceled" | null> {
+    const live = this.agents.get(id);
+    if (live) return live.lastTurnOutcome ?? null;
+    return (await this.registry?.get(id))?.lastTurnOutcome ?? null;
+  }
+
   fetchTimeline(id: string, options?: AgentTimelineFetchOptions): AgentTimelineFetchResult {
     this.requireAgent(id);
     return this.timelineStore.fetch(id, options);
@@ -1612,6 +1649,7 @@ export class AgentManager {
     const preservedHistoryPrimed = existing.historyPrimed;
     const preservedLastUsage = existing.lastUsage;
     const preservedLastError = existing.lastError;
+    const preservedLastTurnOutcome = existing.lastTurnOutcome;
     const preservedAttention = existing.attention;
     const handle = existing.persistence;
     const provider = handle?.provider ?? existing.provider;
@@ -1664,6 +1702,7 @@ export class AgentManager {
         historyPrimed: rehydrateFromDisk ? false : preservedHistoryPrimed,
         lastUsage: preservedLastUsage,
         lastError: preservedLastError,
+        lastTurnOutcome: preservedLastTurnOutcome,
         attention: preservedAttention,
       });
     } finally {
@@ -2021,6 +2060,7 @@ export class AgentManager {
         lastUserMessageAt: record.lastUserMessageAt ? new Date(record.lastUserMessageAt) : null,
         lastUsage: undefined,
         lastError: record.lastError ?? undefined,
+        lastTurnOutcome: record.lastTurnOutcome,
         attention: { requiresAttention: false },
         internal: record.internal,
         labels: record.labels,
@@ -2575,6 +2615,7 @@ export class AgentManager {
       }
       agent.activeForegroundTurnId = turnId;
       agent.lifecycle = "running";
+      agent.lastTurnOutcome = null;
       this.touchUpdatedAt(agent);
       this.emitState(agent);
       this.logger.trace(
@@ -3259,6 +3300,7 @@ export class AgentManager {
       historyPrimed?: boolean;
       lastUsage?: AgentUsage;
       lastError?: string;
+      lastTurnOutcome?: "completed" | "failed" | "canceled" | null;
       attention?: AttentionState;
       initialTitle?: string | null;
       publishWhenReady?: boolean;
@@ -3406,6 +3448,7 @@ export class AgentManager {
           historyPrimed?: boolean;
           lastUsage?: AgentUsage;
           lastError?: string;
+          lastTurnOutcome?: "completed" | "failed" | "canceled" | null;
           attention?: AttentionState;
           persistence?: AgentPersistenceHandle;
           workspaceId?: string;
@@ -3447,6 +3490,7 @@ export class AgentManager {
       lastUserMessageAt: options?.lastUserMessageAt ?? null,
       lastUsage: options?.lastUsage,
       lastError: options?.lastError,
+      lastTurnOutcome: resolveLastTurnOutcome(options),
       attention: resolveInitialAttention(options?.attention),
       internal: config.internal ?? false,
       labels: options?.labels ?? {},
@@ -4156,6 +4200,7 @@ export class AgentManager {
     );
     agent.lastUsage = event.usage;
     agent.lastError = undefined;
+    agent.lastTurnOutcome = "completed";
     if (!isForegroundEvent && agent.lifecycle !== "idle" && !agent.pendingReplacement) {
       (agent as ActiveManagedAgent).lifecycle = "idle";
       this.emitState(agent);
@@ -4190,6 +4235,7 @@ export class AgentManager {
       agent.lifecycle = "error";
     }
     agent.lastError = event.error;
+    agent.lastTurnOutcome = "failed";
     await this.appendSystemErrorTimelineMessage(
       agent,
       event.provider,
@@ -4230,6 +4276,7 @@ export class AgentManager {
       agent.lifecycle = "idle";
     }
     agent.lastError = undefined;
+    agent.lastTurnOutcome = "canceled";
     this.resolvePendingPermissionsForAgent(agent, event.provider, options, "Interrupted");
     if (!isForegroundEvent) {
       this.emitState(agent);
@@ -4242,6 +4289,7 @@ export class AgentManager {
     isForegroundEvent: boolean;
   }): void {
     const { agent, eventTurnId, isForegroundEvent } = params;
+    agent.lastTurnOutcome = null;
     this.logger.trace(
       {
         agentId: agent.id,

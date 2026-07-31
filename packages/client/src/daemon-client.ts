@@ -1996,6 +1996,7 @@ export class DaemonClient {
       type: "fetch_agents_request",
       requestId: resolvedRequestId,
       ...(options?.scope ? { scope: options.scope } : {}),
+      ...(options?.includeMaterialProgress === true ? { includeMaterialProgress: true } : {}),
       ...(options?.filter ? { filter: options.filter } : {}),
       ...(options?.sort ? { sort: options.sort } : {}),
       ...(options?.page ? { page: options.page } : {}),

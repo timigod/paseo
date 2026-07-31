@@ -685,6 +685,16 @@ const AgentRuntimeInfoSchema: z.ZodType<AgentRuntimeInfo> = z.object({
   extra: z.record(z.string(), z.unknown()).optional(),
 });
 
+export const MaterialProgressPayloadSchema = z.object({
+  state: z.enum(["none", "progressing", "warning", "stalled"]),
+  completedCompactionsSinceMaterialProgress: z.number().int().nonnegative(),
+  lastMaterialProgressAt: z.string().nullable(),
+  lastMaterialProgressKind: z.enum(["edit", "write", "assistant_result"]).nullable(),
+  reason: z.string(),
+});
+
+export type MaterialProgressPayload = z.infer<typeof MaterialProgressPayloadSchema>;
+
 export const AgentSnapshotPayloadSchema = z.object({
   id: z.string(),
   provider: AgentProviderSchema,
@@ -713,6 +723,7 @@ export const AgentSnapshotPayloadSchema = z.object({
   attentionTimestamp: z.string().nullable().optional(),
   archivedAt: z.string().nullable().optional(),
   providerUnavailable: z.boolean().optional(),
+  materialProgress: MaterialProgressPayloadSchema.optional(),
 });
 
 export type AgentSnapshotPayload = z.infer<typeof AgentSnapshotPayloadSchema>;
@@ -1010,6 +1021,7 @@ export const FetchAgentsRequestMessageSchema = z.object({
   type: z.literal("fetch_agents_request"),
   requestId: z.string(),
   scope: z.enum(["active"]).optional(),
+  includeMaterialProgress: z.boolean().optional(),
   filter: AgentDirectoryFilterSchema.optional(),
   sort: z
     .array(

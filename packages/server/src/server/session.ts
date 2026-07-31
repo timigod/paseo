@@ -100,6 +100,7 @@ import {
   type TimelineProjectionEntry,
   type TimelineProjectionMode,
 } from "./agent/timeline-projection.js";
+import { analyzeMaterialProgress } from "./agent/material-progress.js";
 import { buildAgentForkContextAttachment } from "./agent/activity-curator.js";
 import { buildAgentPrompt } from "./agent/prompt-attachments.js";
 import type { StructuredGenerationDaemonConfig } from "./agent/structured-generation-providers.js";
@@ -4344,7 +4345,9 @@ export class Session {
     const live = this.agentManager.getAgent(agentId);
     if (live) {
       const payload = await this.buildAgentPayload(live);
-      return this.isProviderVisibleToClient(payload.provider) ? payload : null;
+      return this.isProviderVisibleToClient(payload.provider)
+        ? await this.attachMaterialProgress(payload)
+        : null;
     }
 
     const record = await this.agentStorage.get(agentId);
@@ -4352,7 +4355,31 @@ export class Session {
       return null;
     }
     const payload = this.buildStoredAgentPayload(record);
-    return this.isProviderVisibleToClient(payload.provider) ? payload : null;
+    return this.isProviderVisibleToClient(payload.provider)
+      ? await this.attachMaterialProgress(payload)
+      : null;
+  }
+
+  private async attachMaterialProgress(
+    payload: AgentSnapshotPayload,
+  ): Promise<AgentSnapshotPayload> {
+    let entries: TimelineProjectionEntry[] | null = null;
+    try {
+      const rows = await this.agentManager.getMaterialProgressTimelineRows(payload.id);
+      entries = rows === null ? null : projectTimelineRows({ rows, mode: "projected" });
+    } catch (error) {
+      this.sessionLogger.debug(
+        { err: error, agentId: payload.id },
+        "Material progress timeline is unavailable",
+      );
+    }
+    return {
+      ...payload,
+      materialProgress: analyzeMaterialProgress({
+        entries,
+        turnOutcome: await this.agentManager.getLastTurnOutcome(payload.id),
+      }),
+    };
   }
 
   private async resolveDelegationRootWorkspaceId(agentId: string): Promise<string | null> {
@@ -4523,7 +4550,16 @@ export class Session {
       filter,
     });
 
-    const pagedEntries = matchedEntries.slice(0, limit);
+    const selectedEntries = matchedEntries.slice(0, limit);
+    const pagedEntries =
+      request.type === "fetch_agents_request" && request.includeMaterialProgress === true
+        ? await Promise.all(
+            selectedEntries.map(async (entry) => ({
+              ...entry,
+              agent: await this.attachMaterialProgress(entry.agent),
+            })),
+          )
+        : selectedEntries;
     const hasMore = matchedEntries.length > limit;
     const nextCursor =
       hasMore && pagedEntries.length > 0

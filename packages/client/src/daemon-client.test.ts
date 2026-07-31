@@ -3839,6 +3839,7 @@ test("fetches agents via RPC with filters, sort, and pagination", async () => {
   ]);
   expect(request.page).toEqual({ limit: 25, cursor: "cursor-1" });
   expect(request.subscribe).toEqual({ subscriptionId: "sub-1" });
+  expect(request).not.toHaveProperty("includeMaterialProgress");
 
   mock.triggerMessage(
     JSON.stringify({
@@ -3932,6 +3933,7 @@ test("sends active-scoped fetch_agents_request", async () => {
 
   const promise = client.fetchAgents({
     scope: "active",
+    includeMaterialProgress: true,
     page: { limit: 50 },
   });
 
@@ -3940,6 +3942,7 @@ test("sends active-scoped fetch_agents_request", async () => {
   expect(request).toMatchObject({
     type: "fetch_agents_request",
     scope: "active",
+    includeMaterialProgress: true,
   });
 
   mock.triggerMessage(

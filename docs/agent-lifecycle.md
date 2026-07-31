@@ -110,6 +110,28 @@ explicit recovery because normal send resumes its durable provider session. JSON
 `fleetHost`, `fleetEndpoint`, `agentId`, and `restored` so an orchestrator can retain the resolved
 owner identity.
 
+#### Material progress and compaction stalls
+
+Agent inspection and `fleet status` expose a provider-agnostic `materialProgress` signal computed
+on demand from the retained projected timeline after the latest user message. A completed edit or
+write, or the final assistant result of a terminal turn resets the compaction count. Reads, searches,
+shell commands, child lifecycle logs, reasoning, todo updates, commentary, errors, retries, and
+compaction itself do not. This deliberately conservative definition avoids mistaking inspection or
+provider lifecycle noise for delivery; a terminal research-only task becomes material when it emits
+its final result.
+
+The first completed compaction without later material progress is `warning`; the second and every
+later one is `stalled`. The signal is observational. Paseo does not stop, recover, replace, restart,
+or poll an agent in response. The orchestrator decides whether to continue or stop after reading the
+named host and agent. Older daemons omit the optional field; the CLI reports that as `unavailable`.
+Fleet decoration is an explicit read-only request and scans only a bounded retained continuation
+tail, so ordinary desktop/mobile agent-directory refreshes do not read every task timeline.
+
+```sh
+paseo agent inspect <id> --json
+paseo fleet status --json
+```
+
 The `packages/cli/src/commands/fleet` boundary is intentionally CLI-local while Paseo has no general
 third-party command loader. A future companion extension or library would need to extract the
 topology contract and configuration, host inspection and connection adapter, pure owner matching,
