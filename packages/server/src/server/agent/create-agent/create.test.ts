@@ -9,8 +9,18 @@ import { createProviderSnapshotManagerStub } from "../../test-utils/session-stub
 import { AgentManager } from "../agent-manager.js";
 import { AgentStorage } from "../agent-storage.js";
 import type { CreatePaseoWorktreeWorkflowResult } from "../../worktree-session.js";
-import { createAgentCommand } from "./create.js";
+import {
+  beginCreateAgentCommand,
+  createAgentCommand,
+  recoverPendingCreateAgentCommands,
+} from "./create.js";
 import type { ManagedAgent } from "../agent-manager.js";
+import type {
+  AgentClient,
+  AgentPromptInput,
+  AgentRunOptions,
+  AgentSession,
+} from "../agent-sdk-types.js";
 
 const logger = createTestLogger();
 
@@ -36,7 +46,16 @@ function fakeWorktreeCreator(args: { repoRoot: string; createdWorkspaceId: strin
       workspace: { workspaceId: args.createdWorkspaceId, cwd: workspaceCwd },
       repoRoot: args.repoRoot,
       created: true,
-      setupContinuation: { kind: "agent" as const, startAfterAgentCreate: () => {} },
+      setupContinuation: {
+        kind: "agent" as const,
+        recovery: {
+          workspaceId: args.createdWorkspaceId,
+          worktree: { branchName: "feature", worktreePath },
+          workspaceCwd,
+          shouldBootstrap: true,
+        },
+        startAfterAgentCreate: () => {},
+      },
     }) as unknown as CreatePaseoWorktreeWorkflowResult;
 }
 
@@ -77,6 +96,383 @@ test("session create forwards clientMessageId to the initial prompt run options"
   expect(streamAgent).toHaveBeenCalledWith("agent-1", "hello from create", {
     clientMessageId: "msg-create-1",
   });
+});
+
+test("acknowledged creation recovers its first turn and setup continuation after a daemon crash", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "create-agent-crash-recovery-test-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const originalBaseClient = createTestAgentClients().codex;
+  const restartedBaseClient = createTestAgentClients().codex;
+  if (!originalBaseClient || !restartedBaseClient) {
+    throw new Error("Expected Codex test clients");
+  }
+
+  const neverCreates = new Promise<AgentSession>(() => undefined);
+  const heldClient = new Proxy(originalBaseClient, {
+    get(target, property, receiver) {
+      if (property === "createSession") {
+        return async () => await neverCreates;
+      }
+      const value = Reflect.get(target, property, receiver);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  }) as AgentClient;
+  const originalManager = new AgentManager({
+    clients: { codex: heldClient },
+    registry: storage,
+    logger,
+  });
+
+  const observedTurns: Array<{ prompt: AgentPromptInput; options?: AgentRunOptions }> = [];
+  const restartedClient = new Proxy(restartedBaseClient, {
+    get(target, property, receiver) {
+      if (property === "createSession") {
+        return async (...args: Parameters<AgentClient["createSession"]>) => {
+          const session = await target.createSession(...args);
+          return new Proxy(session, {
+            get(sessionTarget, sessionProperty, sessionReceiver) {
+              if (sessionProperty === "startTurn") {
+                return async (prompt: AgentPromptInput, options?: AgentRunOptions) => {
+                  observedTurns.push({ prompt, options });
+                  return await sessionTarget.startTurn(prompt, options);
+                };
+              }
+              const value = Reflect.get(sessionTarget, sessionProperty, sessionReceiver);
+              return typeof value === "function" ? value.bind(sessionTarget) : value;
+            },
+          });
+        };
+      }
+      const value = Reflect.get(target, property, receiver);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  }) as AgentClient;
+  const restartedManager = new AgentManager({
+    clients: { codex: restartedClient },
+    registry: storage,
+    logger,
+  });
+  const runWorktreeBootstrap = vi.fn(async () => undefined);
+
+  try {
+    const creation = await beginCreateAgentCommand(
+      {
+        agentManager: originalManager,
+        agentStorage: storage,
+        logger,
+        providerSnapshotManager: createProviderSnapshotManagerStub().manager,
+      },
+      {
+        kind: "session",
+        config: { provider: "codex", cwd: workdir },
+        workspaceId: "ws-source",
+        initialPrompt: "Resume this exact first turn",
+        clientMessageId: "msg-durable-first-turn",
+        outputSchema: { type: "object", properties: { done: { type: "boolean" } } },
+        labels: {},
+        provisionalTitle: null,
+        firstAgentContext: { attachments: [] },
+        buildSessionConfig: async (config) => ({
+          sessionConfig: config,
+          setupContinuation: {
+            kind: "agent",
+            recovery: {
+              workspaceId: "ws-durable-worktree",
+              worktree: {
+                branchName: "durable-create",
+                worktreePath: join(workdir, "durable-create"),
+              },
+              workspaceCwd: join(workdir, "durable-create"),
+              shouldBootstrap: true,
+            },
+            startAfterAgentCreate: () => {
+              throw new Error("The crashed daemon must not reach its in-memory continuation");
+            },
+          },
+          createdWorkspaceId: "ws-durable-worktree",
+        }),
+      },
+    );
+
+    await creation.prepareForAcknowledgement();
+    creation.acknowledge(() => undefined);
+    await expect(storage.get(creation.snapshot.id)).resolves.toMatchObject({
+      pendingCreateContinuation: {
+        phase: "awaiting_dispatch",
+        prompt: {
+          input: "Resume this exact first turn",
+          runOptions: {
+            clientMessageId: "msg-durable-first-turn",
+            outputSchema: { type: "object", properties: { done: { type: "boolean" } } },
+          },
+        },
+        setup: {
+          workspaceId: "ws-durable-worktree",
+          worktree: {
+            branchName: "durable-create",
+            worktreePath: join(workdir, "durable-create"),
+          },
+          shouldBootstrap: true,
+        },
+      },
+    });
+
+    await recoverPendingCreateAgentCommands({
+      agentManager: restartedManager,
+      agentStorage: storage,
+      logger,
+      terminalManager: null,
+      providerSnapshotManager: createProviderSnapshotManagerStub().manager,
+      runWorktreeBootstrap: async (options) => {
+        await runWorktreeBootstrap(options);
+      },
+    });
+    await recoverPendingCreateAgentCommands({
+      agentManager: restartedManager,
+      agentStorage: storage,
+      logger,
+      terminalManager: null,
+      providerSnapshotManager: createProviderSnapshotManagerStub().manager,
+      runWorktreeBootstrap: async (options) => {
+        await runWorktreeBootstrap(options);
+      },
+    });
+
+    expect(observedTurns).toEqual([
+      {
+        prompt: "Resume this exact first turn",
+        options: {
+          clientMessageId: "msg-durable-first-turn",
+          outputSchema: { type: "object", properties: { done: { type: "boolean" } } },
+        },
+      },
+    ]);
+    expect(runWorktreeBootstrap).toHaveBeenCalledWith(
+      expect.objectContaining({
+        agentId: creation.snapshot.id,
+        workspaceId: "ws-durable-worktree",
+        worktree: {
+          branchName: "durable-create",
+          worktreePath: join(workdir, "durable-create"),
+        },
+        shouldBootstrap: true,
+      }),
+    );
+    expect(runWorktreeBootstrap).toHaveBeenCalledTimes(1);
+    expect((await storage.get(creation.snapshot.id))?.pendingCreateContinuation).toBeUndefined();
+  } finally {
+    restartedManager.prepareForShutdown();
+    await Promise.all(
+      restartedManager.listAgents().map((agent) => restartedManager.closeAgent(agent.id)),
+    );
+    await restartedManager.flushForShutdown();
+    await storage.flush();
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("provider failure settled before publish cannot be acknowledged", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "create-agent-pre-ack-failure-test-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const baseClient = createTestAgentClients().codex;
+  if (!baseClient) {
+    throw new Error("Expected Codex test client");
+  }
+
+  let rejectCreate!: (error: unknown) => void;
+  const createResult = new Promise<AgentSession>((_resolve, reject) => {
+    rejectCreate = reject;
+  });
+  const client = new Proxy(baseClient, {
+    get(target, property, receiver) {
+      if (property === "createSession") {
+        return async () => await createResult;
+      }
+      const value = Reflect.get(target, property, receiver);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  }) as AgentClient;
+  const manager = new AgentManager({ clients: { codex: client }, registry: storage, logger });
+
+  try {
+    const creation = await beginCreateAgentCommand(
+      {
+        agentManager: manager,
+        agentStorage: storage,
+        logger,
+        providerSnapshotManager: createProviderSnapshotManagerStub().manager,
+      },
+      {
+        kind: "session",
+        config: { provider: "codex", cwd: workdir },
+        workspaceId: "ws-pre-ack-failure",
+        initialPrompt: "Must not be falsely acknowledged",
+        clientMessageId: "msg-pre-ack-failure",
+        labels: {},
+        provisionalTitle: null,
+        firstAgentContext: { attachments: [] },
+        buildSessionConfig: async (config) => ({ sessionConfig: config }),
+      },
+    );
+
+    await creation.prepareForAcknowledgement();
+    const startupError = new Error("provider failed at acknowledgement boundary");
+    rejectCreate(startupError);
+    await expect(creation.completion).rejects.toBe(startupError);
+
+    const publish = vi.fn();
+    expect(() => creation.acknowledge(publish)).toThrow(
+      "provider failed at acknowledgement boundary",
+    );
+    expect(publish).not.toHaveBeenCalled();
+    await creation.abortBeforeAcknowledgement(startupError);
+    await expect(storage.get(creation.snapshot.id)).resolves.toBeNull();
+  } finally {
+    manager.prepareForShutdown();
+    await manager.flushForShutdown();
+    await storage.flush();
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("provider failure after publish preserves the acknowledged creation for recovery", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "create-agent-post-ack-failure-test-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const baseClient = createTestAgentClients().codex;
+  if (!baseClient) {
+    throw new Error("Expected Codex test client");
+  }
+
+  let rejectCreate!: (error: unknown) => void;
+  const createResult = new Promise<AgentSession>((_resolve, reject) => {
+    rejectCreate = reject;
+  });
+  const client = new Proxy(baseClient, {
+    get(target, property, receiver) {
+      if (property === "createSession") {
+        return async () => await createResult;
+      }
+      const value = Reflect.get(target, property, receiver);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  }) as AgentClient;
+  const manager = new AgentManager({ clients: { codex: client }, registry: storage, logger });
+
+  try {
+    const creation = await beginCreateAgentCommand(
+      {
+        agentManager: manager,
+        agentStorage: storage,
+        logger,
+        providerSnapshotManager: createProviderSnapshotManagerStub().manager,
+      },
+      {
+        kind: "session",
+        config: { provider: "codex", cwd: workdir },
+        workspaceId: "ws-post-ack-failure",
+        initialPrompt: "Recover this acknowledged first turn",
+        clientMessageId: "msg-post-ack-failure",
+        labels: {},
+        provisionalTitle: null,
+        firstAgentContext: { attachments: [] },
+        buildSessionConfig: async (config) => ({ sessionConfig: config }),
+      },
+    );
+
+    await creation.prepareForAcknowledgement();
+    const publish = vi.fn();
+    creation.acknowledge(publish);
+    expect(publish).toHaveBeenCalledOnce();
+
+    const startupError = new Error("provider failed after acknowledgement");
+    rejectCreate(startupError);
+    await expect(creation.completion).rejects.toBe(startupError);
+    expect(manager.getAgent(creation.snapshot.id)).toBeNull();
+    await expect(storage.get(creation.snapshot.id)).resolves.toMatchObject({
+      lastStatus: "closed",
+      lastError: "provider failed after acknowledgement",
+      pendingCreateContinuation: {
+        prompt: {
+          input: "Recover this acknowledged first turn",
+          runOptions: { clientMessageId: "msg-post-ack-failure" },
+        },
+      },
+    });
+  } finally {
+    manager.prepareForShutdown();
+    await manager.flushForShutdown();
+    await storage.flush();
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("recovery does not dispatch an already-observed first turn twice", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "create-agent-dispatch-dedupe-test-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const baseClient = createTestAgentClients().codex;
+  if (!baseClient) {
+    throw new Error("Expected Codex test client");
+  }
+
+  const observedTurns: AgentPromptInput[] = [];
+  const client = new Proxy(baseClient, {
+    get(target, property, receiver) {
+      if (property === "createSession") {
+        return async (...args: Parameters<AgentClient["createSession"]>) => {
+          const session = await target.createSession(...args);
+          return new Proxy(session, {
+            get(sessionTarget, sessionProperty, sessionReceiver) {
+              if (sessionProperty === "startTurn") {
+                return async (prompt: AgentPromptInput, options?: AgentRunOptions) => {
+                  observedTurns.push(prompt);
+                  return await sessionTarget.startTurn(prompt, options);
+                };
+              }
+              const value = Reflect.get(sessionTarget, sessionProperty, sessionReceiver);
+              return typeof value === "function" ? value.bind(sessionTarget) : value;
+            },
+          });
+        };
+      }
+      const value = Reflect.get(target, property, receiver);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  }) as AgentClient;
+  const manager = new AgentManager({ clients: { codex: client }, registry: storage, logger });
+
+  try {
+    const agent = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: "ws-dispatch-dedupe",
+    });
+    await manager.appendTimelineItem(agent.id, {
+      type: "user_message",
+      text: "Already accepted first turn",
+      clientMessageId: "msg-already-accepted",
+    });
+    await storage.setPendingCreateContinuation(agent.id, {
+      phase: "awaiting_dispatch",
+      prompt: {
+        input: "Already accepted first turn",
+        runOptions: { clientMessageId: "msg-already-accepted" },
+      },
+    });
+
+    await recoverPendingCreateAgentCommands({
+      agentManager: manager,
+      agentStorage: storage,
+      logger,
+      providerSnapshotManager: createProviderSnapshotManagerStub().manager,
+    });
+
+    expect(observedTurns).toEqual([]);
+    expect((await storage.get(agent.id))?.pendingCreateContinuation).toBeUndefined();
+  } finally {
+    manager.prepareForShutdown();
+    await Promise.all(manager.listAgents().map((agent) => manager.closeAgent(agent.id)));
+    await manager.flushForShutdown();
+    await storage.flush();
+    rmSync(workdir, { recursive: true, force: true });
+  }
 });
 
 test("session create validates the requested mode against the provider's modes", async () => {
@@ -264,7 +660,16 @@ test("session create stamps the new worktree's workspaceId when a setup continua
         firstAgentContext: { attachments: [] },
         buildSessionConfig: async (config) => ({
           sessionConfig: config,
-          setupContinuation: { kind: "agent", startAfterAgentCreate: () => {} },
+          setupContinuation: {
+            kind: "agent",
+            recovery: {
+              workspaceId: "ws-new-worktree",
+              worktree: { branchName: "feature", worktreePath: workdir },
+              workspaceCwd: workdir,
+              shouldBootstrap: true,
+            },
+            startAfterAgentCreate: () => {},
+          },
           createdWorkspaceId: "ws-new-worktree",
         }),
       },
