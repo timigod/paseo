@@ -198,6 +198,7 @@ import { workspaceIdsOnCheckout } from "./workspace-directory.js";
 import { resolveFirstAgentPromptTitle } from "./agent/create-agent-title.js";
 import {
   createAgentCommand,
+  recoverPendingCreateAgentCommands,
   type CreateAgentCommandDependencies,
 } from "./agent/create-agent/create.js";
 import { archiveAgentCommand, cancelAgentRunCommand } from "./agent/lifecycle-command.js";
@@ -1043,6 +1044,9 @@ export async function createPaseoDaemon(
     createPaseoWorktree: createPaseoWorktreeForTools,
     ensureWorkspaceForCreate: ensureWorkspaceForCreateAndBroadcastExternal,
   };
+  void recoverPendingCreateAgentCommands(createAgentCommandDependencies).catch((error) => {
+    logger.error({ err: error }, "Pending create-agent continuation recovery failed");
+  });
   const createAgent = (input: Parameters<typeof createAgentCommand>[1]) =>
     createAgentCommand(createAgentCommandDependencies, input);
   const archiveWorkspaceByIdExternal = (workspaceId: string, requestId: string) =>

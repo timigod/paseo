@@ -1363,6 +1363,46 @@ test("create retry survives owner disconnect while provider startup is still pen
   }
 });
 
+test("create does not acknowledge a provider startup failure that settled before acknowledgement", async () => {
+  const workdir = mkdtempSync(path.join(tmpdir(), "paseo-create-agent-settled-failure-"));
+  class SettledFailureClient extends CreateAgentTestClient {
+    override async createSession(): Promise<AgentSession> {
+      throw new Error("provider startup failed before acknowledgement");
+    }
+  }
+  const harness = createDurableCreateAgentHarness({
+    workdir,
+    cwd: workdir,
+    client: new SettledFailureClient(),
+  });
+  const requestId = "req-create-settled-failure";
+
+  try {
+    await harness.session.handleMessage({
+      type: "create_agent_request",
+      requestId,
+      config: { provider: "codex", cwd: workdir },
+      initialPrompt: "This turn must never be acknowledged",
+      attachments: [],
+    });
+
+    expect(filterByType(harness.emitted, "status").map((message) => message.payload)).toEqual([
+      expect.objectContaining({
+        status: "agent_create_failed",
+        requestId,
+        error: "provider startup failed before acknowledgement",
+      }),
+    ]);
+    expect(harness.agentManager.listAgents()).toEqual([]);
+    await expect(harness.agentStorage.list()).resolves.toEqual([]);
+  } finally {
+    harness.agentManager.prepareForShutdown();
+    await harness.agentManager.flushForShutdown();
+    await harness.agentStorage.flush();
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
 test("create retry replays from durable storage after restart and rejects changed input", async () => {
   const workdir = mkdtempSync(path.join(tmpdir(), "paseo-create-agent-restart-replay-"));
   const initialClient = new InitialPromptEventTestClient();

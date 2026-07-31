@@ -306,6 +306,7 @@ export interface CreateAgentOptions {
 export interface AgentCreationHandle {
   snapshot: ManagedAgent;
   completion: Promise<ManagedAgent>;
+  commitAcknowledgement: (publish: () => void) => void;
 }
 
 export interface AgentCreateRequestOutcome {
@@ -1325,6 +1326,13 @@ export class AgentManager {
       throw error;
     }
 
+    let acknowledgementClaimed = false;
+    let startupFailureBeforeAcknowledgement: unknown | null = null;
+    const markStartupFailure = (error: unknown): void => {
+      if (!acknowledgementClaimed) {
+        startupFailureBeforeAcknowledgement = error;
+      }
+    };
     const completion = this.trackAgentRegistrationOperation(
       this.startPendingAgentSession({
         pending,
@@ -1332,9 +1340,21 @@ export class AgentManager {
         providerLaunchConfig,
         launchContext,
         createOptions,
+        markStartupFailure,
+        isAcknowledgementClaimed: () => acknowledgementClaimed,
       }),
     );
-    return { snapshot: { ...pending }, completion };
+    return {
+      snapshot: { ...pending },
+      completion,
+      commitAcknowledgement: (publish) => {
+        if (startupFailureBeforeAcknowledgement !== null) {
+          throw startupFailureBeforeAcknowledgement;
+        }
+        publish();
+        acknowledgementClaimed = true;
+      },
+    };
   }
 
   private async startPendingAgentSession(params: {
@@ -1343,13 +1363,29 @@ export class AgentManager {
     providerLaunchConfig: AgentSessionConfig;
     launchContext: AgentLaunchContext;
     createOptions: AgentCreateSessionOptions | undefined;
+    markStartupFailure: (error: unknown) => void;
+    isAcknowledgementClaimed: () => boolean;
   }): Promise<ManagedAgent> {
-    const { pending, client, providerLaunchConfig, launchContext, createOptions } = params;
+    const {
+      pending,
+      client,
+      providerLaunchConfig,
+      launchContext,
+      createOptions,
+      markStartupFailure,
+      isAcknowledgementClaimed,
+    } = params;
     let session: AgentSession;
     try {
       session = await client.createSession(providerLaunchConfig, launchContext, createOptions);
     } catch (error) {
-      await this.removeFailedPendingAgent(pending, "provider session creation failed");
+      markStartupFailure(error);
+      await this.settleFailedPendingAgent({
+        pending,
+        reason: "provider session creation failed",
+        error,
+        preserve: isAcknowledgementClaimed(),
+      });
       throw error;
     }
 
@@ -1385,7 +1421,13 @@ export class AgentManager {
       });
       return snapshot;
     } catch (error) {
-      await this.removeFailedPendingAgent(pending, "provider session registration failed");
+      markStartupFailure(error);
+      await this.settleFailedPendingAgent({
+        pending,
+        reason: "provider session registration failed",
+        error,
+        preserve: isAcknowledgementClaimed(),
+      });
       throw error;
     } finally {
       if (!installed) {
@@ -1394,18 +1436,31 @@ export class AgentManager {
     }
   }
 
-  private async removeFailedPendingAgent(
-    pending: ManagedAgentInitializing,
-    reason: string,
-  ): Promise<void> {
+  private async settleFailedPendingAgent(params: {
+    pending: ManagedAgentInitializing;
+    reason: string;
+    error: unknown;
+    preserve: boolean;
+  }): Promise<void> {
+    const { pending, reason, error, preserve } = params;
     await this.queueAgentLifecycleHandoff(pending.id, async () => {
       if (this.agents.get(pending.id) !== pending) {
         return;
       }
+      pending.lastError = abortMessage(error, "Provider session startup failed");
+      pending.attention = {
+        requiresAttention: true,
+        attentionReason: "error",
+        attentionTimestamp: new Date(),
+      };
       const closed = this.prepareAgentForClosure(pending, reason);
-      await this.deleteAgentState(pending.id);
-      if (this.registry) {
-        await this.registry.remove(pending.id);
+      if (preserve) {
+        await this.persistSnapshot(closed);
+      } else {
+        await this.deleteAgentState(pending.id);
+        if (this.registry) {
+          await this.registry.remove(pending.id);
+        }
       }
       this.emitClosedAgent(closed, { persist: false });
     });

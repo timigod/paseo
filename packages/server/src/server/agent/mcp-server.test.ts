@@ -800,6 +800,12 @@ function createPaseoWorktreeForMcpTest(options: {
         ...result,
         setupContinuation: {
           kind: "agent",
+          recovery: {
+            workspaceId: result.workspace.workspaceId,
+            worktree: result.worktree,
+            workspaceCwd: result.workspace.cwd,
+            shouldBootstrap: result.created,
+          },
           startAfterAgentCreate: ({ agentId }) => {
             options.startedAgentSetupIds?.push(agentId);
           },
@@ -2398,6 +2404,15 @@ describe("create_agent MCP tool", () => {
           ? {
               setupContinuation: {
                 kind: "agent" as const,
+                recovery: {
+                  workspaceId: "ws-pr-123",
+                  worktree: {
+                    branchName: "pr-123",
+                    worktreePath: "/tmp/worktrees/pr-123",
+                  },
+                  workspaceCwd: "/tmp/worktrees/pr-123",
+                  shouldBootstrap: true,
+                },
                 startAfterAgentCreate: ({ agentId }: { agentId: string }) => {
                   startedAgentSetupIds.push(agentId);
                 },

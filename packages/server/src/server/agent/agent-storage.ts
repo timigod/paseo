@@ -5,6 +5,7 @@ import type { Logger } from "pino";
 
 import { writeJsonFileAtomic } from "../atomic-file.js";
 import {
+  AgentAttachmentSchema,
   AgentFeatureSchema,
   AgentStatusSchema,
   MaterialProgressPayloadSchema,
@@ -37,6 +38,45 @@ const PERSISTENCE_HANDLE_SCHEMA = z
   })
   .nullable()
   .optional();
+
+const AGENT_PROMPT_CONTENT_BLOCK_SCHEMA = z.union([
+  AgentAttachmentSchema,
+  z.object({
+    type: z.literal("image"),
+    data: z.string(),
+    mimeType: z.string(),
+  }),
+  z.object({
+    type: z.literal("text"),
+    text: z.string(),
+  }),
+]);
+
+const PENDING_CREATE_CONTINUATION_SCHEMA = z.object({
+  phase: z.literal("awaiting_dispatch"),
+  prompt: z
+    .object({
+      input: z.union([z.string(), z.array(AGENT_PROMPT_CONTENT_BLOCK_SCHEMA)]),
+      runOptions: z
+        .object({
+          outputSchema: z.unknown().optional(),
+          clientMessageId: z.string().optional(),
+        })
+        .optional(),
+    })
+    .optional(),
+  setup: z
+    .object({
+      workspaceId: z.string(),
+      worktree: z.object({
+        branchName: z.string(),
+        worktreePath: z.string(),
+      }),
+      workspaceCwd: z.string().optional(),
+      shouldBootstrap: z.boolean(),
+    })
+    .optional(),
+});
 
 const STORED_AGENT_SCHEMA = z.object({
   id: z.string(),
@@ -74,6 +114,7 @@ const STORED_AGENT_SCHEMA = z.object({
   internal: z.boolean().optional(),
   archivedAt: z.string().nullable().optional(),
   owner: AgentOwnerSchema.optional(),
+  pendingCreateContinuation: PENDING_CREATE_CONTINUATION_SCHEMA.optional(),
 });
 
 export type SerializableAgentConfig = Pick<
@@ -86,6 +127,9 @@ export type SerializableAgentConfig = Pick<
   | "systemPrompt"
   | "mcpServers"
 >;
+
+export type PendingCreateContinuation = z.infer<typeof PENDING_CREATE_CONTINUATION_SCHEMA>;
+export type PendingCreateContinuationStep = "prompt" | "setup";
 
 export type StoredAgentRecord = z.infer<typeof STORED_AGENT_SCHEMA>;
 export function parseStoredAgentRecord(value: unknown): StoredAgentRecord {
@@ -248,7 +292,47 @@ export class AgentStorage {
       if (existing && existing.archivedAt !== undefined) {
         record.archivedAt = existing.archivedAt;
       }
+      if (existing?.pendingCreateContinuation) {
+        record.pendingCreateContinuation = existing.pendingCreateContinuation;
+      }
       return record;
+    });
+  }
+
+  async setPendingCreateContinuation(
+    agentId: string,
+    continuation: PendingCreateContinuation,
+  ): Promise<void> {
+    await this.load();
+    await this.queueRecordMutation(agentId, (existing) => {
+      if (!existing) {
+        throw new Error(`Agent ${agentId} not found`);
+      }
+      return { ...existing, pendingCreateContinuation: continuation };
+    });
+  }
+
+  async completePendingCreateContinuationStep(
+    agentId: string,
+    step: PendingCreateContinuationStep,
+  ): Promise<void> {
+    await this.load();
+    await this.queueRecordMutation(agentId, (existing) => {
+      if (!existing) {
+        throw new Error(`Agent ${agentId} not found`);
+      }
+      const pending = existing.pendingCreateContinuation;
+      if (!pending || pending[step] === undefined) {
+        return existing;
+      }
+      const next = { ...pending };
+      delete next[step];
+      if (next.prompt === undefined && next.setup === undefined) {
+        const record = { ...existing };
+        delete record.pendingCreateContinuation;
+        return record;
+      }
+      return { ...existing, pendingCreateContinuation: next };
     });
   }
 

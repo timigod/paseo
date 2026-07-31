@@ -1,6 +1,7 @@
 import type { Logger } from "pino";
 
 import type { TerminalManager } from "../../../terminal/terminal-manager.js";
+import { runAsyncWorktreeBootstrap } from "../../worktree-bootstrap.js";
 import type { CreatePaseoWorktreeInput } from "../../paseo-worktree-service.js";
 import { expandUserPath, resolvePathFromBase } from "../../path-utils.js";
 import { toWorktreeRequestError } from "../../worktree-errors.js";
@@ -13,9 +14,14 @@ import type {
 import type { AgentAttachment, FirstAgentContext, GitSetupOptions } from "../../messages.js";
 import type { AgentManager, CreateAgentOptions, ManagedAgent } from "../agent-manager.js";
 import type { AgentPromptInput, AgentRunOptions, AgentSessionConfig } from "../agent-sdk-types.js";
-import type { AgentStorage } from "../agent-storage.js";
+import {
+  type AgentStorage,
+  type PendingCreateContinuation,
+  type StoredAgentRecord,
+} from "../agent-storage.js";
 import type { AgentOwner } from "../agent-owner.js";
 import type { ProviderSnapshotManager } from "../provider-snapshot-manager.js";
+import { ensureAgentLoaded } from "../agent-loading.js";
 import { setupFinishNotification, startCreatedAgentInitialPrompt } from "../agent-prompt.js";
 import { resolveCreateAgentTitles } from "../create-agent-title.js";
 import { buildAgentPrompt } from "../prompt-attachments.js";
@@ -46,6 +52,7 @@ export interface CreateAgentCommandDependencies {
   createPaseoWorktree?: CreatePaseoWorktreeWorkflowFn;
   // Mints a fresh directory workspace for a cwd and returns its id.
   ensureWorkspaceForCreate?: EnsureWorkspaceForCreate;
+  runWorktreeBootstrap?: typeof runAsyncWorktreeBootstrap;
 }
 
 export type EnsureWorkspaceForCreate = (
@@ -134,7 +141,8 @@ export interface CreateAgentCommandResult {
 export interface CreateAgentCommandHandle {
   snapshot: ManagedAgent;
   completion: Promise<CreateAgentCommandResult>;
-  releaseAfterAcknowledgement: () => void;
+  prepareForAcknowledgement: () => Promise<void>;
+  acknowledge: (publish: () => void) => void;
   abortBeforeAcknowledgement: (error: unknown) => Promise<void>;
 }
 
@@ -204,6 +212,7 @@ export async function beginCreateAgentCommand(
     resolved.createOptions,
   );
   const snapshot = creation.snapshot;
+  const pendingContinuation = buildPendingCreateContinuation(resolved);
   let releaseContinuation!: () => void;
   let rejectContinuation!: (error: unknown) => void;
   let continuationDecided = false;
@@ -228,10 +237,21 @@ export async function beginCreateAgentCommand(
     snapshot,
     completion: Promise.all([acknowledgement, creation.completion]).then(
       async ([, liveSnapshot]) => {
-        return await completeCreateAgentCommand(dependencies, input, resolved, liveSnapshot);
+        return await completeCreateAgentCommand(dependencies, input, resolved, liveSnapshot, {
+          persistedContinuation: pendingContinuation !== null,
+        });
       },
     ),
-    releaseAfterAcknowledgement: () => {
+    prepareForAcknowledgement: async () => {
+      if (pendingContinuation) {
+        await dependencies.agentStorage.setPendingCreateContinuation(
+          snapshot.id,
+          pendingContinuation,
+        );
+      }
+    },
+    acknowledge: (publish) => {
+      creation.commitAcknowledgement(publish);
       decideOnce("continue");
     },
     abortBeforeAcknowledgement: async (error) => {
@@ -257,10 +277,24 @@ async function completeCreateAgentCommand(
   input: CreateAgentCommandInput,
   resolved: ResolvedCreateAgent,
   snapshot: ManagedAgent,
+  options?: { persistedContinuation?: boolean },
 ): Promise<CreateAgentCommandResult> {
-  resolved.setupContinuation?.startAfterAgentCreate({
-    agentId: snapshot.id,
-  });
+  const setupCompletion = resolved.setupContinuation
+    ? Promise.resolve(
+        resolved.setupContinuation.startAfterAgentCreate({
+          agentId: snapshot.id,
+        }),
+      ).then(async () => {
+        if (options?.persistedContinuation) {
+          await dependencies.agentStorage.completePendingCreateContinuationStep(
+            snapshot.id,
+            "setup",
+          );
+        }
+        return undefined;
+      })
+    : null;
+  void setupCompletion?.catch(() => undefined);
 
   let liveSnapshot = snapshot;
   let initialPromptStarted = false;
@@ -273,6 +307,9 @@ async function completeCreateAgentCommand(
     initialPromptStarted = sendResult.started;
     liveSnapshot = sendResult.liveSnapshot;
     initialPromptError = sendResult.error ?? null;
+    if (options?.persistedContinuation) {
+      await dependencies.agentStorage.completePendingCreateContinuationStep(snapshot.id, "prompt");
+    }
   }
 
   if (input.kind === "mcp" && input.notifyOnFinish && input.callerAgentId && initialPromptStarted) {
@@ -286,6 +323,19 @@ async function completeCreateAgentCommand(
     });
   }
 
+  if (setupCompletion) {
+    if (options?.persistedContinuation) {
+      await setupCompletion;
+    } else {
+      void setupCompletion.catch((error) => {
+        dependencies.logger.error(
+          { err: error, agentId: snapshot.id },
+          "Failed to finish worktree setup after agent creation",
+        );
+      });
+    }
+  }
+
   return {
     snapshot,
     liveSnapshot,
@@ -294,6 +344,125 @@ async function completeCreateAgentCommand(
     initialPromptError,
     ...(resolved.createdWorktree ? { createdWorktree: resolved.createdWorktree } : {}),
   };
+}
+
+function buildPendingCreateContinuation(
+  resolved: ResolvedCreateAgent,
+): PendingCreateContinuation | null {
+  const prompt = resolved.prompt
+    ? {
+        input: resolved.prompt,
+        ...(resolved.runOptions ? { runOptions: resolved.runOptions } : {}),
+      }
+    : undefined;
+  const setup = resolved.setupContinuation?.recovery;
+  if (!prompt && !setup) {
+    return null;
+  }
+  return {
+    phase: "awaiting_dispatch",
+    ...(prompt ? { prompt } : {}),
+    ...(setup ? { setup } : {}),
+  };
+}
+
+export async function recoverPendingCreateAgentCommands(
+  dependencies: CreateAgentCommandDependencies,
+): Promise<void> {
+  const records = await dependencies.agentStorage.list();
+  const pendingRecords = records.filter(
+    (record) => !record.archivedAt && record.pendingCreateContinuation,
+  );
+  await Promise.all(
+    pendingRecords.map(async (record) => {
+      try {
+        await recoverPendingCreateAgentCommand(dependencies, record);
+      } catch (error) {
+        dependencies.logger.error(
+          { err: error, agentId: record.id },
+          "Failed to recover pending create-agent continuation",
+        );
+      }
+    }),
+  );
+}
+
+async function recoverPendingCreateAgentCommand(
+  dependencies: CreateAgentCommandDependencies,
+  record: StoredAgentRecord,
+): Promise<void> {
+  const pending = record.pendingCreateContinuation;
+  if (!pending) {
+    return;
+  }
+  const snapshot = await ensureAgentLoaded(record.id, {
+    agentManager: dependencies.agentManager,
+    agentStorage: dependencies.agentStorage,
+    logger: dependencies.logger,
+  });
+  const setupCompletion = pending.setup
+    ? (dependencies.runWorktreeBootstrap ?? runAsyncWorktreeBootstrap)({
+        agentId: record.id,
+        workspaceId: pending.setup.workspaceId,
+        worktree: pending.setup.worktree,
+        workspaceCwd: pending.setup.workspaceCwd,
+        shouldBootstrap: pending.setup.shouldBootstrap,
+        terminalManager: dependencies.terminalManager ?? null,
+        appendTimelineItem: (item) =>
+          appendTimelineItemIfAgentKnown({
+            agentManager: dependencies.agentManager,
+            agentId: record.id,
+            item,
+          }),
+        emitLiveTimelineItem: (item) =>
+          emitLiveTimelineItemIfAgentKnown({
+            agentManager: dependencies.agentManager,
+            agentId: record.id,
+            item,
+          }),
+        logger: dependencies.logger,
+      }).then(() =>
+        dependencies.agentStorage.completePendingCreateContinuationStep(record.id, "setup"),
+      )
+    : null;
+  void setupCompletion?.catch(() => undefined);
+
+  if (pending.prompt && pendingCreatePromptWasAlreadyDispatched(dependencies, snapshot, pending)) {
+    await dependencies.agentStorage.completePendingCreateContinuationStep(record.id, "prompt");
+  } else if (pending.prompt) {
+    await startCreatedAgentInitialPrompt({
+      agentManager: dependencies.agentManager,
+      agentId: record.id,
+      snapshot,
+      prompt: pending.prompt.input,
+      runOptions: pending.prompt.runOptions,
+      logger: dependencies.logger,
+    });
+    await dependencies.agentStorage.completePendingCreateContinuationStep(record.id, "prompt");
+  }
+  await setupCompletion;
+}
+
+function pendingCreatePromptWasAlreadyDispatched(
+  dependencies: CreateAgentCommandDependencies,
+  snapshot: ManagedAgent,
+  pending: PendingCreateContinuation,
+): boolean {
+  const prompt = pending.prompt;
+  if (!prompt) {
+    return false;
+  }
+
+  const clientMessageId = prompt.runOptions?.clientMessageId;
+  return dependencies.agentManager.getTimeline(snapshot.id).some((item) => {
+    if (item.type !== "user_message") {
+      return false;
+    }
+    if (clientMessageId && item.clientMessageId === clientMessageId) {
+      return true;
+    }
+    return typeof prompt.input === "string" && item.text === prompt.input;
+  });
 }
 
 async function resolveSessionCreateAgent(
@@ -339,7 +508,10 @@ async function resolveSessionCreateAgent(
   };
   const prompt = buildAgentPrompt(trimmedPrompt ?? "", input.images, input.attachments);
   const hasPromptContent = Array.isArray(prompt) ? prompt.length > 0 : prompt.length > 0;
-  const clientMessageId = normalizeClientMessageId(input.clientMessageId);
+  const normalizedClientMessageId = normalizeClientMessageId(input.clientMessageId);
+  const clientMessageId = hasPromptContent
+    ? (normalizedClientMessageId ?? resolveClientMessageId(undefined))
+    : normalizedClientMessageId;
   const runOptions: AgentRunOptions | undefined =
     input.outputSchema || clientMessageId
       ? {
@@ -368,7 +540,7 @@ async function resolveSessionCreateAgent(
     background: true,
     promptFailure: "throw",
     promptLogger: dependencies.logger.child({
-      clientMessageId: resolveClientMessageId(input.clientMessageId),
+      clientMessageId: clientMessageId ?? resolveClientMessageId(undefined),
     }),
   };
 }
