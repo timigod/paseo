@@ -74,6 +74,7 @@ function timelineRow(seq: number, item: AgentTimelineItem): AgentTimelineRow {
 
 class TestDurableTimelineStore implements AgentTimelineStore {
   private readonly store = new InMemoryAgentTimelineStore();
+  private readonly historyQuarantineStartSeqs = new Map<string, number>();
   afterNextFetch: (() => Promise<void>) | null = null;
   beforeNextBulkInsert: (() => Promise<void>) | null = null;
 
@@ -118,8 +119,36 @@ class TestDurableTimelineStore implements AgentTimelineStore {
     return this.store.getLastAssistantMessage(agentId);
   }
 
+  async getHistoryQuarantineStartSeq(agentId: string): Promise<number | null> {
+    return this.historyQuarantineStartSeqs.get(agentId) ?? null;
+  }
+
+  async appendHistoryQuarantined(
+    agentId: string,
+    row: AgentTimelineRow,
+    startSeq: number,
+  ): Promise<void> {
+    await this.bulkInsert(agentId, [row]);
+    if (!this.historyQuarantineStartSeqs.has(agentId)) {
+      this.historyQuarantineStartSeqs.set(agentId, startSeq);
+    }
+  }
+
+  async clearHistoryQuarantine(agentId: string): Promise<void> {
+    this.historyQuarantineStartSeqs.delete(agentId);
+  }
+
+  async replaceCommitted(agentId: string, rows: readonly AgentTimelineRow[]): Promise<void> {
+    this.store.initialize(agentId, {
+      rows,
+      nextSeq: (rows.at(-1)?.seq ?? 0) + 1,
+    });
+    this.historyQuarantineStartSeqs.delete(agentId);
+  }
+
   async deleteAgent(agentId: string): Promise<void> {
     if (this.store.has(agentId)) this.store.delete(agentId);
+    this.historyQuarantineStartSeqs.delete(agentId);
   }
 
   async bulkInsert(agentId: string, rows: readonly AgentTimelineRow[]): Promise<void> {
@@ -2915,6 +2944,85 @@ test("reloadAgentSession preserves timeline and does not force history replay", 
   expect(afterHydrate).toEqual(beforeReload);
 });
 
+test("hydration queued during reload does not commit stale session history", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-hydration-reload-generation-"));
+  const resumeStarted = deferred<void>();
+  const resumeAllowed = deferred<void>();
+
+  class GenerationHistorySession extends TestAgentSession {
+    historyCalls = 0;
+
+    constructor(
+      config: AgentSessionConfig,
+      private readonly historyText: string,
+    ) {
+      super(config);
+    }
+
+    override async *streamHistory(): AsyncGenerator<AgentStreamEvent> {
+      this.historyCalls += 1;
+      yield {
+        type: "timeline",
+        provider: "codex",
+        item: { type: "assistant_message", text: this.historyText },
+      };
+    }
+  }
+
+  let originalSession: GenerationHistorySession | null = null;
+  let replacementSession: GenerationHistorySession | null = null;
+  class GenerationHistoryClient extends TestAgentClient {
+    override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+      originalSession = new GenerationHistorySession(config, "stale original history");
+      return originalSession;
+    }
+
+    override async resumeSession(
+      _handle: AgentPersistenceHandle,
+      config?: Partial<AgentSessionConfig>,
+    ): Promise<AgentSession> {
+      resumeStarted.resolve();
+      await resumeAllowed.promise;
+      replacementSession = new GenerationHistorySession(
+        { provider: "codex", cwd: config?.cwd ?? workdir },
+        "replacement history",
+      );
+      return replacementSession;
+    }
+  }
+
+  const manager = new AgentManager({
+    clients: { codex: new GenerationHistoryClient() },
+    durableTimelineStore: new TestDurableTimelineStore(),
+    logger,
+    idFactory: () => "00000000-0000-4000-8000-000000000159",
+  });
+
+  try {
+    const snapshot = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+    const reload = manager.reloadAgentSession(snapshot.id);
+    await resumeStarted.promise;
+    const staleHydration = manager.hydrateTimelineFromProvider(snapshot.id);
+    resumeAllowed.resolve();
+    await Promise.all([reload, staleHydration]);
+
+    await manager.hydrateTimelineFromProvider(snapshot.id);
+    await manager.flush();
+
+    expect(originalSession?.historyCalls).toBe(0);
+    expect(replacementSession?.historyCalls).toBe(1);
+    expect(manager.getTimeline(snapshot.id)).toEqual([
+      { type: "assistant_message", text: "replacement history" },
+    ]);
+  } finally {
+    resumeAllowed.resolve();
+    await manager.closeAgent("00000000-0000-4000-8000-000000000159").catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
 test("reloadAgentSession clears provider children before rehydrating from disk", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-provider-child-reload-"));
   const storage = new AgentStorage(join(workdir, "agents"), logger);
@@ -4321,6 +4429,298 @@ test("a failed partial history hydration preserves persisted material progress",
   }
 });
 
+test("archive waits for blocked history hydration before deriving material progress", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-history-archive-order-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const durableTimelineStore = new TestDurableTimelineStore();
+  const agentId = "00000000-0000-4000-8000-000000000153";
+  const historyStarted = deferred<void>();
+  const historyAllowed = deferred<void>();
+
+  class BlockingFailingHistorySession extends TestAgentSession {
+    override async *streamHistory(): AsyncGenerator<AgentStreamEvent> {
+      historyStarted.resolve();
+      await historyAllowed.promise;
+      yield await Promise.reject(new Error("provider history unavailable"));
+    }
+  }
+
+  class BlockingFailingHistoryClient extends TestAgentClient {
+    override async resumeSession(
+      _handle: AgentPersistenceHandle,
+      config?: Partial<AgentSessionConfig>,
+    ): Promise<AgentSession> {
+      return new BlockingFailingHistorySession({
+        provider: "codex",
+        cwd: config?.cwd ?? workdir,
+      });
+    }
+  }
+
+  const firstManager = new AgentManager({
+    clients: { codex: new TestAgentClient() },
+    registry: storage,
+    logger,
+    idFactory: () => agentId,
+  });
+  let resumedManager: AgentManager | null = null;
+
+  try {
+    const created = await firstManager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+    await firstManager.appendTimelineItem(created.id, {
+      type: "user_message",
+      text: "preserve this progress",
+    });
+    await firstManager.appendTimelineItem(created.id, {
+      type: "tool_call",
+      callId: "write-before-archive-hydration",
+      name: "write",
+      status: "completed",
+      error: null,
+      detail: { type: "write", filePath: "result.txt", content: "durable" },
+    });
+    await firstManager.closeAgent(created.id);
+    const record = await storage.get(created.id);
+    expect(record?.persistence).toBeTruthy();
+    expect(record?.materialProgress).toMatchObject({
+      state: "progressing",
+      lastMaterialProgressKind: "write",
+    });
+
+    resumedManager = new AgentManager({
+      clients: { codex: new BlockingFailingHistoryClient() },
+      registry: storage,
+      durableTimelineStore,
+      logger,
+    });
+    await resumedManager.resumeAgentFromPersistence(
+      record!.persistence!,
+      { cwd: workdir },
+      created.id,
+    );
+    await resumedManager.flush();
+
+    const hydration = resumedManager.hydrateTimelineFromProvider(created.id);
+    await historyStarted.promise;
+    await expect(resumedManager.getMaterialProgressSnapshot(created.id)).resolves.toMatchObject({
+      rows: null,
+      persisted: {
+        state: "progressing",
+        lastMaterialProgressKind: "write",
+      },
+    });
+
+    const applySnapshot = vi.spyOn(storage, "applySnapshot");
+    let archiveSettled = false;
+    const archive = resumedManager
+      .archiveSnapshot(created.id, new Date().toISOString())
+      .then((archived) => {
+        archiveSettled = true;
+        return archived;
+      });
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(applySnapshot).not.toHaveBeenCalled();
+    expect(archiveSettled).toBe(false);
+
+    historyAllowed.resolve();
+    await Promise.all([hydration, archive]);
+    expect((await storage.get(created.id))?.materialProgress).toMatchObject({
+      state: "progressing",
+      lastMaterialProgressKind: "write",
+    });
+  } finally {
+    historyAllowed.resolve();
+    await resumedManager?.closeAgent(agentId).catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("failed history hydration preserves a quarantined live suffix across restart", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-history-quarantine-restart-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const durableTimelineStore = new TestDurableTimelineStore();
+  const agentId = "00000000-0000-4000-8000-000000000154";
+  let session: TestAgentSession | null = null;
+
+  class FailedHistorySession extends TestAgentSession {
+    override async *streamHistory(): AsyncGenerator<AgentStreamEvent> {
+      yield await Promise.reject(new Error("provider history unavailable"));
+    }
+  }
+
+  class FailedHistoryClient extends TestAgentClient {
+    override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+      session = new FailedHistorySession(config);
+      return session;
+    }
+  }
+
+  const firstManager = new AgentManager({
+    clients: { codex: new FailedHistoryClient() },
+    registry: storage,
+    durableTimelineStore,
+    logger,
+    idFactory: () => agentId,
+  });
+  let resumedManager: AgentManager | null = null;
+
+  try {
+    const created = await firstManager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+    await firstManager.hydrateTimelineFromProvider(created.id);
+    session?.pushEvent({
+      type: "timeline",
+      provider: "codex",
+      item: { type: "assistant_message", text: "live answer after history failure" },
+    });
+    session?.pushEvent({
+      type: "timeline",
+      provider: "codex",
+      item: {
+        type: "tool_call",
+        callId: "write-in-quarantined-suffix",
+        name: "write",
+        status: "completed",
+        error: null,
+        detail: { type: "write", filePath: "live.txt", content: "live" },
+      },
+    });
+    await firstManager.flush();
+    await firstManager.closeAgent(created.id);
+    const record = await storage.get(created.id);
+    expect(record?.persistence).toBeTruthy();
+
+    resumedManager = new AgentManager({
+      clients: { codex: new TestAgentClient() },
+      registry: storage,
+      durableTimelineStore,
+      logger,
+    });
+    await resumedManager.resumeAgentFromPersistence(
+      record!.persistence!,
+      { cwd: workdir },
+      created.id,
+    );
+
+    expect(resumedManager.getAgent(created.id)?.historyPrimed).toBe(false);
+    expect((await resumedManager.getTimelineRows(created.id)).map((row) => row.item)).toEqual([
+      { type: "assistant_message", text: "live answer after history failure" },
+      {
+        type: "tool_call",
+        callId: "write-in-quarantined-suffix",
+        name: "write",
+        status: "completed",
+        error: null,
+        detail: { type: "write", filePath: "live.txt", content: "live" },
+      },
+    ]);
+  } finally {
+    await resumedManager?.closeAgent(agentId).catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("successful history retry merges and deduplicates the quarantined live suffix", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-history-quarantine-retry-"));
+  const durableTimelineStore = new TestDurableTimelineStore();
+  const agentId = "00000000-0000-4000-8000-000000000155";
+  let session: TestAgentSession | null = null;
+  let historyCalls = 0;
+
+  class RetriedHistorySession extends TestAgentSession {
+    override async *streamHistory(): AsyncGenerator<AgentStreamEvent> {
+      historyCalls += 1;
+      if (historyCalls === 1) {
+        throw new Error("provider history unavailable");
+      }
+      yield {
+        type: "timeline",
+        provider: "codex",
+        item: { type: "user_message", text: "historical request" },
+      };
+      yield {
+        type: "timeline",
+        provider: "codex",
+        item: { type: "assistant_message", text: "historical answer" },
+      };
+      yield {
+        type: "timeline",
+        provider: "codex",
+        item: { type: "assistant_message", text: "live answer recovered by history" },
+      };
+    }
+  }
+
+  class RetriedHistoryClient extends TestAgentClient {
+    override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+      session = new RetriedHistorySession(config);
+      return session;
+    }
+  }
+
+  const manager = new AgentManager({
+    clients: { codex: new RetriedHistoryClient() },
+    durableTimelineStore,
+    logger,
+    idFactory: () => agentId,
+  });
+
+  try {
+    const created = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+    await manager.hydrateTimelineFromProvider(created.id);
+    session?.pushEvent({
+      type: "timeline",
+      provider: "codex",
+      item: { type: "assistant_message", text: "live answer recovered by history" },
+    });
+    session?.pushEvent({
+      type: "timeline",
+      provider: "codex",
+      item: {
+        type: "tool_call",
+        callId: "tool-only-in-live-suffix",
+        name: "shell",
+        status: "completed",
+        error: null,
+        detail: { type: "shell", command: "npm test", output: "passed", exitCode: 0 },
+      },
+    });
+    await manager.flush();
+
+    await manager.hydrateTimelineFromProvider(created.id);
+    await manager.flush();
+
+    const expectedItems: AgentTimelineItem[] = [
+      { type: "user_message", text: "historical request" },
+      { type: "assistant_message", text: "historical answer" },
+      { type: "assistant_message", text: "live answer recovered by history" },
+      {
+        type: "tool_call",
+        callId: "tool-only-in-live-suffix",
+        name: "shell",
+        status: "completed",
+        error: null,
+        detail: { type: "shell", command: "npm test", output: "passed", exitCode: 0 },
+      },
+    ];
+    expect(manager.getTimeline(created.id)).toEqual(expectedItems);
+    expect((await manager.getTimelineRows(created.id)).map((row) => row.item)).toEqual(
+      expectedItems,
+    );
+    expect(manager.getAgent(created.id)?.historyPrimed).toBe(true);
+  } finally {
+    await manager.closeAgent(agentId).catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
 test("close waits for failed history hydration before persisting trust state", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-history-close-order-"));
   const storage = new AgentStorage(join(workdir, "agents"), logger);
@@ -4414,7 +4814,7 @@ test("close waits for failed history hydration before persisting trust state", a
 
     expect(
       (await durableTimelineStore.getCommittedRows(created.id)).map((row) => row.item),
-    ).toEqual([]);
+    ).toEqual([{ type: "assistant_message", text: "live event during failed hydration" }]);
     expect((await storage.get(created.id))?.materialProgress).toMatchObject({
       state: "progressing",
       lastMaterialProgressKind: "write",
