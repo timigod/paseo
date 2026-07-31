@@ -52,7 +52,7 @@ test("session create forwards clientMessageId to the initial prompt run options"
     agentManager: {
       createAgent: vi.fn(async () => snapshot),
       getAgent: vi.fn(() => snapshot),
-      tryRunOutOfBand: vi.fn(() => false),
+      tryRunOutOfBand: vi.fn(async () => false),
       hasInFlightRun: vi.fn(() => false),
       streamAgent,
       waitForAgentRunStart: vi.fn(async () => undefined),

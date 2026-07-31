@@ -112,6 +112,7 @@ export function extractTimestamps(record: StoredAgentRecord): {
   workspaceId?: string;
   owner?: StoredAgentRecord["owner"];
   lastTurnOutcome?: StoredAgentRecord["lastTurnOutcome"];
+  createRequestFingerprint?: string;
 } {
   return {
     createdAt: new Date(record.createdAt),
@@ -121,6 +122,7 @@ export function extractTimestamps(record: StoredAgentRecord): {
     workspaceId: record.workspaceId,
     owner: record.owner,
     lastTurnOutcome: record.lastTurnOutcome,
+    createRequestFingerprint: record.createRequestFingerprint,
   };
 }
 

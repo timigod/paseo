@@ -76,6 +76,7 @@ export function toStoredAgentRecord(
     provider: agent.provider,
     cwd: agent.cwd,
     workspaceId: agent.workspaceId,
+    createRequestFingerprint: agent.createRequestFingerprint,
     createdAt,
     updatedAt: agent.updatedAt.toISOString(),
     lastActivityAt: agent.updatedAt.toISOString(),

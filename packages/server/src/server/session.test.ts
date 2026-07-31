@@ -4780,7 +4780,9 @@ test("unions viewed timelines across socket sources and removes detached sources
       item: { type: "assistant_message", messageId: "message-b", text: "B" },
     },
   });
-  expect(messages.filter((message) => message.type === "agent_stream")).toHaveLength(2);
+  await vi.waitFor(() => {
+    expect(messages.filter((message) => message.type === "agent_stream")).toHaveLength(2);
+  });
 
   const legacySocket = {};
   session.updateClientCapabilities(null, legacySocket);
@@ -4796,7 +4798,9 @@ test("unions viewed timelines across socket sources and removes detached sources
       item: { type: "assistant_message", messageId: "message-legacy", text: "legacy" },
     },
   });
-  expect(messages.some((message) => message.type === "agent_stream")).toBe(true);
+  await vi.waitFor(() => {
+    expect(messages.some((message) => message.type === "agent_stream")).toBe(true);
+  });
 
   session.clearAgentTimelineSubscription(legacySocket);
 
@@ -4820,11 +4824,13 @@ test("unions viewed timelines across socket sources and removes detached sources
       item: { type: "assistant_message", messageId: "message-b-2", text: "retained B" },
     },
   });
-  expect(
-    messages.flatMap((message) =>
-      message.type === "agent_stream" ? [message.payload.agentId] : [],
-    ),
-  ).toEqual(["agent-b"]);
+  await vi.waitFor(() => {
+    expect(
+      messages.flatMap((message) =>
+        message.type === "agent_stream" ? [message.payload.agentId] : [],
+      ),
+    ).toEqual(["agent-b"]);
+  });
 });
 
 test("keeps selective delivery scoped per socket when a retained session also has a legacy socket", async () => {
@@ -4868,15 +4874,17 @@ test("keeps selective delivery scoped per socket when a retained session also ha
   });
 
   expect(messages).toEqual([]);
-  expect(targetedMessages).toEqual([
-    {
-      source: legacySocket,
-      message: expect.objectContaining({
-        type: "agent_stream",
-        payload: expect.objectContaining({ agentId: "not-viewed-agent" }),
-      }),
-    },
-  ]);
+  await vi.waitFor(() => {
+    expect(targetedMessages).toEqual([
+      {
+        source: legacySocket,
+        message: expect.objectContaining({
+          type: "agent_stream",
+          payload: expect.objectContaining({ agentId: "not-viewed-agent" }),
+        }),
+      },
+    ]);
+  });
 });
 
 test("sends project updates only to capable sockets in a retained session", () => {
