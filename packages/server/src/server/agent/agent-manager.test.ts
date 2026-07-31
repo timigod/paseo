@@ -78,6 +78,8 @@ class TestDurableTimelineStore implements AgentTimelineStore {
   afterNextFetch: (() => Promise<void>) | null = null;
   beforeNextBulkInsert: (() => Promise<void>) | null = null;
   beforeNextReplaceCommitted: (() => Promise<void>) | null = null;
+  afterReplaceCommitted: ((callCount: number) => void | Promise<void>) | null = null;
+  replaceCommittedCallCount = 0;
 
   async appendCommitted(
     agentId: string,
@@ -148,6 +150,8 @@ class TestDurableTimelineStore implements AgentTimelineStore {
       nextSeq: (rows.at(-1)?.seq ?? 0) + 1,
     });
     this.historyQuarantineStartSeqs.delete(agentId);
+    this.replaceCommittedCallCount += 1;
+    await this.afterReplaceCommitted?.(this.replaceCommittedCallCount);
   }
 
   async deleteAgent(agentId: string): Promise<void> {
@@ -5123,6 +5127,163 @@ test("closing cancels a hung provider history iterator without permitting a late
     ).toEqual(expectedItems);
   } finally {
     lateHistoryAllowed.resolve();
+    await manager.closeAgent(agentId).catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("closing releases a blocked durable history replacement and rolls back its late write", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-history-close-replace-cancel-"));
+  const durableTimelineStore = new TestDurableTimelineStore();
+  const replaceStarted = deferred<void>();
+  const replaceAllowed = deferred<void>();
+  const replacementRestored = deferred<void>();
+  const agentId = "00000000-0000-4000-8000-000000000169";
+
+  class BlockedReplaceHistorySession extends TestAgentSession {
+    override async *streamHistory(): AsyncGenerator<AgentStreamEvent> {
+      yield {
+        type: "timeline",
+        provider: "codex",
+        item: { type: "assistant_message", text: "late durable replacement" },
+      };
+    }
+  }
+
+  class BlockedReplaceHistoryClient extends TestAgentClient {
+    override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+      return new BlockedReplaceHistorySession(config);
+    }
+  }
+
+  const manager = new AgentManager({
+    clients: { codex: new BlockedReplaceHistoryClient() },
+    durableTimelineStore,
+    logger,
+    idFactory: () => agentId,
+    historyHydrationLimits: { timeoutMs: 60_000 },
+  });
+
+  try {
+    const created = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+    await manager.appendTimelineItem(created.id, {
+      type: "assistant_message",
+      text: "timeline before blocked replacement",
+    });
+    durableTimelineStore.beforeNextReplaceCommitted = async () => {
+      replaceStarted.resolve();
+      await replaceAllowed.promise;
+    };
+    durableTimelineStore.afterReplaceCommitted = (callCount) => {
+      if (callCount === 2) replacementRestored.resolve();
+    };
+
+    const hydration = manager.hydrateTimelineFromProvider(created.id);
+    await replaceStarted.promise;
+    let closeSettled = false;
+    const close = manager.closeAgent(created.id).then(() => {
+      closeSettled = true;
+      return undefined;
+    });
+    await vi.waitFor(() => expect(closeSettled).toBe(true), { timeout: 250 });
+    await Promise.all([close, hydration]);
+    expect(durableTimelineStore.replaceCommittedCallCount).toBe(0);
+
+    replaceAllowed.resolve();
+    await replacementRestored.promise;
+    await manager.flush();
+
+    const expectedItems = [
+      { type: "assistant_message", text: "timeline before blocked replacement" },
+    ];
+    expect(manager.getAgent(created.id)).toBeNull();
+    expect(
+      (await durableTimelineStore.getCommittedRows(created.id)).map((row) => row.item),
+    ).toEqual(expectedItems);
+  } finally {
+    replaceAllowed.resolve();
+    await manager.closeAgent(agentId).catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("history timeout releases a blocked durable replacement and rejects its late write", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-history-timeout-replace-cancel-"));
+  const durableTimelineStore = new TestDurableTimelineStore();
+  const replaceStarted = deferred<void>();
+  const replaceAllowed = deferred<void>();
+  const replacementRestored = deferred<void>();
+  const agentId = "00000000-0000-4000-8000-000000000170";
+
+  class TimedOutReplaceHistorySession extends TestAgentSession {
+    override async *streamHistory(): AsyncGenerator<AgentStreamEvent> {
+      yield {
+        type: "timeline",
+        provider: "codex",
+        item: { type: "assistant_message", text: "late timed-out durable replacement" },
+      };
+    }
+  }
+
+  class TimedOutReplaceHistoryClient extends TestAgentClient {
+    override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+      return new TimedOutReplaceHistorySession(config);
+    }
+  }
+
+  const manager = new AgentManager({
+    clients: { codex: new TimedOutReplaceHistoryClient() },
+    durableTimelineStore,
+    logger,
+    idFactory: () => agentId,
+    historyHydrationLimits: { timeoutMs: 10 },
+  });
+
+  try {
+    const created = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+    await manager.appendTimelineItem(created.id, {
+      type: "assistant_message",
+      text: "timeline before timed-out replacement",
+    });
+    durableTimelineStore.beforeNextReplaceCommitted = async () => {
+      replaceStarted.resolve();
+      await replaceAllowed.promise;
+    };
+    durableTimelineStore.afterReplaceCommitted = (callCount) => {
+      if (callCount === 2) replacementRestored.resolve();
+    };
+
+    let hydrationSettled = false;
+    const hydration = manager.hydrateTimelineFromProvider(created.id).then(() => {
+      hydrationSettled = true;
+      return undefined;
+    });
+    await replaceStarted.promise;
+    await vi.waitFor(() => expect(hydrationSettled).toBe(true), { timeout: 250 });
+    await hydration;
+    expect(durableTimelineStore.replaceCommittedCallCount).toBe(0);
+    expect(manager.getTimeline(created.id)).toEqual([
+      { type: "assistant_message", text: "timeline before timed-out replacement" },
+    ]);
+
+    replaceAllowed.resolve();
+    await replacementRestored.promise;
+    await manager.flush();
+
+    const expectedItems = [
+      { type: "assistant_message", text: "timeline before timed-out replacement" },
+    ];
+    expect(manager.getAgent(created.id)?.historyPrimed).toBe(false);
+    expect(manager.getTimeline(created.id)).toEqual(expectedItems);
+    expect(
+      (await durableTimelineStore.getCommittedRows(created.id)).map((row) => row.item),
+    ).toEqual(expectedItems);
+  } finally {
+    replaceAllowed.resolve();
     await manager.closeAgent(agentId).catch(() => undefined);
     rmSync(workdir, { recursive: true, force: true });
   }

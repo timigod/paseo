@@ -72,6 +72,7 @@
         "commit": "6fc491e6220fba6543bbbe4bf1b1f58cfe59228b"
       },
       "tests": [
+        "packages/server/src/server/agent/agent-manager.test.ts",
         "packages/server/src/server/agent/agent-manager-stream-coalescing.test.ts",
         "packages/server/src/server/agent/providers/opencode-agent.test.ts"
       ],

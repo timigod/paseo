@@ -753,6 +753,7 @@ export class AgentManager {
   private readonly activeHistoryHydrationAgentIds = new Set<string>();
   private readonly bufferedHistoryHydrationSessionEvents = new Map<string, AgentStreamEvent[]>();
   private readonly activeHistoryHydrationControllers = new Map<string, AbortController>();
+  private readonly activeHistoryReplacementTokens = new Map<string, object>();
   private readonly agentLifecycleOperationTails = new Map<string, Promise<void>>();
   private readonly durableTimelineMutationTails = new Map<string, Promise<void>>();
   private readonly closingAgentIds = new Set<string>();
@@ -3535,6 +3536,7 @@ export class AgentManager {
         agent.id,
         historyEvents,
         false,
+        signal,
       );
       agent.historyPrimed = true;
       this.failedHistoryHydrationAgentIds.delete(agent.id);
@@ -3582,6 +3584,7 @@ export class AgentManager {
       const controller = new AbortController();
       this.activeHistoryHydrationControllers.set(agentId, controller);
       const timeout = setTimeout(() => {
+        this.invalidateActiveHistoryReplacement(agentId);
         controller.abort(
           new ProviderHistoryHydrationError(
             `Provider history hydration timed out after ${this.historyHydrationLimits.timeoutMs}ms`,
@@ -3609,6 +3612,7 @@ export class AgentManager {
   }
 
   private abortActiveHistoryHydration(agentId: string, reason: string): void {
+    this.invalidateActiveHistoryReplacement(agentId);
     this.activeHistoryHydrationControllers
       .get(agentId)
       ?.abort(new ProviderHistoryHydrationError(`Provider history hydration canceled: ${reason}`));
@@ -3673,6 +3677,13 @@ export class AgentManager {
     iterator: AsyncIterator<AgentStreamEvent>,
     signal: AbortSignal,
   ): Promise<IteratorResult<AgentStreamEvent>> {
+    return this.waitForProviderHistoryOperation(iterator.next(), signal);
+  }
+
+  private waitForProviderHistoryOperation<T>(
+    operation: Promise<T>,
+    signal: AbortSignal,
+  ): Promise<T> {
     if (signal.aborted) {
       return Promise.reject(this.providerHistoryAbortReason(signal));
     }
@@ -3683,7 +3694,7 @@ export class AgentManager {
     });
     const onAbort = () => rejectAbort(this.providerHistoryAbortReason(signal));
     signal.addEventListener("abort", onAbort, { once: true });
-    return Promise.race([iterator.next(), aborted]).finally(() => {
+    return Promise.race([operation, aborted]).finally(() => {
       signal.removeEventListener("abort", onAbort);
     });
   }
@@ -3737,7 +3748,12 @@ export class AgentManager {
         if (this.agents.get(agent.id) !== agent) {
           return;
         }
-        historyRows = await this.replaceTimelineFromProviderHistory(agent.id, timelineEvents, true);
+        historyRows = await this.replaceTimelineFromProviderHistory(
+          agent.id,
+          timelineEvents,
+          true,
+          signal,
+        );
         agent.historyPrimed = true;
         this.failedHistoryHydrationAgentIds.delete(agent.id);
       } catch {
@@ -3775,7 +3791,10 @@ export class AgentManager {
     agentId: string,
     timelineEvents: readonly Extract<AgentStreamEvent, { type: "timeline" }>[],
     preserveLiveSuffix: boolean,
+    signal: AbortSignal,
   ): Promise<AgentTimelineRow[]> {
+    const replacementToken = {};
+    this.activeHistoryReplacementTokens.set(agentId, replacementToken);
     const timestamp = new Date().toISOString();
     const historyRows = timelineEvents.map((event, index) => ({
       seq: index + 1,
@@ -3784,43 +3803,143 @@ export class AgentManager {
     }));
     let suffixRows = preserveLiveSuffix ? this.timelineStore.getRows(agentId) : [];
     const quarantineStartSeq = this.historyQuarantineStartSeqs.get(agentId);
+    let durableRowsBeforeReplacement: AgentTimelineRow[] = [];
 
-    if (preserveLiveSuffix && quarantineStartSeq !== undefined && this.durableTimelineStore) {
-      await this.durableTimelineMutationTails.get(agentId)?.catch(() => undefined);
-      const durableRows = await this.durableTimelineStore.getCommittedRows(agentId);
-      const rowsBySeq = new Map(
-        durableRows
-          .filter((row) => row.seq >= quarantineStartSeq)
-          .map((row) => [row.seq, row] as const),
-      );
-      for (const row of suffixRows) {
-        if (row.seq >= quarantineStartSeq) {
-          rowsBySeq.set(row.seq, row);
+    try {
+      if (this.durableTimelineStore) {
+        const pendingMutation = this.durableTimelineMutationTails.get(agentId);
+        if (pendingMutation) {
+          await this.waitForProviderHistoryOperation(
+            pendingMutation.catch(() => undefined),
+            signal,
+          );
         }
+        durableRowsBeforeReplacement = await this.waitForProviderHistoryOperation(
+          this.durableTimelineStore.getCommittedRows(agentId),
+          signal,
+        );
       }
-      suffixRows = [...rowsBySeq.values()].sort((left, right) => left.seq - right.seq);
-    }
 
-    const overlapRowCount = getTimelineBoundaryOverlapRowCount(historyRows, suffixRows);
-    const deduplicatedSuffixRows = suffixRows.slice(overlapRowCount);
-    const rows = [...historyRows, ...deduplicatedSuffixRows].map((row, index) => ({
-      seq: index + 1,
-      timestamp: row.timestamp,
-      item: row.item,
-    }));
+      if (preserveLiveSuffix && quarantineStartSeq !== undefined && this.durableTimelineStore) {
+        const rowsBySeq = new Map(
+          durableRowsBeforeReplacement
+            .filter((row) => row.seq >= quarantineStartSeq)
+            .map((row) => [row.seq, row] as const),
+        );
+        for (const row of suffixRows) {
+          if (row.seq >= quarantineStartSeq) {
+            rowsBySeq.set(row.seq, row);
+          }
+        }
+        suffixRows = [...rowsBySeq.values()].sort((left, right) => left.seq - right.seq);
+      }
 
-    if (this.durableTimelineStore) {
-      await this.queueDurableTimelineMutation(agentId, () =>
-        this.durableTimelineStore!.replaceCommitted(agentId, rows),
-      );
+      const overlapRowCount = getTimelineBoundaryOverlapRowCount(historyRows, suffixRows);
+      const deduplicatedSuffixRows = suffixRows.slice(overlapRowCount);
+      const rows = [...historyRows, ...deduplicatedSuffixRows].map((row, index) => ({
+        seq: index + 1,
+        timestamp: row.timestamp,
+        item: row.item,
+      }));
+
+      if (this.durableTimelineStore) {
+        const durableReplacement = this.queueDurableTimelineMutation(agentId, async () => {
+          if (!this.isActiveHistoryReplacement(agentId, replacementToken, signal)) {
+            return;
+          }
+          let replacementAttempted = false;
+          let restorationAttempted = false;
+          try {
+            replacementAttempted = true;
+            await this.durableTimelineStore!.replaceCommitted(agentId, rows);
+            if (!this.isActiveHistoryReplacement(agentId, replacementToken, signal)) {
+              restorationAttempted = true;
+              await this.restoreCanceledDurableHistoryReplacement(
+                agentId,
+                durableRowsBeforeReplacement,
+                quarantineStartSeq,
+              );
+              return;
+            }
+            this.commitHistoryReplacementInMemory(agentId, rows, timestamp);
+            this.clearActiveHistoryReplacement(agentId, replacementToken);
+          } catch (error) {
+            if (
+              replacementAttempted &&
+              !restorationAttempted &&
+              !this.isActiveHistoryReplacement(agentId, replacementToken, signal)
+            ) {
+              await this.restoreCanceledDurableHistoryReplacement(
+                agentId,
+                durableRowsBeforeReplacement,
+                quarantineStartSeq,
+              );
+            }
+            throw error;
+          }
+        });
+        await this.waitForProviderHistoryOperation(durableReplacement, signal);
+      } else {
+        if (!this.isActiveHistoryReplacement(agentId, replacementToken, signal)) {
+          throw this.providerHistoryAbortReason(signal);
+        }
+        this.commitHistoryReplacementInMemory(agentId, rows, timestamp);
+        this.clearActiveHistoryReplacement(agentId, replacementToken);
+      }
+      return rows.slice(0, historyRows.length);
+    } finally {
+      this.clearActiveHistoryReplacement(agentId, replacementToken);
     }
+  }
+
+  private isActiveHistoryReplacement(
+    agentId: string,
+    replacementToken: object,
+    signal: AbortSignal,
+  ): boolean {
+    return !signal.aborted && this.activeHistoryReplacementTokens.get(agentId) === replacementToken;
+  }
+
+  private clearActiveHistoryReplacement(agentId: string, replacementToken: object): void {
+    if (this.activeHistoryReplacementTokens.get(agentId) === replacementToken) {
+      this.activeHistoryReplacementTokens.delete(agentId);
+    }
+  }
+
+  private invalidateActiveHistoryReplacement(agentId: string): void {
+    this.activeHistoryReplacementTokens.delete(agentId);
+  }
+
+  private commitHistoryReplacementInMemory(
+    agentId: string,
+    rows: readonly AgentTimelineRow[],
+    timestamp: string,
+  ): void {
     this.timelineStore.initialize(agentId, {
       rows,
       nextSeq: rows.length + 1,
       timestamp,
     });
     this.historyQuarantineStartSeqs.delete(agentId);
-    return rows.slice(0, historyRows.length);
+  }
+
+  private async restoreCanceledDurableHistoryReplacement(
+    agentId: string,
+    rows: readonly AgentTimelineRow[],
+    quarantineStartSeq: number | undefined,
+  ): Promise<void> {
+    const durableTimelineStore = this.durableTimelineStore;
+    if (!durableTimelineStore) return;
+    await durableTimelineStore.replaceCommitted(agentId, rows);
+    if (quarantineStartSeq === undefined) return;
+    const firstQuarantinedRow = rows.find((row) => row.seq >= quarantineStartSeq);
+    if (firstQuarantinedRow) {
+      await durableTimelineStore.appendHistoryQuarantined(
+        agentId,
+        firstQuarantinedRow,
+        quarantineStartSeq,
+      );
+    }
   }
 
   private notifyForegroundTurnWaiters(agentId: string, event: AgentStreamEvent): void {
