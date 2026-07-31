@@ -3420,17 +3420,19 @@ export class Session {
           createdWorktree,
         });
         const agentPayload = await this.buildAgentPayload(snapshot);
-        this.emit({
-          type: "status",
-          payload: {
-            status: "agent_created",
-            agentId: snapshot.id,
-            requestId,
-            agent: agentPayload,
-          },
+        await creation.prepareForAcknowledgement();
+        creation.acknowledge(() => {
+          this.emit({
+            type: "status",
+            payload: {
+              status: "agent_created",
+              agentId: snapshot.id,
+              requestId,
+              agent: agentPayload,
+            },
+          });
         });
         this.releaseAgentOutboundVisibilityGate(snapshot.id);
-        creation.releaseAfterAcknowledgement();
       } catch (error) {
         try {
           await creation.abortBeforeAcknowledgement(error);
