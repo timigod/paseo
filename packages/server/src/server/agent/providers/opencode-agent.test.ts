@@ -1628,6 +1628,40 @@ describe("OpenCode adapter startTurn error handling", () => {
     ]);
   });
 
+  test.each([
+    {
+      name: "error response",
+      messagesResponse: { data: undefined, error: { message: "Bad Gateway", statusCode: 502 } },
+      expected: "Bad Gateway",
+    },
+    {
+      name: "missing response data",
+      messagesResponse: { data: undefined, error: undefined },
+      expected: "messages response contained no data",
+    },
+  ])("streamHistory fails when OpenCode messages are unavailable: $name", async (testCase) => {
+    const fakeClient = {
+      session: {
+        get: vi.fn().mockResolvedValue({
+          data: { revert: undefined },
+          error: undefined,
+        }),
+        messages: vi.fn().mockResolvedValue(testCase.messagesResponse),
+      },
+    } as never;
+    const session = new __openCodeInternals.OpenCodeAgentSession(
+      { provider: "opencode", cwd: "/tmp/test" },
+      fakeClient,
+      "ses_unit_test",
+      createTestLogger(),
+    );
+
+    await expect(session.streamHistory().next()).rejects.toMatchObject({
+      name: "OpenCodeHistoryUnavailableError",
+      message: expect.stringContaining(testCase.expected),
+    });
+  });
+
   test("streamHistory omits replay timestamps when OpenCode omits times", async () => {
     const fakeClient = {
       session: {

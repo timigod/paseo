@@ -14,6 +14,13 @@ to 64 KiB, and the same bounded item is used for durable timeline rows and live 
 Provider history hydration applies the same rule so reopening an agent cannot restore an oversized
 tool payload.
 
+Provider history hydration is also a bounded atomic replacement. A single attempt may consume at
+most 10,000 provider events or 16 MiB of encoded event data and may hold the per-agent hydration
+barrier for at most 30 seconds. Exceeding any boundary fails the attempt without replacing the
+existing timeline, releases the barrier, and drains live events that arrived meanwhile. Closing or
+archiving the agent cancels the same generation immediately; a late provider iterator result cannot
+overwrite the preserved timeline.
+
 ## Presence is not delivery
 
 Client heartbeat reports presence:

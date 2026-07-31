@@ -11,12 +11,79 @@
       "tests": [
         "packages/protocol/src/material-progress-schema.test.ts",
         "packages/server/src/server/agent/material-progress.test.ts",
-        "packages/server/src/server/agent/agent-manager.test.ts",
         "packages/server/src/server/material-progress.e2e.test.ts",
         "packages/cli/src/commands/agent/inspect.test.ts"
       ],
+      "testCases": [
+        "material progress analysis remains bounded and persisted",
+        "agent inspect returns singular persisted terminal-turn semantics"
+      ],
       "upstreamable": true,
+      "upstreamCondition": "Submit independently when upstream still lacks singular material-progress inspection and persisted terminal-turn semantics on the latest stable base.",
       "dropCondition": "Remove when the official stable release exposes equivalent singular agent material-progress inspection with persisted terminal-turn semantics.",
+      "deployedReceipt": null,
+      "deployedAt": null
+    },
+    {
+      "id": "paseo-v025-history-hydration-atomicity",
+      "category": "stable-core-correctness",
+      "base": {
+        "tag": "v0.2.5",
+        "commit": "6fc491e6220fba6543bbbe4bf1b1f58cfe59228b"
+      },
+      "tests": ["packages/server/src/server/agent/agent-manager.test.ts"],
+      "testCases": [
+        "history replacement flushes a pre-buffered coalescer delta before taking the live suffix",
+        "out-of-band timeline events wait behind a blocked history replacement",
+        "direct timeline append waits for history replacement in memory and durable storage"
+      ],
+      "upstreamable": true,
+      "upstreamCondition": "Submit independently while upstream provider-history replacement can race live, coalesced, direct, or out-of-band timeline persistence.",
+      "dropCondition": "Remove when the latest stable release serializes hydration and every timeline writer behind one lossless durable barrier with bounded cancellation.",
+      "deployedReceipt": null,
+      "deployedAt": null
+    },
+    {
+      "id": "paseo-v025-history-failure-persistence",
+      "category": "stable-core-persistence",
+      "base": {
+        "tag": "v0.2.5",
+        "commit": "6fc491e6220fba6543bbbe4bf1b1f58cfe59228b"
+      },
+      "tests": [
+        "packages/server/src/server/agent/agent-manager.test.ts",
+        "packages/server/src/server/agent/agent-storage.test.ts"
+      ],
+      "testCases": [
+        "a failed partial history hydration preserves persisted material progress",
+        "successful history retry merges and deduplicates the quarantined live suffix"
+      ],
+      "upstreamable": true,
+      "upstreamCondition": "Submit independently while failed hydration can erase or overstate persisted material progress, trust, quarantine, or terminal-turn state.",
+      "dropCondition": "Remove when the latest stable release preserves failure/quarantine state and resumes trustworthy progress after a new live continuation.",
+      "deployedReceipt": null,
+      "deployedAt": null
+    },
+    {
+      "id": "paseo-v025-history-lifecycle-reconciliation",
+      "category": "stable-core-provider-lifecycle",
+      "base": {
+        "tag": "v0.2.5",
+        "commit": "6fc491e6220fba6543bbbe4bf1b1f58cfe59228b"
+      },
+      "tests": [
+        "packages/server/src/server/agent/agent-manager-stream-coalescing.test.ts",
+        "packages/server/src/server/agent/providers/opencode-agent.test.ts"
+      ],
+      "testCases": [
+        "history retry preserves a distinct unkeyed repeated message at the exact boundary",
+        "history retry canonicalizes OpenCode text deltas and tool lifecycle rows",
+        "streamHistory fails when OpenCode messages are unavailable",
+        "closing cancels a hung provider history iterator without permitting a late overwrite"
+      ],
+      "upstreamable": true,
+      "upstreamCondition": "Submit independently while provider replay/live shapes require explicit identity reconciliation and unavailable history can be mistaken for a successful empty replay.",
+      "dropCondition": "Remove when the latest stable release reconciles keyed replay/live events without suppressing unkeyed repeats and treats provider history failures as retryable hydration failures.",
       "deployedReceipt": null,
       "deployedAt": null
     }

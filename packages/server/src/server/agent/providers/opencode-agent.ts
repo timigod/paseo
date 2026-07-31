@@ -98,6 +98,13 @@ const OPENCODE_CAPABILITIES: AgentCapabilityFlags = {
   supportsRewindBoth: true,
 };
 
+export class OpenCodeHistoryUnavailableError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "OpenCodeHistoryUnavailableError";
+  }
+}
+
 const OPENCODE_BUILD_MODE_ID = "build";
 const OPENCODE_LEGACY_FULL_ACCESS_MODE_ID = "full-access";
 const OPENCODE_AUTO_ACCEPT_FEATURE_ID = "auto_accept";
@@ -3827,8 +3834,15 @@ class OpenCodeAgentSession implements AgentSession {
       directory: this.config.cwd,
     });
 
-    if (response.error || !response.data) {
-      return;
+    if (response.error) {
+      throw new OpenCodeHistoryUnavailableError(
+        `OpenCode session history is unavailable: ${toDiagnosticErrorMessage(response.error)}`,
+      );
+    }
+    if (!response.data) {
+      throw new OpenCodeHistoryUnavailableError(
+        "OpenCode session history is unavailable: messages response contained no data",
+      );
     }
 
     const messages = filterOpenCodeRevertedMessages(

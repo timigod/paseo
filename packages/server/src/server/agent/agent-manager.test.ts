@@ -4683,6 +4683,7 @@ test("successful history retry merges and deduplicates the quarantined live suff
       workspaceId: undefined,
     });
     await manager.hydrateTimelineFromProvider(created.id);
+    expect(manager.getAgent(created.id)?.historyPrimed).toBe(false);
     session?.pushEvent({
       type: "timeline",
       provider: "codex",
@@ -4705,6 +4706,7 @@ test("successful history retry merges and deduplicates the quarantined live suff
       },
     });
     await manager.flush();
+    expect(await durableTimelineStore.getHistoryQuarantineStartSeq(created.id)).not.toBeNull();
 
     await manager.hydrateTimelineFromProvider(created.id);
     await manager.flush();
@@ -4798,6 +4800,7 @@ test("history retry preserves a distinct unkeyed repeated message at the exact b
     expect(
       (await durableTimelineStore.getCommittedRows(created.id)).map((row) => row.item),
     ).toEqual(expectedItems);
+    expect(await durableTimelineStore.getHistoryQuarantineStartSeq(created.id)).toBeNull();
   } finally {
     await manager.closeAgent(agentId).catch(() => undefined);
     rmSync(workdir, { recursive: true, force: true });
@@ -4908,6 +4911,398 @@ test("history retry canonicalizes OpenCode text deltas and tool lifecycle rows",
     expect((await manager.getTimelineRows(created.id)).map((row) => row.item)).toEqual(
       expectedItems,
     );
+    expect(
+      (await durableTimelineStore.getCommittedRows(created.id)).map((row) => row.item),
+    ).toEqual(expectedItems);
+  } finally {
+    await manager.closeAgent(agentId).catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("history replacement flushes a pre-buffered coalescer delta before taking the live suffix", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-history-coalescer-barrier-"));
+  const durableTimelineStore = new TestDurableTimelineStore();
+  const replaceStarted = deferred<void>();
+  const replaceAllowed = deferred<void>();
+  const agentId = "00000000-0000-4000-8000-000000000163";
+  let session: TestAgentSession | null = null;
+
+  class CoalescerBarrierSession extends TestAgentSession {
+    override async *streamHistory(): AsyncGenerator<AgentStreamEvent> {
+      yield {
+        type: "timeline",
+        provider: "codex",
+        item: { type: "user_message", text: "history before live delta" },
+      };
+    }
+  }
+
+  class CoalescerBarrierClient extends TestAgentClient {
+    override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+      session = new CoalescerBarrierSession(config);
+      return session;
+    }
+  }
+
+  durableTimelineStore.beforeNextReplaceCommitted = async () => {
+    replaceStarted.resolve();
+    await replaceAllowed.promise;
+  };
+  const manager = new AgentManager({
+    clients: { codex: new CoalescerBarrierClient() },
+    durableTimelineStore,
+    logger,
+    idFactory: () => agentId,
+    agentStreamCoalesceWindowMs: 10,
+  });
+
+  try {
+    const created = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+    session?.pushEvent({
+      type: "timeline",
+      provider: "codex",
+      item: { type: "assistant_message", text: "pre-buffered live delta" },
+    });
+    await new Promise<void>((resolvePromise) => setImmediate(resolvePromise));
+
+    const hydration = manager.hydrateTimelineFromProvider(created.id);
+    await replaceStarted.promise;
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 25));
+    replaceAllowed.resolve();
+    await hydration;
+    await manager.flush();
+
+    const expectedItems: AgentTimelineItem[] = [
+      { type: "user_message", text: "history before live delta" },
+      { type: "assistant_message", text: "pre-buffered live delta" },
+    ];
+    expect(manager.getTimeline(created.id)).toEqual(expectedItems);
+    expect(
+      (await durableTimelineStore.getCommittedRows(created.id)).map((row) => row.item),
+    ).toEqual(expectedItems);
+  } finally {
+    replaceAllowed.resolve();
+    await manager.closeAgent(agentId).catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("out-of-band timeline events wait behind a blocked history replacement", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-history-oob-barrier-"));
+  const durableTimelineStore = new TestDurableTimelineStore();
+  const replaceStarted = deferred<void>();
+  const replaceAllowed = deferred<void>();
+  const outOfBandEmitted = deferred<void>();
+  const agentId = "00000000-0000-4000-8000-000000000164";
+
+  class OutOfBandBarrierSession extends TestAgentSession {
+    override async *streamHistory(): AsyncGenerator<AgentStreamEvent> {
+      yield {
+        type: "timeline",
+        provider: "codex",
+        item: { type: "user_message", text: "history before side effect" },
+      };
+    }
+
+    override tryHandleOutOfBand() {
+      return {
+        run: async ({ emit }: { emit: (event: AgentStreamEvent) => void }) => {
+          emit({
+            type: "timeline",
+            provider: "codex",
+            item: { type: "assistant_message", text: "out-of-band result" },
+          });
+          outOfBandEmitted.resolve();
+        },
+      };
+    }
+  }
+
+  class OutOfBandBarrierClient extends TestAgentClient {
+    override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+      return new OutOfBandBarrierSession(config);
+    }
+  }
+
+  durableTimelineStore.beforeNextReplaceCommitted = async () => {
+    replaceStarted.resolve();
+    await replaceAllowed.promise;
+  };
+  const manager = new AgentManager({
+    clients: { codex: new OutOfBandBarrierClient() },
+    durableTimelineStore,
+    logger,
+    idFactory: () => agentId,
+  });
+
+  try {
+    const created = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+    const hydration = manager.hydrateTimelineFromProvider(created.id);
+    await replaceStarted.promise;
+
+    expect(manager.tryRunOutOfBand(created.id, "/goal pause")).toBe(true);
+    await outOfBandEmitted.promise;
+    replaceAllowed.resolve();
+    await hydration;
+    await manager.flush();
+
+    const expectedItems: AgentTimelineItem[] = [
+      { type: "user_message", text: "history before side effect" },
+      { type: "assistant_message", text: "out-of-band result" },
+    ];
+    expect(manager.getTimeline(created.id)).toEqual(expectedItems);
+    expect(
+      (await durableTimelineStore.getCommittedRows(created.id)).map((row) => row.item),
+    ).toEqual(expectedItems);
+  } finally {
+    replaceAllowed.resolve();
+    await manager.closeAgent(agentId).catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("closing cancels a hung provider history iterator without permitting a late overwrite", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-history-close-cancel-"));
+  const durableTimelineStore = new TestDurableTimelineStore();
+  const historyEntered = deferred<void>();
+  const lateHistoryAllowed = deferred<void>();
+  const agentId = "00000000-0000-4000-8000-000000000165";
+
+  class HungHistorySession extends TestAgentSession {
+    override async *streamHistory(): AsyncGenerator<AgentStreamEvent> {
+      historyEntered.resolve();
+      await lateHistoryAllowed.promise;
+      yield {
+        type: "timeline",
+        provider: "codex",
+        item: { type: "assistant_message", text: "late history must not overwrite" },
+      };
+    }
+  }
+
+  class HungHistoryClient extends TestAgentClient {
+    override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+      return new HungHistorySession(config);
+    }
+  }
+
+  const manager = new AgentManager({
+    clients: { codex: new HungHistoryClient() },
+    durableTimelineStore,
+    logger,
+    idFactory: () => agentId,
+    historyHydrationLimits: { timeoutMs: 60_000 },
+  });
+
+  try {
+    const created = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+    await manager.appendTimelineItem(created.id, {
+      type: "assistant_message",
+      text: "timeline before hydration",
+    });
+    const hydration = manager.hydrateTimelineFromProvider(created.id);
+    await historyEntered.promise;
+
+    await expect(manager.closeAgent(created.id)).resolves.toBeUndefined();
+    await hydration;
+    lateHistoryAllowed.resolve();
+    await new Promise<void>((resolvePromise) => setImmediate(resolvePromise));
+    await manager.flush();
+
+    const expectedItems = [{ type: "assistant_message", text: "timeline before hydration" }];
+    expect(manager.getAgent(created.id)).toBeNull();
+    expect(
+      (await durableTimelineStore.getCommittedRows(created.id)).map((row) => row.item),
+    ).toEqual(expectedItems);
+  } finally {
+    lateHistoryAllowed.resolve();
+    await manager.closeAgent(agentId).catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("history hydration timeout drains buffered live events and preserves the prior timeline", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-history-timeout-"));
+  const durableTimelineStore = new TestDurableTimelineStore();
+  const historyEntered = deferred<void>();
+  const never = deferred<void>();
+  const agentId = "00000000-0000-4000-8000-000000000166";
+  let session: TestAgentSession | null = null;
+
+  class TimedOutHistorySession extends TestAgentSession {
+    override async *streamHistory(): AsyncGenerator<AgentStreamEvent> {
+      historyEntered.resolve();
+      await never.promise;
+      yield {
+        type: "timeline",
+        provider: "codex",
+        item: { type: "assistant_message", text: "late timeout history" },
+      };
+    }
+  }
+
+  class TimedOutHistoryClient extends TestAgentClient {
+    override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+      session = new TimedOutHistorySession(config);
+      return session;
+    }
+  }
+
+  const manager = new AgentManager({
+    clients: { codex: new TimedOutHistoryClient() },
+    durableTimelineStore,
+    logger,
+    idFactory: () => agentId,
+    historyHydrationLimits: { timeoutMs: 10 },
+  });
+
+  try {
+    const created = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+    await manager.appendTimelineItem(created.id, {
+      type: "assistant_message",
+      text: "timeline before timeout",
+    });
+    const hydration = manager.hydrateTimelineFromProvider(created.id);
+    await historyEntered.promise;
+    session?.pushEvent({
+      type: "timeline",
+      provider: "codex",
+      item: { type: "assistant_message", text: "live event during timeout" },
+    });
+    await hydration;
+    await manager.flush();
+
+    const expectedItems = [
+      { type: "assistant_message", text: "timeline before timeout" },
+      { type: "assistant_message", text: "live event during timeout" },
+    ];
+    expect(manager.getAgent(created.id)?.historyPrimed).toBe(false);
+    expect(manager.getTimeline(created.id)).toEqual(expectedItems);
+    expect(
+      (await durableTimelineStore.getCommittedRows(created.id)).map((row) => row.item),
+    ).toEqual(expectedItems);
+    expect(await durableTimelineStore.getHistoryQuarantineStartSeq(created.id)).not.toBeNull();
+  } finally {
+    await manager.closeAgent(agentId).catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("provider history event cap fails closed without replacing the live timeline", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-history-limit-"));
+  const durableTimelineStore = new TestDurableTimelineStore();
+  const agentId = "00000000-0000-4000-8000-000000000167";
+
+  class OversizedHistorySession extends TestAgentSession {
+    override async *streamHistory(): AsyncGenerator<AgentStreamEvent> {
+      yield {
+        type: "timeline",
+        provider: "codex",
+        item: { type: "assistant_message", text: "history row one" },
+      };
+      yield {
+        type: "timeline",
+        provider: "codex",
+        item: { type: "assistant_message", text: "history row two exceeds count cap" },
+      };
+    }
+  }
+
+  class OversizedHistoryClient extends TestAgentClient {
+    override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+      return new OversizedHistorySession(config);
+    }
+  }
+
+  const manager = new AgentManager({
+    clients: { codex: new OversizedHistoryClient() },
+    durableTimelineStore,
+    logger,
+    idFactory: () => agentId,
+    historyHydrationLimits: { maxEvents: 1, maxBytes: 256 },
+  });
+
+  try {
+    const created = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+    await manager.appendTimelineItem(created.id, {
+      type: "assistant_message",
+      text: "live timeline remains authoritative",
+    });
+
+    await manager.hydrateTimelineFromProvider(created.id);
+    await manager.flush();
+
+    const expectedItems = [
+      { type: "assistant_message", text: "live timeline remains authoritative" },
+    ];
+    expect(manager.getAgent(created.id)?.historyPrimed).toBe(false);
+    expect(manager.getTimeline(created.id)).toEqual(expectedItems);
+    expect(
+      (await durableTimelineStore.getCommittedRows(created.id)).map((row) => row.item),
+    ).toEqual(expectedItems);
+  } finally {
+    await manager.closeAgent(agentId).catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("provider history byte cap fails closed without replacing the live timeline", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-history-byte-limit-"));
+  const durableTimelineStore = new TestDurableTimelineStore();
+  const agentId = "00000000-0000-4000-8000-000000000168";
+
+  class OversizedHistorySession extends TestAgentSession {
+    override async *streamHistory(): AsyncGenerator<AgentStreamEvent> {
+      yield {
+        type: "timeline",
+        provider: "codex",
+        item: { type: "assistant_message", text: "x".repeat(512) },
+      };
+    }
+  }
+
+  class OversizedHistoryClient extends TestAgentClient {
+    override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+      return new OversizedHistorySession(config);
+    }
+  }
+
+  const manager = new AgentManager({
+    clients: { codex: new OversizedHistoryClient() },
+    durableTimelineStore,
+    logger,
+    idFactory: () => agentId,
+    historyHydrationLimits: { maxEvents: 10, maxBytes: 128 },
+  });
+
+  try {
+    const created = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+    await manager.appendTimelineItem(created.id, {
+      type: "assistant_message",
+      text: "live timeline survives oversized bytes",
+    });
+
+    await manager.hydrateTimelineFromProvider(created.id);
+    await manager.flush();
+
+    const expectedItems = [
+      { type: "assistant_message", text: "live timeline survives oversized bytes" },
+    ];
+    expect(manager.getAgent(created.id)?.historyPrimed).toBe(false);
+    expect(manager.getTimeline(created.id)).toEqual(expectedItems);
     expect(
       (await durableTimelineStore.getCommittedRows(created.id)).map((row) => row.item),
     ).toEqual(expectedItems);

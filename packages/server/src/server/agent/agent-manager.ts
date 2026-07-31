@@ -80,6 +80,9 @@ import type { MaterialProgressPayload } from "../messages.js";
 
 const RELOAD_SESSION_CLOSE_TIMEOUT_MS = 3_000;
 const INTERRUPT_SESSION_TIMEOUT_MS = 2_000;
+const HISTORY_HYDRATION_TIMEOUT_MS = 30_000;
+const HISTORY_HYDRATION_MAX_EVENTS = 10_000;
+const HISTORY_HYDRATION_MAX_BYTES = 16 * 1024 * 1024;
 const MATERIAL_PROGRESS_PAGE_SIZE = 1_000;
 const MATERIAL_PROGRESS_MAX_SCAN_ROWS = 10_000;
 const STORED_AGENT_CAPABILITIES: AgentCapabilityFlags = {
@@ -363,6 +366,34 @@ interface AgentManagerRescueTimeouts {
   interruptSessionMs?: number;
 }
 
+interface AgentManagerHistoryHydrationLimits {
+  timeoutMs?: number;
+  maxEvents?: number;
+  maxBytes?: number;
+}
+
+function resolveHistoryHydrationLimits(
+  limits: AgentManagerHistoryHydrationLimits | undefined,
+): Required<AgentManagerHistoryHydrationLimits> {
+  return {
+    timeoutMs: limits?.timeoutMs ?? HISTORY_HYDRATION_TIMEOUT_MS,
+    maxEvents: limits?.maxEvents ?? HISTORY_HYDRATION_MAX_EVENTS,
+    maxBytes: limits?.maxBytes ?? HISTORY_HYDRATION_MAX_BYTES,
+  };
+}
+
+interface CollectedProviderHistory {
+  timelineEvents: Extract<AgentStreamEvent, { type: "timeline" }>[];
+  providerSubagentEvents: Extract<AgentStreamEvent, { type: "provider_subagent" }>[];
+}
+
+class ProviderHistoryHydrationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ProviderHistoryHydrationError";
+  }
+}
+
 interface ProviderEnabledFlag {
   enabled: boolean;
   derivedFromProviderId?: string | null;
@@ -397,6 +428,7 @@ export interface AgentManagerOptions {
   appendSystemPrompt?: string;
   agentStreamCoalesceWindowMs?: number;
   rescueTimeouts?: AgentManagerRescueTimeouts;
+  historyHydrationLimits?: AgentManagerHistoryHydrationLimits;
   logger: Logger;
 }
 
@@ -720,6 +752,7 @@ export class AgentManager {
   private readonly historyQuarantineStartSeqs = new Map<string, number>();
   private readonly activeHistoryHydrationAgentIds = new Set<string>();
   private readonly bufferedHistoryHydrationSessionEvents = new Map<string, AgentStreamEvent[]>();
+  private readonly activeHistoryHydrationControllers = new Map<string, AbortController>();
   private readonly agentLifecycleOperationTails = new Map<string, Promise<void>>();
   private readonly durableTimelineMutationTails = new Map<string, Promise<void>>();
   private readonly closingAgentIds = new Set<string>();
@@ -743,6 +776,7 @@ export class AgentManager {
   private onWorkspaceStateMayHaveChanged?: (params: { cwd: string }) => void;
   private logger: Logger;
   private readonly rescueTimeouts: Required<AgentManagerRescueTimeouts>;
+  private readonly historyHydrationLimits: Required<AgentManagerHistoryHydrationLimits>;
   private acceptingAgentRegistrations = true;
 
   constructor(options: AgentManagerOptions) {
@@ -762,6 +796,7 @@ export class AgentManager {
       interruptSessionMs:
         options.rescueTimeouts?.interruptSessionMs ?? INTERRUPT_SESSION_TIMEOUT_MS,
     };
+    this.historyHydrationLimits = resolveHistoryHydrationLimits(options.historyHydrationLimits);
     this.agentStreamCoalescer = new AgentStreamCoalescer({
       windowMs: options.agentStreamCoalesceWindowMs ?? AGENT_STREAM_COALESCE_DEFAULT_WINDOW_MS,
       timers: { setTimeout, clearTimeout },
@@ -1527,6 +1562,7 @@ export class AgentManager {
     }
 
     this.closingAgentIds.add(agentId);
+    this.abortActiveHistoryHydration(agentId, "agent close requested");
     const close = this.withAgentLifecycleGate(agentId, () => this.closeAgentRuntime(agentId));
     this.inFlightAgentCloses.set(agentId, close);
     const clearClose = () => {
@@ -1603,6 +1639,7 @@ export class AgentManager {
 
   archiveAgent(agentId: string): Promise<{ archivedAt: string }> {
     this.closingAgentIds.add(agentId);
+    this.abortActiveHistoryHydration(agentId, "agent archive requested");
     const archive = this.withAgentLifecycleGate(agentId, () => this.archiveAgentInternal(agentId));
     void archive.then(
       () => this.closingAgentIds.delete(agentId),
@@ -2075,8 +2112,9 @@ export class AgentManager {
    * Try to run a prompt out-of-band — i.e. without allocating a foreground turn
    * and without canceling any active turn. Returns true when the session
    * accepted the prompt as a side-effect command (e.g. /goal pause). Events
-   * emitted by the handler flow through dispatchStream so they persist and
-   * broadcast like normal timeline events.
+   * Timeline events emitted by the handler flow through the session event queue
+   * so hydration, persistence, and broadcast ordering match normal provider
+   * events; non-timeline notices retain their direct broadcast semantics.
    */
   tryRunOutOfBand(agentId: string, prompt: AgentPromptInput): boolean {
     const agent = this.requireSessionAgent(agentId);
@@ -2085,16 +2123,8 @@ export class AgentManager {
       return false;
     }
     const dispatch = (event: AgentStreamEvent): void => {
-      // Persist timeline items so they show up in fetchAgentTimeline; broadcast
-      // for live subscribers. Other event types are broadcast only.
       if (event.type === "timeline") {
-        this.touchUpdatedAt(agent);
-        const row = this.recordTimeline(agent.id, event.item);
-        this.dispatchStream(agent.id, event, {
-          seq: row.seq,
-          epoch: this.timelineStore.getEpoch(agent.id),
-          timestamp: row.timestamp,
-        });
+        this.enqueueSessionEvent(agent.id, event);
         return;
       }
       this.dispatchStream(agent.id, event, { timestamp: new Date().toISOString() });
@@ -3494,24 +3524,13 @@ export class AgentManager {
     agent: ActiveManagedAgent,
     broadcast: boolean,
   ): Promise<void> {
-    await this.withHistoryHydrationBarrier(agent, async () => {
-      const historyEvents: Extract<AgentStreamEvent, { type: "timeline" }>[] = [];
-      const providerSubagentEvents: Extract<AgentStreamEvent, { type: "provider_subagent" }>[] = [];
-      for await (const event of agent.session.streamHistory()) {
-        if (event.type === "timeline") {
-          if (event.item.type === "user_message" && isSystemInjectedEnvelope(event.item.text)) {
-            continue;
-          }
-          historyEvents.push(event);
-        } else if (event.type === "provider_subagent") {
-          providerSubagentEvents.push(event);
-        }
-      }
+    await this.withHistoryHydrationBarrier(agent, async (signal) => {
+      const { timelineEvents: historyEvents, providerSubagentEvents } =
+        await this.collectProviderHistory(agent, signal);
       if (this.agents.get(agent.id) !== agent) {
         return;
       }
 
-      this.agentStreamCoalescer.flushAndDiscard(agent.id);
       const historyRows = await this.replaceTimelineFromProviderHistory(
         agent.id,
         historyEvents,
@@ -3549,18 +3568,35 @@ export class AgentManager {
 
   private async withHistoryHydrationBarrier(
     agent: ActiveManagedAgent,
-    hydrate: () => Promise<void>,
+    hydrate: (signal: AbortSignal) => Promise<void>,
   ): Promise<void> {
     const agentId = agent.id;
     await this.withAgentLifecycleGate(agentId, async () => {
-      if (this.agents.get(agentId) !== agent) {
+      if (this.agents.get(agentId) !== agent || this.closingAgentIds.has(agentId)) {
         return;
       }
+      // A coalesced delta may predate the hydration gate. Flush it before the
+      // live suffix snapshot, then quarantine all newly arriving session events.
+      this.agentStreamCoalescer.flushFor(agentId);
       this.activeHistoryHydrationAgentIds.add(agentId);
+      const controller = new AbortController();
+      this.activeHistoryHydrationControllers.set(agentId, controller);
+      const timeout = setTimeout(() => {
+        controller.abort(
+          new ProviderHistoryHydrationError(
+            `Provider history hydration timed out after ${this.historyHydrationLimits.timeoutMs}ms`,
+          ),
+        );
+      }, this.historyHydrationLimits.timeoutMs);
+      timeout.unref?.();
       try {
         await this.drainSessionEvents(agentId);
-        await hydrate();
+        await hydrate(controller.signal);
       } finally {
+        clearTimeout(timeout);
+        if (this.activeHistoryHydrationControllers.get(agentId) === controller) {
+          this.activeHistoryHydrationControllers.delete(agentId);
+        }
         this.activeHistoryHydrationAgentIds.delete(agentId);
         const buffered = this.bufferedHistoryHydrationSessionEvents.get(agentId) ?? [];
         this.bufferedHistoryHydrationSessionEvents.delete(agentId);
@@ -3570,6 +3606,92 @@ export class AgentManager {
         await this.drainSessionEvents(agentId);
       }
     });
+  }
+
+  private abortActiveHistoryHydration(agentId: string, reason: string): void {
+    this.activeHistoryHydrationControllers
+      .get(agentId)
+      ?.abort(new ProviderHistoryHydrationError(`Provider history hydration canceled: ${reason}`));
+  }
+
+  private async collectProviderHistory(
+    agent: ActiveManagedAgent,
+    signal: AbortSignal,
+  ): Promise<CollectedProviderHistory> {
+    const timelineEvents: Extract<AgentStreamEvent, { type: "timeline" }>[] = [];
+    const providerSubagentEvents: Extract<AgentStreamEvent, { type: "provider_subagent" }>[] = [];
+    const iterator = agent.session.streamHistory()[Symbol.asyncIterator]();
+    let eventCount = 0;
+    let byteCount = 0;
+    let completed = false;
+
+    try {
+      while (true) {
+        const next = await this.nextProviderHistoryEvent(iterator, signal);
+        if (next.done) {
+          completed = true;
+          break;
+        }
+        eventCount += 1;
+        byteCount += Buffer.byteLength(JSON.stringify(next.value), "utf8");
+        if (
+          eventCount > this.historyHydrationLimits.maxEvents ||
+          byteCount > this.historyHydrationLimits.maxBytes
+        ) {
+          throw new ProviderHistoryHydrationError(
+            `Provider history hydration exceeded its bounded limit (${eventCount} events, ${byteCount} bytes)`,
+          );
+        }
+
+        const event = next.value;
+        if (event.type === "provider_subagent") {
+          providerSubagentEvents.push(event);
+          continue;
+        }
+        if (event.type !== "timeline") {
+          continue;
+        }
+        if (event.item.type === "user_message" && isSystemInjectedEnvelope(event.item.text)) {
+          continue;
+        }
+        timelineEvents.push(event);
+      }
+      return { timelineEvents, providerSubagentEvents };
+    } finally {
+      if (!completed && iterator.return) {
+        void iterator.return(undefined).catch((error) => {
+          this.logger.debug(
+            { err: error, agentId: agent.id },
+            "Provider history iterator cleanup failed",
+          );
+        });
+      }
+    }
+  }
+
+  private nextProviderHistoryEvent(
+    iterator: AsyncIterator<AgentStreamEvent>,
+    signal: AbortSignal,
+  ): Promise<IteratorResult<AgentStreamEvent>> {
+    if (signal.aborted) {
+      return Promise.reject(this.providerHistoryAbortReason(signal));
+    }
+
+    let rejectAbort!: (reason: Error) => void;
+    const aborted = new Promise<never>((_resolvePromise, rejectPromise) => {
+      rejectAbort = rejectPromise;
+    });
+    const onAbort = () => rejectAbort(this.providerHistoryAbortReason(signal));
+    signal.addEventListener("abort", onAbort, { once: true });
+    return Promise.race([iterator.next(), aborted]).finally(() => {
+      signal.removeEventListener("abort", onAbort);
+    });
+  }
+
+  private providerHistoryAbortReason(signal: AbortSignal): Error {
+    return signal.reason instanceof Error
+      ? signal.reason
+      : new ProviderHistoryHydrationError("Provider history hydration canceled");
   }
 
   private withAgentLifecycleGate<T>(agentId: string, operation: () => Promise<T>): Promise<T> {
@@ -3600,27 +3722,18 @@ export class AgentManager {
     agent: ActiveManagedAgent,
     broadcast: boolean | (() => boolean),
   ): Promise<void> {
-    await this.withHistoryHydrationBarrier(agent, async () => {
+    await this.withHistoryHydrationBarrier(agent, async (signal) => {
       if (agent.historyPrimed) {
         return;
       }
-      const timelineEvents: Extract<AgentStreamEvent, { type: "timeline" }>[] = [];
-      const providerSubagentEvents: Extract<AgentStreamEvent, { type: "provider_subagent" }>[] = [];
+      let timelineEvents: Extract<AgentStreamEvent, { type: "timeline" }>[];
+      let providerSubagentEvents: Extract<AgentStreamEvent, { type: "provider_subagent" }>[];
       let historyRows: AgentTimelineRow[];
       try {
-        for await (const event of agent.session.streamHistory()) {
-          if (event.type === "provider_subagent") {
-            providerSubagentEvents.push(event);
-            continue;
-          }
-          if (event.type !== "timeline") {
-            continue;
-          }
-          if (event.item.type === "user_message" && isSystemInjectedEnvelope(event.item.text)) {
-            continue;
-          }
-          timelineEvents.push(event);
-        }
+        ({ timelineEvents, providerSubagentEvents } = await this.collectProviderHistory(
+          agent,
+          signal,
+        ));
         if (this.agents.get(agent.id) !== agent) {
           return;
         }
