@@ -4737,7 +4737,7 @@ test("successful history retry merges and deduplicates the quarantined live suff
   }
 });
 
-test("history retry preserves a distinct repeated message outside the reconciliation boundary", async () => {
+test("history retry preserves a distinct unkeyed repeated message at the exact boundary", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-history-repeated-content-"));
   const durableTimelineStore = new TestDurableTimelineStore();
   const agentId = "00000000-0000-4000-8000-000000000160";
@@ -4754,11 +4754,6 @@ test("history retry preserves a distinct repeated message outside the reconcilia
         type: "timeline",
         provider: "codex",
         item: { type: "assistant_message", text: "same content, separate events" },
-      };
-      yield {
-        type: "timeline",
-        provider: "codex",
-        item: { type: "user_message", text: "later historical boundary" },
       };
     }
   }
@@ -4794,13 +4789,128 @@ test("history retry preserves a distinct repeated message outside the reconcilia
 
     const expectedItems: AgentTimelineItem[] = [
       { type: "assistant_message", text: "same content, separate events" },
-      { type: "user_message", text: "later historical boundary" },
       { type: "assistant_message", text: "same content, separate events" },
     ];
     expect(manager.getTimeline(created.id)).toEqual(expectedItems);
     expect((await manager.getTimelineRows(created.id)).map((row) => row.item)).toEqual(
       expectedItems,
     );
+    expect(
+      (await durableTimelineStore.getCommittedRows(created.id)).map((row) => row.item),
+    ).toEqual(expectedItems);
+  } finally {
+    await manager.closeAgent(agentId).catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("history retry canonicalizes OpenCode text deltas and tool lifecycle rows", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-history-opencode-deltas-"));
+  const durableTimelineStore = new TestDurableTimelineStore();
+  const agentId = "00000000-0000-4000-8000-000000000162";
+  let session: TestAgentSession | null = null;
+  let historyCalls = 0;
+
+  const completedToolCall: AgentTimelineItem = {
+    type: "tool_call",
+    callId: "opencode-call-recovered",
+    name: "shell",
+    status: "completed",
+    error: null,
+    detail: { type: "shell", command: "npm test", output: "passed", exitCode: 0 },
+  };
+
+  class OpenCodeDeltaHistorySession extends TestAgentSession {
+    override async *streamHistory(): AsyncGenerator<AgentStreamEvent> {
+      historyCalls += 1;
+      if (historyCalls === 1) {
+        throw new Error("provider history unavailable");
+      }
+      yield {
+        type: "timeline",
+        provider: "opencode",
+        item: {
+          type: "assistant_message",
+          text: "completed response",
+          messageId: "opencode-message-recovered",
+        },
+      };
+      yield { type: "timeline", provider: "opencode", item: completedToolCall };
+    }
+  }
+
+  class OpenCodeDeltaHistoryClient extends TestAgentClient {
+    override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+      session = new OpenCodeDeltaHistorySession(config);
+      return session;
+    }
+  }
+
+  const manager = new AgentManager({
+    clients: { codex: new OpenCodeDeltaHistoryClient() },
+    durableTimelineStore,
+    logger,
+    idFactory: () => agentId,
+  });
+
+  try {
+    const created = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+    await manager.hydrateTimelineFromProvider(created.id);
+
+    session?.pushEvent({
+      type: "timeline",
+      provider: "opencode",
+      item: {
+        type: "assistant_message",
+        text: "completed ",
+        messageId: "opencode-message-recovered",
+      },
+    });
+    await manager.flush();
+    session?.pushEvent({
+      type: "timeline",
+      provider: "opencode",
+      item: {
+        type: "assistant_message",
+        text: "response",
+        messageId: "opencode-message-recovered",
+      },
+    });
+    await manager.flush();
+    session?.pushEvent({
+      type: "timeline",
+      provider: "opencode",
+      item: {
+        ...completedToolCall,
+        status: "running",
+        detail: { type: "shell", command: "npm test" },
+      },
+    });
+    await manager.flush();
+    session?.pushEvent({ type: "timeline", provider: "opencode", item: completedToolCall });
+    await manager.flush();
+
+    expect(manager.getTimeline(created.id)).toHaveLength(4);
+    await manager.hydrateTimelineFromProvider(created.id);
+    await manager.flush();
+
+    const expectedItems: AgentTimelineItem[] = [
+      {
+        type: "assistant_message",
+        text: "completed response",
+        messageId: "opencode-message-recovered",
+      },
+      completedToolCall,
+    ];
+    expect(manager.getTimeline(created.id)).toEqual(expectedItems);
+    expect((await manager.getTimelineRows(created.id)).map((row) => row.item)).toEqual(
+      expectedItems,
+    );
+    expect(
+      (await durableTimelineStore.getCommittedRows(created.id)).map((row) => row.item),
+    ).toEqual(expectedItems);
   } finally {
     await manager.closeAgent(agentId).catch(() => undefined);
     rmSync(workdir, { recursive: true, force: true });

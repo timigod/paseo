@@ -168,36 +168,68 @@ function getTimelineItemIdentity(item: AgentTimelineItem): string | null {
   return null;
 }
 
-function timelineItemsRepresentSameEvent(
-  historyItem: AgentTimelineItem,
-  suffixItem: AgentTimelineItem,
-): boolean {
-  const historyIdentity = getTimelineItemIdentity(historyItem);
-  const suffixIdentity = getTimelineItemIdentity(suffixItem);
-  if (historyIdentity !== null || suffixIdentity !== null) {
-    return (
-      historyIdentity !== null &&
-      historyIdentity === suffixIdentity &&
-      equal(historyItem, suffixItem)
-    );
-  }
-  return equal(historyItem, suffixItem);
+interface TimelineReconciliationEvent {
+  identity: string | null;
+  item: AgentTimelineItem;
+  sourceRowCount: number;
 }
 
-function getTimelineBoundaryOverlapLength(
+function mergeTimelineReconciliationItems(
+  previous: AgentTimelineItem,
+  next: AgentTimelineItem,
+): AgentTimelineItem {
+  if (previous.type === "assistant_message" && next.type === "assistant_message") {
+    return { ...next, text: previous.text + next.text };
+  }
+  return next;
+}
+
+function buildTimelineReconciliationEvents(
+  rows: readonly AgentTimelineRow[],
+): TimelineReconciliationEvent[] {
+  const events: TimelineReconciliationEvent[] = [];
+  for (const row of rows) {
+    const identity = getTimelineItemIdentity(row.item);
+    const previous = events.at(-1);
+    if (identity !== null && previous?.identity === identity) {
+      previous.item = mergeTimelineReconciliationItems(previous.item, row.item);
+      previous.sourceRowCount += 1;
+      continue;
+    }
+    events.push({ identity, item: row.item, sourceRowCount: 1 });
+  }
+  return events;
+}
+
+function reconciliationEventsMatch(
+  historyEvent: TimelineReconciliationEvent,
+  suffixEvent: TimelineReconciliationEvent,
+): boolean {
+  return (
+    historyEvent.identity !== null &&
+    historyEvent.identity === suffixEvent.identity &&
+    equal(historyEvent.item, suffixEvent.item)
+  );
+}
+
+function getTimelineBoundaryOverlapRowCount(
   historyRows: readonly AgentTimelineRow[],
   suffixRows: readonly AgentTimelineRow[],
 ): number {
-  const maxOverlap = Math.min(historyRows.length, suffixRows.length);
+  const historyEvents = buildTimelineReconciliationEvents(historyRows);
+  const suffixEvents = buildTimelineReconciliationEvents(suffixRows);
+  const maxOverlap = Math.min(historyEvents.length, suffixEvents.length);
   for (let overlap = maxOverlap; overlap > 0; overlap -= 1) {
-    const historyStart = historyRows.length - overlap;
-    const matches = suffixRows
+    const historyStart = historyEvents.length - overlap;
+    const matches = suffixEvents
       .slice(0, overlap)
-      .every((suffixRow, index) =>
-        timelineItemsRepresentSameEvent(historyRows[historyStart + index]!.item, suffixRow.item),
+      .every((suffixEvent, index) =>
+        reconciliationEventsMatch(historyEvents[historyStart + index]!, suffixEvent),
       );
     if (matches) {
-      return overlap;
+      return suffixEvents
+        .slice(0, overlap)
+        .reduce((rowCount, event) => rowCount + event.sourceRowCount, 0);
     }
   }
   return 0;
@@ -3541,6 +3573,8 @@ export class AgentManager {
   }
 
   private withAgentLifecycleGate<T>(agentId: string, operation: () => Promise<T>): Promise<T> {
+    // Operations passed here must not call another lifecycle-gated public method
+    // for the same agent; the gate is intentionally serial and non-reentrant.
     const previous = this.agentLifecycleOperationTails.get(agentId);
     let current: Promise<T>;
     try {
@@ -3654,8 +3688,8 @@ export class AgentManager {
       suffixRows = [...rowsBySeq.values()].sort((left, right) => left.seq - right.seq);
     }
 
-    const overlapLength = getTimelineBoundaryOverlapLength(historyRows, suffixRows);
-    const deduplicatedSuffixRows = suffixRows.slice(overlapLength);
+    const overlapRowCount = getTimelineBoundaryOverlapRowCount(historyRows, suffixRows);
+    const deduplicatedSuffixRows = suffixRows.slice(overlapRowCount);
     const rows = [...historyRows, ...deduplicatedSuffixRows].map((row, index) => ({
       seq: index + 1,
       timestamp: row.timestamp,
