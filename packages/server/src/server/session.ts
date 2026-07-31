@@ -230,6 +230,7 @@ import {
   handlePaseoWorktreeArchiveRequest as handleWorktreeArchiveRequest,
   handlePaseoWorktreeListRequest as handleWorktreeListRequest,
   handleWorkspaceSetupStatusRequest as handleWorkspaceSetupStatusRequestMessage,
+  cacheWorkspaceSetupSnapshot,
 } from "./worktree-session.js";
 import { archiveByScope, type ActiveWorkspaceRef } from "./workspace-archive-service.js";
 import { WorktreeRequestError, toWorktreeWireError } from "./worktree-errors.js";
@@ -4596,6 +4597,7 @@ export class Session {
       archivedAt: archiveTimestamp,
       workspaceRegistry: this.workspaceRegistry,
     });
+    this.workspaceSetupSnapshots.delete(workspaceId);
     if (!existingWorkspace) {
       this.workspaceGitObserver.removeForWorkspaceId(workspaceId);
       return;
@@ -5737,7 +5739,7 @@ export class Session {
         emitWorkspaceUpdateForWorkspaceId: (workspaceId) =>
           this.emitWorkspaceUpdateForWorkspaceId(workspaceId),
         cacheWorkspaceSetupSnapshot: (workspaceId, snapshot) => {
-          this.workspaceSetupSnapshots.set(workspaceId, snapshot);
+          cacheWorkspaceSetupSnapshot(this.workspaceSetupSnapshots, workspaceId, snapshot);
         },
         emit: (message) => this.emit(message),
         sessionLogger: this.sessionLogger,
