@@ -4676,6 +4676,8 @@ export const PaseoWorktreeArchiveResponseSchema = z.object({
   payload: z.object({
     success: z.boolean(),
     removedAgents: z.array(z.string()).optional(),
+    removedDirectory: z.boolean().optional(),
+    cleanupPending: z.boolean().optional(),
     error: CheckoutErrorSchema.nullable(),
     requestId: z.string(),
   }),
