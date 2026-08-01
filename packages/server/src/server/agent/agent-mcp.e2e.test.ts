@@ -12,6 +12,7 @@ import { withTimeout } from "../../utils/promise-timeout.js";
 import { hashDaemonPassword } from "../auth.js";
 import { createPaseoDaemon, type PaseoDaemonConfig } from "../bootstrap.js";
 import { createTestAgentClients } from "../test-utils/fake-agent-client.js";
+import { DaemonClient } from "../test-utils/daemon-client.js";
 import type {
   AgentClient,
   AgentPersistenceHandle,
@@ -165,7 +166,7 @@ async function assertAgentNotRunning(options: {
 }
 
 describe("agent MCP end-to-end (offline)", () => {
-  test("unacknowledged durable creates stay hidden from MCP list and get tools", async () => {
+  test("the first durable create snapshot stays hidden from fetch_agents and MCP tools", async () => {
     const paseoHome = await mkdtemp(path.join(os.tmpdir(), "paseo-home-private-create-"));
     const staticDir = await mkdtemp(path.join(os.tmpdir(), "paseo-static-private-create-"));
     const port = await getAvailablePort();
@@ -183,33 +184,68 @@ describe("agent MCP end-to-end (offline)", () => {
       },
       pino({ level: "silent" }),
     );
-    await daemon.agentStorage.upsert({
-      id: "agent-mcp-private-create",
-      provider: "codex",
-      cwd: paseoHome,
-      createdAt: "2026-07-31T00:00:00.000Z",
-      updatedAt: "2026-07-31T00:00:00.000Z",
-      labels: {},
-      lastStatus: "closed",
-      config: null,
-      pendingCreateContinuation: {
-        phase: "awaiting_dispatch",
-        acknowledged: false,
-      },
-    });
     await daemon.start();
     const client = await createMcpClient(`http://127.0.0.1:${port}/mcp/agents`);
+    const websocketClient = new DaemonClient({ url: `ws://127.0.0.1:${port}/ws` });
+    await websocketClient.connect();
+
+    const originalSetContinuation = daemon.agentStorage.setPendingCreateContinuation.bind(
+      daemon.agentStorage,
+    );
+    let releaseContinuation!: () => void;
+    let enteredContinuation!: () => void;
+    const continuationEntered = new Promise<void>((resolve) => {
+      enteredContinuation = resolve;
+    });
+    const continuationRelease = new Promise<void>((resolve) => {
+      releaseContinuation = resolve;
+    });
+    daemon.agentStorage.setPendingCreateContinuation = async (...args) => {
+      enteredContinuation();
+      await continuationRelease;
+      await originalSetContinuation(...args);
+    };
+    let createPromise: ReturnType<DaemonClient["createAgent"]> | null = null;
 
     try {
-      const listed = await client.callTool({ name: "list_agents" });
-      expect(JSON.stringify(listed)).not.toContain("agent-mcp-private-create");
-
-      const fetched = await client.callTool({
-        name: "get_agent_status",
-        args: { agentId: "agent-mcp-private-create" },
+      createPromise = websocketClient.createAgent({
+        provider: "codex",
+        cwd: paseoHome,
+        requestId: "req-private-first-snapshot",
       });
-      expect(fetched.isError).toBe(true);
+      await withTimeout(continuationEntered, 5_000, "durable continuation interleaving");
+
+      const privateRecord = (await daemon.agentStorage.list()).find(
+        (record) => record.createRequestFingerprint !== undefined,
+      );
+      expect(privateRecord).toMatchObject({ createAcknowledged: false });
+      const privateAgentId = privateRecord?.id;
+      expect(privateAgentId).toBeTruthy();
+
+      const [fetchAgentsResult, listed] = await Promise.all([
+        websocketClient.fetchAgents({ requestId: "fetch-during-private-snapshot" }),
+        client.callTool({ name: "list_agents" }),
+      ]);
+      expect(JSON.stringify(fetchAgentsResult)).not.toContain(privateAgentId);
+      expect(JSON.stringify(listed)).not.toContain(privateAgentId);
+
+      const fetchedStatus = await client.callTool({
+        name: "get_agent_status",
+        args: { agentId: privateAgentId },
+      });
+      expect(fetchedStatus.isError).toBe(true);
+
+      releaseContinuation();
+      const created = await createPromise;
+      expect(created.id).toBe(privateAgentId);
+      await expect(daemon.agentStorage.get(created.id)).resolves.toMatchObject({
+        createAcknowledged: true,
+      });
+      await client.callTool({ name: "kill_agent", args: { agentId: created.id } });
     } finally {
+      releaseContinuation();
+      await createPromise?.catch(() => undefined);
+      await websocketClient.close();
       await client.close();
       await daemon.stop();
       await rm(paseoHome, { recursive: true, force: true });

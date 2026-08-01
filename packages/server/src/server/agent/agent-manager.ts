@@ -1271,7 +1271,10 @@ export class AgentManager {
     }
     this.previousStatuses.set(resolvedAgentId, pending.lifecycle);
     try {
-      await this.persistSnapshot(pending, { title: initialPersistedTitle });
+      await this.persistSnapshot(pending, {
+        title: initialPersistedTitle,
+        ...(options.deferPublication ? { createAcknowledged: false } : {}),
+      });
       this.assertPendingAgentRegistrationActive(pending);
       this.emitState(pending, { persist: false });
     } catch (error) {
@@ -3621,7 +3624,11 @@ export class AgentManager {
 
   private async persistSnapshot(
     agent: ManagedAgent,
-    options?: { title?: string | null; internal?: boolean },
+    options?: {
+      title?: string | null;
+      internal?: boolean;
+      createAcknowledged?: boolean;
+    },
   ): Promise<void> {
     if (!this.registry) {
       return;

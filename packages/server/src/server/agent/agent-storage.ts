@@ -90,6 +90,8 @@ const PENDING_CREATE_CONTINUATION_SCHEMA = z.object({
         kind: z.literal("created-worktree"),
         workspaceId: z.string(),
         worktreePath: z.string(),
+        worktreeIncarnationId: z.string().uuid().optional(),
+        cleanupOnly: z.boolean().optional(),
       }),
     ])
     .optional(),
@@ -101,6 +103,10 @@ const STORED_AGENT_SCHEMA = z.object({
   cwd: z.string(),
   workspaceId: z.string().optional(),
   createRequestFingerprint: z.string().optional(),
+  // A deferred create must be private from the first persisted snapshot. This
+  // field is written atomically with that snapshot, before the richer durable
+  // continuation can be attached. Missing means legacy/public.
+  createAcknowledged: z.boolean().optional(),
   createdAt: z.string(),
   updatedAt: z.string(),
   lastActivityAt: z.string().optional(),
@@ -154,7 +160,9 @@ export function parseStoredAgentRecord(value: unknown): StoredAgentRecord {
 
 /** Public transport/lifecycle views must not expose a create that was never acknowledged. */
 export function isStoredAgentPublic(record: StoredAgentRecord): boolean {
-  return record.pendingCreateContinuation?.acknowledged !== false;
+  return (
+    record.createAcknowledged !== false && record.pendingCreateContinuation?.acknowledged !== false
+  );
 }
 
 export class AgentStorage {
@@ -284,13 +292,19 @@ export class AgentStorage {
 
   async applySnapshot(
     agent: ManagedAgent,
-    options?: { title?: string | null; internal?: boolean },
+    options?: {
+      title?: string | null;
+      internal?: boolean;
+      createAcknowledged?: boolean;
+    },
   ): Promise<void> {
     await this.load();
     const hasTitleOverride =
       options !== undefined && Object.prototype.hasOwnProperty.call(options, "title");
     const hasInternalOverride =
       options !== undefined && Object.prototype.hasOwnProperty.call(options, "internal");
+    const hasCreateAcknowledgedOverride =
+      options !== undefined && Object.prototype.hasOwnProperty.call(options, "createAcknowledged");
     await this.queueRecordMutation(agent.id, (existing) => {
       const record = toStoredAgentRecord(agent, {
         title: hasTitleOverride ? (options?.title ?? null) : (existing?.title ?? null),
@@ -306,6 +320,11 @@ export class AgentStorage {
       }
       if (existing?.pendingCreateContinuation) {
         record.pendingCreateContinuation = existing.pendingCreateContinuation;
+      }
+      if (hasCreateAcknowledgedOverride) {
+        record.createAcknowledged = options?.createAcknowledged;
+      } else if (existing?.createAcknowledged !== undefined) {
+        record.createAcknowledged = existing.createAcknowledged;
       }
       return record;
     });
@@ -332,6 +351,7 @@ export class AgentStorage {
       }
       const next = {
         ...existing,
+        createAcknowledged: true,
         pendingCreateContinuation: {
           ...existing.pendingCreateContinuation,
           acknowledged: true,

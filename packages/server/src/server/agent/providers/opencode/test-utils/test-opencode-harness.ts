@@ -115,6 +115,7 @@ export class TestOpenCodeClient {
   sessionCommandEvents: unknown[] = [idleEvent()];
   sessionCommandResponse: OpenCodeResponse = {};
   sessionCreateResponse: OpenCodeResponse = { data: { id: "session-1" } };
+  sessionCreateImplementation: ((parameters: unknown) => Promise<OpenCodeResponse>) | null = null;
   sessionDeleteResponse: OpenCodeResponse = {};
   sessionChildrenResponses: OpenCodeResponse[] = [];
   sessionChildrenImplementation: ((parameters: unknown) => Promise<OpenCodeResponse>) | null = null;
@@ -235,7 +236,9 @@ export class TestOpenCodeClient {
         },
         create: async (parameters: unknown) => {
           this.calls.sessionCreate.push(parameters);
-          return this.sessionCreateResponse;
+          return this.sessionCreateImplementation
+            ? await this.sessionCreateImplementation(parameters)
+            : this.sessionCreateResponse;
         },
         delete: async (parameters: unknown) => {
           this.calls.sessionDelete.push(parameters);

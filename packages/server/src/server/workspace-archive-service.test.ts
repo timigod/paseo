@@ -13,11 +13,14 @@ import type { AgentStorage, StoredAgentRecord } from "./agent/agent-storage.js";
 import type { WorkspaceGitService } from "./workspace-git-service.js";
 import {
   archiveByScope,
+  cleanupArchivedWorkspaceDirectory,
   type ActiveWorkspaceRef,
   type ArchiveDependencies,
   type ArchiveResult,
   resolveWorkspaceIdAtPath,
 } from "./workspace-archive-service.js";
+import { defaultWorkspaceReferenceCoordinator } from "./workspace-reference-coordinator.js";
+import { ensurePaseoWorktreeIncarnationId } from "../utils/worktree-metadata.js";
 
 const cleanupPaths: string[] = [];
 
@@ -113,6 +116,67 @@ async function createPaseoOwnedWorktree(
     paseoHome,
   });
 }
+
+test("cleanup-only serializes a sibling creation attempt between reference reads", async () => {
+  const { tempDir, repoDir } = createGitRepo();
+  const paseoHome = path.join(tempDir, "paseo-home");
+  const worktree = await createPaseoOwnedWorktree(repoDir, paseoHome, "cleanup-race");
+  const worktreeIncarnationId = ensurePaseoWorktreeIncarnationId(worktree.worktreePath);
+  const activeWorkspaces: ActiveWorkspaceRef[] = [];
+  let listCount = 0;
+  let releaseFinalRead!: () => void;
+  let enteredFinalRead!: () => void;
+  const finalReadEntered = new Promise<void>((resolve) => {
+    enteredFinalRead = resolve;
+  });
+  const finalReadRelease = new Promise<void>((resolve) => {
+    releaseFinalRead = resolve;
+  });
+  const listActiveWorkspaces = async () => {
+    listCount += 1;
+    if (listCount === 2) {
+      enteredFinalRead();
+      await finalReadRelease;
+    }
+    return [...activeWorkspaces];
+  };
+
+  const cleanup = cleanupArchivedWorkspaceDirectory(
+    {
+      paseoHome,
+      github: createGitHubServiceStub(),
+      listActiveWorkspaces,
+      sessionLogger: createLogger(),
+    },
+    {
+      workspaceId: "ws-archived",
+      targetPath: worktree.worktreePath,
+      worktreeIncarnationId,
+      requestId: "cleanup-race-request",
+    },
+  );
+  await finalReadEntered;
+
+  let siblingCreationEntered = false;
+  const siblingCreation = defaultWorkspaceReferenceCoordinator.runExclusive(async () => {
+    siblingCreationEntered = true;
+    activeWorkspaces.push({
+      workspaceId: "ws-sibling",
+      cwd: worktree.worktreePath,
+      kind: "worktree",
+      worktreeRoot: worktree.worktreePath,
+      isPaseoOwnedWorktree: true,
+      mainRepoRoot: repoDir,
+    });
+  });
+  await Promise.resolve();
+  expect(siblingCreationEntered).toBe(false);
+
+  releaseFinalRead();
+  await expect(cleanup).resolves.toMatchObject({ completed: true, reason: "removed" });
+  await siblingCreation;
+  expect(siblingCreationEntered).toBe(true);
+});
 
 interface ArchiveDepsInput {
   paseoHome: string;

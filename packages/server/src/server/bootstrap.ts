@@ -1094,6 +1094,7 @@ export async function createPaseoDaemon(
     clearWorkspaceArchiving: clearWorkspaceArchivingExternal,
     killTerminalsForWorkspace: (workspaceId) =>
       killTerminalsForWorkspace({ terminalManager, sessionLogger: logger }, workspaceId),
+    workspaceRegistry,
     logger,
   });
   createAgentCommandDependencies.registerAutoArchive = (agentId, target) => {

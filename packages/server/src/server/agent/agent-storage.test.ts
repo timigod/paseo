@@ -5,7 +5,7 @@ import { mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { promises as fs } from "node:fs";
 
 import { createTestLogger } from "../../test-utils/test-logger.js";
-import { AgentStorage } from "./agent-storage.js";
+import { AgentStorage, isStoredAgentPublic } from "./agent-storage.js";
 import { buildConfigOverrides, buildSessionConfig } from "../persistence-hooks.js";
 import type { ManagedAgent } from "./agent-manager.js";
 import type {
@@ -412,6 +412,25 @@ describe("AgentStorage", () => {
     // Registry should return all agents - filtering is done at the manager level
     const records = await storage.list();
     expect(records).toHaveLength(2);
+  });
+
+  test("the initial deferred snapshot is private until acknowledgement commits", async () => {
+    const agent = createManagedAgent({ id: "deferred-create", cwd: "/tmp/project" });
+    await storage.applySnapshot(agent, { createAcknowledged: false });
+
+    const initial = await storage.get(agent.id);
+    expect(initial).toMatchObject({ createAcknowledged: false });
+    expect(isStoredAgentPublic(initial!)).toBe(false);
+
+    await storage.setPendingCreateContinuation(agent.id, {
+      phase: "awaiting_dispatch",
+      acknowledged: false,
+    });
+    await storage.acknowledgePendingCreateContinuation(agent.id);
+
+    const acknowledged = await storage.get(agent.id);
+    expect(acknowledged).toMatchObject({ createAcknowledged: true });
+    expect(isStoredAgentPublic(acknowledged!)).toBe(true);
   });
 
   test("get returns internal agents by ID", async () => {

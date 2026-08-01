@@ -74,6 +74,45 @@ test("auto-archive autonomously retries after an observable failure", async () =
   expect(agents.listenerCount()).toBe(0);
 });
 
+test("cleanup-only pending waits for a lifecycle rearm without a retry loop", async () => {
+  vi.useFakeTimers();
+  const agentId = "4a7e2521-286d-4ad5-af35-e091c55302e5";
+  const agents = new AgentLifecycleEvents();
+  let archiveCount = 0;
+  let rearm: (() => void) | null = null;
+  const registration = registerAgentAutoArchive({
+    agentManager: agents,
+    agentId,
+    archive: async () => {
+      archiveCount += 1;
+      if (archiveCount === 1) throw new Error("cleanup-only pending");
+    },
+    shouldRetry: () => false,
+    subscribeToRearm: (callback) => {
+      rearm = callback;
+      return () => {
+        rearm = null;
+      };
+    },
+    retryDelayMs: 1,
+  });
+
+  try {
+    agents.completeTurn(agentId);
+    await vi.waitFor(() => expect(archiveCount).toBe(1));
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(archiveCount).toBe(1);
+    expect(rearm).not.toBeNull();
+
+    rearm?.();
+    await vi.waitFor(() => expect(archiveCount).toBe(2));
+    expect(agents.listenerCount()).toBe(0);
+  } finally {
+    await registration.cancel();
+    vi.useRealTimers();
+  }
+});
+
 test("actual-target auto-archive rejects a swallowed workspace teardown failure", () => {
   expect(() =>
     requireExactWorkspaceArchive(

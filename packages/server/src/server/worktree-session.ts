@@ -47,6 +47,8 @@ import {
   createPaseoWorktreeCommand,
   listPaseoWorktreesCommand,
 } from "./worktree/commands.js";
+import { defaultWorkspaceReferenceCoordinator } from "./workspace-reference-coordinator.js";
+import { ensurePaseoWorktreeIncarnationId } from "../utils/worktree-metadata.js";
 
 const SAFE_GIT_REF_PATTERN = /^[A-Za-z0-9._/-]+$/;
 
@@ -142,6 +144,7 @@ export interface AgentWorktreeSetupContinuation {
   recovery: {
     workspaceId: string;
     worktree: WorktreeConfig;
+    worktreeIncarnationId?: string;
     workspaceCwd?: string;
     shouldBootstrap: boolean;
     progress?: {
@@ -155,6 +158,7 @@ export interface AgentWorktreeSetupContinuation {
 }
 
 export type CreatePaseoWorktreeWorkflowResult = CreatePaseoWorktreeResult & {
+  worktreeIncarnationId?: string;
   setupContinuation?: AgentWorktreeSetupContinuation;
 };
 
@@ -602,17 +606,33 @@ export async function createPaseoWorktreeWorkflow(
     setupContinuation?: CreatePaseoWorktreeSetupContinuationInput;
   },
 ): Promise<CreatePaseoWorktreeWorkflowResult> {
-  const createdWorktree = await dependencies.createPaseoWorktree(
-    {
-      ...input,
-      runSetup: false,
-      paseoHome: input.paseoHome ?? dependencies.paseoHome,
-      worktreesRoot: input.worktreesRoot ?? dependencies.worktreesRoot,
-    },
-    options?.resolveDefaultBranch
-      ? { resolveDefaultBranch: options.resolveDefaultBranch }
-      : undefined,
-  );
+  const { createdWorktree, worktreeIncarnationId } =
+    await defaultWorkspaceReferenceCoordinator.runExclusive(async () => {
+      const created = await dependencies.createPaseoWorktree(
+        {
+          ...input,
+          runSetup: false,
+          paseoHome: input.paseoHome ?? dependencies.paseoHome,
+          worktreesRoot: input.worktreesRoot ?? dependencies.worktreesRoot,
+        },
+        options?.resolveDefaultBranch
+          ? { resolveDefaultBranch: options.resolveDefaultBranch }
+          : undefined,
+      );
+      let incarnationId: string | undefined;
+      try {
+        incarnationId = ensurePaseoWorktreeIncarnationId(created.worktree.worktreePath);
+      } catch (error) {
+        dependencies.sessionLogger.warn(
+          { err: error, worktreePath: created.worktree.worktreePath },
+          "Could not persist worktree cleanup incarnation; cleanup will fail closed",
+        );
+      }
+      return {
+        createdWorktree: created,
+        ...(incarnationId ? { worktreeIncarnationId: incarnationId } : {}),
+      };
+    });
   const slug = basename(createdWorktree.worktree.worktreePath);
   const workspace = createdWorktree.workspace;
   const setupContinuation = options?.setupContinuation ?? { kind: "workspace" };
@@ -647,11 +667,13 @@ export async function createPaseoWorktreeWorkflow(
   if (setupContinuation.kind === "agent") {
     return {
       ...createdWorktree,
+      worktreeIncarnationId,
       setupContinuation: {
         kind: "agent",
         recovery: {
           workspaceId: workspace.workspaceId,
           worktree: createdWorktree.worktree,
+          worktreeIncarnationId,
           workspaceCwd: workspace.cwd,
           shouldBootstrap: createdWorktree.created,
           ...(createdWorktree.created
@@ -683,7 +705,7 @@ export async function createPaseoWorktreeWorkflow(
     };
   }
 
-  return createdWorktree;
+  return { ...createdWorktree, worktreeIncarnationId };
 }
 
 export async function handleWorkspaceSetupStatusRequest(
