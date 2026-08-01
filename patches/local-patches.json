@@ -9,10 +9,12 @@
         "commit": "6fc491e6220fba6543bbbe4bf1b1f58cfe59228b"
       },
       "tests": [
+        "packages/cli/src/commands/agent/inspect.test.ts",
         "packages/protocol/src/material-progress-schema.test.ts",
+        "packages/server/src/server/agent/agent-manager.test.ts",
+        "packages/server/src/server/agent/agent-storage.test.ts",
         "packages/server/src/server/agent/material-progress.test.ts",
-        "packages/server/src/server/material-progress.e2e.test.ts",
-        "packages/cli/src/commands/agent/inspect.test.ts"
+        "packages/server/src/server/material-progress.e2e.test.ts"
       ],
       "sources": [
         "packages/cli/src/commands/agent/inspect.ts",
@@ -26,8 +28,27 @@
       ],
       "docs": ["docs/data-model.md"],
       "testCases": [
-        "material progress analysis remains bounded and persisted",
-        "agent inspect returns singular persisted terminal-turn semantics"
+        "preserves the structured signal and renders its state and reason",
+        "accepts legacy snapshots without the optional signal",
+        "accepts a structured material progress signal",
+        "an unhydrated resumed agent exposes its persisted material progress",
+        "a resumed agent with an empty live timeline derives progress from its durable tail",
+        "material progress pages beyond the durable 1000-row tail to the current continuation",
+        "a delayed material progress write cannot overwrite a newer continuation",
+        "persists terminal outcomes and clears the previous outcome when a new turn starts",
+        "concurrent snapshots preserve a newly derived material progress signal",
+        "setTitle started before a newer snapshot cannot overwrite its material progress",
+        "setTitle still runs after an earlier queued write fails",
+        "reports none when history or a current continuation is unavailable",
+        "treats completed edits and writes as material progress",
+        "warns after one compaction and stalls after two",
+        "uses only the latest user continuation and completion sequence",
+        "does not count read-only tools or commentary as material progress",
+        "counts a completed turn's final message as a deliverable, not semantic success",
+        "fetch agent exposes a backward-compatible material progress signal",
+        "fetch agent preserves material progress after the live worker is collected",
+        "fetch agent preserves material progress after archive discards the live timeline",
+        "fetch agent restores material progress after daemon restart"
       ],
       "upstreamable": true,
       "upstreamCondition": "Submit independently when upstream still lacks singular material-progress inspection and persisted terminal-turn semantics on the latest stable base.",
@@ -49,14 +70,20 @@
       ],
       "docs": ["docs/timeline-sync.md"],
       "testCases": [
+        "force provider hydration replays concurrent live events after the replacement history",
+        "force provider hydration orders durable deletion behind earlier appends",
         "history replacement flushes a pre-buffered coalescer delta before taking the live suffix",
         "out-of-band timeline events wait behind a blocked history replacement",
-        "direct timeline append waits for history replacement in memory and durable storage",
         "startTurn failure is serialized after a blocked history replacement",
         "history timeout aborts while waiting for a pre-existing durable timeline tail",
         "history timeout aborts a blocked durable committed-row read",
         "history timeout rejects a queued replacement that has not started",
-        "a canceled late replacement restores before a newer quarantined live mutation"
+        "a canceled late replacement restores before a newer quarantined live mutation",
+        "direct timeline append waits for history replacement in memory and durable storage",
+        "successful history hydration orders buffered live events after recovered history",
+        "history hydration installs its live-event barrier before the first await",
+        "history hydration serializes overlapping normal and forced replacements",
+        "overlapping normal history hydrations replay provider history only once"
       ],
       "upstreamable": true,
       "upstreamCondition": "Submit independently while upstream provider-history replacement can race live, coalesced, direct, or out-of-band timeline persistence.",
@@ -71,19 +98,17 @@
         "tag": "v0.2.5",
         "commit": "6fc491e6220fba6543bbbe4bf1b1f58cfe59228b"
       },
-      "tests": [
-        "packages/server/src/server/agent/agent-manager.test.ts",
-        "packages/server/src/server/agent/agent-storage.test.ts"
-      ],
+      "tests": ["packages/server/src/server/agent/agent-manager.test.ts"],
       "sources": [
         "packages/server/src/server/agent/agent-manager.ts",
-        "packages/server/src/server/agent/agent-storage.ts"
+        "packages/server/src/server/agent/agent-timeline-store-types.ts"
       ],
       "docs": ["docs/timeline-sync.md"],
       "testCases": [
         "a failed partial history hydration preserves persisted material progress",
+        "failed history hydration preserves a quarantined live suffix across restart",
         "successful history retry merges and deduplicates the quarantined live suffix",
-        "failed history hydration preserves a quarantined live suffix across restart"
+        "close waits for failed history hydration before persisting trust state"
       ],
       "upstreamable": true,
       "upstreamCondition": "Submit independently while failed hydration can erase or overstate persisted material progress, trust, quarantine, or terminal-turn state.",
@@ -100,7 +125,6 @@
       },
       "tests": [
         "packages/server/src/server/agent/agent-manager.test.ts",
-        "packages/server/src/server/agent/agent-manager-stream-coalescing.test.ts",
         "packages/server/src/server/agent/providers/opencode-agent.test.ts"
       ],
       "sources": [
@@ -109,18 +133,18 @@
       ],
       "docs": ["docs/timeline-sync.md"],
       "testCases": [
-        "history retry preserves a distinct unkeyed repeated message at the exact boundary",
-        "history retry canonicalizes OpenCode text deltas and tool lifecycle rows",
-        "streamHistory fails when OpenCode messages are unavailable",
-        "closing cancels a hung provider history iterator without permitting a late overwrite",
         "hydration queued during reload does not commit stale session history",
         "archive waits for blocked history hydration before deriving material progress",
+        "history retry preserves a distinct unkeyed repeated message at the exact boundary",
+        "history retry canonicalizes OpenCode text deltas and tool lifecycle rows",
         "archiving releases a blocked history replacement and restores its late write",
+        "closing cancels a hung provider history iterator without permitting a late overwrite",
         "closing releases a blocked durable history replacement and rolls back its late write",
         "history timeout releases a blocked durable replacement and rejects its late write",
         "history hydration timeout drains buffered live events and preserves the prior timeline",
         "provider history event cap fails closed without replacing the live timeline",
-        "provider history byte cap fails closed without replacing the live timeline"
+        "provider history byte cap fails closed without replacing the live timeline",
+        "streamHistory fails when OpenCode messages are unavailable: $name"
       ],
       "upstreamable": true,
       "upstreamCondition": "Submit independently while provider replay/live shapes require explicit identity reconciliation and unavailable history can be mistaken for a successful empty replay.",
