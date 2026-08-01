@@ -3,6 +3,7 @@ import type pino from "pino";
 import type { TerminalManager } from "../../terminal/terminal-manager.js";
 
 import type { ForgeService } from "../../services/forge-service.js";
+import { createRealpathAwarePathMatcher } from "../../utils/path.js";
 import { isPaseoOwnedWorktreeCwd } from "../../utils/worktree.js";
 import {
   archiveByScope,
@@ -270,9 +271,16 @@ export class CreateAgentLifecycleDispatch {
     agentId: string | null,
     worktreePath: string,
   ): Promise<void> {
-    const workspaceIsActive = (await this.dependencies.listActiveWorkspaces()).some(
+    const activeWorkspaces = await this.dependencies.listActiveWorkspaces();
+    const workspaceIsActive = activeWorkspaces.some(
       (workspace) => workspace.workspaceId === workspaceId,
     );
+    if (
+      !workspaceIsActive &&
+      (await this.activeWorkspaceReferencesWorktree(activeWorkspaces, worktreePath))
+    ) {
+      throw new Error(`Auto-created worktree remains referenced by an active sibling workspace`);
+    }
     const result = await archiveByScope(
       {
         paseoHome: this.dependencies.paseoHome,
@@ -298,6 +306,24 @@ export class CreateAgentLifecycleDispatch {
       },
     );
     requireExactWorkspaceArchive(result, workspaceId, agentId, workspaceIsActive);
+  }
+
+  private async activeWorkspaceReferencesWorktree(
+    activeWorkspaces: ActiveWorkspaceRef[],
+    worktreePath: string,
+  ): Promise<boolean> {
+    const matchesTarget = createRealpathAwarePathMatcher(worktreePath);
+    for (const workspace of activeWorkspaces) {
+      const candidatePath = workspace.worktreeRoot ?? workspace.cwd;
+      const ownership = await isPaseoOwnedWorktreeCwd(candidatePath, {
+        paseoHome: this.dependencies.paseoHome,
+        worktreesRoot: this.dependencies.worktreesRoot,
+      });
+      const backingPath =
+        ownership.allowed && ownership.worktreePath ? ownership.worktreePath : candidatePath;
+      if (matchesTarget(backingPath)) return true;
+    }
+    return false;
   }
 
   private async archiveAutoCreatedWorktree(options: {

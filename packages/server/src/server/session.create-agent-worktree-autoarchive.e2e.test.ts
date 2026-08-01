@@ -97,6 +97,7 @@ async function expectWorktreeListEmpty(repoDir: string): Promise<void> {
 async function createAgentInBranchOffWorktree(options?: {
   autoArchive?: boolean;
   branchName?: string;
+  deferInitialPrompt?: boolean;
   repoDir?: string;
 }): Promise<{ repoDir: string; agentId: string; worktreePath: string }> {
   const repoDir = options?.repoDir ?? createGitRepo();
@@ -112,7 +113,7 @@ async function createAgentInBranchOffWorktree(options?: {
       base: "main",
     },
     ...(options?.autoArchive !== undefined ? { autoArchive: options.autoArchive } : {}),
-    initialPrompt: "Say done.",
+    ...(options?.deferInitialPrompt ? {} : { initialPrompt: "Say done." }),
   });
   return { repoDir, agentId: created.id, worktreePath: created.cwd };
 }
@@ -335,7 +336,10 @@ test("archiving a created worktree removes the directory on last reference", asy
 });
 
 test("auto-archiving a created worktree keeps the directory when a sibling workspace references it", async () => {
-  const created = await createAgentInBranchOffWorktree({ autoArchive: true });
+  const created = await createAgentInBranchOffWorktree({
+    autoArchive: true,
+    deferInitialPrompt: true,
+  });
 
   // Create a sibling workspace that shares the same backing directory.
   const sibling = await ctx.client.createWorkspace({
@@ -346,10 +350,13 @@ test("auto-archiving a created worktree keeps the directory when a sibling works
     throw new Error(sibling.error ?? "Failed to create sibling workspace");
   }
 
+  await ctx.client.sendMessage(created.agentId, "Say done.");
   await ctx.client.waitForFinish(created.agentId, 10000);
 
   await expectAgentAbsentFromActiveList(created.agentId);
   await expectWorktreePresentInList(created.repoDir, created.worktreePath);
+  const activeWorkspaces = await ctx.client.fetchWorkspaces();
+  expect(activeWorkspaces.entries.map((workspace) => workspace.id)).toContain(sibling.workspace.id);
   expect(existsSync(created.worktreePath)).toBe(true);
 
   await ctx.client.archivePaseoWorktree({ worktreePath: created.worktreePath });
