@@ -26,7 +26,7 @@ export type AgentLoaderManager = Pick<
   | "hydrateTimelineFromProvider"
   | "resumeAgentFromPersistence"
 > &
-  Partial<Pick<AgentManager, "waitForAgentClose">>;
+  Partial<Pick<AgentManager, "getAgentInternal" | "waitForAgentClose">>;
 
 export interface EnsureAgentLoadedDeps {
   agentManager: AgentLoaderManager;
@@ -34,6 +34,7 @@ export interface EnsureAgentLoadedDeps {
   validProviders?: Iterable<AgentProvider>;
   broadcastTimeline?: boolean;
   logger: Logger;
+  signal?: AbortSignal;
 }
 
 export async function ensureUnarchivedAgentLoaded(
@@ -63,7 +64,9 @@ export async function ensureAgentLoaded(
   agentId: string,
   deps: EnsureAgentLoadedDeps,
 ): Promise<ManagedAgent> {
+  deps.signal?.throwIfAborted();
   await deps.agentManager.waitForAgentClose?.(agentId);
+  deps.signal?.throwIfAborted();
 
   const inflight = pendingAgentInitializations.get(agentId);
   if (inflight) {
@@ -71,7 +74,8 @@ export async function ensureAgentLoaded(
     return inflight.promise;
   }
 
-  const existing = deps.agentManager.getAgent(agentId);
+  const existing =
+    deps.agentManager.getAgentInternal?.(agentId) ?? deps.agentManager.getAgent(agentId);
   if (existing) {
     return existing;
   }
@@ -80,6 +84,7 @@ export async function ensureAgentLoaded(
   // work. Once the live lookup is empty, this second barrier closes that gap
   // before storage-backed resume begins.
   await deps.agentManager.waitForAgentClose?.(agentId);
+  deps.signal?.throwIfAborted();
 
   const laterInflight = pendingAgentInitializations.get(agentId);
   if (laterInflight) {
@@ -91,7 +96,9 @@ export async function ensureAgentLoaded(
     broadcastTimeline: deps.broadcastTimeline === true,
   };
   const initPromise = (async () => {
+    deps.signal?.throwIfAborted();
     const record = await deps.agentStorage.get(agentId);
+    deps.signal?.throwIfAborted();
     if (!record) {
       throw new Error(`Agent not found: ${agentId}`);
     }
@@ -110,7 +117,7 @@ export async function ensureAgentLoaded(
         buildConfigOverrides(record),
         agentId,
         extractTimestamps(record),
-        record.archivedAt ? { purpose: "history" } : undefined,
+        record.archivedAt ? { purpose: "history", signal: deps.signal } : { signal: deps.signal },
       );
       deps.logger.info({ agentId, provider: record.provider }, "Agent resumed from persistence");
     } else {
@@ -125,14 +132,22 @@ export async function ensureAgentLoaded(
         workspaceId: record.workspaceId,
         owner: record.owner,
         createRequestFingerprint: record.createRequestFingerprint,
+        lastTurnOutcome: record.lastTurnOutcome,
+        signal: deps.signal,
+        preserveOnStartupFailure: true,
       });
       deps.logger.info({ agentId, provider: record.provider }, "Agent created from stored config");
     }
 
     await deps.agentManager.hydrateTimelineFromProvider(agentId, {
       broadcast: () => pendingOptions.broadcastTimeline,
+      signal: deps.signal,
     });
-    return deps.agentManager.getAgent(agentId) ?? snapshot;
+    return (
+      deps.agentManager.getAgentInternal?.(agentId) ??
+      deps.agentManager.getAgent(agentId) ??
+      snapshot
+    );
   })();
 
   const pending: PendingAgentInitialization = { promise: initPromise, options: pendingOptions };

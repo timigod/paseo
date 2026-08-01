@@ -4973,9 +4973,11 @@ describe("agent config setters", () => {
   function liveAgentManager(overrides: { [K in keyof SessionOptions["agentManager"]]?: unknown }): {
     [K in keyof SessionOptions["agentManager"]]?: unknown;
   } {
+    const getAgent = vi.fn(() => ({ id: "agent-1" }));
     return {
       waitForAgentClose: vi.fn().mockResolvedValue(undefined),
-      getAgent: vi.fn(() => ({ id: "agent-1" })),
+      getAgent,
+      getAgentInternal: getAgent,
       ...overrides,
     };
   }

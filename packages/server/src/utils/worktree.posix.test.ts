@@ -1,6 +1,6 @@
 // POSIX-only: git worktree and teardown shell fixtures
 /* eslint-disable max-nested-callbacks */
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import {
   BranchAlreadyCheckedOutError,
   createWorktree as createWorktreePrimitive,
@@ -825,6 +825,27 @@ describe.skipIf(isPlatform("win32"))("worktree POSIX-only", () => {
       expect(progressEvents.some((event) => event.type === "command_started")).toBe(true);
       expect(progressEvents.some((event) => event.type === "output")).toBe(true);
       expect(progressEvents.some((event) => event.type === "command_completed")).toBe(true);
+    });
+
+    it("cancels a running setup command and terminates its owned process tree", async () => {
+      const pidPath = join(repoDir, "setup-command.pid");
+      const script = `require("node:fs").writeFileSync(${JSON.stringify(pidPath)}, String(process.pid)); setInterval(() => {}, 1000);`;
+      const command = `${JSON.stringify(process.execPath)} -e ${JSON.stringify(script)}`;
+      const abort = new AbortController();
+      const setup = runWorktreeSetupCommands({
+        worktreePath: repoDir,
+        branchName: "main",
+        cleanupOnFailure: false,
+        commands: [command],
+        onEvent: () => undefined,
+        signal: abort.signal,
+      });
+      await vi.waitFor(() => expect(existsSync(pidPath)).toBe(true));
+      const pid = Number(readFileSync(pidPath, "utf8"));
+
+      abort.abort(new Error("daemon shutdown"));
+      await expect(setup).rejects.toThrow();
+      await vi.waitFor(() => expect(() => process.kill(pid, 0)).toThrow());
     });
 
     it("reuses persisted worktree runtime port across resolutions", async () => {

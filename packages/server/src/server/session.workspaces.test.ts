@@ -1257,7 +1257,8 @@ test("concurrent create requests acknowledge each session before forwarding the 
     const ownerRequest = owner.session.handleMessage(request);
     await createStarted;
     const followerRequest = follower.session.handleMessage(request);
-    expect(owner.agentManager.listAgents()).toMatchObject([
+    expect(owner.agentManager.listAgents()).toEqual([]);
+    expect(owner.agentManager.listAgentsInternal()).toMatchObject([
       { lifecycle: "initializing", session: null },
     ]);
 
@@ -9141,7 +9142,8 @@ test("a follower Session buffers owner events until its replayed agent_created a
     const ownerCreating = ownerSession.handleMessage(request);
     const followerCreating = followerSession.handleMessage({ ...request });
     await vi.waitFor(() => {
-      expect(ownerHarness.agentManager.listAgents()[0]?.lifecycle).toBe("idle");
+      expect(ownerHarness.agentManager.listAgents()).toEqual([]);
+      expect(ownerHarness.agentManager.listAgentsInternal()[0]?.lifecycle).toBe("idle");
     });
     await waitForImmediate();
 
@@ -9158,7 +9160,6 @@ test("a follower Session buffers owner events until its replayed agent_created a
       expect(ownerOrder).toEqual(
         expect.arrayContaining([
           "agent_created",
-          "stream:thread_started",
           "stream:turn_started",
           "stream:permission_requested",
           "permission_request",
@@ -9168,7 +9169,6 @@ test("a follower Session buffers owner events until its replayed agent_created a
       expect(followerOrder).toEqual(
         expect.arrayContaining([
           "agent_created",
-          "stream:thread_started",
           "stream:turn_started",
           "stream:permission_requested",
           "permission_request",
@@ -9180,7 +9180,6 @@ test("a follower Session buffers owner events until its replayed agent_created a
     for (const order of [ownerOrder, followerOrder]) {
       expect(order[0]).toBe("agent_created");
       for (const output of [
-        "stream:thread_started",
         "stream:turn_started",
         "stream:permission_requested",
         "permission_request",
@@ -9188,6 +9187,7 @@ test("a follower Session buffers owner events until its replayed agent_created a
       ]) {
         expect(order.indexOf(output)).toBeGreaterThan(0);
       }
+      expect(order).not.toContain("stream:thread_started");
       expect(order.findIndex((output) => output.startsWith("agent_update:"))).toBeGreaterThan(0);
     }
     expect(ownerSession.agentOutboundVisibilityGates.size).toBe(0);

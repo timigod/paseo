@@ -966,6 +966,7 @@ export class Session {
       worktreesRoot: this.worktreesRoot,
       agentManager: this.agentManager,
       agentStorage: this.agentStorage,
+      terminalManager: this.terminalManager,
       github: this.github,
       workspaceGitService: this.workspaceGitService,
       createPaseoWorktreeWorkflow: (input, workflowOptions) =>
@@ -3388,17 +3389,8 @@ export class Session {
         env,
         provisionalTitle,
         firstAgentContext,
-        ...(autoArchive
-          ? {
-              autoArchiveTarget: createdWorktree
-                ? {
-                    kind: "created-worktree" as const,
-                    workspaceId: createdWorktree.workspace.workspaceId,
-                    worktreePath: createdWorktree.worktree.worktreePath,
-                  }
-                : { kind: "agent-only" as const },
-            }
-          : {}),
+        autoArchive,
+        ...(createdWorktree ? { setupContinuation: createdWorktree.setupContinuation } : {}),
         buildSessionConfig: (sessionConfig, gitOptions, legacyWorktreeName, ctx) =>
           this.buildAgentSessionConfig(sessionConfig, gitOptions, legacyWorktreeName, ctx),
       });
@@ -3417,15 +3409,6 @@ export class Session {
             { err: error, agentId: snapshot.id, provider: snapshot.provider },
             "Agent startup failed after its creation acknowledgement",
           );
-          void recoverPendingCreateAgentCommandById(
-            this.createAgentCommandDependencies(),
-            snapshot.id,
-          ).catch((recoveryError) => {
-            this.sessionLogger.error(
-              { err: recoveryError, agentId: snapshot.id },
-              "Online create-agent continuation recovery failed",
-            );
-          });
           return undefined;
         },
       );

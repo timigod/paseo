@@ -1965,6 +1965,81 @@ describe("OpenCode adapter startTurn error handling", () => {
     expect(settled).toBe(true);
   });
 
+  test("startTurn awaits slash-command acceptance before reporting success", async () => {
+    const runtime = new TestOpenCodeHarness();
+    const openCode = new TestOpenCodeClient();
+    openCode.commandListResponse = {
+      data: [{ name: "ship", description: "Ship", source: "command", hints: [] }],
+    };
+    openCode.sessionCommandEvents = [];
+    let accept!: () => void;
+    openCode.sessionCommandImplementation = async () =>
+      await new Promise((resolve) => {
+        accept = () => resolve({ data: {} });
+      });
+    runtime.enqueueClient(openCode);
+    const client = new OpenCodeAgentClient(createTestLogger(), undefined, {
+      serverManager: runtime,
+      createClient: runtime.createClient,
+    });
+    const session = await client.createSession({ provider: "opencode", cwd: "/tmp/test" });
+
+    let settled = false;
+    const start = session.startTurn("/ship now").then(() => (settled = true));
+    await vi.waitFor(() => expect(openCode.calls.sessionCommand).toHaveLength(1));
+    expect(settled).toBe(false);
+    accept();
+    await start;
+    expect(settled).toBe(true);
+    await session.close();
+  });
+
+  test("slash-command definite rejection fails its turn and is safe to retry", async () => {
+    const runtime = new TestOpenCodeHarness();
+    const openCode = new TestOpenCodeClient();
+    openCode.commandListResponse = {
+      data: [{ name: "ship", description: "Ship", source: "command", hints: [] }],
+    };
+    openCode.sessionCommandEvents = [];
+    openCode.sessionCommandResponse = { error: { message: "Forbidden" } };
+    runtime.enqueueClient(openCode);
+    const client = new OpenCodeAgentClient(createTestLogger(), undefined, {
+      serverManager: runtime,
+      createClient: runtime.createClient,
+    });
+    const session = await client.createSession({ provider: "opencode", cwd: "/tmp/test" });
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+
+    await expect(session.startTurn("/ship now")).rejects.toThrow("PASEO_TURN_ACCEPTANCE_REJECTED");
+    expect(events.some((event) => event.type === "turn_failed")).toBe(true);
+    await session.close();
+  });
+
+  test("slash-command header timeout stays ambiguous without a false failed receipt", async () => {
+    const runtime = new TestOpenCodeHarness();
+    const openCode = new TestOpenCodeClient();
+    openCode.commandListResponse = {
+      data: [{ name: "ship", description: "Ship", source: "command", hints: [] }],
+    };
+    openCode.sessionCommandEvents = [];
+    openCode.sessionCommandError = Object.assign(new Error("Headers Timeout Error"), {
+      code: "UND_ERR_HEADERS_TIMEOUT",
+    });
+    runtime.enqueueClient(openCode);
+    const client = new OpenCodeAgentClient(createTestLogger(), undefined, {
+      serverManager: runtime,
+      createClient: runtime.createClient,
+    });
+    const session = await client.createSession({ provider: "opencode", cwd: "/tmp/test" });
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+
+    await expect(session.startTurn("/ship now")).rejects.toThrow("PASEO_TURN_ACCEPTANCE_AMBIGUOUS");
+    expect(events.some((event) => event.type === "turn_failed")).toBe(false);
+    await session.close();
+  });
+
   test("waits for the stop abort and provider idle before starting the next prompt", async () => {
     const { parent: session, openCode } = await createParentSession("ses_unit_test");
     const retryStarted = createTestDeferred<void>();

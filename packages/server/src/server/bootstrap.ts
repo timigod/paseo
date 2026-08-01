@@ -1078,6 +1078,7 @@ export async function createPaseoDaemon(
     worktreesRoot: config.worktreesRoot,
     agentManager,
     agentStorage,
+    terminalManager,
     github,
     workspaceGitService,
     createPaseoWorktreeWorkflow: createPaseoWorktreeForTools,
@@ -1664,7 +1665,7 @@ export async function createPaseoDaemon(
 }
 
 async function closeAllAgents(logger: Logger, agentManager: AgentManager): Promise<void> {
-  const agents = agentManager.listAgents();
+  const agents = agentManager.listAgentsInternal();
   await Promise.all(
     agents.map(async (agent) => {
       try {

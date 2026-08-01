@@ -32,6 +32,7 @@ import {
 } from "./worktree-metadata.js";
 import { runGitCommand } from "./run-git-command.js";
 import { spawnProcess } from "./spawn.js";
+import { terminateWithTreeKill } from "./tree-kill.js";
 import { resolvePaseoHome } from "../server/paseo-home.js";
 import { createExternalProcessEnv } from "../server/paseo-env.js";
 import { parseGitRevParsePath, resolveGitRevParsePath } from "./git-rev-parse-path.js";
@@ -413,7 +414,7 @@ export function processCarriageReturns(text: string): string {
 
 async function execSetupCommand(
   command: string,
-  options: { cwd: string; env: NodeJS.ProcessEnv },
+  options: { cwd: string; env: NodeJS.ProcessEnv; signal?: AbortSignal },
 ): Promise<WorktreeSetupCommandResult> {
   const startedAt = Date.now();
   const shellInvocation = buildStringCommandShellInvocation({ command });
@@ -421,6 +422,7 @@ async function execSetupCommand(
     const { stdout, stderr } = await execFileAsync(shellInvocation.shell, shellInvocation.args, {
       cwd: options.cwd,
       env: options.env,
+      signal: options.signal,
     });
     return {
       command,
@@ -450,12 +452,14 @@ async function execSetupCommandStreamed(options: {
   index: number;
   total: number;
   onEvent?: (event: WorktreeSetupCommandProgressEvent) => void;
+  signal?: AbortSignal;
 }): Promise<WorktreeSetupCommandResult> {
-  return new Promise((resolvePromise) => {
+  return new Promise((resolvePromise, rejectPromise) => {
     const startedAt = Date.now();
     const stdoutChunks: string[] = [];
     const stderrChunks: string[] = [];
     let settled = false;
+    let abort = () => undefined;
 
     const emitOutput = (stream: "stdout" | "stderr", chunk: string) => {
       const text = stripAnsi(chunk);
@@ -483,6 +487,7 @@ async function execSetupCommandStreamed(options: {
         return;
       }
       settled = true;
+      options.signal?.removeEventListener("abort", abort);
       const result: WorktreeSetupCommandResult = {
         command: options.command,
         cwd: options.cwd,
@@ -520,6 +525,21 @@ async function execSetupCommandStreamed(options: {
       shell: false,
       stdio: ["ignore", "pipe", "pipe"],
     });
+    abort = () => {
+      void terminateWithTreeKill(child, {
+        gracefulTimeoutMs: 1_000,
+        forceTimeoutMs: 1_000,
+      }).finally(() => {
+        if (settled) return;
+        settled = true;
+        rejectPromise(options.signal?.reason ?? new DOMException("Aborted", "AbortError"));
+      });
+    };
+    if (options.signal?.aborted) {
+      abort();
+    } else {
+      options.signal?.addEventListener("abort", abort, { once: true });
+    }
 
     child.stdout?.on("data", (chunk: Buffer | string) => {
       emitOutput("stdout", chunk.toString());
@@ -535,6 +555,7 @@ async function execSetupCommandStreamed(options: {
     });
 
     child.on("close", (code) => {
+      options.signal?.removeEventListener("abort", abort);
       finish(typeof code === "number" ? code : null);
     });
   });
@@ -626,7 +647,9 @@ export async function runWorktreeSetupCommands(options: {
   startCommandIndex?: number;
   beforeCommand?: (index: number, command: string) => Promise<void>;
   afterCommand?: (index: number, command: string) => Promise<void>;
+  signal?: AbortSignal;
 }): Promise<WorktreeSetupCommandResult[]> {
+  options.signal?.throwIfAborted();
   // Read paseo.json from the worktree (it will have the same content as the source repo)
   const setupCommands = options.commands ?? getWorktreeSetupCommands(options.worktreePath);
   if (setupCommands.length === 0) {
@@ -645,6 +668,7 @@ export async function runWorktreeSetupCommands(options: {
   const results: WorktreeSetupCommandResult[] = [];
   const startCommandIndex = options.startCommandIndex ?? 0;
   for (let index = startCommandIndex; index < setupCommands.length; index += 1) {
+    options.signal?.throwIfAborted();
     const cmd = setupCommands[index];
     await options.beforeCommand?.(index, cmd);
     const result = options.onEvent
@@ -655,10 +679,12 @@ export async function runWorktreeSetupCommands(options: {
           index: index + 1,
           total: setupCommands.length,
           onEvent: options.onEvent,
+          signal: options.signal,
         })
       : await execSetupCommand(cmd, {
           cwd: options.worktreePath,
           env: setupEnv,
+          signal: options.signal,
         });
     results.push(result);
 

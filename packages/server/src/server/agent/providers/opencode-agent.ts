@@ -31,6 +31,7 @@ import {
   type AgentPermissionResponse,
   type AgentPersistenceHandle,
   type AgentPromptInput,
+  type AgentResumeSessionOptions,
   type AgentRunOptions,
   type AgentRunResult,
   type AgentRuntimeInfo,
@@ -40,6 +41,7 @@ import {
   type AgentStreamEvent,
   type AgentTimelineItem,
   type AgentUsage,
+  AgentTurnAcceptanceError,
   type FetchCatalogOptions,
   type ImportableProviderSession,
   type ImportProviderSessionContext,
@@ -64,6 +66,25 @@ import {
   type ProviderRuntimeSettings,
 } from "../provider-launch-config.js";
 import { withTimeout } from "../../../utils/promise-timeout.js";
+
+async function awaitWithAbort<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return await promise;
+  signal.throwIfAborted();
+  return await new Promise<T>((resolve, reject) => {
+    const abort = () => reject(signal.reason ?? new DOMException("Aborted", "AbortError"));
+    signal.addEventListener("abort", abort, { once: true });
+    void promise.then(
+      (value) => {
+        signal.removeEventListener("abort", abort);
+        return resolve(value);
+      },
+      (error) => {
+        signal.removeEventListener("abort", abort);
+        return reject(error);
+      },
+    );
+  });
+}
 import { execCommand } from "../../../utils/spawn.js";
 import { mapOpencodeToolCall } from "./opencode/tool-call-mapper.js";
 import {
@@ -1289,21 +1310,42 @@ export class OpenCodeAgentClient implements AgentClient {
     options?: AgentCreateSessionOptions,
   ): Promise<AgentSession> {
     const openCodeConfig = this.assertConfig(config);
-    const acquisition = launchContext?.env
-      ? await this.serverManager.acquireDedicated(launchContext.env)
-      : await this.serverManager.acquireCurrent();
+    const acquisitionPromise = launchContext?.env
+      ? this.serverManager.acquireDedicated(launchContext.env)
+      : this.serverManager.acquireCurrent();
+    let acquisition: Awaited<typeof acquisitionPromise>;
+    try {
+      acquisition = await awaitWithAbort(acquisitionPromise, options?.signal);
+    } catch (error) {
+      if (options?.signal?.aborted) {
+        void acquisitionPromise.then(
+          (late) => late.release(),
+          () => undefined,
+        );
+      }
+      throw error;
+    }
     const { url } = acquisition.server;
     const client = this.createOpenCodeClient({
       baseUrl: url,
       directory: openCodeConfig.cwd,
     });
+    let createResponsePromise: Promise<{
+      data?: { id: string };
+      error?: unknown;
+    }> | null = null;
+    let createdSessionId: string | null = null;
 
     try {
-      const response = await withTimeout(
-        client.session.create({ directory: openCodeConfig.cwd }),
+      createResponsePromise = withTimeout(
+        client.session.create({ directory: openCodeConfig.cwd }) as Promise<{
+          data?: { id: string };
+          error?: unknown;
+        }>,
         10_000,
         "OpenCode session.create timed out after 10s",
       );
+      const response = await awaitWithAbort(createResponsePromise, options?.signal);
 
       if (response.error) {
         throw new Error(`Failed to create OpenCode session: ${JSON.stringify(response.error)}`);
@@ -1313,8 +1355,12 @@ export class OpenCodeAgentClient implements AgentClient {
       if (!session) {
         throw new Error("OpenCode session creation returned no data");
       }
+      createdSessionId = session.id;
 
-      await this.populateModelContextWindowCache(client, openCodeConfig.cwd);
+      await awaitWithAbort(
+        this.populateModelContextWindowCache(client, openCodeConfig.cwd),
+        options?.signal,
+      );
 
       return new OpenCodeAgentSession(
         openCodeConfig,
@@ -1328,6 +1374,23 @@ export class OpenCodeAgentClient implements AgentClient {
         url,
       );
     } catch (error) {
+      if (createdSessionId) {
+        await client.session
+          .delete({ sessionID: createdSessionId, directory: openCodeConfig.cwd })
+          .catch(() => undefined);
+      } else if (options?.signal?.aborted && createResponsePromise) {
+        void createResponsePromise.then(
+          async (lateResponse) => {
+            if (lateResponse.data?.id) {
+              await client.session
+                .delete({ sessionID: lateResponse.data.id, directory: openCodeConfig.cwd })
+                .catch(() => undefined);
+            }
+            return undefined;
+          },
+          () => undefined,
+        );
+      }
       await acquisition.release();
       throw error;
     }
@@ -1337,6 +1400,7 @@ export class OpenCodeAgentClient implements AgentClient {
     handle: AgentPersistenceHandle,
     overrides?: Partial<AgentSessionConfig>,
     launchContext?: AgentLaunchContext,
+    options?: AgentResumeSessionOptions,
   ): Promise<AgentSession> {
     const metadata = (handle.metadata ?? {}) as Partial<AgentSessionConfig>;
     const cwd = overrides?.cwd ?? metadata.cwd;
@@ -1355,11 +1419,26 @@ export class OpenCodeAgentClient implements AgentClient {
     const registeredAcquisition = registeredServerUrl
       ? this.serverManager.acquireExisting(registeredServerUrl)
       : null;
-    const acquisition =
-      registeredAcquisition ??
-      (launchContext?.env
-        ? await this.serverManager.acquireDedicated(launchContext.env)
-        : await this.serverManager.acquireCurrent());
+    let acquisitionPromise;
+    if (registeredAcquisition) {
+      acquisitionPromise = Promise.resolve(registeredAcquisition);
+    } else if (launchContext?.env) {
+      acquisitionPromise = this.serverManager.acquireDedicated(launchContext.env);
+    } else {
+      acquisitionPromise = this.serverManager.acquireCurrent();
+    }
+    let acquisition: Awaited<typeof acquisitionPromise>;
+    try {
+      acquisition = await awaitWithAbort(acquisitionPromise, options?.signal);
+    } catch (error) {
+      if (options?.signal?.aborted) {
+        void acquisitionPromise.then(
+          (late) => late.release(),
+          () => undefined,
+        );
+      }
+      throw error;
+    }
     const { url } = acquisition.server;
     const client = this.createOpenCodeClient({
       baseUrl: url,
@@ -1367,7 +1446,10 @@ export class OpenCodeAgentClient implements AgentClient {
     });
 
     try {
-      await this.populateModelContextWindowCache(client, openCodeConfig.cwd);
+      await awaitWithAbort(
+        this.populateModelContextWindowCache(client, openCodeConfig.cwd),
+        options?.signal,
+      );
 
       return new OpenCodeAgentSession(
         openCodeConfig,
@@ -3247,92 +3329,13 @@ class OpenCodeAgentSession implements AgentSession {
 
     const slashCommand = await this.resolveSlashCommandInvocation(prompt);
     if (slashCommand) {
-      if (slashCommand.commandName === "compact" || slashCommand.commandName === "summarize") {
-        this.suppressAssistantMessagesUntilIdle.active = true;
-        void this.client.session
-          .summarize({
-            sessionID: this.sessionId,
-            directory: this.config.cwd,
-            ...(model ? { providerID: model.providerID, modelID: model.modelID } : {}),
-          })
-          .then((response) => {
-            if (response.error) {
-              this.suppressAssistantMessagesUntilIdle.active = false;
-              this.finishForegroundTurn(
-                {
-                  type: "turn_failed",
-                  provider: "opencode",
-                  error: toDiagnosticErrorMessage(response.error),
-                },
-                turnId,
-              );
-            }
-            return;
-          })
-          .catch((error) => {
-            this.suppressAssistantMessagesUntilIdle.active = false;
-            this.finishForegroundTurn(
-              {
-                type: "turn_failed",
-                provider: "opencode",
-                error: toDiagnosticErrorMessage(error),
-              },
-              turnId,
-            );
-          });
-        return { turnId };
-      }
-
-      // command() is only dispatch acknowledgement. OpenCode session events are
-      // the source of truth for when the command turn becomes idle or fails.
-      void this.client.session
-        .command({
-          sessionID: this.sessionId,
-          directory: this.config.cwd,
-          command: slashCommand.commandName,
-          arguments: slashCommand.args ?? "",
-          ...(this.config.model ? { model: this.config.model } : {}),
-          ...(effectiveMode ? { agent: effectiveMode } : {}),
-          ...(effectiveVariant ? { variant: effectiveVariant } : {}),
-        })
-        .then((response) => {
-          if (response.error) {
-            if (isOpenCodeHeadersTimeoutFailure(response.error)) {
-              this.logger.warn(
-                {
-                  err: response.error,
-                  commandName: slashCommand.commandName,
-                  turnId,
-                },
-                "OpenCode slash command hit a header timeout; waiting for SSE terminal event",
-              );
-              return;
-            }
-            const errorMsg = toDiagnosticErrorMessage(response.error);
-            this.finishForegroundTurn(
-              { type: "turn_failed", provider: "opencode", error: errorMsg },
-              turnId,
-            );
-          }
-          return;
-        })
-        .catch((err) => {
-          if (isOpenCodeHeadersTimeoutFailure(err)) {
-            this.logger.warn(
-              {
-                err,
-                commandName: slashCommand.commandName,
-                turnId,
-              },
-              "OpenCode slash command hit a header timeout; waiting for SSE terminal event",
-            );
-            return;
-          }
-          this.finishForegroundTurn(
-            { type: "turn_failed", provider: "opencode", error: toDiagnosticErrorMessage(err) },
-            turnId,
-          );
-        });
+      await this.dispatchSlashCommandForTurn({
+        turnId,
+        slashCommand,
+        model,
+        effectiveMode,
+        effectiveVariant,
+      });
     } else {
       await this.dispatchPromptForTurn({
         turnId,
@@ -3345,6 +3348,80 @@ class OpenCodeAgentSession implements AgentSession {
     }
 
     return { turnId };
+  }
+
+  private async dispatchSlashCommandForTurn(input: {
+    turnId: string;
+    slashCommand: { commandName: string; args?: string };
+    model: { providerID: string; modelID: string } | undefined;
+    effectiveMode: string | undefined;
+    effectiveVariant: string | undefined;
+  }): Promise<void> {
+    if (
+      input.slashCommand.commandName === "compact" ||
+      input.slashCommand.commandName === "summarize"
+    ) {
+      await this.dispatchSummarizeCommandForTurn(input.turnId, input.model);
+      return;
+    }
+
+    // command() is only dispatch acknowledgement. OpenCode session events are
+    // the source of truth for when the command turn becomes idle or fails.
+    try {
+      const response = await this.client.session.command({
+        sessionID: this.sessionId,
+        directory: this.config.cwd,
+        command: input.slashCommand.commandName,
+        arguments: input.slashCommand.args ?? "",
+        ...(this.config.model ? { model: this.config.model } : {}),
+        ...(input.effectiveMode ? { agent: input.effectiveMode } : {}),
+        ...(input.effectiveVariant ? { variant: input.effectiveVariant } : {}),
+      });
+      if (response.error) throw response.error;
+    } catch (error) {
+      if (isOpenCodeHeadersTimeoutFailure(error)) {
+        this.logger.warn(
+          {
+            err: error,
+            commandName: input.slashCommand.commandName,
+            turnId: input.turnId,
+          },
+          "OpenCode slash command hit a header timeout; waiting for SSE terminal event",
+        );
+        throw new AgentTurnAcceptanceError("ambiguous", toDiagnosticErrorMessage(error));
+      }
+      const message = toDiagnosticErrorMessage(error);
+      this.finishForegroundTurn(
+        { type: "turn_failed", provider: "opencode", error: message },
+        input.turnId,
+      );
+      throw new AgentTurnAcceptanceError("rejected", message);
+    }
+  }
+
+  private async dispatchSummarizeCommandForTurn(
+    turnId: string,
+    model: { providerID: string; modelID: string } | undefined,
+  ): Promise<void> {
+    this.suppressAssistantMessagesUntilIdle.active = true;
+    try {
+      const response = await this.client.session.summarize({
+        sessionID: this.sessionId,
+        directory: this.config.cwd,
+        ...(model ? { providerID: model.providerID, modelID: model.modelID } : {}),
+      });
+      if (response.error) throw response.error;
+    } catch (error) {
+      this.suppressAssistantMessagesUntilIdle.active = false;
+      const acceptance = isOpenCodeHeadersTimeoutFailure(error) ? "ambiguous" : "rejected";
+      if (acceptance === "rejected") {
+        this.finishForegroundTurn(
+          { type: "turn_failed", provider: "opencode", error: toDiagnosticErrorMessage(error) },
+          turnId,
+        );
+      }
+      throw new AgentTurnAcceptanceError(acceptance, toDiagnosticErrorMessage(error));
+    }
   }
 
   private async dispatchPromptForTurn(input: {
