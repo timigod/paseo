@@ -61,6 +61,7 @@ export interface RunAsyncWorktreeBootstrapOptions {
   beforeTerminalBootstrap?: () => Promise<void>;
   afterTerminalBootstrap?: () => Promise<void>;
   throwOnFailure?: boolean;
+  signal?: AbortSignal;
 }
 
 const MAX_WORKTREE_SETUP_COMMAND_OUTPUT_BYTES = 64 * 1024;
@@ -511,6 +512,38 @@ function terminalHasOutput(state: ReturnType<TerminalSession["getState"]>): bool
   return false;
 }
 
+async function awaitBootstrapStep<T>(
+  promise: Promise<T>,
+  signal?: AbortSignal,
+  onLateValue?: (value: T) => void,
+): Promise<T> {
+  if (!signal) return await promise;
+  signal.throwIfAborted();
+  return await new Promise<T>((resolve, reject) => {
+    let aborted = false;
+    const abort = () => {
+      aborted = true;
+      reject(signal.reason ?? new DOMException("Aborted", "AbortError"));
+    };
+    signal.addEventListener("abort", abort, { once: true });
+    void promise.then(
+      (value) => {
+        signal.removeEventListener("abort", abort);
+        if (aborted) {
+          onLateValue?.(value);
+          return undefined;
+        }
+        return resolve(value);
+      },
+      (error) => {
+        signal.removeEventListener("abort", abort);
+        if (!aborted) return reject(error);
+        return undefined;
+      },
+    );
+  });
+}
+
 async function runWorktreeTerminalBootstrap(
   options: RunAsyncWorktreeBootstrapOptions,
   runtimeEnv: WorktreeRuntimeEnv,
@@ -551,14 +584,20 @@ async function runWorktreeTerminalBootstrap(
   const terminalManager = options.terminalManager;
   const results = await Promise.all(
     terminalSpecs.map(async (spec): Promise<WorktreeBootstrapTerminalResult> => {
+      let terminal: TerminalSession | null = null;
       try {
-        const terminal = await terminalManager.createTerminal({
-          cwd: workspaceCwd,
-          name: spec.name,
-          env: runtimeEnv,
-          workspaceId: options.workspaceId,
-        });
-        await waitForTerminalBootstrapReadiness(terminal);
+        terminal = await awaitBootstrapStep(
+          terminalManager.createTerminal({
+            cwd: workspaceCwd,
+            name: spec.name,
+            env: runtimeEnv,
+            workspaceId: options.workspaceId,
+          }),
+          options.signal,
+          (lateTerminal) => terminalManager.killTerminal(lateTerminal.id),
+        );
+        await awaitBootstrapStep(waitForTerminalBootstrapReadiness(terminal), options.signal);
+        options.signal?.throwIfAborted();
         terminal.send({
           type: "input",
           data: `${spec.command}\r`,
@@ -571,6 +610,10 @@ async function runWorktreeTerminalBootstrap(
           error: null,
         };
       } catch (error) {
+        if (options.signal?.aborted) {
+          if (terminal) terminalManager.killTerminal(terminal.id);
+          throw error;
+        }
         const message = error instanceof Error ? error.message : String(error);
         options.logger?.warn(
           { agentId: options.agentId, command: spec.command, err: error },
@@ -601,6 +644,7 @@ async function runWorktreeTerminalBootstrap(
 export async function runAsyncWorktreeBootstrap(
   options: RunAsyncWorktreeBootstrapOptions,
 ): Promise<void> {
+  options.signal?.throwIfAborted();
   if (options.shouldBootstrap === false) {
     return;
   }
@@ -667,6 +711,7 @@ export async function runAsyncWorktreeBootstrap(
         applyWorktreeSetupProgressEvent(progressAccumulator, event);
         queueLiveRunningEmit();
       },
+      signal: options.signal,
     });
     await liveEmitQueue;
 
@@ -706,7 +751,9 @@ export async function runAsyncWorktreeBootstrap(
   }
 
   await options.beforeTerminalBootstrap?.();
+  options.signal?.throwIfAborted();
   await runWorktreeTerminalBootstrap(options, runtimeEnv);
+  options.signal?.throwIfAborted();
   await options.afterTerminalBootstrap?.();
 }
 

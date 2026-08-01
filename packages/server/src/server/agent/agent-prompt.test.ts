@@ -69,7 +69,7 @@ function createFinishNotificationScenario(
   Reflect.set(callerAgent, "config", { title: "Caller Agent" });
 
   const agentManager: AgentManager = Object.create(AgentManager.prototype);
-  Reflect.set(agentManager, "getAgent", (agentId: string) => {
+  const getAgent = (agentId: string) => {
     if (agentId === "child-agent") {
       return childAgent;
     }
@@ -77,7 +77,9 @@ function createFinishNotificationScenario(
       return callerAgent;
     }
     return null;
-  });
+  };
+  Reflect.set(agentManager, "getAgent", getAgent);
+  Reflect.set(agentManager, "getAgentInternal", getAgent);
   Reflect.set(agentManager, "subscribe", (callback: (event: AgentManagerEvent) => void) => {
     subscriber = callback;
     return () => {
@@ -163,11 +165,9 @@ test("sendPromptToAgent forwards the client message id as run options", async ()
 
   const streamAgentSpy = vi.fn(() => (async function* noop() {})());
   const agentManager: AgentManager = Object.create(AgentManager.prototype);
-  Reflect.set(
-    agentManager,
-    "getAgent",
-    vi.fn(() => agent),
-  );
+  const getAgent = vi.fn(() => agent);
+  Reflect.set(agentManager, "getAgent", getAgent);
+  Reflect.set(agentManager, "getAgentInternal", getAgent);
   Reflect.set(agentManager, "waitForAgentClose", vi.fn().mockResolvedValue(undefined));
   Reflect.set(agentManager, "tryRunOutOfBand", vi.fn().mockResolvedValue(false));
   Reflect.set(agentManager, "hasInFlightRun", vi.fn().mockReturnValue(false));

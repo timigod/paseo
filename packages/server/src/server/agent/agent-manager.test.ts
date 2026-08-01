@@ -38,6 +38,7 @@ import type {
   ImportProviderSessionContext,
   ResolveAgentDefaultModeInput,
 } from "./agent-sdk-types.js";
+import { AgentTurnAcceptanceError } from "./agent-sdk-types.js";
 import type { PaseoToolCatalog } from "./tools/types.js";
 import type { ProviderDefinition } from "./provider-registry.js";
 
@@ -1749,7 +1750,10 @@ test("createAgent passes persistSession to provider create options", async () =>
     { persistSession: false, workspaceId: undefined },
   );
 
-  expect(client.lastCreateOptions).toEqual({ persistSession: false });
+  expect(client.lastCreateOptions).toEqual({
+    persistSession: false,
+    signal: expect.any(AbortSignal),
+  });
 
   rmSync(workdir, { recursive: true, force: true });
 });
@@ -5990,6 +5994,50 @@ test("streamAgent clears pending run when startTurn fails before a turn id exist
       canceled: false,
     }),
   );
+});
+
+test("ambiguous turn acceptance is surfaced without a false turn_failed event", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-ambiguous-acceptance-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const turnId = "turn-ambiguous-acceptance";
+  class AmbiguousAcceptanceSession extends TestAgentSession {
+    override async startTurn(): Promise<{ turnId: string }> {
+      this.pushEvent({ type: "turn_started", provider: "codex", turnId });
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      throw new AgentTurnAcceptanceError("ambiguous", "Headers Timeout Error");
+    }
+  }
+  class AmbiguousAcceptanceClient extends TestAgentClient {
+    readonly session = new AmbiguousAcceptanceSession({ provider: "codex", cwd: workdir });
+    override async createSession(): Promise<AgentSession> {
+      return this.session;
+    }
+  }
+  const client = new AmbiguousAcceptanceClient();
+  const manager = new AgentManager({ clients: { codex: client }, registry: storage, logger });
+  const agent = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+    workspaceId: "ws-ambiguous-acceptance",
+  });
+  const streamEvents: AgentStreamEvent[] = [];
+  manager.subscribe((event) => {
+    if (event.type === "agent_stream") streamEvents.push(event.event);
+  });
+
+  const iterator = manager.streamAgent(agent.id, "/ship");
+  const drain = (async () => {
+    for await (const _event of iterator) {
+      // event collection happens through the manager subscription
+    }
+  })();
+  await expect(manager.waitForAgentRunStart(agent.id)).rejects.toThrow(
+    "PASEO_TURN_ACCEPTANCE_AMBIGUOUS",
+  );
+  await expect(drain).rejects.toThrow("PASEO_TURN_ACCEPTANCE_AMBIGUOUS");
+  expect(streamEvents.some((event) => event.type === "turn_failed")).toBe(false);
+
+  client.session.pushEvent({ type: "turn_completed", provider: "codex", turnId });
+  await manager.flush();
+  expect(manager.getAgent(agent.id)?.lifecycle).toBe("idle");
 });
 
 test("archiveAgent persists archivedAt and updatedAt before emitting closed state", async () => {

@@ -600,12 +600,16 @@ export interface AgentCreateSessionOptions {
    * Defaults to true. Providers that cannot honor false should no-op.
    */
   persistSession?: boolean;
+  /** Cooperative daemon shutdown for provider startup. */
+  signal?: AbortSignal;
 }
 
 /** Runtime-only intent for a persisted-session resume. Never persist this option. */
 export interface AgentResumeSessionOptions {
   /** Defaults to interactive. History loading may be read-only for archived native sessions. */
   purpose?: "interactive" | "history";
+  /** Cooperative daemon shutdown for provider resume. */
+  signal?: AbortSignal;
 }
 
 /**
@@ -658,6 +662,26 @@ export interface AgentSession {
   tryHandleOutOfBand?(prompt: AgentPromptInput): {
     run(ctx: { emit: (event: AgentStreamEvent) => void }): Promise<void>;
   } | null;
+}
+
+export type AgentTurnAcceptance = "rejected" | "ambiguous";
+
+export class AgentTurnAcceptanceError extends Error {
+  readonly acceptance: AgentTurnAcceptance;
+
+  constructor(acceptance: AgentTurnAcceptance, message: string) {
+    super(`PASEO_TURN_ACCEPTANCE_${acceptance.toUpperCase()}: ${message}`);
+    this.name = "AgentTurnAcceptanceError";
+    this.acceptance = acceptance;
+  }
+}
+
+export function getAgentTurnAcceptance(error: unknown): AgentTurnAcceptance | null {
+  if (error instanceof AgentTurnAcceptanceError) return error.acceptance;
+  const message = error instanceof Error ? error.message : String(error);
+  if (message.includes("PASEO_TURN_ACCEPTANCE_AMBIGUOUS:")) return "ambiguous";
+  if (message.includes("PASEO_TURN_ACCEPTANCE_REJECTED:")) return "rejected";
+  return null;
 }
 
 export type FetchCatalogOptions =

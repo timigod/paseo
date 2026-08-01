@@ -1,4 +1,4 @@
-import { expect, test } from "vitest";
+import { expect, test, vi } from "vitest";
 
 import type { AgentManagerEvent, AgentSubscriber } from "./agent-manager.js";
 import { registerAgentAutoArchive } from "./create-agent-lifecycle-dispatch.js";
@@ -43,5 +43,30 @@ test("auto-archive self-releases once and later cancellation waits harmlessly", 
   agents.completeTurn(agentId);
 
   expect(archiveCount).toBe(1);
+  expect(agents.listenerCount()).toBe(0);
+});
+
+test("auto-archive remains subscribed and retries after an observable failure", async () => {
+  const agentId = "4a7e2521-286d-4ad5-af35-e091c55302e4";
+  const agents = new AgentLifecycleEvents();
+  const onError = vi.fn();
+  let archiveCount = 0;
+  const registration = registerAgentAutoArchive({
+    agentManager: agents,
+    agentId,
+    archive: async () => {
+      archiveCount += 1;
+      if (archiveCount === 1) throw new Error("archive transport failed");
+    },
+    onError,
+  });
+
+  agents.completeTurn(agentId);
+  await vi.waitFor(() => expect(onError).toHaveBeenCalledOnce());
+  expect(agents.listenerCount()).toBe(1);
+  agents.completeTurn(agentId);
+  await registration.cancel();
+
+  expect(archiveCount).toBe(2);
   expect(agents.listenerCount()).toBe(0);
 });

@@ -284,6 +284,72 @@ test("acknowledged creation recovers its first turn and setup continuation after
   }
 });
 
+test("pending-create recovery aborts a provider resume blocked during shutdown", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "create-agent-provider-abort-test-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const originalManager = createRealAgentManager(storage);
+  const agent = await originalManager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+    workspaceId: "ws-provider-abort",
+  });
+  await originalManager.closeAgent(agent.id);
+  await storage.setPendingCreateContinuation(agent.id, {
+    phase: "awaiting_dispatch",
+    prompt: { input: "resume after restart" },
+  });
+
+  const baseClient = createTestAgentClients().codex;
+  if (!baseClient) throw new Error("Expected Codex test client");
+  let observedSignal: AbortSignal | undefined;
+  const blockedClient = new Proxy(baseClient, {
+    get(target, property, receiver) {
+      if (property === "resumeSession") {
+        return async (...args: Parameters<NonNullable<AgentClient["resumeSession"]>>) => {
+          observedSignal = args[3]?.signal;
+          await new Promise((_resolve, reject) => {
+            const signal = observedSignal;
+            if (!signal) return;
+            const abort = () => reject(signal.reason ?? new Error("aborted"));
+            if (signal.aborted) abort();
+            else signal.addEventListener("abort", abort, { once: true });
+          });
+          throw new Error("unreachable");
+        };
+      }
+      const value = Reflect.get(target, property, receiver);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  }) as AgentClient;
+  const restartedManager = new AgentManager({
+    clients: { codex: blockedClient },
+    registry: storage,
+    logger,
+  });
+  const abort = new AbortController();
+
+  try {
+    const recovery = recoverPendingCreateAgentCommandById(
+      {
+        agentManager: restartedManager,
+        agentStorage: storage,
+        logger,
+        providerSnapshotManager: createProviderSnapshotManagerStub().manager,
+      },
+      agent.id,
+      { signal: abort.signal },
+    );
+    await vi.waitFor(() => expect(observedSignal).toBeDefined());
+    abort.abort(new Error("daemon shutdown"));
+    await expect(recovery).rejects.toThrow("daemon shutdown");
+    expect(observedSignal?.aborted).toBe(true);
+    expect(restartedManager.listAgentsInternal()).toEqual([]);
+  } finally {
+    restartedManager.prepareForShutdown();
+    await restartedManager.flushForShutdown();
+    await storage.flush();
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
 test("provider failure settled before publish cannot be acknowledged", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "create-agent-pre-ack-failure-test-"));
   const storage = new AgentStorage(join(workdir, "agents"), logger);
@@ -306,6 +372,8 @@ test("provider failure settled before publish cannot be acknowledged", async () 
     },
   }) as AgentClient;
   const manager = new AgentManager({ clients: { codex: client }, registry: storage, logger });
+  const observedPublicEvents: string[] = [];
+  const unsubscribe = manager.subscribe((event) => observedPublicEvents.push(event.type));
 
   try {
     const creation = await beginCreateAgentCommand(
@@ -340,7 +408,9 @@ test("provider failure settled before publish cannot be acknowledged", async () 
     expect(publish).not.toHaveBeenCalled();
     await creation.abortBeforeAcknowledgement(startupError);
     await expect(storage.get(creation.snapshot.id)).resolves.toBeNull();
+    expect(observedPublicEvents).toEqual([]);
   } finally {
+    unsubscribe();
     manager.prepareForShutdown();
     await manager.flushForShutdown();
     await storage.flush();
@@ -515,6 +585,19 @@ test("recovery does not dispatch an already-observed first turn twice", async ()
                   return await sessionTarget.startTurn(prompt, options);
                 };
               }
+              if (sessionProperty === "streamHistory") {
+                return async function* () {
+                  yield {
+                    type: "timeline" as const,
+                    provider: "codex" as const,
+                    item: {
+                      type: "user_message" as const,
+                      text: "Already accepted first turn",
+                      clientMessageId: "msg-already-accepted",
+                    },
+                  };
+                };
+              }
               const value = Reflect.get(sessionTarget, sessionProperty, sessionReceiver);
               return typeof value === "function" ? value.bind(sessionTarget) : value;
             },
@@ -531,14 +614,10 @@ test("recovery does not dispatch an already-observed first turn twice", async ()
     const agent = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
       workspaceId: "ws-dispatch-dedupe",
     });
-    await manager.appendTimelineItem(agent.id, {
-      type: "user_message",
-      text: "Already accepted first turn",
-      clientMessageId: "msg-already-accepted",
-    });
     await storage.setPendingCreateContinuation(agent.id, {
       phase: "awaiting_dispatch",
       prompt: {
+        status: "ambiguous",
         input: "Already accepted first turn",
         runOptions: { clientMessageId: "msg-already-accepted" },
       },
@@ -592,6 +671,13 @@ test("a passive subscriber cannot observe a create before its durable acknowledg
 
     await Promise.resolve();
     expect(observedAgentIds).not.toContain(creation.snapshot.id);
+    expect(manager.listAgents()).toEqual([]);
+    expect(manager.getAgent(creation.snapshot.id)).toBeNull();
+    expect(() => manager.getTimeline(creation.snapshot.id)).toThrow("Unknown agent");
+    expect(() => manager.fetchTimeline(creation.snapshot.id)).toThrow("Unknown agent");
+    expect(manager.getAgentInternal(creation.snapshot.id)).toMatchObject({
+      id: creation.snapshot.id,
+    });
     const replayedAgentIds: string[] = [];
     const unsubscribeReplay = manager.subscribe((event) => {
       if (event.type === "agent_state") replayedAgentIds.push(event.agent.id);
@@ -749,6 +835,67 @@ test("auto-archive intent is persisted before acknowledgement and restored with 
   } finally {
     manager.prepareForShutdown();
     await Promise.all(manager.listAgents().map((agent) => manager.closeAgent(agent.id)));
+    await manager.flushForShutdown();
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("modern explicit worktree setup and auto-archive use the durable continuation", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "create-agent-modern-worktree-test-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const manager = createRealAgentManager(storage);
+  const runWorktreeBootstrap = vi.fn(async () => undefined);
+  const registerAutoArchive = vi.fn();
+  const workspaceId = "ws-modern-worktree";
+  const setupContinuation = (
+    await fakeWorktreeCreator({ repoRoot: workdir, createdWorkspaceId: workspaceId })()
+  ).setupContinuation;
+
+  try {
+    const creation = await beginCreateAgentCommand(
+      {
+        agentManager: manager,
+        agentStorage: storage,
+        logger,
+        terminalManager: null,
+        providerSnapshotManager: createProviderSnapshotManagerStub().manager,
+        runWorktreeBootstrap,
+        registerAutoArchive,
+      },
+      {
+        kind: "session",
+        config: { provider: "codex", cwd: workdir },
+        workspaceId,
+        labels: {},
+        provisionalTitle: null,
+        firstAgentContext: { attachments: [] },
+        autoArchive: true,
+        setupContinuation,
+        buildSessionConfig: async (config) => ({ sessionConfig: config }),
+      },
+    );
+    await creation.prepareForAcknowledgement();
+    await expect(storage.get(creation.snapshot.id)).resolves.toMatchObject({
+      pendingCreateContinuation: {
+        setup: { workspaceId },
+        autoArchive: {
+          kind: "created-worktree",
+          workspaceId,
+          worktreePath: setupContinuation.recovery.worktree.worktreePath,
+        },
+      },
+    });
+    creation.acknowledge(() => undefined);
+    await creation.completion;
+    expect(runWorktreeBootstrap).toHaveBeenCalledOnce();
+    expect(registerAutoArchive).toHaveBeenCalledWith(creation.snapshot.id, {
+      kind: "created-worktree",
+      workspaceId,
+      worktreePath: setupContinuation.recovery.worktree.worktreePath,
+    });
+  } finally {
+    manager.prepareForShutdown();
+    await Promise.all(manager.listAgentsInternal().map((agent) => manager.closeAgent(agent.id)));
     await manager.flushForShutdown();
     rmSync(workdir, { recursive: true, force: true });
   }

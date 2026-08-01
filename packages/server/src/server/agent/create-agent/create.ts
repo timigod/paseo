@@ -13,7 +13,12 @@ import type {
 } from "../../worktree-session.js";
 import type { AgentAttachment, FirstAgentContext, GitSetupOptions } from "../../messages.js";
 import type { AgentManager, CreateAgentOptions, ManagedAgent } from "../agent-manager.js";
-import type { AgentPromptInput, AgentRunOptions, AgentSessionConfig } from "../agent-sdk-types.js";
+import {
+  getAgentTurnAcceptance,
+  type AgentPromptInput,
+  type AgentRunOptions,
+  type AgentSessionConfig,
+} from "../agent-sdk-types.js";
 import {
   type AgentStorage,
   type PendingCreateContinuation,
@@ -82,6 +87,8 @@ export interface CreateAgentFromSessionInput {
   provisionalTitle: string | null;
   firstAgentContext: FirstAgentContext;
   autoArchiveTarget?: NonNullable<PendingCreateContinuation["autoArchive"]>;
+  autoArchive?: boolean;
+  setupContinuation?: AgentWorktreeSetupContinuation;
   buildSessionConfig: (
     config: AgentSessionConfig,
     gitOptions?: GitSetupOptions,
@@ -204,7 +211,9 @@ export async function createAgentCommand(
     input.kind === "session" ? input.agentId : undefined,
     resolved.createOptions,
   );
-  return await completeCreateAgentCommand(dependencies, input, resolved, snapshot);
+  return await completeCreateAgentCommand(dependencies, input, resolved, snapshot, {
+    signal: dependencies.agentManager.getLifecycleSignal?.(),
+  });
 }
 
 export async function beginCreateAgentCommand(
@@ -238,16 +247,21 @@ export async function beginCreateAgentCommand(
     }
     return true;
   };
+  const completion = ownPendingCreateContinuation(
+    dependencies.agentManager,
+    snapshot.id,
+    async () => {
+      const [, liveSnapshot] = await Promise.all([acknowledgement, creation.completion]);
+      return await completeCreateAgentCommand(dependencies, input, resolved, liveSnapshot, {
+        persistedContinuation: pendingContinuation !== null,
+        signal: dependencies.agentManager.getLifecycleSignal?.(),
+      });
+    },
+  );
 
   return {
     snapshot,
-    completion: Promise.all([acknowledgement, creation.completion]).then(
-      async ([, liveSnapshot]) => {
-        return await completeCreateAgentCommand(dependencies, input, resolved, liveSnapshot, {
-          persistedContinuation: pendingContinuation !== null,
-        });
-      },
-    ),
+    completion,
     prepareForAcknowledgement: async () => {
       if (pendingContinuation) {
         await dependencies.agentStorage.setPendingCreateContinuation(
@@ -283,15 +297,16 @@ async function completeCreateAgentCommand(
   input: CreateAgentCommandInput,
   resolved: ResolvedCreateAgent,
   snapshot: ManagedAgent,
-  options?: { persistedContinuation?: boolean },
+  options?: { persistedContinuation?: boolean; signal?: AbortSignal },
 ): Promise<CreateAgentCommandResult> {
   const persistedContinuation = options?.persistedContinuation ?? false;
-  registerCreateAutoArchive(dependencies, input, snapshot.id);
+  registerCreateAutoArchive(dependencies, input, resolved, snapshot.id);
   const setupCompletion = startCreateSetupCompletion({
     dependencies,
     resolved,
     agentId: snapshot.id,
     persistedContinuation,
+    signal: options?.signal,
   });
   void setupCompletion?.catch(() => undefined);
 
@@ -307,6 +322,7 @@ async function completeCreateAgentCommand(
       resolved,
       snapshot,
       persistedContinuation,
+      signal: options?.signal,
     });
     initialPromptStarted = sendResult.started;
     liveSnapshot = sendResult.liveSnapshot;
@@ -337,10 +353,11 @@ async function completeCreateAgentCommand(
 function registerCreateAutoArchive(
   dependencies: CreateAgentCommandDependencies,
   input: CreateAgentCommandInput,
+  resolved: ResolvedCreateAgent,
   agentId: string,
 ): void {
-  if (input.kind === "session" && input.autoArchiveTarget) {
-    dependencies.registerAutoArchive?.(agentId, input.autoArchiveTarget);
+  if (input.kind === "session" && resolved.autoArchiveTarget) {
+    dependencies.registerAutoArchive?.(agentId, resolved.autoArchiveTarget);
   }
 }
 
@@ -349,12 +366,15 @@ function startCreateSetupCompletion(input: {
   resolved: ResolvedCreateAgent;
   agentId: string;
   persistedContinuation: boolean;
+  signal?: AbortSignal;
 }): Promise<void> | null {
   const continuation = input.resolved.setupContinuation;
   if (!continuation) return null;
   const task = input.persistedContinuation
-    ? runPendingCreateSetup(input.dependencies, input.agentId, continuation.recovery)
-    : Promise.resolve(continuation.startAfterAgentCreate({ agentId: input.agentId }));
+    ? runPendingCreateSetup(input.dependencies, input.agentId, continuation.recovery, input.signal)
+    : Promise.resolve(
+        continuation.startAfterAgentCreate({ agentId: input.agentId, signal: input.signal }),
+      );
   return task.then(async () => {
     if (input.persistedContinuation) {
       await input.dependencies.agentStorage.completePendingCreateContinuationStep(
@@ -414,6 +434,7 @@ async function dispatchCreatedAgentPrompt(input: {
   resolved: ResolvedCreateAgent;
   snapshot: ManagedAgent;
   persistedContinuation: boolean;
+  signal?: AbortSignal;
 }): Promise<Awaited<ReturnType<typeof sendInitialPrompt>>> {
   if (input.persistedContinuation) {
     await input.dependencies.agentStorage.updatePendingCreateContinuation(
@@ -424,7 +445,31 @@ async function dispatchCreatedAgentPrompt(input: {
       }),
     );
   }
-  return await sendInitialPrompt(input.dependencies, input.resolved, input.snapshot);
+  try {
+    return await sendInitialPrompt(
+      input.dependencies,
+      input.resolved,
+      input.snapshot,
+      input.signal,
+    );
+  } catch (error) {
+    if (input.persistedContinuation) {
+      const acceptance = getAgentTurnAcceptance(error);
+      await input.dependencies.agentStorage.updatePendingCreateContinuation(
+        input.snapshot.id,
+        (pending) => ({
+          ...pending,
+          prompt: pending.prompt
+            ? {
+                ...pending.prompt,
+                status: acceptance === "rejected" ? "pending" : "ambiguous",
+              }
+            : undefined,
+        }),
+      );
+    }
+    throw error;
+  }
 }
 
 function buildPendingCreateContinuation(
@@ -469,7 +514,7 @@ export async function recoverPendingCreateAgentCommands(
     pendingRecords.map(async (record) => {
       if (options?.signal?.aborted) return;
       try {
-        await recoverPendingCreateAgentCommand(dependencies, record, options?.signal);
+        await recoverPendingCreateAgentCommandById(dependencies, record.id, options);
       } catch (error) {
         dependencies.logger.error(
           { err: error, agentId: record.id },
@@ -480,32 +525,41 @@ export async function recoverPendingCreateAgentCommands(
   );
 }
 
-const pendingCreateRecoveries = new WeakMap<AgentStorage, Map<string, Promise<void>>>();
+const pendingCreateContinuations = new WeakMap<AgentManager, Map<string, Promise<unknown>>>();
+
+function ownPendingCreateContinuation<T>(
+  manager: AgentManager,
+  agentId: string,
+  start: () => Promise<T>,
+): Promise<T> {
+  let continuations = pendingCreateContinuations.get(manager);
+  if (!continuations) {
+    continuations = new Map();
+    pendingCreateContinuations.set(manager, continuations);
+  }
+  const existing = continuations.get(agentId);
+  if (existing) return existing as Promise<T>;
+  const task = start();
+  continuations.set(agentId, task);
+  void task
+    .finally(() => {
+      if (continuations?.get(agentId) === task) continuations.delete(agentId);
+    })
+    .catch(() => undefined);
+  return task;
+}
 
 export async function recoverPendingCreateAgentCommandById(
   dependencies: CreateAgentCommandDependencies,
   agentId: string,
   options?: { signal?: AbortSignal },
 ): Promise<void> {
-  let recoveries = pendingCreateRecoveries.get(dependencies.agentStorage);
-  if (!recoveries) {
-    recoveries = new Map();
-    pendingCreateRecoveries.set(dependencies.agentStorage, recoveries);
-  }
-  const existing = recoveries.get(agentId);
-  if (existing) return await existing;
-  const task = (async () => {
+  await ownPendingCreateContinuation(dependencies.agentManager, agentId, async () => {
     if (options?.signal?.aborted) return;
     const record = await dependencies.agentStorage.get(agentId);
     if (!record?.pendingCreateContinuation || record.archivedAt) return;
     await recoverPendingCreateAgentCommand(dependencies, record, options?.signal);
-  })();
-  recoveries.set(agentId, task);
-  try {
-    await task;
-  } finally {
-    if (recoveries.get(agentId) === task) recoveries.delete(agentId);
-  }
+  });
 }
 
 async function recoverPendingCreateAgentCommand(
@@ -522,49 +576,75 @@ async function recoverPendingCreateAgentCommand(
     agentManager: dependencies.agentManager,
     agentStorage: dependencies.agentStorage,
     logger: dependencies.logger,
+    signal,
   });
   if (signal?.aborted) return;
   if (pending.autoArchive) {
     dependencies.registerAutoArchive?.(record.id, pending.autoArchive);
   }
   const setupCompletion = pending.setup
-    ? runPendingCreateSetup(dependencies, record.id, pending.setup).then(() =>
+    ? runPendingCreateSetup(dependencies, record.id, pending.setup, signal).then(() =>
         dependencies.agentStorage.completePendingCreateContinuationStep(record.id, "setup"),
       )
     : null;
   void setupCompletion?.catch(() => undefined);
 
-  if (pending.prompt?.status === "dispatching") {
-    await dependencies.agentManager.hydrateTimelineFromProvider(record.id, { force: true });
-    if (pendingCreatePromptWasAlreadyDispatched(dependencies, snapshot, pending)) {
-      await dependencies.agentStorage.completePendingCreateContinuationStep(record.id, "prompt");
-    } else {
+  await recoverPendingCreatePrompt(dependencies, record, pending, snapshot, signal);
+  await setupCompletion;
+}
+
+async function recoverPendingCreatePrompt(
+  dependencies: CreateAgentCommandDependencies,
+  record: StoredAgentRecord,
+  pending: PendingCreateContinuation,
+  snapshot: ManagedAgent,
+  signal?: AbortSignal,
+): Promise<void> {
+  const prompt = pending.prompt;
+  if (!prompt) return;
+
+  if (prompt.status === "dispatching" || prompt.status === "ambiguous") {
+    await dependencies.agentManager.hydrateTimelineFromProvider(record.id, { force: true, signal });
+    if (!pendingCreatePromptWasAlreadyDispatched(dependencies, snapshot, pending)) {
       throw new Error(
         "Initial prompt dispatch has no provider receipt; refusing an ambiguous duplicate retry",
       );
     }
-  } else if (
-    pending.prompt &&
-    pendingCreatePromptWasAlreadyDispatched(dependencies, snapshot, pending)
-  ) {
     await dependencies.agentStorage.completePendingCreateContinuationStep(record.id, "prompt");
-  } else if (pending.prompt) {
-    if (signal?.aborted) return;
-    await dependencies.agentStorage.updatePendingCreateContinuation(record.id, (current) => ({
-      ...current,
-      prompt: current.prompt ? { ...current.prompt, status: "dispatching" } : undefined,
-    }));
+    return;
+  }
+
+  if (pendingCreatePromptWasAlreadyDispatched(dependencies, snapshot, pending)) {
+    await dependencies.agentStorage.completePendingCreateContinuationStep(record.id, "prompt");
+    return;
+  }
+
+  if (signal?.aborted) return;
+  await dependencies.agentStorage.updatePendingCreateContinuation(record.id, (current) => ({
+    ...current,
+    prompt: current.prompt ? { ...current.prompt, status: "dispatching" } : undefined,
+  }));
+  try {
     await startCreatedAgentInitialPrompt({
       agentManager: dependencies.agentManager,
       agentId: record.id,
       snapshot,
-      prompt: pending.prompt.input,
-      runOptions: pending.prompt.runOptions,
+      prompt: prompt.input,
+      runOptions: prompt.runOptions,
       logger: dependencies.logger,
+      signal,
     });
-    await dependencies.agentStorage.completePendingCreateContinuationStep(record.id, "prompt");
+  } catch (error) {
+    const acceptance = getAgentTurnAcceptance(error);
+    await dependencies.agentStorage.updatePendingCreateContinuation(record.id, (current) => ({
+      ...current,
+      prompt: current.prompt
+        ? { ...current.prompt, status: acceptance === "rejected" ? "pending" : "ambiguous" }
+        : undefined,
+    }));
+    throw error;
   }
-  await setupCompletion;
+  await dependencies.agentStorage.completePendingCreateContinuationStep(record.id, "prompt");
 }
 
 type PendingCreateSetup = NonNullable<PendingCreateContinuation["setup"]>;
@@ -573,7 +653,9 @@ async function runPendingCreateSetup(
   dependencies: CreateAgentCommandDependencies,
   agentId: string,
   setup: PendingCreateSetup,
+  signal?: AbortSignal,
 ): Promise<void> {
+  signal?.throwIfAborted();
   if (!setup.shouldBootstrap) {
     return;
   }
@@ -639,6 +721,7 @@ async function runPendingCreateSetup(
     emitLiveTimelineItem: (item) =>
       emitLiveTimelineItemIfAgentKnown({ agentManager: dependencies.agentManager, agentId, item }),
     logger: dependencies.logger,
+    signal,
   });
 }
 
@@ -653,7 +736,7 @@ function pendingCreatePromptWasAlreadyDispatched(
   }
 
   const clientMessageId = prompt.runOptions?.clientMessageId;
-  return dependencies.agentManager.getTimeline(snapshot.id).some((item) => {
+  return dependencies.agentManager.getTimelineInternal(snapshot.id).some((item) => {
     if (item.type !== "user_message") {
       return false;
     }
@@ -697,7 +780,7 @@ async function resolveSessionCreateAgent(
   const trimmedPrompt = input.initialPrompt?.trim();
   const {
     sessionConfig: builtSessionConfig,
-    setupContinuation,
+    setupContinuation: builtSetupContinuation,
     createdWorkspaceId,
   } = await input.buildSessionConfig(
     input.config,
@@ -744,7 +827,19 @@ async function resolveSessionCreateAgent(
           ...(clientMessageId ? { clientMessageId } : {}),
         }
       : undefined;
-  const workspaceId = setupContinuation ? createdWorkspaceId : input.workspaceId;
+  const setupContinuation = input.setupContinuation ?? builtSetupContinuation;
+  const workspaceId =
+    builtSetupContinuation && !input.setupContinuation ? createdWorkspaceId : input.workspaceId;
+  let autoArchiveTarget = input.autoArchiveTarget;
+  if (input.autoArchive) {
+    autoArchiveTarget = setupContinuation
+      ? {
+          kind: "created-worktree" as const,
+          workspaceId: setupContinuation.recovery.workspaceId,
+          worktreePath: setupContinuation.recovery.worktree.worktreePath,
+        }
+      : { kind: "agent-only" as const };
+  }
 
   return {
     config: sessionConfig,
@@ -767,7 +862,7 @@ async function resolveSessionCreateAgent(
     promptLogger: dependencies.logger.child({
       clientMessageId: clientMessageId ?? resolveClientMessageId(undefined),
     }),
-    autoArchiveTarget: input.autoArchiveTarget,
+    autoArchiveTarget,
   };
 }
 
@@ -920,6 +1015,7 @@ async function sendInitialPrompt(
   dependencies: CreateAgentCommandDependencies,
   resolved: ResolvedCreateAgent,
   snapshot: ManagedAgent,
+  signal?: AbortSignal,
 ): Promise<{ started: boolean; liveSnapshot: ManagedAgent; error?: unknown }> {
   try {
     const prompt = resolved.prompt;
@@ -933,6 +1029,7 @@ async function sendInitialPrompt(
       prompt,
       runOptions: resolved.runOptions,
       logger: resolved.promptLogger ?? dependencies.logger,
+      signal,
     });
     return { started: true, liveSnapshot };
   } catch (error) {
