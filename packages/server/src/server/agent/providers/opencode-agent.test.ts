@@ -354,6 +354,45 @@ describe("OpenCodeAgentClient adapter smoke tests", () => {
     }
   });
 
+  test("owns rejecting late delete and release cleanup through client shutdown", async () => {
+    const cwd = tmpCwd();
+    const runtime = new TestOpenCodeHarness();
+    const openCode = new TestOpenCodeClient();
+    const lateCreate = createTestDeferred<{ data: { id: string } }>();
+    openCode.sessionCreateImplementation = async () => lateCreate.promise;
+    openCode.sessionDeleteImplementation = async () => {
+      throw new Error("delete rejected");
+    };
+    runtime.releaseImplementation = async () => {
+      throw new Error("release rejected");
+    };
+    runtime.enqueueClient(openCode);
+    const client = new OpenCodeAgentClient(logger, undefined, {
+      serverManager: runtime,
+      createClient: runtime.createClient,
+    });
+    const abort = new AbortController();
+
+    try {
+      const creating = client.createSession(buildConfig(cwd), undefined, {
+        signal: abort.signal,
+      });
+      await vi.waitFor(() => expect(openCode.calls.sessionCreate).toHaveLength(1));
+      abort.abort(new Error("cancel rejecting cleanup"));
+      await expect(creating).rejects.toThrow("cancel rejecting cleanup");
+
+      lateCreate.resolve({ data: { id: "late-rejecting-session" } });
+      await expect(client.shutdown()).resolves.toBeUndefined();
+      expect(openCode.calls.sessionDelete).toContainEqual({
+        sessionID: "late-rejecting-session",
+        directory: cwd,
+      });
+      expect(runtime.acquisitions[0]?.releaseCount).toBe(1);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
   test("archives and unarchives the durable native session through client hooks", async () => {
     const cwd = tmpCwd();
     const runtime = new TestOpenCodeHarness();

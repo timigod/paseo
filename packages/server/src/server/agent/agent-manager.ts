@@ -45,7 +45,11 @@ import {
   type ListImportableSessionsOptions,
 } from "./agent-sdk-types.js";
 import { buildArchivedAgentRecord, type ArchivedStoredAgentRecord } from "./agent-archive.js";
-import type { StoredAgentRecord, AgentStorage } from "./agent-storage.js";
+import type {
+  PendingCreateContinuation,
+  StoredAgentRecord,
+  AgentStorage,
+} from "./agent-storage.js";
 import type { AgentOwner } from "./agent-owner.js";
 import {
   InMemoryAgentTimelineStore,
@@ -245,6 +249,8 @@ export interface CreateAgentOptions {
   lastTurnOutcome?: AgentTurnOutcome | null;
   /** Keep a two-phase create invisible until its durable acknowledgement publishes. */
   deferPublication?: boolean;
+  /** Persisted atomically with the first private snapshot for a two-phase create. */
+  pendingCreateContinuation?: PendingCreateContinuation;
   signal?: AbortSignal;
   /** Storage-backed recovery must retain the durable record when startup fails. */
   preserveOnStartupFailure?: boolean;
@@ -1195,6 +1201,9 @@ export class AgentManager {
     options: CreateAgentOptions,
   ): Promise<AgentCreationHandle> {
     this.assertAcceptingAgentRegistrations();
+    if (options.deferPublication && !options.pendingCreateContinuation) {
+      throw new Error("Deferred agent creation requires a durable continuation");
+    }
     const resolvedAgentId = validateAgentId(agentId ?? this.idFactory(), "createAgent");
     await this.deleteAgentState(resolvedAgentId);
     const { storedConfig, launchConfig } = await this.prepareSessionConfig(
@@ -1274,6 +1283,9 @@ export class AgentManager {
       await this.persistSnapshot(pending, {
         title: initialPersistedTitle,
         ...(options.deferPublication ? { createAcknowledged: false } : {}),
+        ...(options.pendingCreateContinuation
+          ? { pendingCreateContinuation: options.pendingCreateContinuation }
+          : {}),
       });
       this.assertPendingAgentRegistrationActive(pending);
       this.emitState(pending, { persist: false });
@@ -3628,6 +3640,7 @@ export class AgentManager {
       title?: string | null;
       internal?: boolean;
       createAcknowledged?: boolean;
+      pendingCreateContinuation?: PendingCreateContinuation;
     },
   ): Promise<void> {
     if (!this.registry) {

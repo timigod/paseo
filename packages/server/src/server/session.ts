@@ -118,7 +118,7 @@ import {
   type AgentRunOptions,
   type AgentSessionConfig,
 } from "./agent/agent-sdk-types.js";
-import type { StoredAgentRecord } from "./agent/agent-storage.js";
+import type { PendingCreateContinuation, StoredAgentRecord } from "./agent/agent-storage.js";
 import type { AgentStorage } from "./agent/agent-storage.js";
 import {
   ImportSessionsRequestError,
@@ -259,7 +259,7 @@ const LEGACY_PROVIDER_IDS = new Set(["claude", "codex", "opencode"]);
 const MIN_VERSION_ALL_PROVIDERS = "0.1.45";
 const MIN_VERSION_EXPLICIT_WORKSPACE_RECOVERY = "0.1.105";
 
-function deriveCreateAgentId(clientId: string, requestId: string): string {
+export function deriveCreateAgentId(clientId: string, requestId: string): string {
   const bytes = createHash("sha256")
     .update("paseo:create-agent:v1\0")
     .update(clientId)
@@ -291,7 +291,7 @@ function canonicalizeCreateRequestValue(value: unknown): unknown {
   return value;
 }
 
-function deriveCreateAgentRequestFingerprint(msg: CreateAgentRequestMessage): string {
+export function deriveCreateAgentRequestFingerprint(msg: CreateAgentRequestMessage): string {
   return createHash("sha256")
     .update("paseo:create-agent-request:v1\0")
     .update(JSON.stringify(canonicalizeCreateRequestValue(msg)))
@@ -468,6 +468,11 @@ export interface SessionOptions {
   worktreesRoot?: string;
   agentManager: AgentManager;
   agentStorage: AgentStorage;
+  registerPersistedAutoArchive?: (
+    agentId: string,
+    target: NonNullable<PendingCreateContinuation["autoArchive"]>,
+    options?: { startImmediately?: boolean },
+  ) => void;
   projectRegistry: ProjectRegistry;
   workspaceRegistry: WorkspaceRegistry;
   filesystem?: SessionFileSystem;
@@ -630,13 +635,6 @@ function resolveCreateAgentReplayPreflight(
       error: `The agent from this create request was archived at ${storedAgent.archivedAt}.`,
     };
   }
-  if (storedAgent?.createAcknowledged === false && !storedAgent.pendingCreateContinuation) {
-    return {
-      status: "failed",
-      error:
-        "Agent creation has not reached its durable acknowledgement boundary; retry the same requestId.",
-    };
-  }
   return null;
 }
 
@@ -729,6 +727,7 @@ export class Session {
   private readonly hubExecutionController: HubExecutionController | null;
   private readonly workspaceScripts: WorkspaceScriptsService;
   private readonly createAgentLifecycleDispatch: CreateAgentLifecycleDispatch;
+  private readonly registerPersistedAutoArchive: SessionOptions["registerPersistedAutoArchive"];
 
   constructor(options: SessionOptions) {
     const {
@@ -750,6 +749,7 @@ export class Session {
       worktreesRoot,
       agentManager,
       agentStorage,
+      registerPersistedAutoArchive,
       projectRegistry,
       workspaceRegistry,
       filesystem,
@@ -816,6 +816,7 @@ export class Session {
     });
     this.agentManager = agentManager;
     this.agentStorage = agentStorage;
+    this.registerPersistedAutoArchive = registerPersistedAutoArchive;
     this.projectRegistry = projectRegistry;
     this.workspaceRegistry = workspaceRegistry;
     this.filesystem = filesystem ?? nodeSessionFileSystem;
@@ -3271,6 +3272,60 @@ export class Session {
     });
   }
 
+  private async recoverLegacyPrivateCreateRecord(input: {
+    agentId: string;
+    requestId: string;
+    createRequestFingerprint: string;
+    liveAgent: ManagedAgent | null;
+  }): Promise<
+    | { kind: "recreate" }
+    | { kind: "continue"; storedAgent: StoredAgentRecord }
+    | { kind: "outcome"; outcome: AgentCreateRequestOutcome }
+  > {
+    if (input.liveAgent) {
+      return {
+        kind: "outcome",
+        outcome: {
+          status: "failed",
+          error: "The prior private create is still active; retry the same requestId.",
+        },
+      };
+    }
+    const discarded = await this.agentStorage.discardUnacknowledgedCreate(
+      input.agentId,
+      input.createRequestFingerprint,
+    );
+    if (discarded) {
+      this.sessionLogger.warn(
+        { agentId: input.agentId, requestId: input.requestId },
+        "Discarded legacy private create record without a durable continuation",
+      );
+      return { kind: "recreate" };
+    }
+
+    const storedAgent = await this.agentStorage.get(input.agentId);
+    if (!storedAgent) return { kind: "recreate" };
+    const changedPreflight = resolveCreateAgentReplayPreflight(
+      this.agentManager.getAgent(input.agentId),
+      storedAgent,
+      input.createRequestFingerprint,
+    );
+    if (changedPreflight && changedPreflight !== "not-found") {
+      return { kind: "outcome", outcome: changedPreflight };
+    }
+    if (changedPreflight === "not-found") return { kind: "recreate" };
+    if (storedAgent.createAcknowledged === false && !storedAgent.pendingCreateContinuation) {
+      return {
+        kind: "outcome",
+        outcome: {
+          status: "failed",
+          error: "The prior private create changed during recovery; retry the same requestId.",
+        },
+      };
+    }
+    return { kind: "continue", storedAgent };
+  }
+
   private async replayCreateAgentRequest(
     agentId: string,
     requestId: string,
@@ -3289,6 +3344,22 @@ export class Session {
     if (preflight) {
       this.emitCreateAgentRequestOutcome(requestId, preflight);
       return preflight;
+    }
+    if (storedAgent?.createAcknowledged === false && !storedAgent.pendingCreateContinuation) {
+      const recovery = await this.recoverLegacyPrivateCreateRecord({
+        agentId,
+        requestId,
+        createRequestFingerprint,
+        liveAgent,
+      });
+      if (recovery.kind === "recreate") {
+        return null;
+      }
+      if (recovery.kind === "outcome") {
+        this.emitCreateAgentRequestOutcome(requestId, recovery.outcome);
+        return recovery.outcome;
+      }
+      storedAgent = recovery.storedAgent;
     }
     const continuationNeedsAcknowledgement =
       storedAgent?.pendingCreateContinuation?.acknowledged === false;
@@ -3525,7 +3596,11 @@ export class Session {
       providerSnapshotManager: this.providerSnapshotManager,
       terminalManager: this.terminalManager,
       registerAutoArchive: (agentId, target, options) => {
-        this.createAgentLifecycleDispatch.registerPersistedAutoArchive(agentId, target, options);
+        if (this.registerPersistedAutoArchive) {
+          this.registerPersistedAutoArchive(agentId, target, options);
+        } else {
+          this.createAgentLifecycleDispatch.registerPersistedAutoArchive(agentId, target, options);
+        }
       },
     };
   }
@@ -7016,6 +7091,16 @@ export class Session {
   public async cleanup(): Promise<void> {
     this.sessionLogger.trace({}, "agent.session.lifecycle.cleanup");
     this.isCleanedUp = true;
+
+    const lifecycleShutdown = await this.createAgentLifecycleDispatch.shutdown({
+      timeoutMs: 5_000,
+    });
+    if (!lifecycleShutdown.completed) {
+      this.sessionLogger.warn(
+        { pendingAgentIds: lifecycleShutdown.pendingAgentIds },
+        "Session create-agent lifecycle cleanup remains incomplete",
+      );
+    }
 
     if (this.unsubscribeAgentEvents) {
       this.unsubscribeAgentEvents();

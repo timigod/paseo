@@ -165,6 +165,21 @@ export function isStoredAgentPublic(record: StoredAgentRecord): boolean {
   );
 }
 
+function assignStoredCreateState(
+  record: StoredAgentRecord,
+  state: {
+    createAcknowledged: boolean | undefined;
+    pendingCreateContinuation: PendingCreateContinuation | undefined;
+  },
+): void {
+  if (state.createAcknowledged !== undefined) {
+    record.createAcknowledged = state.createAcknowledged;
+  }
+  if (state.pendingCreateContinuation !== undefined) {
+    record.pendingCreateContinuation = state.pendingCreateContinuation;
+  }
+}
+
 export class AgentStorage {
   private cache: Map<string, StoredAgentRecord> = new Map();
   private pathById: Map<string, string> = new Map();
@@ -290,12 +305,59 @@ export class AgentStorage {
     this.pathsById.delete(agentId);
   }
 
+  async discardUnacknowledgedCreate(
+    agentId: string,
+    createRequestFingerprint: string,
+  ): Promise<boolean> {
+    await this.load();
+    let removed = false;
+    const previous = (this.pendingWrites.get(agentId) ?? Promise.resolve()).catch(() => undefined);
+    const next = previous.then(async () => {
+      const existing = this.cache.get(agentId);
+      if (
+        !existing ||
+        existing.createAcknowledged !== false ||
+        existing.pendingCreateContinuation !== undefined ||
+        existing.createRequestFingerprint !== createRequestFingerprint
+      ) {
+        return undefined;
+      }
+
+      const paths = Array.from(this.pathsById.get(agentId) ?? []);
+      await Promise.all(
+        paths.map(async (filePath) => {
+          try {
+            await fs.unlink(filePath);
+          } catch (error) {
+            const code = (error as NodeJS.ErrnoException).code;
+            if (code && code !== "ENOENT") throw error;
+          }
+        }),
+      );
+      this.cache.delete(agentId);
+      this.removeOwnerIndex(agentId);
+      this.pathById.delete(agentId);
+      this.pathsById.delete(agentId);
+      removed = true;
+      return undefined;
+    });
+    const tracked = next.finally(() => {
+      if (this.pendingWrites.get(agentId) === tracked) {
+        this.pendingWrites.delete(agentId);
+      }
+    });
+    this.pendingWrites.set(agentId, tracked);
+    await tracked;
+    return removed;
+  }
+
   async applySnapshot(
     agent: ManagedAgent,
     options?: {
       title?: string | null;
       internal?: boolean;
       createAcknowledged?: boolean;
+      pendingCreateContinuation?: PendingCreateContinuation;
     },
   ): Promise<void> {
     await this.load();
@@ -305,6 +367,9 @@ export class AgentStorage {
       options !== undefined && Object.prototype.hasOwnProperty.call(options, "internal");
     const hasCreateAcknowledgedOverride =
       options !== undefined && Object.prototype.hasOwnProperty.call(options, "createAcknowledged");
+    const hasPendingCreateContinuationOverride =
+      options !== undefined &&
+      Object.prototype.hasOwnProperty.call(options, "pendingCreateContinuation");
     await this.queueRecordMutation(agent.id, (existing) => {
       const record = toStoredAgentRecord(agent, {
         title: hasTitleOverride ? (options?.title ?? null) : (existing?.title ?? null),
@@ -318,14 +383,13 @@ export class AgentStorage {
       if (existing && existing.archivedAt !== undefined) {
         record.archivedAt = existing.archivedAt;
       }
-      if (existing?.pendingCreateContinuation) {
-        record.pendingCreateContinuation = existing.pendingCreateContinuation;
-      }
-      if (hasCreateAcknowledgedOverride) {
-        record.createAcknowledged = options?.createAcknowledged;
-      } else if (existing?.createAcknowledged !== undefined) {
-        record.createAcknowledged = existing.createAcknowledged;
-      }
+      const createAcknowledged = hasCreateAcknowledgedOverride
+        ? options?.createAcknowledged
+        : existing?.createAcknowledged;
+      const pendingCreateContinuation = hasPendingCreateContinuationOverride
+        ? options?.pendingCreateContinuation
+        : existing?.pendingCreateContinuation;
+      assignStoredCreateState(record, { createAcknowledged, pendingCreateContinuation });
       return record;
     });
   }

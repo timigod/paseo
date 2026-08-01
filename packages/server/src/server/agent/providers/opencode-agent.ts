@@ -89,6 +89,7 @@ import { execCommand } from "../../../utils/spawn.js";
 import { mapOpencodeToolCall } from "./opencode/tool-call-mapper.js";
 import {
   OpenCodeServerManager,
+  type OpenCodeServerAcquisition,
   type OpenCodeServerManagerLike,
 } from "./opencode/server-manager.js";
 import { resolveOpenCodeHomeDir } from "./opencode/paths.js";
@@ -124,6 +125,7 @@ const OPENCODE_LEGACY_FULL_ACCESS_MODE_ID = "full-access";
 const OPENCODE_AUTO_ACCEPT_FEATURE_ID = "auto_accept";
 const OPENCODE_PERSISTED_SESSION_LIMIT = 200;
 const OPENCODE_PENDING_ABORT_START_TIMEOUT_MS = 10_000;
+const OPENCODE_FAILED_CREATE_DELETE_TIMEOUT_MS = 5_000;
 const OPENCODE_CHILD_SESSION_HYDRATION_LIMIT = 100;
 const OPENCODE_CHILD_SESSION_SERVER_REGISTRY_LIMIT = 500;
 const OPENCODE_PERMISSION_ACTION_ALLOW_ONCE = "allow_once";
@@ -1297,6 +1299,7 @@ export class OpenCodeAgentClient implements AgentClient {
   private readonly logger: Logger;
   private readonly runtimeSettings?: ProviderRuntimeSettings;
   private readonly modelContextWindows = new Map<string, number>();
+  private readonly failedCreateCleanupTasks = new Set<Promise<void>>();
 
   constructor(
     logger: Logger,
@@ -1329,10 +1332,19 @@ export class OpenCodeAgentClient implements AgentClient {
       acquisition = await awaitWithAbort(acquisitionPromise, options?.signal);
     } catch (error) {
       if (options?.signal?.aborted) {
-        void acquisitionPromise.then(
-          (late) => late.release(),
-          () => undefined,
-        );
+        this.ownFailedCreateCleanup(async () => {
+          let late: OpenCodeServerAcquisition;
+          try {
+            late = await acquisitionPromise;
+          } catch (lateError) {
+            this.logger.warn(
+              { err: lateError },
+              "Failed to reconcile OpenCode server acquisition after create abort",
+            );
+            return;
+          }
+          await this.releaseFailedCreateAcquisition(late);
+        });
       }
       throw error;
     }
@@ -1389,27 +1401,81 @@ export class OpenCodeAgentClient implements AgentClient {
       );
     } catch (error) {
       if (createdSessionId) {
-        await client.session
-          .delete({ sessionID: createdSessionId, directory: openCodeConfig.cwd })
-          .catch(() => undefined);
+        await this.deleteFailedCreateSession(client, createdSessionId, openCodeConfig.cwd);
+        await this.releaseFailedCreateAcquisition(acquisition);
       } else if (rawCreateResponsePromise) {
-        // Timeout and abort reject only the consumer-side race. The provider
-        // request can still succeed later, so retain the original promise and
-        // delete any late session instead of orphaning a worker.
-        void rawCreateResponsePromise.then(
-          async (lateResponse) => {
+        // Timeout and abort reject only the consumer-side race. Retain the
+        // real server acquisition until the raw request is reconciled, then
+        // delete any late provider session before the final release can stop
+        // its zero-reference helper server.
+        const pendingRawCreate = rawCreateResponsePromise;
+        this.ownFailedCreateCleanup(async () => {
+          try {
+            const lateResponse = await pendingRawCreate;
             if (lateResponse.data?.id) {
-              await client.session
-                .delete({ sessionID: lateResponse.data.id, directory: openCodeConfig.cwd })
-                .catch(() => undefined);
+              await this.deleteFailedCreateSession(
+                client,
+                lateResponse.data.id,
+                openCodeConfig.cwd,
+              );
             }
-            return undefined;
-          },
-          () => undefined,
+          } catch (lateError) {
+            this.logger.warn(
+              { err: lateError },
+              "Failed to reconcile OpenCode session.create after create failure",
+            );
+          } finally {
+            await this.releaseFailedCreateAcquisition(acquisition);
+          }
+        });
+      } else {
+        await this.releaseFailedCreateAcquisition(acquisition);
+      }
+      throw error;
+    }
+  }
+
+  private ownFailedCreateCleanup(operation: () => Promise<void>): void {
+    const task = Promise.resolve()
+      .then(operation)
+      .catch((error) => {
+        this.logger.warn({ err: error }, "OpenCode failed-create cleanup rejected");
+      });
+    this.failedCreateCleanupTasks.add(task);
+    void task.finally(() => this.failedCreateCleanupTasks.delete(task));
+  }
+
+  private async deleteFailedCreateSession(
+    client: OpencodeClient,
+    sessionId: string,
+    directory: string,
+  ): Promise<void> {
+    try {
+      const response = await withTimeout(
+        client.session.delete({ sessionID: sessionId, directory }),
+        OPENCODE_FAILED_CREATE_DELETE_TIMEOUT_MS,
+        `OpenCode session.delete timed out for failed create ${sessionId}`,
+      );
+      if (response.error && !isOpenCodeNotFoundError(response.error)) {
+        throw new Error(
+          `OpenCode session.delete failed: ${toDiagnosticErrorMessage(response.error)}`,
         );
       }
+    } catch (error) {
+      this.logger.warn(
+        { err: error, sessionId, directory },
+        "Failed to delete OpenCode session after create failure",
+      );
+    }
+  }
+
+  private async releaseFailedCreateAcquisition(
+    acquisition: OpenCodeServerAcquisition,
+  ): Promise<void> {
+    try {
       await acquisition.release();
-      throw error;
+    } catch (error) {
+      this.logger.warn({ err: error }, "Failed to release OpenCode server after create failure");
     }
   }
 
@@ -1650,6 +1716,9 @@ export class OpenCodeAgentClient implements AgentClient {
   }
 
   async shutdown(): Promise<void> {
+    while (this.failedCreateCleanupTasks.size > 0) {
+      await Promise.all(Array.from(this.failedCreateCleanupTasks));
+    }
     await this.serverManager.shutdown();
   }
 

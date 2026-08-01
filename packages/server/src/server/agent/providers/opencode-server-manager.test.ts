@@ -21,6 +21,8 @@ import {
   type OpenCodePortAllocator,
   type OpenCodeServerProcessSpawner,
 } from "./opencode/server-manager.js";
+import { OpenCodeAgentClient } from "./opencode-agent.js";
+import { TestOpenCodeClient } from "./opencode/test-utils/test-opencode-harness.js";
 
 afterEach(() => {
   vi.useRealTimers();
@@ -35,6 +37,52 @@ describe("OpenCodeServerManager generations", () => {
 
     expect(runtime.spawnCalls[0]?.options.baseEnv).toEqual(baseEnv);
     await acquisition.release();
+  });
+
+  test("late create reconciliation retains the real zero-ref server until session deletion", async () => {
+    const { manager, runtime } = createTestManager([4099]);
+    const openCode = new TestOpenCodeClient();
+    let resolveLateCreate!: (value: { data: { id: string } }) => void;
+    const lateCreate = new Promise<{ data: { id: string } }>((resolve) => {
+      resolveLateCreate = resolve;
+    });
+    openCode.sessionCreateImplementation = async () => lateCreate;
+    openCode.sessionDeleteImplementation = async () => {
+      expect(runtime.terminatedPorts).toEqual([]);
+      return {};
+    };
+    const client = new OpenCodeAgentClient(createTestLogger(), undefined, {
+      serverManager: manager,
+      createClient: () => openCode.asSdkClient(),
+    });
+    const abort = new AbortController();
+
+    const creating = client.createSession(
+      { provider: "opencode", cwd: os.tmpdir(), model: "opencode/big-pickle" },
+      undefined,
+      { signal: abort.signal },
+    );
+    await vi.waitFor(() => expect(openCode.calls.sessionCreate).toHaveLength(1));
+    abort.abort(new Error("cancel late create"));
+    await expect(creating).rejects.toThrow("cancel late create");
+
+    expect(runtime.terminatedPorts).toEqual([]);
+    let shutdownSettled = false;
+    const shutdown = client.shutdown().then(() => {
+      shutdownSettled = true;
+      return undefined;
+    });
+    await Promise.resolve();
+    expect(shutdownSettled).toBe(false);
+    resolveLateCreate({ data: { id: "late-session" } });
+    await vi.waitFor(() =>
+      expect(openCode.calls.sessionDelete).toContainEqual({
+        sessionID: "late-session",
+        directory: os.tmpdir(),
+      }),
+    );
+    await shutdown;
+    expect(runtime.terminatedPorts).toEqual([4099]);
   });
 
   test("rotation creates a new current server without killing a referenced old server", async () => {

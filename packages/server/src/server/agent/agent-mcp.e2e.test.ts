@@ -13,6 +13,8 @@ import { hashDaemonPassword } from "../auth.js";
 import { createPaseoDaemon, type PaseoDaemonConfig } from "../bootstrap.js";
 import { createTestAgentClients } from "../test-utils/fake-agent-client.js";
 import { DaemonClient } from "../test-utils/daemon-client.js";
+import { SessionInboundMessageSchema } from "../messages.js";
+import { deriveCreateAgentId, deriveCreateAgentRequestFingerprint } from "../session.js";
 import type {
   AgentClient,
   AgentPersistenceHandle,
@@ -189,9 +191,7 @@ describe("agent MCP end-to-end (offline)", () => {
     const websocketClient = new DaemonClient({ url: `ws://127.0.0.1:${port}/ws` });
     await websocketClient.connect();
 
-    const originalSetContinuation = daemon.agentStorage.setPendingCreateContinuation.bind(
-      daemon.agentStorage,
-    );
+    const originalApplySnapshot = daemon.agentStorage.applySnapshot.bind(daemon.agentStorage);
     let releaseContinuation!: () => void;
     let enteredContinuation!: () => void;
     const continuationEntered = new Promise<void>((resolve) => {
@@ -200,10 +200,12 @@ describe("agent MCP end-to-end (offline)", () => {
     const continuationRelease = new Promise<void>((resolve) => {
       releaseContinuation = resolve;
     });
-    daemon.agentStorage.setPendingCreateContinuation = async (...args) => {
-      enteredContinuation();
-      await continuationRelease;
-      await originalSetContinuation(...args);
+    daemon.agentStorage.applySnapshot = async (...args) => {
+      await originalApplySnapshot(...args);
+      if (args[1]?.createAcknowledged === false) {
+        enteredContinuation();
+        await continuationRelease;
+      }
     };
     let createPromise: ReturnType<DaemonClient["createAgent"]> | null = null;
 
@@ -218,7 +220,13 @@ describe("agent MCP end-to-end (offline)", () => {
       const privateRecord = (await daemon.agentStorage.list()).find(
         (record) => record.createRequestFingerprint !== undefined,
       );
-      expect(privateRecord).toMatchObject({ createAcknowledged: false });
+      expect(privateRecord).toMatchObject({
+        createAcknowledged: false,
+        pendingCreateContinuation: {
+          phase: "awaiting_dispatch",
+          acknowledged: false,
+        },
+      });
       const privateAgentId = privateRecord?.id;
       expect(privateAgentId).toBeTruthy();
 
@@ -247,6 +255,77 @@ describe("agent MCP end-to-end (offline)", () => {
       await createPromise?.catch(() => undefined);
       await websocketClient.close();
       await client.close();
+      await daemon.stop();
+      await rm(paseoHome, { recursive: true, force: true });
+      await rm(staticDir, { recursive: true, force: true });
+    }
+  });
+
+  test("the same request converges after the legacy snapshot-to-continuation crash gap", async () => {
+    const paseoHome = await mkdtemp(path.join(os.tmpdir(), "paseo-home-create-crash-retry-"));
+    const staticDir = await mkdtemp(path.join(os.tmpdir(), "paseo-static-create-crash-retry-"));
+    const port = await getAvailablePort();
+    const daemon = await createPaseoDaemon(
+      {
+        listen: `127.0.0.1:${port}`,
+        paseoHome,
+        corsAllowedOrigins: [],
+        hostnames: true,
+        mcpEnabled: true,
+        staticDir,
+        mcpDebug: false,
+        agentClients: createTestAgentClients(),
+        agentStoragePath: path.join(paseoHome, "agents"),
+      },
+      pino({ level: "silent" }),
+    );
+    await daemon.start();
+    const clientId = "legacy-crash-retry-client";
+    const requestId = "legacy-crash-retry-request";
+    const websocketClient = new DaemonClient({
+      url: `ws://127.0.0.1:${port}/ws`,
+      clientId,
+    });
+    await websocketClient.connect();
+    const requestMessage = SessionInboundMessageSchema.parse({
+      type: "create_agent_request",
+      requestId,
+      config: { provider: "codex", cwd: paseoHome },
+    });
+    if (requestMessage.type !== "create_agent_request") {
+      throw new Error("Expected create_agent_request fixture");
+    }
+    const agentId = deriveCreateAgentId(clientId, requestId);
+    const createRequestFingerprint = deriveCreateAgentRequestFingerprint(requestMessage);
+    const now = new Date().toISOString();
+    await daemon.agentStorage.upsert({
+      id: agentId,
+      provider: "codex",
+      cwd: paseoHome,
+      createRequestFingerprint,
+      createAcknowledged: false,
+      createdAt: now,
+      updatedAt: now,
+      labels: {},
+      lastStatus: "closed",
+      config: {},
+      persistence: null,
+    });
+
+    try {
+      const created = await websocketClient.createAgent({
+        provider: "codex",
+        cwd: paseoHome,
+        requestId,
+      });
+      expect(created.id).toBe(agentId);
+      const records = (await daemon.agentStorage.list()).filter(
+        (record) => record.createRequestFingerprint === createRequestFingerprint,
+      );
+      expect(records).toHaveLength(1);
+      expect(records[0]).toMatchObject({ id: agentId, createAcknowledged: true });
+    } finally {
+      await websocketClient.close();
       await daemon.stop();
       await rm(paseoHome, { recursive: true, force: true });
       await rm(staticDir, { recursive: true, force: true });

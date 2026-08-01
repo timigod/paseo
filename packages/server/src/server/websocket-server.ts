@@ -32,7 +32,12 @@ import { asUint8Array, decodeBinaryFrame } from "@getpaseo/protocol/binary-frame
 import type { TerminalActivity } from "@getpaseo/protocol/terminal-activity";
 import type { HostnamesConfig } from "./hostnames.js";
 import { isHostnameAllowed } from "./hostnames.js";
-import { Session, type SessionLifecycleIntent, type SessionRuntimeMetrics } from "./session.js";
+import {
+  Session,
+  type SessionLifecycleIntent,
+  type SessionOptions,
+  type SessionRuntimeMetrics,
+} from "./session.js";
 import type { HubRelationshipManagement } from "./hub/relationship-controller.js";
 import type { HubExecutionAgents } from "./hub/daemon-executions.js";
 import type { AgentProvider } from "./agent/agent-sdk-types.js";
@@ -537,6 +542,9 @@ export class VoiceAssistantWebSocketServer {
   private readonly voiceCallerContexts = new Map<string, VoiceCallerContext>();
   private readonly workspaceSetupSnapshots = new Map<string, WorkspaceSetupSnapshot>();
   private readonly providerSnapshotManager: ProviderSnapshotManager;
+  private readonly registerPersistedAutoArchive: NonNullable<
+    SessionOptions["registerPersistedAutoArchive"]
+  > | null;
   private onLifecycleIntent!: ((intent: SessionLifecycleIntent) => void) | null;
   private onBranchChanged!:
     | ((workspaceId: string, oldBranch: string | null, newBranch: string | null) => void)
@@ -603,6 +611,7 @@ export class VoiceAssistantWebSocketServer {
     serviceProxyPublicBaseUrl?: string | null,
     browserToolsBroker?: BrowserToolsBroker | null,
     hubRelationships?: HubRelationshipManagement | null,
+    registerPersistedAutoArchive?: SessionOptions["registerPersistedAutoArchive"],
   ) {
     this.logger = logger.child({ module: "websocket-server" });
     this.advertiseDaemonStatusRpc = wsConfig.daemonStatusRpc !== false;
@@ -615,6 +624,7 @@ export class VoiceAssistantWebSocketServer {
     this.daemonRuntimeConfig = daemonRuntimeConfig;
     this.browserToolsBroker = browserToolsBroker ?? null;
     this.hubRelationships = hubRelationships ?? null;
+    this.registerPersistedAutoArchive = registerPersistedAutoArchive ?? null;
     this.agentManager = agentManager;
     this.agentStorage = agentStorage;
     this.projectRegistry = projectRegistry ?? createNoopProjectRegistry();
@@ -1325,6 +1335,7 @@ export class VoiceAssistantWebSocketServer {
       worktreesRoot: this.worktreesRoot,
       agentManager: this.agentManager,
       agentStorage: this.agentStorage,
+      registerPersistedAutoArchive: this.registerPersistedAutoArchive ?? undefined,
       projectRegistry: this.projectRegistry,
       workspaceRegistry: this.workspaceRegistry,
       chatService: this.chatService,
