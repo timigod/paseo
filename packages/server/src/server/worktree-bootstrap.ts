@@ -52,6 +52,15 @@ export interface RunAsyncWorktreeBootstrapOptions {
   appendTimelineItem: (item: AgentTimelineItem) => Promise<boolean>;
   emitLiveTimelineItem?: (item: AgentTimelineItem) => Promise<boolean>;
   logger?: Logger;
+  setupProgress?: {
+    commands: readonly string[];
+    nextCommandIndex: number;
+  };
+  beforeSetupCommand?: (index: number, command: string) => Promise<void>;
+  afterSetupCommand?: (index: number, command: string) => Promise<void>;
+  beforeTerminalBootstrap?: () => Promise<void>;
+  afterTerminalBootstrap?: () => Promise<void>;
+  throwOnFailure?: boolean;
 }
 
 const MAX_WORKTREE_SETUP_COMMAND_OUTPUT_BYTES = 64 * 1024;
@@ -646,6 +655,14 @@ export async function runAsyncWorktreeBootstrap(
       branchName: options.worktree.branchName,
       cleanupOnFailure: false,
       runtimeEnv,
+      ...(options.setupProgress
+        ? {
+            commands: options.setupProgress.commands,
+            startCommandIndex: options.setupProgress.nextCommandIndex,
+          }
+        : {}),
+      beforeCommand: options.beforeSetupCommand,
+      afterCommand: options.afterSetupCommand,
       onEvent: (event) => {
         applyWorktreeSetupProgressEvent(progressAccumulator, event);
         queueLiveRunningEmit();
@@ -682,10 +699,15 @@ export async function runAsyncWorktreeBootstrap(
         errorMessage: message,
       }),
     );
+    if (options.throwOnFailure) {
+      throw error;
+    }
     return;
   }
 
+  await options.beforeTerminalBootstrap?.();
   await runWorktreeTerminalBootstrap(options, runtimeEnv);
+  await options.afterTerminalBootstrap?.();
 }
 
 // ---------------------------------------------------------------------------

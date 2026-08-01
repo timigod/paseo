@@ -12,6 +12,7 @@ import type { CreatePaseoWorktreeWorkflowResult } from "../../worktree-session.j
 import {
   beginCreateAgentCommand,
   createAgentCommand,
+  recoverPendingCreateAgentCommandById,
   recoverPendingCreateAgentCommands,
 } from "./create.js";
 import type { ManagedAgent } from "../agent-manager.js";
@@ -53,6 +54,12 @@ function fakeWorktreeCreator(args: { repoRoot: string; createdWorkspaceId: strin
           worktree: { branchName: "feature", worktreePath },
           workspaceCwd,
           shouldBootstrap: true,
+          progress: {
+            commands: [],
+            nextCommandIndex: 0,
+            inFlightCommandIndex: null,
+            terminals: "pending",
+          },
         },
         startAfterAgentCreate: () => {},
       },
@@ -184,6 +191,12 @@ test("acknowledged creation recovers its first turn and setup continuation after
               },
               workspaceCwd: join(workdir, "durable-create"),
               shouldBootstrap: true,
+              progress: {
+                commands: [],
+                nextCommandIndex: 0,
+                inFlightCommandIndex: null,
+                terminals: "pending",
+              },
             },
             startAfterAgentCreate: () => {
               throw new Error("The crashed daemon must not reach its in-memory continuation");
@@ -406,6 +419,80 @@ test("provider failure after publish preserves the acknowledged creation for rec
   }
 });
 
+test("an acknowledged provider-start failure retries online without a daemon restart", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "create-agent-online-recovery-test-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const baseClient = createTestAgentClients().codex;
+  if (!baseClient) throw new Error("Expected Codex test client");
+  const observedTurns: AgentPromptInput[] = [];
+  let createAttempts = 0;
+  let rejectFirstCreate!: (error: unknown) => void;
+  const firstCreate = new Promise<AgentSession>((_resolve, reject) => {
+    rejectFirstCreate = reject;
+  });
+  const client = new Proxy(baseClient, {
+    get(target, property, receiver) {
+      if (property === "createSession") {
+        return async (...args: Parameters<AgentClient["createSession"]>) => {
+          createAttempts += 1;
+          if (createAttempts === 1) {
+            return await firstCreate;
+          }
+          const session = await target.createSession(...args);
+          return new Proxy(session, {
+            get(sessionTarget, sessionProperty, sessionReceiver) {
+              if (sessionProperty === "startTurn") {
+                return async (prompt: AgentPromptInput, options?: AgentRunOptions) => {
+                  observedTurns.push(prompt);
+                  return await sessionTarget.startTurn(prompt, options);
+                };
+              }
+              const value = Reflect.get(sessionTarget, sessionProperty, sessionReceiver);
+              return typeof value === "function" ? value.bind(sessionTarget) : value;
+            },
+          });
+        };
+      }
+      const value = Reflect.get(target, property, receiver);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  }) as AgentClient;
+  const manager = new AgentManager({ clients: { codex: client }, registry: storage, logger });
+  const dependencies = {
+    agentManager: manager,
+    agentStorage: storage,
+    logger,
+    providerSnapshotManager: createProviderSnapshotManagerStub().manager,
+  };
+
+  try {
+    const creation = await beginCreateAgentCommand(dependencies, {
+      kind: "session",
+      config: { provider: "codex", cwd: workdir },
+      workspaceId: "ws-online-recovery",
+      initialPrompt: "Retry me online",
+      clientMessageId: "msg-online-recovery",
+      labels: {},
+      provisionalTitle: null,
+      firstAgentContext: { attachments: [] },
+      buildSessionConfig: async (config) => ({ sessionConfig: config }),
+    });
+    await creation.prepareForAcknowledgement();
+    creation.acknowledge(() => undefined);
+    rejectFirstCreate(new Error("transient provider start failure"));
+    await expect(creation.completion).rejects.toThrow("transient provider start failure");
+
+    await recoverPendingCreateAgentCommandById(dependencies, creation.snapshot.id);
+    expect(observedTurns).toEqual(["Retry me online"]);
+    expect((await storage.get(creation.snapshot.id))?.pendingCreateContinuation).toBeUndefined();
+  } finally {
+    manager.prepareForShutdown();
+    await Promise.all(manager.listAgents().map((agent) => manager.closeAgent(agent.id)));
+    await manager.flushForShutdown();
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
 test("recovery does not dispatch an already-observed first turn twice", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "create-agent-dispatch-dedupe-test-"));
   const storage = new AgentStorage(join(workdir, "agents"), logger);
@@ -471,6 +558,198 @@ test("recovery does not dispatch an already-observed first turn twice", async ()
     await Promise.all(manager.listAgents().map((agent) => manager.closeAgent(agent.id)));
     await manager.flushForShutdown();
     await storage.flush();
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("a passive subscriber cannot observe a create before its durable acknowledgement", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "create-agent-publication-gate-test-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const manager = createRealAgentManager(storage);
+  const observedAgentIds: string[] = [];
+  const unsubscribe = manager.subscribe((event) => {
+    if (event.type === "agent_state") observedAgentIds.push(event.agent.id);
+  });
+
+  try {
+    const creation = await beginCreateAgentCommand(
+      {
+        agentManager: manager,
+        agentStorage: storage,
+        logger,
+        providerSnapshotManager: createProviderSnapshotManagerStub().manager,
+      },
+      {
+        kind: "session",
+        config: { provider: "codex", cwd: workdir },
+        workspaceId: "ws-publication-gate",
+        labels: {},
+        provisionalTitle: null,
+        firstAgentContext: { attachments: [] },
+        buildSessionConfig: async (config) => ({ sessionConfig: config }),
+      },
+    );
+
+    await Promise.resolve();
+    expect(observedAgentIds).not.toContain(creation.snapshot.id);
+    const replayedAgentIds: string[] = [];
+    const unsubscribeReplay = manager.subscribe((event) => {
+      if (event.type === "agent_state") replayedAgentIds.push(event.agent.id);
+    });
+    expect(replayedAgentIds).not.toContain(creation.snapshot.id);
+    unsubscribeReplay();
+    await creation.prepareForAcknowledgement();
+    creation.acknowledge(() => undefined);
+    await creation.completion;
+    expect(observedAgentIds).toContain(creation.snapshot.id);
+  } finally {
+    unsubscribe();
+    manager.prepareForShutdown();
+    await Promise.all(manager.listAgents().map((agent) => manager.closeAgent(agent.id)));
+    await manager.flushForShutdown();
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("recovery refuses to replay an ambiguously dispatched first prompt", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "create-agent-ambiguous-prompt-test-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const manager = createRealAgentManager(storage);
+  const observedTurns: AgentPromptInput[] = [];
+  const originalStreamAgent = manager.streamAgent.bind(manager);
+  manager.streamAgent = ((agentId, prompt, options) => {
+    observedTurns.push(prompt);
+    return originalStreamAgent(agentId, prompt, options);
+  }) as typeof manager.streamAgent;
+
+  try {
+    const agent = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: "ws-ambiguous-prompt",
+    });
+    await storage.setPendingCreateContinuation(agent.id, {
+      phase: "awaiting_dispatch",
+      prompt: {
+        status: "dispatching",
+        input: [{ type: "image", data: "AA==", mimeType: "image/png" }],
+        runOptions: { clientMessageId: "msg-ambiguous" },
+      },
+    });
+
+    await recoverPendingCreateAgentCommands({
+      agentManager: manager,
+      agentStorage: storage,
+      logger,
+      providerSnapshotManager: createProviderSnapshotManagerStub().manager,
+    });
+
+    expect(observedTurns).toEqual([]);
+    await expect(storage.get(agent.id)).resolves.toMatchObject({
+      pendingCreateContinuation: { prompt: { status: "dispatching" } },
+    });
+  } finally {
+    manager.prepareForShutdown();
+    await Promise.all(manager.listAgents().map((agent) => manager.closeAgent(agent.id)));
+    await manager.flushForShutdown();
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("recovery refuses to replay a worktree command left in flight", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "create-agent-setup-boundary-test-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const manager = createRealAgentManager(storage);
+  const runWorktreeBootstrap = vi.fn(async () => undefined);
+
+  try {
+    const agent = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: "ws-setup-boundary",
+    });
+    await storage.setPendingCreateContinuation(agent.id, {
+      phase: "awaiting_dispatch",
+      setup: {
+        workspaceId: "ws-setup-boundary",
+        worktree: { branchName: "setup-boundary", worktreePath: workdir },
+        shouldBootstrap: true,
+        progress: {
+          commands: ["npm install"],
+          nextCommandIndex: 0,
+          inFlightCommandIndex: 0,
+          terminals: "pending",
+        },
+      },
+    });
+
+    await recoverPendingCreateAgentCommands({
+      agentManager: manager,
+      agentStorage: storage,
+      logger,
+      providerSnapshotManager: createProviderSnapshotManagerStub().manager,
+      runWorktreeBootstrap,
+    });
+
+    expect(runWorktreeBootstrap).not.toHaveBeenCalled();
+    await expect(storage.get(agent.id)).resolves.toMatchObject({
+      pendingCreateContinuation: { setup: { progress: { inFlightCommandIndex: 0 } } },
+    });
+  } finally {
+    manager.prepareForShutdown();
+    await Promise.all(manager.listAgents().map((agent) => manager.closeAgent(agent.id)));
+    await manager.flushForShutdown();
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("auto-archive intent is persisted before acknowledgement and restored with recovery", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "create-agent-autoarchive-intent-test-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const manager = createRealAgentManager(storage);
+  const registerAutoArchive = vi.fn();
+
+  try {
+    const creation = await beginCreateAgentCommand(
+      {
+        agentManager: manager,
+        agentStorage: storage,
+        logger,
+        providerSnapshotManager: createProviderSnapshotManagerStub().manager,
+        registerAutoArchive,
+      },
+      {
+        kind: "session",
+        config: { provider: "codex", cwd: workdir },
+        workspaceId: "ws-autoarchive-intent",
+        labels: {},
+        provisionalTitle: null,
+        firstAgentContext: { attachments: [] },
+        autoArchiveTarget: {
+          kind: "created-worktree",
+          workspaceId: "ws-autoarchive-intent",
+          worktreePath: workdir,
+        },
+        buildSessionConfig: async (config) => ({ sessionConfig: config }),
+      },
+    );
+    await creation.prepareForAcknowledgement();
+    await expect(storage.get(creation.snapshot.id)).resolves.toMatchObject({
+      pendingCreateContinuation: {
+        autoArchive: {
+          kind: "created-worktree",
+          workspaceId: "ws-autoarchive-intent",
+          worktreePath: workdir,
+        },
+      },
+    });
+    creation.acknowledge(() => undefined);
+    await creation.completion;
+    expect(registerAutoArchive).toHaveBeenCalledWith(creation.snapshot.id, {
+      kind: "created-worktree",
+      workspaceId: "ws-autoarchive-intent",
+      worktreePath: workdir,
+    });
+  } finally {
+    manager.prepareForShutdown();
+    await Promise.all(manager.listAgents().map((agent) => manager.closeAgent(agent.id)));
+    await manager.flushForShutdown();
     rmSync(workdir, { recursive: true, force: true });
   }
 });

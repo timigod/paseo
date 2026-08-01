@@ -2,21 +2,43 @@
   "schemaVersion": 1,
   "patches": [
     {
-      "id": "paseo-v025-material-progress-inspect",
-      "category": "stable-core-observability",
+      "id": "paseo-v025-durable-agent-create",
+      "category": "agent-create-lifecycle",
       "base": {
         "tag": "v0.2.5",
         "commit": "6fc491e6220fba6543bbbe4bf1b1f58cfe59228b"
       },
+      "source": [
+        "packages/server/src/server/agent/agent-manager.ts",
+        "packages/server/src/server/agent/agent-sdk-types.ts",
+        "packages/server/src/server/agent/agent-storage.ts",
+        "packages/server/src/server/agent/create-agent-lifecycle-dispatch.ts",
+        "packages/server/src/server/agent/create-agent/create.ts",
+        "packages/server/src/server/agent/providers/acp-agent.ts",
+        "packages/server/src/server/agent/providers/opencode-agent.ts",
+        "packages/server/src/server/bootstrap.ts",
+        "packages/server/src/server/session.ts",
+        "packages/server/src/server/worktree-bootstrap.ts",
+        "packages/server/src/server/worktree-session.ts",
+        "packages/server/src/utils/worktree.ts"
+      ],
       "tests": [
-        "packages/protocol/src/material-progress-schema.test.ts",
-        "packages/server/src/server/agent/material-progress.test.ts",
         "packages/server/src/server/agent/agent-manager.test.ts",
-        "packages/server/src/server/material-progress.e2e.test.ts",
-        "packages/cli/src/commands/agent/inspect.test.ts"
+        "packages/server/src/server/agent/create-agent-lifecycle-dispatch.test.ts",
+        "packages/server/src/server/agent/create-agent/create.test.ts",
+        "packages/server/src/server/agent/providers/acp-agent.test.ts",
+        "packages/server/src/server/agent/providers/opencode-agent.test.ts",
+        "packages/server/src/server/bootstrap.test.ts",
+        "packages/server/src/server/session.create-agent-worktree-autoarchive.e2e.test.ts",
+        "packages/server/src/server/worktree-bootstrap.test.ts",
+        "packages/server/src/server/worktree-session.test.ts",
+        "packages/server/src/utils/worktree.posix.test.ts"
       ],
       "upstreamable": true,
-      "dropCondition": "Remove when the official stable release exposes equivalent singular agent material-progress inspection with persisted terminal-turn semantics.",
+      "upstreamCondition": "Submit only after rebuilding these durable-create commits directly on the v0.2.5 base and proving the same focused lifecycle matrix there.",
+      "dropCondition": "Remove when an official stable release provides equivalent acknowledged-create recovery, provider prompt acceptance, globally atomic publication, stepwise setup recovery, durable auto-archive, and shutdown-owned recovery.",
+      "candidateBranch": "review/v025-durable-create-round2-native",
+      "candidateCommit": null,
       "deployedReceipt": null,
       "deployedAt": null
     }
