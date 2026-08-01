@@ -621,9 +621,13 @@ export async function runWorktreeSetupCommands(options: {
   repoRootPath?: string;
   runtimeEnv?: WorktreeRuntimeEnv;
   onEvent?: (event: WorktreeSetupCommandProgressEvent) => void;
+  commands?: readonly string[];
+  startCommandIndex?: number;
+  beforeCommand?: (index: number, command: string) => Promise<void>;
+  afterCommand?: (index: number, command: string) => Promise<void>;
 }): Promise<WorktreeSetupCommandResult[]> {
   // Read paseo.json from the worktree (it will have the same content as the source repo)
-  const setupCommands = getWorktreeSetupCommands(options.worktreePath);
+  const setupCommands = options.commands ?? getWorktreeSetupCommands(options.worktreePath);
   if (setupCommands.length === 0) {
     return [];
   }
@@ -638,7 +642,10 @@ export async function runWorktreeSetupCommands(options: {
   const setupEnv = createStringCommandShellEnv(createExternalProcessEnv(process.env, runtimeEnv));
 
   const results: WorktreeSetupCommandResult[] = [];
-  for (const [index, cmd] of setupCommands.entries()) {
+  const startCommandIndex = options.startCommandIndex ?? 0;
+  for (let index = startCommandIndex; index < setupCommands.length; index += 1) {
+    const cmd = setupCommands[index];
+    await options.beforeCommand?.(index, cmd);
     const result = options.onEvent
       ? await execSetupCommandStreamed({
           command: cmd,
@@ -670,6 +677,7 @@ export async function runWorktreeSetupCommands(options: {
         results,
       );
     }
+    await options.afterCommand?.(index, cmd);
   }
 
   return results;

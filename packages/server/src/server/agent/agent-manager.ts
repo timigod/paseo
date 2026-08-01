@@ -240,6 +240,8 @@ export interface CreateAgentOptions {
   workspaceId: string | undefined;
   owner?: AgentOwner;
   createRequestFingerprint?: string;
+  /** Keep a two-phase create invisible until its durable acknowledgement publishes. */
+  deferPublication?: boolean;
 }
 
 export interface AgentCreationHandle {
@@ -628,6 +630,7 @@ export class AgentManager {
   private readonly clients = new Map<AgentProvider, AgentClient>();
   private readonly providerEnabled = new Map<AgentProvider, boolean>();
   private readonly agents = new Map<string, LiveManagedAgent>();
+  private readonly unpublishedAgentIds = new Set<string>();
   private readonly timelineStore = new InMemoryAgentTimelineStore();
   private readonly providerSubagents = new ProviderSubagentStore();
   private readonly agentsAwaitingInitialSnapshotPersist = new Set<string>();
@@ -892,7 +895,7 @@ export class AgentManager {
     if (options?.replayState !== false) {
       if (record.agentId) {
         const agent = this.agents.get(record.agentId);
-        if (agent) {
+        if (agent && !this.unpublishedAgentIds.has(agent.id)) {
           callback({
             type: "agent_state",
             agent: { ...agent },
@@ -901,7 +904,7 @@ export class AgentManager {
       } else {
         // For global subscribers, skip internal agents during replay
         for (const agent of this.agents.values()) {
-          if (agent.internal) {
+          if (agent.internal || this.unpublishedAgentIds.has(agent.id)) {
             continue;
           }
           callback({
@@ -925,6 +928,10 @@ export class AgentManager {
     return Array.from(this.agents.values())
       .filter((agent) => !agent.internal)
       .map((agent) => Object.assign({}, agent));
+  }
+
+  isAgentPublished(agentId: string): boolean {
+    return !this.unpublishedAgentIds.has(agentId);
   }
 
   async listImportableSessions(
@@ -1219,12 +1226,16 @@ export class AgentManager {
       throw new Error(`Agent with id ${resolvedAgentId} already exists`);
     }
     this.agents.set(resolvedAgentId, pending);
+    if (options.deferPublication) {
+      this.unpublishedAgentIds.add(resolvedAgentId);
+    }
     this.previousStatuses.set(resolvedAgentId, pending.lifecycle);
     try {
       await this.persistSnapshot(pending, { title: initialPersistedTitle });
       this.assertPendingAgentRegistrationActive(pending);
       this.emitState(pending, { persist: false });
     } catch (error) {
+      this.unpublishedAgentIds.delete(resolvedAgentId);
       this.prepareAgentForClosure(pending, "agent creation registration failed");
       await this.deleteAgentState(resolvedAgentId);
       if (this.registry) {
@@ -1260,6 +1271,12 @@ export class AgentManager {
         }
         publish();
         acknowledgementClaimed = true;
+        if (this.unpublishedAgentIds.delete(resolvedAgentId)) {
+          const current = this.agents.get(resolvedAgentId);
+          if (current) {
+            this.emitState(current, { persist: false });
+          }
+        }
       },
     };
   }
@@ -1364,6 +1381,7 @@ export class AgentManager {
       if (preserve) {
         await this.persistSnapshot(closed);
       } else {
+        this.unpublishedAgentIds.delete(pending.id);
         await this.deleteAgentState(pending.id);
         if (this.registry) {
           await this.registry.remove(pending.id);
@@ -1703,6 +1721,7 @@ export class AgentManager {
 
     try {
       await this.queueAgentLifecycleHandoff(agentId, async () => {
+        this.unpublishedAgentIds.delete(agentId);
         const agent = this.agents.get(agentId);
         detached.session = agent?.session ?? null;
         if (agent) {
@@ -2428,6 +2447,7 @@ export class AgentManager {
       try {
         const result = await agent.session.startTurn(prompt, options);
         turnId = result.turnId;
+        await agent.session.waitForTurnAcceptance?.(turnId);
       } catch (error) {
         agent.pendingReplacement = false;
         const errorMsg = error instanceof Error ? error.message : "Failed to start turn";
@@ -4300,6 +4320,10 @@ export class AgentManager {
       },
       "agent.manager.emit_state",
     );
+
+    if (this.unpublishedAgentIds.has(agent.id)) {
+      return;
+    }
 
     this.dispatch({
       type: "agent_state",

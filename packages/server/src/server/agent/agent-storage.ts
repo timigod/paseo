@@ -50,6 +50,7 @@ const PENDING_CREATE_CONTINUATION_SCHEMA = z.object({
   phase: z.literal("awaiting_dispatch"),
   prompt: z
     .object({
+      status: z.enum(["pending", "dispatching"]).default("pending"),
       input: z.union([z.string(), z.array(AGENT_PROMPT_CONTENT_BLOCK_SCHEMA)]),
       runOptions: z
         .object({
@@ -68,7 +69,25 @@ const PENDING_CREATE_CONTINUATION_SCHEMA = z.object({
       }),
       workspaceCwd: z.string().optional(),
       shouldBootstrap: z.boolean(),
+      progress: z
+        .object({
+          commands: z.array(z.string()),
+          nextCommandIndex: z.number().int().nonnegative(),
+          inFlightCommandIndex: z.number().int().nonnegative().nullable(),
+          terminals: z.enum(["pending", "running", "completed"]),
+        })
+        .optional(),
     })
+    .optional(),
+  autoArchive: z
+    .discriminatedUnion("kind", [
+      z.object({ kind: z.literal("agent-only") }),
+      z.object({
+        kind: z.literal("created-worktree"),
+        workspaceId: z.string(),
+        worktreePath: z.string(),
+      }),
+    ])
     .optional(),
 });
 
@@ -310,12 +329,28 @@ export class AgentStorage {
       }
       const next = { ...pending };
       delete next[step];
-      if (next.prompt === undefined && next.setup === undefined) {
+      if (next.prompt === undefined && next.setup === undefined && next.autoArchive === undefined) {
         const record = { ...existing };
         delete record.pendingCreateContinuation;
         return record;
       }
       return { ...existing, pendingCreateContinuation: next };
+    });
+  }
+
+  async updatePendingCreateContinuation(
+    agentId: string,
+    update: (continuation: PendingCreateContinuation) => PendingCreateContinuation,
+  ): Promise<void> {
+    await this.load();
+    await this.queueRecordMutation(agentId, (existing) => {
+      if (!existing?.pendingCreateContinuation) {
+        throw new Error(`Agent ${agentId} has no pending create continuation`);
+      }
+      return {
+        ...existing,
+        pendingCreateContinuation: update(existing.pendingCreateContinuation),
+      };
     });
   }
 

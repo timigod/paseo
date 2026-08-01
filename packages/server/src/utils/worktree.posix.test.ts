@@ -746,6 +746,34 @@ describe.skipIf(isPlatform("win32"))("worktree POSIX-only", () => {
       ]);
     });
 
+    it("resumes immutable setup commands from the persisted next-command boundary", async () => {
+      const boundaries: string[] = [];
+      await runWorktreeSetupCommands({
+        worktreePath: repoDir,
+        branchName: "main",
+        cleanupOnFailure: false,
+        commands: ['echo "must not replay" > setup-first.log', 'echo "second" > setup-second.log'],
+        startCommandIndex: 1,
+        beforeCommand: async (index) => {
+          boundaries.push(`before:${index}`);
+        },
+        afterCommand: async (index) => {
+          boundaries.push(`after:${index}`);
+        },
+        runtimeEnv: {
+          PASEO_SOURCE_CHECKOUT_PATH: repoDir,
+          PASEO_ROOT_PATH: repoDir,
+          PASEO_WORKTREE_PATH: repoDir,
+          PASEO_BRANCH_NAME: "main",
+          PASEO_WORKTREE_PORT: "12345",
+        },
+      });
+
+      expect(existsSync(join(repoDir, "setup-first.log"))).toBe(false);
+      expect(readFileSync(join(repoDir, "setup-second.log"), "utf8").trim()).toBe("second");
+      expect(boundaries).toEqual(["before:1", "after:1"]);
+    });
+
     it("does not run setup commands when runSetup=false", async () => {
       const paseoConfig = {
         worktree: {

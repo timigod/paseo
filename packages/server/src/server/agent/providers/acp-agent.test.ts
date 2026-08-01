@@ -2318,6 +2318,29 @@ describe("ACPAgentSession", () => {
     expect(asInternals<ACPSessionInternals>(session).activeForegroundTurnId).toBeNull();
   });
 
+  test("turn acceptance waits for the first matching ACP provider receipt", async () => {
+    const session = createSession();
+    const prompt = vi.fn(() => new Promise<PromptResponse>(() => {}));
+    asInternals<ACPSessionInternals>(session).sessionId = "session-1";
+    asInternals<ACPSessionInternals>(session).connection = { prompt };
+
+    const { turnId } = await session.startTurn("hello", { clientMessageId: "msg-client-1" });
+    let accepted = false;
+    const acceptance = session.waitForTurnAcceptance!(turnId).then(() => {
+      accepted = true;
+      return undefined;
+    });
+    await Promise.resolve();
+    expect(accepted).toBe(false);
+
+    await session.sessionUpdate({
+      sessionId: "session-1",
+      update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "ok" } },
+    });
+    await acceptance;
+    expect(accepted).toBe(true);
+  });
+
   test("startTurn emits the submitted user message even when ACP does not echo it", async () => {
     const session = createSession();
     const events: AgentStreamEvent[] = [];
