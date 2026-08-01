@@ -8,28 +8,32 @@
   },
   "candidate": {
     "branch": "review/v025-opencode-stop-boundary",
-    "commit": "8e6d363b8dabbb000f78964a3bbe6cf0413b2e50",
-    "tree": "4d396dd1b7d82cc850f8f25e8ff70c618d4d7a6f"
+    "commit": "6318bc457d9bd5264cb63821fb5d6b05ca706dea",
+    "tree": "a0d4a17433529c6689bfbd2f88605e97b3b713d1"
   },
   "verification": {
-    "commit": "8e6d363b8dabbb000f78964a3bbe6cf0413b2e50",
-    "completedAt": "2026-08-01T00:28:20Z",
+    "commit": "6318bc457d9bd5264cb63821fb5d6b05ca706dea",
+    "completedAt": "2026-08-01T01:17:53Z",
     "runtime": {
       "node": "v24.18.1"
     },
     "commands": [
-      "cd packages/server && ../../node_modules/.bin/vitest run src/server/agent/agent-manager.test.ts --bail=1",
-      "cd packages/server && ../../node_modules/.bin/vitest run src/server/agent/providers/opencode-agent.test.ts --bail=1",
+      "npx vitest run packages/server/src/server/agent/agent-manager.test.ts --bail=1",
+      "npx vitest run packages/server/src/server/agent/providers/opencode-agent.test.ts --bail=1",
+      "npx vitest run packages/server/src/server/agent/provider-registry-wrap.test.ts --bail=1",
       "npm run build:server",
       "npm run typecheck",
-      "npm run lint -- packages/server/src/server/agent/agent-manager.test.ts packages/server/src/server/agent/agent-manager.ts packages/server/src/server/agent/agent-sdk-types.ts packages/server/src/server/agent/providers/opencode-agent.test.ts packages/server/src/server/agent/providers/opencode-agent.ts",
+      "npm run lint -- packages/server/src/server/agent/agent-sdk-types.ts packages/server/src/server/agent/provider-registry.ts packages/server/src/server/agent/provider-registry-wrap.test.ts packages/server/src/server/agent/agent-manager.ts packages/server/src/server/agent/agent-manager.test.ts packages/server/src/server/agent/providers/opencode-agent.ts packages/server/src/server/agent/providers/opencode-agent.test.ts",
       "npm run format:check",
       "git diff --check",
-      "jq -e '.schemaVersion == 1 and (.patches | length == 1) and .patches[0].base.tag == \"v0.2.5\" and .patches[0].base.commit == \"6fc491e6220fba6543bbbe4bf1b1f58cfe59228b\"' patches/local-patches.json"
+      "jq -e '.schemaVersion == 1 and (.patches | length == 1) and .patches[0].base.tag == \"v0.2.5\" and .patches[0].base.commit == \"6fc491e6220fba6543bbbe4bf1b1f58cfe59228b\" and .patches[0].candidate.commit == \"6318bc457d9bd5264cb63821fb5d6b05ca706dea\"' patches/local-patches.json",
+      "jq -e '.schemaVersion == 1 and .patchId == \"paseo-v025-opencode-stop-boundary-recovery\" and .candidate.commit == \"6318bc457d9bd5264cb63821fb5d6b05ca706dea\" and .candidate.tree == \"a0d4a17433529c6689bfbd2f88605e97b3b713d1\" and .verification.commit == .candidate.commit' patches/receipts/paseo-v025-opencode-stop-boundary-recovery.json",
+      "test \"$(git rev-parse 6318bc457d9bd5264cb63821fb5d6b05ca706dea^{tree})\" = \"$(jq -r '.candidate.tree' patches/receipts/paseo-v025-opencode-stop-boundary-recovery.json)\""
     ],
     "result": {
-      "agentManagerTests": "154 passed",
-      "openCodeAdapterTests": "68 passed",
+      "agentManagerTests": "158 passed",
+      "openCodeAdapterTests": "71 passed",
+      "providerRegistryWrapTests": "2 passed",
       "serverBuild": "passed",
       "workspaceTypecheck": "passed",
       "lint": "0 warnings, 0 errors",

@@ -12,7 +12,7 @@
       "candidate": {
         "branch": "review/v025-opencode-stop-boundary",
         "baseCommit": "6fc491e6220fba6543bbbe4bf1b1f58cfe59228b",
-        "commit": null,
+        "commit": "6318bc457d9bd5264cb63821fb5d6b05ca706dea",
         "pullRequest": null,
         "receipt": "patches/receipts/paseo-v025-opencode-stop-boundary-recovery.json"
       },
@@ -30,10 +30,12 @@
       "sources": [
         "packages/server/src/server/agent/agent-sdk-types.ts",
         "packages/server/src/server/agent/agent-manager.ts",
+        "packages/server/src/server/agent/provider-registry.ts",
         "packages/server/src/server/agent/providers/opencode-agent.ts"
       ],
       "tests": [
         "packages/server/src/server/agent/agent-manager.test.ts",
+        "packages/server/src/server/agent/provider-registry-wrap.test.ts",
         "packages/server/src/server/agent/providers/opencode-agent.test.ts"
       ],
       "testCases": [
@@ -43,27 +45,35 @@
         "a second typed rejection fails without a second reload",
         "ambiguous HTTP, overload, text-matched, and other-provider errors never reload or retry",
         "the original pending-run lock survives reload so start waiters continue and duplicate prompts remain rejected",
-        "interrupt and close during reload cancel the unsent prompt whether runtime reload succeeds or fails"
+        "interrupt and close during reload cancel the unsent prompt whether runtime reload succeeds or fails",
+        "the runtime-only admission object is forwarded unchanged through provider wrapping",
+        "OpenCode claims admission after awaited preparation and before promptAsync, command, or summarize submission",
+        "interrupt, close, and shutdown after reload but before admission cancel the unsent retry and settle the original pending run",
+        "reload failure never reaches retry admission or submits the prompt"
       ],
       "verification": {
         "receipt": "patches/receipts/paseo-v025-opencode-stop-boundary-recovery.json",
-        "completedAt": "2026-08-01T00:28:20Z",
+        "completedAt": "2026-08-01T01:17:53Z",
         "runtime": {
           "node": "v24.18.1"
         },
         "commands": [
-          "cd packages/server && ../../node_modules/.bin/vitest run src/server/agent/agent-manager.test.ts --bail=1",
-          "cd packages/server && ../../node_modules/.bin/vitest run src/server/agent/providers/opencode-agent.test.ts --bail=1",
+          "npx vitest run packages/server/src/server/agent/agent-manager.test.ts --bail=1",
+          "npx vitest run packages/server/src/server/agent/providers/opencode-agent.test.ts --bail=1",
+          "npx vitest run packages/server/src/server/agent/provider-registry-wrap.test.ts --bail=1",
           "npm run build:server",
           "npm run typecheck",
-          "npm run lint -- packages/server/src/server/agent/agent-manager.test.ts packages/server/src/server/agent/agent-manager.ts packages/server/src/server/agent/agent-sdk-types.ts packages/server/src/server/agent/providers/opencode-agent.test.ts packages/server/src/server/agent/providers/opencode-agent.ts",
+          "npm run lint -- packages/server/src/server/agent/agent-sdk-types.ts packages/server/src/server/agent/provider-registry.ts packages/server/src/server/agent/provider-registry-wrap.test.ts packages/server/src/server/agent/agent-manager.ts packages/server/src/server/agent/agent-manager.test.ts packages/server/src/server/agent/providers/opencode-agent.ts packages/server/src/server/agent/providers/opencode-agent.test.ts",
           "npm run format:check",
           "git diff --check",
-          "jq -e '.schemaVersion == 1 and (.patches | length == 1) and .patches[0].base.tag == \"v0.2.5\" and .patches[0].base.commit == \"6fc491e6220fba6543bbbe4bf1b1f58cfe59228b\"' patches/local-patches.json"
+          "jq -e '.schemaVersion == 1 and (.patches | length == 1) and .patches[0].base.tag == \"v0.2.5\" and .patches[0].base.commit == \"6fc491e6220fba6543bbbe4bf1b1f58cfe59228b\" and .patches[0].candidate.commit == \"6318bc457d9bd5264cb63821fb5d6b05ca706dea\"' patches/local-patches.json",
+          "jq -e '.schemaVersion == 1 and .patchId == \"paseo-v025-opencode-stop-boundary-recovery\" and .candidate.commit == \"6318bc457d9bd5264cb63821fb5d6b05ca706dea\" and .candidate.tree == \"a0d4a17433529c6689bfbd2f88605e97b3b713d1\" and .verification.commit == .candidate.commit' patches/receipts/paseo-v025-opencode-stop-boundary-recovery.json",
+          "test \"$(git rev-parse 6318bc457d9bd5264cb63821fb5d6b05ca706dea^{tree})\" = \"$(jq -r '.candidate.tree' patches/receipts/paseo-v025-opencode-stop-boundary-recovery.json)\""
         ],
         "result": {
-          "agentManagerTests": "154 passed",
-          "openCodeAdapterTests": "68 passed",
+          "agentManagerTests": "158 passed",
+          "openCodeAdapterTests": "71 passed",
+          "providerRegistryWrapTests": "2 passed",
           "serverBuild": "passed",
           "workspaceTypecheck": "passed",
           "lint": "0 warnings, 0 errors",
@@ -72,7 +82,7 @@
       },
       "upstreamable": true,
       "upstreamCondition": "Submit independently while a typed OpenCode pre-submit stop-boundary rejection can leave an owned runtime unusable without one bounded reload and retry.",
-      "dropCondition": "Remove when the latest stable release provides equivalent typed pre-submit OpenCode stop-boundary recovery with exactly one owned-runtime reload and retry, preserved prompt and run-options identity, durable session reuse, pending-run exclusion, and interrupt/close safety without retrying ambiguous failures.",
+      "dropCondition": "Remove when the latest stable release provides equivalent typed pre-submit OpenCode stop-boundary recovery with exactly one owned-runtime reload and retry, preserved prompt and run-options identity, durable session reuse, pending-run exclusion, and interrupt/close/shutdown safety through final provider admission without retrying ambiguous failures.",
       "deployedReceipt": null,
       "deployedAt": null
     }
