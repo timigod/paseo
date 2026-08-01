@@ -1091,8 +1091,8 @@ export async function createPaseoDaemon(
     workspaceRegistry,
     logger,
   });
-  createAgentCommandDependencies.registerAutoArchive = (agentId, target) => {
-    hubAgentLifecycle.registerPersistedAutoArchive(agentId, target);
+  createAgentCommandDependencies.registerAutoArchive = (agentId, target, options) => {
+    hubAgentLifecycle.registerPersistedAutoArchive(agentId, target, options);
   };
   const pendingCreateRecoveryAbort = new AbortController();
   const pendingCreateRecoveryTask = recoverPendingCreateAgentCommands(
@@ -1550,6 +1550,9 @@ export async function createPaseoDaemon(
               serviceProxyPublicBaseUrl,
               browserToolsBroker,
               hubRelationships,
+              (agentId, target, options) => {
+                hubAgentLifecycle.registerPersistedAutoArchive(agentId, target, options);
+              },
             );
             await hubRelationships.start();
 
@@ -1620,6 +1623,12 @@ export async function createPaseoDaemon(
     agentManager.prepareForShutdown();
     pendingCreateRecoveryAbort.abort();
     await pendingCreateRecoveryTask;
+    const lifecycleShutdown = await hubAgentLifecycle.shutdown({ timeoutMs: 10_000 });
+    if (!lifecycleShutdown.completed) {
+      throw new Error(
+        `Create-agent lifecycle shutdown remains incomplete for agents: ${lifecycleShutdown.pendingAgentIds.join(", ")}`,
+      );
+    }
     await closeAllAgents(logger, agentManager);
     await agentManager.flushForShutdown().catch(() => undefined);
     detachAgentStoragePersistence();

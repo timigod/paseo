@@ -100,6 +100,7 @@ function createManagedAgent(overrides: ManagedAgentOverrides = {}): ManagedAgent
     id: overrides.id ?? "agent-test",
     provider: core.provider,
     cwd: core.cwd,
+    createRequestFingerprint: overrides.createRequestFingerprint,
     session: core.session,
     capabilities: overrides.capabilities ?? buildDefaultCapabilities(),
     config: core.config,
@@ -416,21 +417,70 @@ describe("AgentStorage", () => {
 
   test("the initial deferred snapshot is private until acknowledgement commits", async () => {
     const agent = createManagedAgent({ id: "deferred-create", cwd: "/tmp/project" });
-    await storage.applySnapshot(agent, { createAcknowledged: false });
+    await storage.applySnapshot(agent, {
+      createAcknowledged: false,
+      pendingCreateContinuation: {
+        phase: "awaiting_dispatch",
+        acknowledged: false,
+      },
+    });
 
     const initial = await storage.get(agent.id);
-    expect(initial).toMatchObject({ createAcknowledged: false });
+    expect(initial).toMatchObject({
+      createAcknowledged: false,
+      pendingCreateContinuation: {
+        phase: "awaiting_dispatch",
+        acknowledged: false,
+      },
+    });
     expect(isStoredAgentPublic(initial!)).toBe(false);
 
-    await storage.setPendingCreateContinuation(agent.id, {
-      phase: "awaiting_dispatch",
-      acknowledged: false,
-    });
     await storage.acknowledgePendingCreateContinuation(agent.id);
 
     const acknowledged = await storage.get(agent.id);
     expect(acknowledged).toMatchObject({ createAcknowledged: true });
     expect(isStoredAgentPublic(acknowledged!)).toBe(true);
+  });
+
+  test("legacy private create cleanup is conditional and permits the same id to be recreated", async () => {
+    const agent = createManagedAgent({
+      id: "legacy-private-create",
+      cwd: "/tmp/project",
+      createRequestFingerprint: "same-request",
+    });
+    await storage.applySnapshot(agent, { createAcknowledged: false });
+
+    await expect(storage.discardUnacknowledgedCreate(agent.id, "same-request")).resolves.toBe(true);
+    await expect(storage.get(agent.id)).resolves.toBeNull();
+
+    await storage.applySnapshot(agent, {
+      createAcknowledged: false,
+      pendingCreateContinuation: { phase: "awaiting_dispatch", acknowledged: false },
+    });
+    await expect(storage.get(agent.id)).resolves.toMatchObject({
+      pendingCreateContinuation: { acknowledged: false },
+    });
+  });
+
+  test("legacy private create cleanup cannot erase a newer durable continuation", async () => {
+    const agent = createManagedAgent({
+      id: "legacy-private-create-race",
+      cwd: "/tmp/project",
+      createRequestFingerprint: "same-request",
+    });
+    await storage.applySnapshot(agent, { createAcknowledged: false });
+
+    const newerWrite = storage.applySnapshot(agent, {
+      createAcknowledged: false,
+      pendingCreateContinuation: { phase: "awaiting_dispatch", acknowledged: false },
+    });
+    const cleanup = storage.discardUnacknowledgedCreate(agent.id, "same-request");
+    await newerWrite;
+
+    await expect(cleanup).resolves.toBe(false);
+    await expect(storage.get(agent.id)).resolves.toMatchObject({
+      pendingCreateContinuation: { acknowledged: false },
+    });
   });
 
   test("get returns internal agents by ID", async () => {

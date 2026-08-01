@@ -16,6 +16,7 @@ export class TestOpenCodeHarness implements OpenCodeServerManagerLike {
   }> = [];
   readonly clientCreations: Array<{ baseUrl: string; directory: string }> = [];
   private readonly clients: TestOpenCodeClient[] = [];
+  releaseImplementation: (() => Promise<void>) | null = null;
 
   server = { port: 1234, url: "http://127.0.0.1:1234" };
 
@@ -55,6 +56,7 @@ export class TestOpenCodeHarness implements OpenCodeServerManagerLike {
       server: this.server,
       release: async () => {
         acquisition.releaseCount += 1;
+        await this.releaseImplementation?.();
       },
     };
   }
@@ -117,6 +119,7 @@ export class TestOpenCodeClient {
   sessionCreateResponse: OpenCodeResponse = { data: { id: "session-1" } };
   sessionCreateImplementation: ((parameters: unknown) => Promise<OpenCodeResponse>) | null = null;
   sessionDeleteResponse: OpenCodeResponse = {};
+  sessionDeleteImplementation: ((parameters: unknown) => Promise<OpenCodeResponse>) | null = null;
   sessionChildrenResponses: OpenCodeResponse[] = [];
   sessionChildrenImplementation: ((parameters: unknown) => Promise<OpenCodeResponse>) | null = null;
   sessionGetResponse: OpenCodeResponse = {
@@ -241,7 +244,9 @@ export class TestOpenCodeClient {
         },
         delete: async (parameters: unknown) => {
           this.calls.sessionDelete.push(parameters);
-          return this.sessionDeleteResponse;
+          return this.sessionDeleteImplementation
+            ? await this.sessionDeleteImplementation(parameters)
+            : this.sessionDeleteResponse;
         },
         children: async (parameters: unknown) => {
           this.calls.sessionChildren.push(parameters);

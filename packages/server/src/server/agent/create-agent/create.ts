@@ -222,13 +222,17 @@ export async function beginCreateAgentCommand(
   input: CreateAgentFromSessionInput,
 ): Promise<CreateAgentCommandHandle> {
   const resolved = await resolveSessionCreateAgent(dependencies, input);
+  const pendingContinuation = buildPendingCreateContinuation(resolved);
   const creation = await dependencies.agentManager.beginAgentCreation(
     resolved.config,
     input.agentId,
-    { ...resolved.createOptions, deferPublication: true },
+    {
+      ...resolved.createOptions,
+      deferPublication: true,
+      pendingCreateContinuation: pendingContinuation,
+    },
   );
   const snapshot = creation.snapshot;
-  const pendingContinuation = buildPendingCreateContinuation(resolved);
   let releaseContinuation!: () => void;
   let rejectContinuation!: (error: unknown) => void;
   let continuationDecided = false;
@@ -264,11 +268,12 @@ export async function beginCreateAgentCommand(
     snapshot,
     completion,
     prepareForAcknowledgement: async () => {
-      if (pendingContinuation) {
-        await dependencies.agentStorage.setPendingCreateContinuation(
-          snapshot.id,
-          pendingContinuation,
-        );
+      const durable = await dependencies.agentStorage.get(snapshot.id);
+      if (
+        durable?.createAcknowledged !== false ||
+        durable.pendingCreateContinuation?.acknowledged !== false
+      ) {
+        throw new Error(`Agent ${snapshot.id} is missing its private durable create continuation`);
       }
     },
     acknowledge: async (publish) => {
