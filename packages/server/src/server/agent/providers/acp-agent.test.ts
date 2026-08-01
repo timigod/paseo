@@ -2938,6 +2938,64 @@ describe("ACPAgentSession close() tree-kill", () => {
 });
 
 describe("ACPAgentSession initialization cleanup", () => {
+  test("client forwards an already-aborted daemon lifecycle signal before ACP spawn", async () => {
+    const client = new ACPAgentClient({
+      provider: "copilot",
+      logger: createTestLogger(),
+      defaultCommand: ["definitely-not-a-real-acp-command", "--acp"],
+      defaultModes: [],
+    });
+    const abort = new AbortController();
+    const shutdown = new Error("agent manager is shutting down");
+    abort.abort(shutdown);
+
+    await expect(
+      client.createSession({ provider: "copilot", cwd: "/tmp/paseo-acp-test" }, undefined, {
+        signal: abort.signal,
+      }),
+    ).rejects.toBe(shutdown);
+  });
+
+  test("daemon shutdown aborts an in-flight ACP session startup and terminates its child", async () => {
+    const terminator = new FakeTerminator();
+    const child = createProbeChildStub();
+    const newSession = vi.fn(() => new Promise(() => undefined));
+
+    class HangingNewSession extends ACPAgentSession {
+      protected override async spawnProcess(): Promise<SpawnedACPProcess> {
+        return {
+          child,
+          connection: { newSession } as unknown as ClientSideConnection,
+          initialize: { agentCapabilities: {} },
+        };
+      }
+    }
+
+    const session = new HangingNewSession(
+      { provider: "copilot", cwd: "/tmp/paseo-acp-test" },
+      {
+        provider: "copilot",
+        logger: createTestLogger(),
+        defaultCommand: ["copilot", "--acp"],
+        defaultModes: [],
+        capabilities: {
+          supportsStreaming: true,
+          supportsSessionPersistence: true,
+        },
+        terminateProcess: terminator.terminate,
+      },
+    );
+    const abort = new AbortController();
+    const shutdown = new Error("daemon shutdown during ACP startup");
+    const startup = session.initializeNewSession(abort.signal);
+    await vi.waitFor(() => expect(newSession).toHaveBeenCalledOnce());
+
+    abort.abort(shutdown);
+
+    await expect(startup).rejects.toBe(shutdown);
+    expect(terminator.terminated).toContain(child);
+  });
+
   test("terminates the ACP process when session/new fails", async () => {
     const terminator = new FakeTerminator();
     const child = createProbeChildStub();

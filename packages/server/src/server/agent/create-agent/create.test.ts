@@ -208,7 +208,7 @@ test("acknowledged creation recovers its first turn and setup continuation after
     );
 
     await creation.prepareForAcknowledgement();
-    creation.acknowledge(() => undefined);
+    await creation.acknowledge(() => undefined);
     await expect(storage.get(creation.snapshot.id)).resolves.toMatchObject({
       pendingCreateContinuation: {
         phase: "awaiting_dispatch",
@@ -284,6 +284,89 @@ test("acknowledged creation recovers its first turn and setup continuation after
   }
 });
 
+test("pending create continuation stays inert until the create acknowledgement is published", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "create-agent-unacknowledged-gate-test-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const originalManager = createRealAgentManager(storage);
+  const baseClient = createTestAgentClients().codex;
+  if (!baseClient) throw new Error("Expected Codex test client");
+  let restartedCreateCalls = 0;
+  const restartedClient = new Proxy(baseClient, {
+    get(target, property, receiver) {
+      if (property === "createSession") {
+        return async (...args: Parameters<AgentClient["createSession"]>) => {
+          restartedCreateCalls += 1;
+          return await target.createSession(...args);
+        };
+      }
+      const value = Reflect.get(target, property, receiver);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  }) as AgentClient;
+  const restartedManager = new AgentManager({
+    clients: { codex: restartedClient },
+    registry: storage,
+    logger,
+  });
+  const registerAutoArchive = vi.fn();
+  const abortError = new Error("client never received agent_created");
+
+  const creation = await beginCreateAgentCommand(
+    {
+      agentManager: originalManager,
+      agentStorage: storage,
+      logger,
+      providerSnapshotManager: createProviderSnapshotManagerStub().manager,
+    },
+    {
+      kind: "session",
+      config: { provider: "codex", cwd: workdir },
+      workspaceId: "ws-unacknowledged-gate",
+      initialPrompt: "Must not run before acknowledgement",
+      clientMessageId: "msg-unacknowledged-gate",
+      labels: {},
+      provisionalTitle: null,
+      firstAgentContext: { attachments: [] },
+      autoArchiveTarget: { kind: "agent-only" },
+      buildSessionConfig: async (config) => ({ sessionConfig: config }),
+    },
+  );
+
+  try {
+    await creation.prepareForAcknowledgement();
+    await expect(storage.get(creation.snapshot.id)).resolves.toMatchObject({
+      pendingCreateContinuation: { acknowledged: false },
+    });
+
+    await recoverPendingCreateAgentCommands({
+      agentManager: restartedManager,
+      agentStorage: storage,
+      logger,
+      providerSnapshotManager: createProviderSnapshotManagerStub().manager,
+      registerAutoArchive,
+    });
+
+    expect(restartedCreateCalls).toBe(0);
+    expect(registerAutoArchive).not.toHaveBeenCalled();
+    await expect(storage.get(creation.snapshot.id)).resolves.toMatchObject({
+      pendingCreateContinuation: {
+        acknowledged: false,
+        prompt: { status: "pending", input: "Must not run before acknowledgement" },
+        autoArchive: { kind: "agent-only" },
+      },
+    });
+  } finally {
+    const completion = expect(creation.completion).rejects.toBe(abortError);
+    await creation.abortBeforeAcknowledgement(abortError);
+    await completion;
+    originalManager.prepareForShutdown();
+    restartedManager.prepareForShutdown();
+    await Promise.all([originalManager.flushForShutdown(), restartedManager.flushForShutdown()]);
+    await storage.flush();
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
 test("pending-create recovery aborts a provider resume blocked during shutdown", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "create-agent-provider-abort-test-"));
   const storage = new AgentStorage(join(workdir, "agents"), logger);
@@ -294,6 +377,7 @@ test("pending-create recovery aborts a provider resume blocked during shutdown",
   await originalManager.closeAgent(agent.id);
   await storage.setPendingCreateContinuation(agent.id, {
     phase: "awaiting_dispatch",
+    acknowledged: true,
     prompt: { input: "resume after restart" },
   });
 
@@ -402,7 +486,7 @@ test("provider failure settled before publish cannot be acknowledged", async () 
     await expect(creation.completion).rejects.toBe(startupError);
 
     const publish = vi.fn();
-    expect(() => creation.acknowledge(publish)).toThrow(
+    await expect(creation.acknowledge(publish)).rejects.toThrow(
       "provider failed at acknowledgement boundary",
     );
     expect(publish).not.toHaveBeenCalled();
@@ -464,7 +548,7 @@ test("provider failure after publish preserves the acknowledged creation for rec
 
     await creation.prepareForAcknowledgement();
     const publish = vi.fn();
-    creation.acknowledge(publish);
+    await creation.acknowledge(publish);
     expect(publish).toHaveBeenCalledOnce();
 
     const startupError = new Error("provider failed after acknowledgement");
@@ -548,7 +632,7 @@ test("an acknowledged provider-start failure retries online without a daemon res
       buildSessionConfig: async (config) => ({ sessionConfig: config }),
     });
     await creation.prepareForAcknowledgement();
-    creation.acknowledge(() => undefined);
+    await creation.acknowledge(() => undefined);
     rejectFirstCreate(new Error("transient provider start failure"));
     await expect(creation.completion).rejects.toThrow("transient provider start failure");
 
@@ -616,6 +700,7 @@ test("recovery does not dispatch an already-observed first turn twice", async ()
     });
     await storage.setPendingCreateContinuation(agent.id, {
       phase: "awaiting_dispatch",
+      acknowledged: true,
       prompt: {
         status: "ambiguous",
         input: "Already accepted first turn",
@@ -685,7 +770,7 @@ test("a passive subscriber cannot observe a create before its durable acknowledg
     expect(replayedAgentIds).not.toContain(creation.snapshot.id);
     unsubscribeReplay();
     await creation.prepareForAcknowledgement();
-    creation.acknowledge(() => undefined);
+    await creation.acknowledge(() => undefined);
     await creation.completion;
     expect(observedAgentIds).toContain(creation.snapshot.id);
   } finally {
@@ -714,6 +799,7 @@ test("recovery refuses to replay an ambiguously dispatched first prompt", async 
     });
     await storage.setPendingCreateContinuation(agent.id, {
       phase: "awaiting_dispatch",
+      acknowledged: true,
       prompt: {
         status: "dispatching",
         input: [{ type: "image", data: "AA==", mimeType: "image/png" }],
@@ -752,6 +838,7 @@ test("recovery refuses to replay a worktree command left in flight", async () =>
     });
     await storage.setPendingCreateContinuation(agent.id, {
       phase: "awaiting_dispatch",
+      acknowledged: true,
       setup: {
         workspaceId: "ws-setup-boundary",
         worktree: { branchName: "setup-boundary", worktreePath: workdir },
@@ -825,7 +912,7 @@ test("auto-archive intent is persisted before acknowledgement and restored with 
         },
       },
     });
-    creation.acknowledge(() => undefined);
+    await creation.acknowledge(() => undefined);
     await creation.completion;
     expect(registerAutoArchive).toHaveBeenCalledWith(creation.snapshot.id, {
       kind: "created-worktree",
@@ -885,7 +972,7 @@ test("modern explicit worktree setup and auto-archive use the durable continuati
         },
       },
     });
-    creation.acknowledge(() => undefined);
+    await creation.acknowledge(() => undefined);
     await creation.completion;
     expect(runWorktreeBootstrap).toHaveBeenCalledOnce();
     expect(registerAutoArchive).toHaveBeenCalledWith(creation.snapshot.id, {

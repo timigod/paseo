@@ -1,7 +1,10 @@
 import { expect, test, vi } from "vitest";
 
 import type { AgentManagerEvent, AgentSubscriber } from "./agent-manager.js";
-import { registerAgentAutoArchive } from "./create-agent-lifecycle-dispatch.js";
+import {
+  registerAgentAutoArchive,
+  requireExactWorkspaceArchive,
+} from "./create-agent-lifecycle-dispatch.js";
 
 class AgentLifecycleEvents {
   private readonly listeners = new Set<AgentSubscriber>();
@@ -69,4 +72,24 @@ test("auto-archive remains subscribed and retries after an observable failure", 
 
   expect(archiveCount).toBe(2);
   expect(agents.listenerCount()).toBe(0);
+});
+
+test("actual-target auto-archive rejects a swallowed workspace teardown failure", () => {
+  expect(() =>
+    requireExactWorkspaceArchive(
+      { archivedAgentIds: [], archivedWorkspaceIds: [], removedDirectory: false },
+      "ws-requested",
+    ),
+  ).toThrow("Auto-archive did not archive requested workspace ws-requested");
+
+  expect(() =>
+    requireExactWorkspaceArchive(
+      {
+        archivedAgentIds: ["agent-1"],
+        archivedWorkspaceIds: ["ws-requested"],
+        removedDirectory: false,
+      },
+      "ws-requested",
+    ),
+  ).not.toThrow();
 });

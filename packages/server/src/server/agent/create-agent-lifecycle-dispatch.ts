@@ -4,7 +4,11 @@ import type { TerminalManager } from "../../terminal/terminal-manager.js";
 
 import type { ForgeService } from "../../services/forge-service.js";
 import { isPaseoOwnedWorktreeCwd } from "../../utils/worktree.js";
-import { archiveByScope, type ActiveWorkspaceRef } from "../workspace-archive-service.js";
+import {
+  archiveByScope,
+  type ActiveWorkspaceRef,
+  type ArchiveResult,
+} from "../workspace-archive-service.js";
 import type {
   CreatePaseoWorktreeWorkflowFn,
   CreatePaseoWorktreeWorkflowResult,
@@ -255,7 +259,7 @@ export class CreateAgentLifecycleDispatch {
   }
 
   private async archiveWorkspaceById(workspaceId: string): Promise<void> {
-    await archiveByScope(
+    const result = await archiveByScope(
       {
         paseoHome: this.dependencies.paseoHome,
         paseoWorktreesBaseRoot: this.dependencies.worktreesRoot,
@@ -274,6 +278,7 @@ export class CreateAgentLifecycleDispatch {
       },
       { scope: { kind: "workspace", workspaceId }, requestId: randomUUID() },
     );
+    requireExactWorkspaceArchive(result, workspaceId);
   }
 
   private async archiveAutoCreatedWorktree(options: {
@@ -295,6 +300,12 @@ export class CreateAgentLifecycleDispatch {
     if (options.agentId) {
       this.dependencies.emitAgentRemove(options.agentId);
     }
+  }
+}
+
+export function requireExactWorkspaceArchive(result: ArchiveResult, workspaceId: string): void {
+  if (!result.archivedWorkspaceIds.includes(workspaceId)) {
+    throw new Error(`Auto-archive did not archive requested workspace ${workspaceId}`);
   }
 }
 

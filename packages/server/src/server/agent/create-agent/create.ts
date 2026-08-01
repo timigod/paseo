@@ -154,7 +154,7 @@ export interface CreateAgentCommandHandle {
   snapshot: ManagedAgent;
   completion: Promise<CreateAgentCommandResult>;
   prepareForAcknowledgement: () => Promise<void>;
-  acknowledge: (publish: () => void) => void;
+  acknowledge: (publish: () => void) => Promise<void>;
   abortBeforeAcknowledgement: (error: unknown) => Promise<void>;
 }
 
@@ -270,9 +270,23 @@ export async function beginCreateAgentCommand(
         );
       }
     },
-    acknowledge: (publish) => {
+    acknowledge: async (publish) => {
       creation.commitAcknowledgement(publish);
-      decideOnce("continue");
+      try {
+        if (pendingContinuation) {
+          // Publish first, then durably open the continuation gate. A daemon
+          // crash may delay acknowledged work, but it can never execute work
+          // for a create result the client did not receive.
+          await dependencies.agentStorage.acknowledgePendingCreateContinuation(snapshot.id);
+        }
+        decideOnce("continue");
+      } catch (error) {
+        decideOnce("abort", error);
+        dependencies.logger.error(
+          { err: error, agentId: snapshot.id },
+          "Create acknowledgement published but its durable continuation remains gated",
+        );
+      }
     },
     abortBeforeAcknowledgement: async (error) => {
       if (!decideOnce("abort", error)) {
@@ -489,6 +503,7 @@ function buildPendingCreateContinuation(
   }
   return {
     phase: "awaiting_dispatch",
+    acknowledged: false,
     ...(prompt ? { prompt } : {}),
     ...(setup ? { setup } : {}),
     ...(autoArchive ? { autoArchive } : {}),
@@ -570,6 +585,13 @@ async function recoverPendingCreateAgentCommand(
   if (signal?.aborted) return;
   const pending = record.pendingCreateContinuation;
   if (!pending) {
+    return;
+  }
+  if (!pending.acknowledged) {
+    dependencies.logger.info(
+      { agentId: record.id },
+      "Pending create-agent continuation is waiting for a client acknowledgement replay",
+    );
     return;
   }
   const snapshot = await ensureAgentLoaded(record.id, {

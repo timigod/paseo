@@ -3194,7 +3194,9 @@ export class Session {
       this.emitCreateAgentRequestOutcome(requestId, outcome);
       return outcome;
     }
-    if (storedAgent?.pendingCreateContinuation) {
+    const continuationNeedsAcknowledgement =
+      storedAgent?.pendingCreateContinuation?.acknowledged === false;
+    if (storedAgent?.pendingCreateContinuation?.acknowledged === true) {
       try {
         await recoverPendingCreateAgentCommandById(this.createAgentCommandDependencies(), agentId);
       } catch (error) {
@@ -3220,6 +3222,20 @@ export class Session {
       },
     });
     this.releaseAgentOutboundVisibilityGate(agentId);
+    if (continuationNeedsAcknowledgement) {
+      try {
+        // This duplicate request is the first observable acknowledgement after
+        // the previous daemon died. Open the durable gate only after emitting
+        // agent_created, then recover the deferred prompt/setup/archive work.
+        await this.agentStorage.acknowledgePendingCreateContinuation(agentId);
+        await recoverPendingCreateAgentCommandById(this.createAgentCommandDependencies(), agentId);
+      } catch (error) {
+        this.sessionLogger.warn(
+          { err: error, agentId },
+          "Acknowledged create-agent replay left its continuation pending",
+        );
+      }
+    }
     this.sessionLogger.info(
       { agentId, requestId, status: agent.status },
       "Replayed durable create-agent result",
@@ -3352,7 +3368,7 @@ export class Session {
         }
         const agentPayload = await this.buildAgentPayload(snapshot);
         await creation.prepareForAcknowledgement();
-        creation.acknowledge(() => {
+        await creation.acknowledge(() => {
           this.emit({
             type: "status",
             payload: {

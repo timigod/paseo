@@ -48,6 +48,10 @@ const AGENT_PROMPT_CONTENT_BLOCK_SCHEMA = z.union([
 
 const PENDING_CREATE_CONTINUATION_SCHEMA = z.object({
   phase: z.literal("awaiting_dispatch"),
+  // A continuation is written before the create acknowledgement so a crash
+  // cannot lose its work. It must remain inert until the acknowledgement has
+  // actually been published to the requesting client.
+  acknowledged: z.boolean().default(false),
   prompt: z
     .object({
       status: z.enum(["pending", "dispatching", "ambiguous"]).default("pending"),
@@ -312,6 +316,22 @@ export class AgentStorage {
         throw new Error(`Agent ${agentId} not found`);
       }
       return { ...existing, pendingCreateContinuation: continuation };
+    });
+  }
+
+  async acknowledgePendingCreateContinuation(agentId: string): Promise<void> {
+    await this.load();
+    await this.queueRecordMutation(agentId, (existing) => {
+      if (!existing?.pendingCreateContinuation) {
+        throw new Error(`Agent ${agentId} has no pending create continuation`);
+      }
+      return {
+        ...existing,
+        pendingCreateContinuation: {
+          ...existing.pendingCreateContinuation,
+          acknowledged: true,
+        },
+      };
     });
   }
 
