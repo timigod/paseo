@@ -49,8 +49,8 @@ const AGENT_PROMPT_CONTENT_BLOCK_SCHEMA = z.union([
 const PENDING_CREATE_CONTINUATION_SCHEMA = z.object({
   phase: z.literal("awaiting_dispatch"),
   // A continuation is written before the create acknowledgement so a crash
-  // cannot lose its work. It must remain inert until the acknowledgement has
-  // actually been published to the requesting client.
+  // cannot lose its work. It remains private and inert until the daemon has
+  // durably committed the acknowledgement immediately before publishing it.
   acknowledged: z.boolean().default(false),
   prompt: z
     .object({
@@ -145,11 +145,16 @@ export type SerializableAgentConfig = Pick<
 >;
 
 export type PendingCreateContinuation = z.infer<typeof PENDING_CREATE_CONTINUATION_SCHEMA>;
-export type PendingCreateContinuationStep = "prompt" | "setup";
+export type PendingCreateContinuationStep = "prompt" | "setup" | "autoArchive";
 
 export type StoredAgentRecord = z.infer<typeof STORED_AGENT_SCHEMA>;
 export function parseStoredAgentRecord(value: unknown): StoredAgentRecord {
   return STORED_AGENT_SCHEMA.parse(value);
+}
+
+/** Public transport/lifecycle views must not expose a create that was never acknowledged. */
+export function isStoredAgentPublic(record: StoredAgentRecord): boolean {
+  return record.pendingCreateContinuation?.acknowledged !== false;
 }
 
 export class AgentStorage {
@@ -325,13 +330,22 @@ export class AgentStorage {
       if (!existing?.pendingCreateContinuation) {
         throw new Error(`Agent ${agentId} has no pending create continuation`);
       }
-      return {
+      const next = {
         ...existing,
         pendingCreateContinuation: {
           ...existing.pendingCreateContinuation,
           acknowledged: true,
         },
       };
+      if (
+        next.pendingCreateContinuation.prompt === undefined &&
+        next.pendingCreateContinuation.setup === undefined &&
+        next.pendingCreateContinuation.autoArchive === undefined
+      ) {
+        const { pendingCreateContinuation: _pending, ...acknowledged } = next;
+        return acknowledged;
+      }
+      return next;
     });
   }
 

@@ -165,6 +165,58 @@ async function assertAgentNotRunning(options: {
 }
 
 describe("agent MCP end-to-end (offline)", () => {
+  test("unacknowledged durable creates stay hidden from MCP list and get tools", async () => {
+    const paseoHome = await mkdtemp(path.join(os.tmpdir(), "paseo-home-private-create-"));
+    const staticDir = await mkdtemp(path.join(os.tmpdir(), "paseo-static-private-create-"));
+    const port = await getAvailablePort();
+    const daemon = await createPaseoDaemon(
+      {
+        listen: `127.0.0.1:${port}`,
+        paseoHome,
+        corsAllowedOrigins: [],
+        hostnames: true,
+        mcpEnabled: true,
+        staticDir,
+        mcpDebug: false,
+        agentClients: createTestAgentClients(),
+        agentStoragePath: path.join(paseoHome, "agents"),
+      },
+      pino({ level: "silent" }),
+    );
+    await daemon.agentStorage.upsert({
+      id: "agent-mcp-private-create",
+      provider: "codex",
+      cwd: paseoHome,
+      createdAt: "2026-07-31T00:00:00.000Z",
+      updatedAt: "2026-07-31T00:00:00.000Z",
+      labels: {},
+      lastStatus: "closed",
+      config: null,
+      pendingCreateContinuation: {
+        phase: "awaiting_dispatch",
+        acknowledged: false,
+      },
+    });
+    await daemon.start();
+    const client = await createMcpClient(`http://127.0.0.1:${port}/mcp/agents`);
+
+    try {
+      const listed = await client.callTool({ name: "list_agents" });
+      expect(JSON.stringify(listed)).not.toContain("agent-mcp-private-create");
+
+      const fetched = await client.callTool({
+        name: "get_agent_status",
+        args: { agentId: "agent-mcp-private-create" },
+      });
+      expect(fetched.isError).toBe(true);
+    } finally {
+      await client.close();
+      await daemon.stop();
+      await rm(paseoHome, { recursive: true, force: true });
+      await rm(staticDir, { recursive: true, force: true });
+    }
+  });
+
   test("create_agent runs initial prompt and affects filesystem", async () => {
     const paseoHome = await mkdtemp(path.join(os.tmpdir(), "paseo-home-"));
     const staticDir = await mkdtemp(path.join(os.tmpdir(), "paseo-static-"));

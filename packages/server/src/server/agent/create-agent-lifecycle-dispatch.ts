@@ -104,8 +104,9 @@ export class CreateAgentLifecycleDispatch {
     target:
       | { kind: "agent-only" }
       | { kind: "created-worktree"; workspaceId: string; worktreePath: string },
+    options?: { startImmediately?: boolean },
   ): LifecycleRegistration {
-    return this.registerAutoArchiveOnTerminalState(agentId, target);
+    return this.registerAutoArchiveOnTerminalState(agentId, target, options);
   }
 
   async cleanupCreatedWorktreeAfterFailedAgentCreate(input: {
@@ -205,6 +206,7 @@ export class CreateAgentLifecycleDispatch {
   private registerAutoArchiveOnTerminalState(
     agentId: string,
     target: AutoArchiveTarget,
+    options?: { startImmediately?: boolean },
   ): LifecycleRegistration {
     return registerAgentAutoArchive({
       agentManager: this.dependencies.agentManager,
@@ -212,6 +214,7 @@ export class CreateAgentLifecycleDispatch {
       archive: () => this.autoArchiveAgentOnce(agentId, target),
       onError: (error) =>
         this.dependencies.logger.warn({ err: error, agentId }, "Failed to auto-archive agent"),
+      startImmediately: options?.startImmediately,
     });
   }
 
@@ -225,6 +228,10 @@ export class CreateAgentLifecycleDispatch {
       } else {
         await this.dependencies.archiveAgentForClose(agentId);
       }
+      await this.dependencies.agentStorage.completePendingCreateContinuationStep(
+        agentId,
+        "autoArchive",
+      );
       this.completedAutoArchiveAgentIds.add(agentId);
     })();
     this.autoArchiveTasks.set(agentId, task);
@@ -254,11 +261,18 @@ export class CreateAgentLifecycleDispatch {
       throw new Error("Auto-created worktree is not a Paseo-owned worktree");
     }
 
-    await this.archiveWorkspaceById(target.workspaceId);
+    await this.archiveWorkspaceById(target.workspaceId, agentId, worktreePath);
     this.dependencies.emitAgentRemove(agentId);
   }
 
-  private async archiveWorkspaceById(workspaceId: string): Promise<void> {
+  private async archiveWorkspaceById(
+    workspaceId: string,
+    agentId: string | null,
+    worktreePath: string,
+  ): Promise<void> {
+    const workspaceIsActive = (await this.dependencies.listActiveWorkspaces()).some(
+      (workspace) => workspace.workspaceId === workspaceId,
+    );
     const result = await archiveByScope(
       {
         paseoHome: this.dependencies.paseoHome,
@@ -276,9 +290,14 @@ export class CreateAgentLifecycleDispatch {
         killTerminalsForWorkspace: this.dependencies.killTerminalsForWorkspace,
         sessionLogger: this.dependencies.logger,
       },
-      { scope: { kind: "workspace", workspaceId }, requestId: randomUUID() },
+      {
+        scope: workspaceIsActive
+          ? { kind: "workspace", workspaceId }
+          : { kind: "worktree", targetPath: worktreePath },
+        requestId: randomUUID(),
+      },
     );
-    requireExactWorkspaceArchive(result, workspaceId);
+    requireExactWorkspaceArchive(result, workspaceId, agentId, workspaceIsActive);
   }
 
   private async archiveAutoCreatedWorktree(options: {
@@ -295,7 +314,11 @@ export class CreateAgentLifecycleDispatch {
       throw new Error("Auto-created worktree is not a Paseo-owned worktree");
     }
 
-    await this.archiveWorkspaceById(createdWorktree.workspace.workspaceId);
+    await this.archiveWorkspaceById(
+      createdWorktree.workspace.workspaceId,
+      options.agentId,
+      worktreePath,
+    );
 
     if (options.agentId) {
       this.dependencies.emitAgentRemove(options.agentId);
@@ -303,9 +326,23 @@ export class CreateAgentLifecycleDispatch {
   }
 }
 
-export function requireExactWorkspaceArchive(result: ArchiveResult, workspaceId: string): void {
-  if (!result.archivedWorkspaceIds.includes(workspaceId)) {
+export function requireExactWorkspaceArchive(
+  result: ArchiveResult,
+  workspaceId: string,
+  agentId: string | null,
+  workspaceWasActive = true,
+): void {
+  if (result.cleanupPending) {
+    throw new Error(`Auto-archive cleanup remains pending for workspace ${workspaceId}`);
+  }
+  if (!result.removedDirectory) {
+    throw new Error(`Auto-archive did not remove workspace directory ${workspaceId}`);
+  }
+  if (workspaceWasActive && !result.archivedWorkspaceIds.includes(workspaceId)) {
     throw new Error(`Auto-archive did not archive requested workspace ${workspaceId}`);
+  }
+  if (workspaceWasActive && agentId && !result.archivedAgentIds.includes(agentId)) {
+    throw new Error(`Auto-archive did not archive requested agent ${agentId}`);
   }
 }
 
@@ -314,10 +351,15 @@ export function registerAgentAutoArchive(input: {
   agentId: string;
   archive: () => Promise<unknown>;
   onError?: (error: unknown) => void;
+  retryDelayMs?: number;
+  startImmediately?: boolean;
 }): LifecycleRegistration {
   let unsubscribe: (() => void) | null = null;
   let archiveTask: Promise<unknown> | null = null;
+  let retryTimer: ReturnType<typeof setTimeout> | null = null;
   let releaseRequested = false;
+  let terminalObserved = input.startImmediately === true;
+  let cancelled = false;
   const release = () => {
     if (!unsubscribe) {
       releaseRequested = true;
@@ -327,8 +369,30 @@ export function registerAgentAutoArchive(input: {
     unsubscribe = null;
     subscribed();
   };
+  const attemptArchive = () => {
+    if (cancelled || archiveTask) return;
+    const task = Promise.resolve().then(input.archive);
+    archiveTask = task;
+    void task.then(
+      () => release(),
+      (error) => {
+        if (archiveTask === task) archiveTask = null;
+        input.onError?.(error);
+        if (!cancelled && terminalObserved && !retryTimer) {
+          retryTimer = setTimeout(() => {
+            retryTimer = null;
+            attemptArchive();
+          }, input.retryDelayMs ?? 1_000);
+          retryTimer.unref?.();
+        }
+      },
+    );
+  };
   const registration: LifecycleRegistration = {
     async cancel() {
+      cancelled = true;
+      if (retryTimer) clearTimeout(retryTimer);
+      retryTimer = null;
       release();
       await archiveTask;
     },
@@ -347,20 +411,13 @@ export function registerAgentAutoArchive(input: {
         event.agent.lifecycle !== "running" &&
         event.agent.lifecycle !== "initializing";
       if (!terminalStream && !terminalState) return;
-      if (archiveTask) return;
-      const task = Promise.resolve().then(input.archive);
-      archiveTask = task;
-      void task.then(
-        () => release(),
-        (error) => {
-          if (archiveTask === task) archiveTask = null;
-          input.onError?.(error);
-        },
-      );
+      terminalObserved = true;
+      attemptArchive();
     },
     { agentId: input.agentId, replayState: true },
   );
   if (releaseRequested) release();
+  if (input.startImmediately) attemptArchive();
   return registration;
 }
 

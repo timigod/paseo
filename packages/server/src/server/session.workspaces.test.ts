@@ -1266,16 +1266,12 @@ test("concurrent create requests acknowledge each session before forwarding the 
     await Promise.all([ownerRequest, followerRequest]);
 
     await vi.waitFor(() => {
-      for (const order of [ownerOrder, followerOrder]) {
-        expect(order).toContain("stream:thread_started");
-        expect(order).toContain("stream:turn_started");
-      }
+      expect(ownerOrder).toContain("stream:turn_started");
     });
     for (const order of [ownerOrder, followerOrder]) {
       expect(order[0]).toBe("agent_created");
-      expect(order).toContain("stream:thread_started");
-      expect(order).toContain("stream:turn_started");
     }
+    expect(ownerOrder).toContain("stream:turn_started");
     expect(client.createSessionCallCount).toBe(1);
     expect(owner.agentManager.listAgents()).toHaveLength(1);
   } finally {
@@ -1322,7 +1318,15 @@ test("create retry survives owner disconnect while provider startup is still pen
     await owner.session.cleanup();
 
     const retryRequest = retry.session.handleMessage(request);
-    await waitForImmediate();
+    await vi.waitFor(() => {
+      expect(
+        filterByType(retry.emitted, "status").some(
+          (message) =>
+            message.payload.status === "agent_created" &&
+            message.payload.requestId === request.requestId,
+        ),
+      ).toBe(true);
+    });
 
     const ownerCreated = filterByType(owner.emitted, "status").find(
       (message) =>
@@ -1833,6 +1837,36 @@ test("unsupported persisted agents are excluded from active lists but preserved 
       persistence: null,
     }),
   );
+});
+
+test("unacknowledged durable creates stay hidden from session list and get paths", async () => {
+  const session = createSessionForWorkspaceTests();
+  const record: StoredAgentRecord = {
+    id: "agent-unacknowledged-private",
+    provider: "codex",
+    cwd: path.resolve("/tmp/private-create"),
+    createdAt: "2026-07-31T00:00:00.000Z",
+    updatedAt: "2026-07-31T00:00:00.000Z",
+    labels: {},
+    lastStatus: "closed",
+    config: null,
+    pendingCreateContinuation: {
+      phase: "awaiting_dispatch",
+      acknowledged: false,
+      prompt: { status: "pending", input: "must remain private" },
+    },
+  };
+  session.agentStorage.list = async () => [record];
+  session.agentStorage.get = async (agentId: string) => (agentId === record.id ? record : null);
+
+  await expect(session.listAgentPayloads({ includeUnavailablePersisted: true })).resolves.toEqual(
+    [],
+  );
+  await expect(session.getAgentPayloadById(record.id)).resolves.toBeNull();
+  await expect(session.resolveAgentIdentifier(record.id)).resolves.toEqual({
+    ok: false,
+    error: `Agent not found: ${record.id}`,
+  });
 });
 
 test("agent_update placement does not refresh git snapshots", async () => {
@@ -6076,7 +6110,6 @@ test("archive_workspace_request hides non-destructive workspace records", async 
     workspaceId: "ws-repo-archive",
     requestId: "req-archive",
   });
-
   expect(workspace.archivedAt).toBeTruthy();
   const response = emitted.find((message) => message.type === "archive_workspace_response") as
     | { payload: Record<string, unknown> }

@@ -5,7 +5,7 @@ import {
   type AgentRunCancellationResult,
   type ManagedAgent,
 } from "./agent-manager.js";
-import type { StoredAgentRecord } from "./agent-storage.js";
+import { isStoredAgentPublic, type StoredAgentRecord } from "./agent-storage.js";
 import type { AgentProviderNotice } from "./agent-sdk-types.js";
 
 export type LifecycleAgentSnapshot = Pick<ManagedAgent, "id" | "cwd" | "lifecycle">;
@@ -220,6 +220,9 @@ async function archiveStoredAgent(
 ): Promise<StoredAgentRecord> {
   const existing = await dependencies.agentStorage.get(agentId);
   if (!existing) {
+    throw new Error(`Agent not found: ${agentId}`);
+  }
+  if (!isStoredAgentPublic(existing)) {
     throw new Error(`Agent not found: ${agentId}`);
   }
 

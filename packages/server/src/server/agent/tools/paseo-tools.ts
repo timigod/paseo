@@ -20,7 +20,7 @@ import {
 } from "../agent-projections.js";
 import { curateAgentActivity } from "../activity-curator.js";
 import { selectItemsByProjectedLimit } from "../timeline-projection.js";
-import type { AgentStorage } from "../agent-storage.js";
+import { isStoredAgentPublic, type AgentStorage } from "../agent-storage.js";
 import { ensureAgentLoaded } from "../agent-loading.js";
 import { isStoredAgentProviderAvailable } from "../../persistence-hooks.js";
 import {
@@ -1971,7 +1971,7 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
       }
 
       const record = await agentStorage.get(agentId);
-      if (!record || record.internal) {
+      if (!record || record.internal || !isStoredAgentPublic(record)) {
         throw new Error(`Agent ${agentId} not found`);
       }
 
@@ -2026,7 +2026,9 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
       const storedRecords = await agentStorage.list();
       const registeredProviderIds = new Set(providerSnapshotManager.listRegisteredProviderIds());
       const storedAgents = storedRecords
-        .filter((record) => !record.internal && !liveIds.has(record.id))
+        .filter(
+          (record) => !record.internal && !liveIds.has(record.id) && isStoredAgentPublic(record),
+        )
         .filter((record) => includeArchived || !record.archivedAt)
         .filter(
           (record) =>

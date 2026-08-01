@@ -280,6 +280,7 @@ export function buildACPClientCapabilities(
 // NO_BROWSER is honored by Gemini CLI; other ACP agents ignore it.
 const PROBE_ENV: Record<string, string> = { NO_BROWSER: "true" };
 const ACP_CATALOG_TIMEOUT_MS = 60_000;
+const ACP_CLOSE_RPC_TIMEOUT_MS = 250;
 const ACP_DIAGNOSTIC_PHASE_TIMEOUT_MS = 20_000;
 
 function summarizeMalformedACPStdoutError(error: unknown): { type: string; message: string } {
@@ -2125,21 +2126,10 @@ export class ACPAgentSession implements AgentSession, ACPClient {
     }
     this.pendingPermissions.clear();
 
-    if (this.connection && this.sessionId) {
-      try {
-        if (this.activeForegroundTurnId) {
-          await this.connection.cancel({ sessionId: this.sessionId });
-        }
-      } catch {}
-
-      try {
-        if (this.agentCapabilities?.sessionCapabilities?.close) {
-          await this.connection.unstable_closeSession({ sessionId: this.sessionId });
-        }
-      } catch (error) {
-        this.logger.debug({ err: error }, "ACP closeSession failed during shutdown");
-      }
-    }
+    // Start provider courtesy RPCs and process teardown together. A resumed
+    // provider can hang cancel/closeSession forever after an aborted handshake;
+    // those RPCs must never stand between shutdown and the owned child tree kill.
+    const providerClose = this.closeProviderSessionBestEffort();
 
     const terminalTerminations = Array.from(this.terminalEntries.values(), (terminal) =>
       this.terminateProcess(terminal.child, {
@@ -2147,17 +2137,46 @@ export class ACPAgentSession implements AgentSession, ACPClient {
         forceTimeoutMs: 2_000,
       }),
     );
-    await Promise.all(terminalTerminations);
+    const childTermination = this.child
+      ? this.terminateProcess(this.child, { gracefulTimeoutMs: 2_000, forceTimeoutMs: 2_000 })
+      : Promise.resolve();
+    await Promise.all([providerClose, childTermination, ...terminalTerminations]);
     this.terminalEntries.clear();
-
-    if (this.child) {
-      await this.terminateProcess(this.child, { gracefulTimeoutMs: 2_000, forceTimeoutMs: 2_000 });
-    }
 
     this.subscribers.clear();
     this.connection = null;
     this.child = null;
     this.activeForegroundTurnId = null;
+  }
+
+  private async closeProviderSessionBestEffort(): Promise<void> {
+    const connection = this.connection;
+    const sessionId = this.sessionId;
+    if (!connection || !sessionId) return;
+
+    if (this.activeForegroundTurnId) {
+      try {
+        await withTimeout(
+          connection.cancel({ sessionId }),
+          ACP_CLOSE_RPC_TIMEOUT_MS,
+          `ACP cancel timed out after ${ACP_CLOSE_RPC_TIMEOUT_MS}ms`,
+        );
+      } catch (error) {
+        this.logger.debug({ err: error }, "ACP cancel failed during shutdown");
+      }
+    }
+
+    if (this.agentCapabilities?.sessionCapabilities?.close) {
+      try {
+        await withTimeout(
+          connection.unstable_closeSession({ sessionId }),
+          ACP_CLOSE_RPC_TIMEOUT_MS,
+          `ACP closeSession timed out after ${ACP_CLOSE_RPC_TIMEOUT_MS}ms`,
+        );
+      } catch (error) {
+        this.logger.debug({ err: error }, "ACP closeSession failed during shutdown");
+      }
+    }
   }
 
   async requestPermission(params: RequestPermissionRequest): Promise<RequestPermissionResponse> {
