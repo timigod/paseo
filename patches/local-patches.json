@@ -27,14 +27,18 @@
         "packages/server/src/server/session.ts",
         "packages/server/src/server/session/agent-updates/agent-updates-service.ts",
         "packages/server/src/server/workspace-archive-service.ts",
+        "packages/server/src/server/workspace-reference-coordinator.ts",
+        "packages/server/src/server/workspace-registry.ts",
         "packages/server/src/server/worktree-bootstrap.ts",
         "packages/server/src/server/worktree-session.ts",
+        "packages/server/src/utils/worktree-metadata.ts",
         "packages/server/src/utils/worktree.ts"
       ],
       "tests": [
         "packages/server/src/server/agent/agent-manager.test.ts",
         "packages/server/src/server/agent/agent-mcp.e2e.test.ts",
         "packages/server/src/server/agent/agent-prompt.test.ts",
+        "packages/server/src/server/agent/agent-storage.test.ts",
         "packages/server/src/server/agent/create-agent-lifecycle-dispatch.test.ts",
         "packages/server/src/server/agent/create-agent/create.test.ts",
         "packages/server/src/server/agent/lifecycle-command.test.ts",
@@ -49,13 +53,14 @@
         "packages/server/src/server/session.workspaces.test.ts",
         "packages/server/src/server/session/agent-updates/agent-updates-service.test.ts",
         "packages/server/src/server/workspace-archive-service.test.ts",
+        "packages/server/src/server/worktree-session.test.ts",
         "packages/server/src/utils/worktree.posix.test.ts"
       ],
       "upstreamable": true,
-      "upstreamCondition": "Submit from this exact v0.2.5 reconstruction after its focused lifecycle matrix and independent exact-tip review are green.",
-      "dropCondition": "Remove when an official stable release provides equivalent acknowledged-create recovery, provider prompt acceptance, globally atomic publication, stepwise setup recovery, durable auto-archive, and shutdown-owned recovery.",
+      "upstreamCondition": "Submit from this exact v0.2.5 reconstruction after its focused lifecycle matrix, current-main replay, and independent exact-tip review are green.",
+      "dropCondition": "Remove when an official stable release provides equivalent atomic acknowledged-create recovery, provider prompt and late-session cleanup, stepwise setup recovery, incarnation-fenced cleanup-only auto-archive with lifecycle rearming, and shutdown-owned recovery.",
       "candidateBranch": "review/v025-durable-create-direct-final",
-      "candidateCommit": "bb17cd22c1e0bd0ac036eb38564f4f47a032b708",
+      "candidateCommit": "67e23daf21868648ec2a696c38a142b4af053bb6",
       "deployedReceipt": null,
       "deployedAt": null
     }
