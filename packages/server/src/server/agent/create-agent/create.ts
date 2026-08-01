@@ -61,6 +61,7 @@ export interface CreateAgentCommandDependencies {
   registerAutoArchive?: (
     agentId: string,
     target: NonNullable<PendingCreateContinuation["autoArchive"]>,
+    options?: { startImmediately?: boolean },
   ) => void;
 }
 
@@ -271,21 +272,27 @@ export async function beginCreateAgentCommand(
       }
     },
     acknowledge: async (publish) => {
-      creation.commitAcknowledgement(publish);
       try {
-        if (pendingContinuation) {
-          // Publish first, then durably open the continuation gate. A daemon
-          // crash may delay acknowledged work, but it can never execute work
-          // for a create result the client did not receive.
-          await dependencies.agentStorage.acknowledgePendingCreateContinuation(snapshot.id);
-        }
+        // Commit the durable acknowledgement before exposing agent_created.
+        // A crash after this write is replayable; a failed write is never
+        // reported as public success and is cleaned up below.
+        await dependencies.agentStorage.acknowledgePendingCreateContinuation(snapshot.id);
+        creation.commitAcknowledgement(publish);
         decideOnce("continue");
       } catch (error) {
         decideOnce("abort", error);
-        dependencies.logger.error(
-          { err: error, agentId: snapshot.id },
-          "Create acknowledgement published but its durable continuation remains gated",
-        );
+        try {
+          await dependencies.agentManager.abortCreatedAgentBeforeAcknowledgement(
+            snapshot.id,
+            error,
+          );
+        } catch (cleanupError) {
+          dependencies.logger.error(
+            { err: cleanupError, acknowledgementError: error, agentId: snapshot.id },
+            "Failed to clean up agent after durable acknowledgement failure",
+          );
+        }
+        throw error;
       }
     },
     abortBeforeAcknowledgement: async (error) => {
@@ -486,9 +493,7 @@ async function dispatchCreatedAgentPrompt(input: {
   }
 }
 
-function buildPendingCreateContinuation(
-  resolved: ResolvedCreateAgent,
-): PendingCreateContinuation | null {
+function buildPendingCreateContinuation(resolved: ResolvedCreateAgent): PendingCreateContinuation {
   const prompt = resolved.prompt
     ? {
         status: "pending" as const,
@@ -498,9 +503,6 @@ function buildPendingCreateContinuation(
     : undefined;
   const setup = resolved.setupContinuation?.recovery;
   const autoArchive = inputAutoArchiveTarget(resolved);
-  if (!prompt && !setup && !autoArchive) {
-    return null;
-  }
   return {
     phase: "awaiting_dispatch",
     acknowledged: false,
@@ -523,7 +525,9 @@ export async function recoverPendingCreateAgentCommands(
   if (options?.signal?.aborted) return;
   const records = await dependencies.agentStorage.list();
   const pendingRecords = records.filter(
-    (record) => !record.archivedAt && record.pendingCreateContinuation,
+    (record) =>
+      record.pendingCreateContinuation &&
+      (!record.archivedAt || record.pendingCreateContinuation.autoArchive !== undefined),
   );
   await Promise.all(
     pendingRecords.map(async (record) => {
@@ -572,7 +576,12 @@ export async function recoverPendingCreateAgentCommandById(
   await ownPendingCreateContinuation(dependencies.agentManager, agentId, async () => {
     if (options?.signal?.aborted) return;
     const record = await dependencies.agentStorage.get(agentId);
-    if (!record?.pendingCreateContinuation || record.archivedAt) return;
+    if (
+      !record?.pendingCreateContinuation ||
+      (record.archivedAt && !record.pendingCreateContinuation.autoArchive)
+    ) {
+      return;
+    }
     await recoverPendingCreateAgentCommand(dependencies, record, options?.signal);
   });
 }
@@ -594,6 +603,12 @@ async function recoverPendingCreateAgentCommand(
     );
     return;
   }
+  if (pending.autoArchive) {
+    dependencies.registerAutoArchive?.(record.id, pending.autoArchive, {
+      startImmediately: Boolean(record.archivedAt),
+    });
+  }
+  if (record.archivedAt) return;
   const snapshot = await ensureAgentLoaded(record.id, {
     agentManager: dependencies.agentManager,
     agentStorage: dependencies.agentStorage,
@@ -601,9 +616,6 @@ async function recoverPendingCreateAgentCommand(
     signal,
   });
   if (signal?.aborted) return;
-  if (pending.autoArchive) {
-    dependencies.registerAutoArchive?.(record.id, pending.autoArchive);
-  }
   const setupCompletion = pending.setup
     ? runPendingCreateSetup(dependencies, record.id, pending.setup, signal).then(() =>
         dependencies.agentStorage.completePendingCreateContinuationStep(record.id, "setup"),

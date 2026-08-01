@@ -367,6 +367,148 @@ test("pending create continuation stays inert until the create acknowledgement i
   }
 });
 
+test("durable acknowledgement failure publishes no success and removes the private create", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "create-agent-ack-persist-failure-test-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const manager = createRealAgentManager(storage);
+  const creation = await beginCreateAgentCommand(
+    {
+      agentManager: manager,
+      agentStorage: storage,
+      logger,
+      providerSnapshotManager: createProviderSnapshotManagerStub().manager,
+    },
+    {
+      kind: "session",
+      config: { provider: "codex", cwd: workdir },
+      workspaceId: "ws-ack-persist-failure",
+      initialPrompt: "must never be dispatched",
+      clientMessageId: "msg-ack-persist-failure",
+      labels: {},
+      provisionalTitle: null,
+      firstAgentContext: { attachments: [] },
+      buildSessionConfig: async (config) => ({ sessionConfig: config }),
+    },
+  );
+  const persistenceError = new Error("durable acknowledgement write failed");
+  const publish = vi.fn();
+
+  try {
+    await creation.prepareForAcknowledgement();
+    vi.spyOn(storage, "acknowledgePendingCreateContinuation").mockRejectedValueOnce(
+      persistenceError,
+    );
+    const completion = expect(creation.completion).rejects.toBe(persistenceError);
+
+    await expect(creation.acknowledge(publish)).rejects.toBe(persistenceError);
+    await completion;
+
+    expect(publish).not.toHaveBeenCalled();
+    expect(manager.getAgentInternal(creation.snapshot.id)).toBeNull();
+    await expect(storage.get(creation.snapshot.id)).resolves.toBeNull();
+  } finally {
+    manager.prepareForShutdown();
+    await manager.flushForShutdown();
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("an internally archived private runtime cannot later publish create success", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "create-agent-private-archive-race-test-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const manager = createRealAgentManager(storage);
+  const creation = await beginCreateAgentCommand(
+    {
+      agentManager: manager,
+      agentStorage: storage,
+      logger,
+      providerSnapshotManager: createProviderSnapshotManagerStub().manager,
+    },
+    {
+      kind: "session",
+      config: { provider: "codex", cwd: workdir },
+      workspaceId: "ws-private-archive-race",
+      initialPrompt: "must never escape the archived runtime",
+      labels: {},
+      provisionalTitle: null,
+      firstAgentContext: { attachments: [] },
+      buildSessionConfig: async (config) => ({ sessionConfig: config }),
+    },
+  );
+  const publish = vi.fn();
+
+  try {
+    await creation.prepareForAcknowledgement();
+    await manager.archiveAgent(creation.snapshot.id);
+    const completion = expect(creation.completion).rejects.toThrow(
+      "is no longer awaiting acknowledgement",
+    );
+
+    await expect(creation.acknowledge(publish)).rejects.toThrow(
+      "is no longer awaiting acknowledgement",
+    );
+    await completion;
+    expect(publish).not.toHaveBeenCalled();
+    await expect(storage.get(creation.snapshot.id)).resolves.toBeNull();
+  } finally {
+    manager.prepareForShutdown();
+    await manager.flushForShutdown();
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("archived partial auto-archive intent is durably rearmed for immediate retry", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "create-agent-autoarchive-rearm-test-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const manager = createRealAgentManager(storage);
+  const registerAutoArchive = vi.fn();
+  await storage.upsert({
+    id: "agent-partial-autoarchive",
+    provider: "codex",
+    cwd: workdir,
+    workspaceId: "ws-partial-autoarchive",
+    createdAt: "2026-07-31T00:00:00.000Z",
+    updatedAt: "2026-07-31T00:00:00.000Z",
+    labels: {},
+    lastStatus: "closed",
+    config: null,
+    archivedAt: "2026-07-31T00:01:00.000Z",
+    pendingCreateContinuation: {
+      phase: "awaiting_dispatch",
+      acknowledged: true,
+      autoArchive: {
+        kind: "created-worktree",
+        workspaceId: "ws-partial-autoarchive",
+        worktreePath: workdir,
+      },
+    },
+  });
+
+  try {
+    await recoverPendingCreateAgentCommands({
+      agentManager: manager,
+      agentStorage: storage,
+      logger,
+      providerSnapshotManager: createProviderSnapshotManagerStub().manager,
+      registerAutoArchive,
+    });
+
+    expect(registerAutoArchive).toHaveBeenCalledWith(
+      "agent-partial-autoarchive",
+      {
+        kind: "created-worktree",
+        workspaceId: "ws-partial-autoarchive",
+        worktreePath: workdir,
+      },
+      { startImmediately: true },
+    );
+  } finally {
+    manager.prepareForShutdown();
+    await manager.flushForShutdown();
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
 test("pending-create recovery aborts a provider resume blocked during shutdown", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "create-agent-provider-abort-test-"));
   const storage = new AgentStorage(join(workdir, "agents"), logger);

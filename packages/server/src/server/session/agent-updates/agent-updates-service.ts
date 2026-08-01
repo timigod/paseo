@@ -6,7 +6,7 @@ import type {
   SessionOutboundMessage,
 } from "../../messages.js";
 import type { ManagedAgent } from "../../agent/agent-manager.js";
-import type { StoredAgentRecord } from "../../agent/agent-storage.js";
+import { isStoredAgentPublic, type StoredAgentRecord } from "../../agent/agent-storage.js";
 import { resolveEffectiveThinkingOptionId } from "../../agent/agent-projections.js";
 
 type AgentUpdatePayload = Extract<SessionOutboundMessage, { type: "agent_update" }>["payload"];
@@ -229,6 +229,11 @@ export function createAgentUpdatesService(deps: AgentUpdatesServiceDeps): AgentU
     const payload = deps.buildStoredAgentPayload(record);
     const sub = subscription;
     if (!sub) {
+      return payload;
+    }
+
+    if (!isStoredAgentPublic(record)) {
+      bufferOrEmit(sub, { kind: "remove", agentId: record.id });
       return payload;
     }
 

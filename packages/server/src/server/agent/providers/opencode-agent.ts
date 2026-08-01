@@ -320,11 +320,22 @@ const OPENCODE_HANDLED_BUILTIN_SLASH_COMMANDS: AgentSlashCommand[] = [
     kind: "command",
   },
 ];
-const OPENCODE_HEADERS_TIMEOUT_TOKENS = [
+const OPENCODE_AMBIGUOUS_TRANSPORT_TOKENS = [
   "headers timeout",
   "headers timeout error",
   "headers_timeout",
   "und_err_headers_timeout",
+  "econnreset",
+  "connection reset",
+  "socket hang up",
+  "und_err_socket",
+  "other side closed",
+  "epipe",
+  "broken pipe",
+  "etimedout",
+  "connection timed out",
+  "network error",
+  "fetch failed",
 ] as const;
 
 const OpencodeToolStateSchema = z
@@ -485,7 +496,7 @@ async function abortOpenCodeSession(params: {
   }
 }
 
-function isOpenCodeHeadersTimeoutFailure(error: unknown): boolean {
+function isOpenCodeAmbiguousTransportFailure(error: unknown): boolean {
   const diagnostics = new Set<string>();
   const queue: unknown[] = [error];
 
@@ -525,7 +536,7 @@ function isOpenCodeHeadersTimeoutFailure(error: unknown): boolean {
   }
 
   return [...diagnostics].some((diagnostic) =>
-    OPENCODE_HEADERS_TIMEOUT_TOKENS.some((token) => diagnostic.includes(token)),
+    OPENCODE_AMBIGUOUS_TRANSPORT_TOKENS.some((token) => diagnostic.includes(token)),
   );
 }
 
@@ -3379,14 +3390,14 @@ class OpenCodeAgentSession implements AgentSession {
       });
       if (response.error) throw response.error;
     } catch (error) {
-      if (isOpenCodeHeadersTimeoutFailure(error)) {
+      if (isOpenCodeAmbiguousTransportFailure(error)) {
         this.logger.warn(
           {
             err: error,
             commandName: input.slashCommand.commandName,
             turnId: input.turnId,
           },
-          "OpenCode slash command hit a header timeout; waiting for SSE terminal event",
+          "OpenCode slash command hit an ambiguous transport failure; waiting for SSE terminal event",
         );
         throw new AgentTurnAcceptanceError("ambiguous", toDiagnosticErrorMessage(error));
       }
@@ -3413,7 +3424,7 @@ class OpenCodeAgentSession implements AgentSession {
       if (response.error) throw response.error;
     } catch (error) {
       this.suppressAssistantMessagesUntilIdle.active = false;
-      const acceptance = isOpenCodeHeadersTimeoutFailure(error) ? "ambiguous" : "rejected";
+      const acceptance = isOpenCodeAmbiguousTransportFailure(error) ? "ambiguous" : "rejected";
       if (acceptance === "rejected") {
         this.finishForegroundTurn(
           { type: "turn_failed", provider: "opencode", error: toDiagnosticErrorMessage(error) },
@@ -3472,7 +3483,7 @@ class OpenCodeAgentSession implements AgentSession {
             ? { name: error.name, message: error.message, stack: error.stack }
             : String(error),
       });
-      const acceptance = isOpenCodeHeadersTimeoutFailure(error) ? "ambiguous" : "rejected";
+      const acceptance = isOpenCodeAmbiguousTransportFailure(error) ? "ambiguous" : "rejected";
       if (acceptance === "rejected") {
         this.finishForegroundTurn(
           {

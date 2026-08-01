@@ -83,6 +83,7 @@ import {
   recoverPendingCreateAgentCommandById,
   type CreateAgentCommandDependencies,
 } from "./agent/create-agent/create.js";
+import { isStoredAgentPublic } from "./agent/agent-storage.js";
 import { resolveCreateAgentIntent, type CreateAgentIntent } from "./agent/create-agent/intent.js";
 import {
   archiveAgentCommand,
@@ -851,7 +852,7 @@ export class Session {
     this.chatScheduleLoopSession = new ChatScheduleLoopSession({
       host: {
         emit: (msg) => this.emit(msg),
-        listStoredAgents: () => this.agentStorage.list(),
+        listStoredAgents: async () => (await this.agentStorage.list()).filter(isStoredAgentPublic),
         listLiveAgents: () => this.agentManager.listAgents(),
         resolveAgentIdentifier: (identifier) => this.resolveAgentIdentifier(identifier),
         sendAgentMessage: async (agentId, text) => {
@@ -3243,7 +3244,7 @@ export class Session {
     requestId: string,
     createRequestFingerprint: string,
   ): Promise<AgentCreateRequestOutcome | null> {
-    let liveAgent = this.agentManager.getAgent(agentId);
+    const liveAgent = this.agentManager.getAgent(agentId);
     let storedAgent = await this.agentStorage.get(agentId);
     if (!liveAgent && !storedAgent) {
       return null;
@@ -3269,16 +3270,21 @@ export class Session {
     }
     const continuationNeedsAcknowledgement =
       storedAgent?.pendingCreateContinuation?.acknowledged === false;
-    if (storedAgent?.pendingCreateContinuation?.acknowledged === true) {
+
+    if (continuationNeedsAcknowledgement) {
       try {
-        await recoverPendingCreateAgentCommandById(this.createAgentCommandDependencies(), agentId);
+        // This durable write is the replayable acknowledgement boundary and
+        // must precede public success on the replacement socket.
+        await this.agentStorage.acknowledgePendingCreateContinuation(agentId);
       } catch (error) {
-        this.sessionLogger.warn(
-          { err: error, agentId },
-          "Online create-agent continuation recovery did not settle",
-        );
+        await this.agentManager.abortCreatedAgentBeforeAcknowledgement(agentId, error);
+        const outcome: AgentCreateRequestOutcome = {
+          status: "failed",
+          error: "Failed to persist the create-agent acknowledgement.",
+        };
+        this.emitCreateAgentRequestOutcome(requestId, outcome);
+        return outcome;
       }
-      liveAgent = this.agentManager.getAgent(agentId);
       storedAgent = await this.agentStorage.get(agentId);
     }
 
@@ -3295,19 +3301,16 @@ export class Session {
       },
     });
     this.releaseAgentOutboundVisibilityGate(agentId);
-    if (continuationNeedsAcknowledgement) {
-      try {
-        // This duplicate request is the first observable acknowledgement after
-        // the previous daemon died. Open the durable gate only after emitting
-        // agent_created, then recover the deferred prompt/setup/archive work.
-        await this.agentStorage.acknowledgePendingCreateContinuation(agentId);
-        await recoverPendingCreateAgentCommandById(this.createAgentCommandDependencies(), agentId);
-      } catch (error) {
+    if (storedAgent?.pendingCreateContinuation?.acknowledged === true) {
+      void recoverPendingCreateAgentCommandById(
+        this.createAgentCommandDependencies(),
+        agentId,
+      ).catch((error) => {
         this.sessionLogger.warn(
           { err: error, agentId },
           "Acknowledged create-agent replay left its continuation pending",
         );
-      }
+      });
     }
     this.sessionLogger.info(
       { agentId, requestId, status: agent.status },
@@ -3499,8 +3502,8 @@ export class Session {
       worktreesRoot: this.worktreesRoot,
       providerSnapshotManager: this.providerSnapshotManager,
       terminalManager: this.terminalManager,
-      registerAutoArchive: (agentId, target) => {
-        this.createAgentLifecycleDispatch.registerPersistedAutoArchive(agentId, target);
+      registerAutoArchive: (agentId, target, options) => {
+        this.createAgentLifecycleDispatch.registerPersistedAutoArchive(agentId, target, options);
       },
     };
   }
@@ -4015,7 +4018,7 @@ export class Session {
       const existing = this.agentManager.getAgent(agentId);
       const stored = existing ? null : await this.agentStorage.get(agentId);
       const agent =
-        existing || (stored && !stored.archivedAt)
+        existing || (stored && isStoredAgentPublic(stored) && !stored.archivedAt)
           ? await ensureAgentLoaded(agentId, {
               agentManager: this.agentManager,
               agentStorage: this.agentStorage,
@@ -4256,7 +4259,9 @@ export class Session {
     const liveIds = new Set(allAgentSnapshots.map((agent) => agent.id));
     const registeredProviderIds = new Set(this.providerSnapshotManager.listRegisteredProviderIds());
     const persistedAgents = registryRecords
-      .filter((record) => !liveIds.has(record.id) && !record.internal)
+      .filter(
+        (record) => !liveIds.has(record.id) && !record.internal && isStoredAgentPublic(record),
+      )
       // Keep raw-record filters ahead of projection; seeded homes can carry thousands of archived agents.
       .filter((record) => includeArchived || !record.archivedAt)
       .filter((record) => labelEntries.every(([key, value]) => record.labels?.[key] === value))
@@ -4293,7 +4298,9 @@ export class Session {
     }
 
     const stored = await this.agentStorage.list();
-    const storedRecords = stored.filter((record) => !record.internal);
+    const storedRecords = stored.filter(
+      (record) => !record.internal && isStoredAgentPublic(record),
+    );
     const knownIds = new Set<string>();
     for (const record of storedRecords) {
       knownIds.add(record.id);
@@ -4345,7 +4352,7 @@ export class Session {
     }
 
     const record = await this.agentStorage.get(agentId);
-    if (!record || record.internal) {
+    if (!record || record.internal || !isStoredAgentPublic(record)) {
       return null;
     }
     const payload = this.buildStoredAgentPayload(record);

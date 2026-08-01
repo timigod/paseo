@@ -3068,6 +3068,57 @@ describe("ACPAgentSession initialization cleanup", () => {
 
     expect(terminator.terminated).toContain(child);
   });
+
+  test("aborted resume kills the child without waiting for a hung closeSession RPC", async () => {
+    const terminator = new FakeTerminator();
+    const child = createProbeChildStub();
+    const loadSession = vi.fn(() => new Promise(() => undefined));
+    const closeSession = vi.fn(() => new Promise(() => undefined));
+
+    class HangingResumeAndClose extends ACPAgentSession {
+      protected override async spawnProcess(): Promise<SpawnedACPProcess> {
+        return {
+          child,
+          connection: {
+            loadSession,
+            unstable_closeSession: closeSession,
+          } as unknown as ClientSideConnection,
+          initialize: {
+            agentCapabilities: {
+              loadSession: true,
+              sessionCapabilities: { close: {} },
+            },
+          },
+        };
+      }
+    }
+
+    const session = new HangingResumeAndClose(
+      { provider: "cursor", cwd: "/tmp/paseo-acp-test" },
+      {
+        provider: "cursor",
+        logger: createTestLogger(),
+        defaultCommand: ["cursor-agent", "acp"],
+        defaultModes: [],
+        capabilities: {
+          supportsStreaming: true,
+          supportsSessionPersistence: true,
+        },
+        handle: { provider: "cursor", sessionId: "session-hung-close" },
+        terminateProcess: terminator.terminate,
+      },
+    );
+    const abort = new AbortController();
+    const shutdown = new Error("daemon shutdown during ACP resume");
+    const startup = session.initializeResumedSession(abort.signal);
+    await vi.waitFor(() => expect(loadSession).toHaveBeenCalledOnce());
+
+    abort.abort(shutdown);
+
+    await vi.waitFor(() => expect(terminator.terminated).toContain(child));
+    expect(closeSession).toHaveBeenCalledOnce();
+    await expect(startup).rejects.toBe(shutdown);
+  });
 });
 
 describe("ACPAgentClient probe cleanup", () => {

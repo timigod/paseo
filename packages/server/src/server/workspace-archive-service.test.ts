@@ -538,6 +538,33 @@ describe("archiveByScope", () => {
     expect(existsSync(worktree.worktreePath)).toBe(true);
   });
 
+  test("terminal teardown failure remains durably retryable", async () => {
+    const { tempDir, repoDir } = createGitRepo();
+    const paseoHome = path.join(tempDir, ".paseo");
+    const worktree = await createPaseoOwnedWorktree(repoDir, paseoHome, "terminal-failure");
+    const workspaceId = "ws-terminal-failure";
+    const deps = createArchiveDeps({
+      paseoHome,
+      activeWorkspaces: [{ workspaceId, cwd: worktree.worktreePath, kind: "worktree" }],
+    });
+    deps.killTerminalsForWorkspace = vi.fn(async () => {
+      throw new Error("terminal still running");
+    });
+
+    const result = await archiveByScope(deps, {
+      scope: { kind: "workspace", workspaceId },
+      requestId: "req-terminal-failure",
+    });
+
+    expect(result).toMatchObject({
+      archivedWorkspaceIds: [],
+      removedDirectory: false,
+      cleanupPending: true,
+    });
+    expect(existsSync(worktree.worktreePath)).toBe(true);
+    expect(await deps.listActiveWorkspaces()).toEqual([expect.objectContaining({ workspaceId })]);
+  });
+
   test("workspace scope with unknown workspace id is a clean no-op", async () => {
     const { tempDir } = createGitRepo();
     const paseoHome = path.join(tempDir, ".paseo");

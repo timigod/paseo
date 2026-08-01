@@ -1310,6 +1310,9 @@ export class AgentManager {
         if (startupFailureBeforeAcknowledgement !== null) {
           throw startupFailureBeforeAcknowledgement;
         }
+        if (!this.agents.has(resolvedAgentId) || !this.unpublishedAgentIds.has(resolvedAgentId)) {
+          throw new Error(`Agent ${resolvedAgentId} is no longer awaiting acknowledgement`);
+        }
         publish();
         acknowledgementClaimed = true;
         if (this.unpublishedAgentIds.delete(resolvedAgentId)) {
@@ -2215,7 +2218,8 @@ export class AgentManager {
 
   async archiveSnapshot(agentId: string, archivedAt: string): Promise<StoredAgentRecord> {
     const registry = this.requireRegistry();
-    const liveAgent = this.getAgent(agentId);
+    const liveAgent = this.getAgentInternal(agentId);
+    const wasUnpublished = liveAgent !== null && !this.isAgentPublished(agentId);
     if (liveAgent) {
       await this.persistSnapshot(liveAgent, {
         internal: liveAgent.internal,
@@ -2232,7 +2236,10 @@ export class AgentManager {
 
     await this.archiveNativeSessionBestEffort(record.provider, record.persistence);
 
-    if (this.agents.has(agentId)) {
+    if (wasUnpublished) {
+      await this.closeAgent(agentId);
+      this.discardRetainedAgentState(agentId);
+    } else if (this.agents.has(agentId)) {
       this.notifyAgentState(agentId);
     } else {
       this.discardRetainedAgentState(agentId);
