@@ -1951,6 +1951,56 @@ describe("OpenCode adapter startTurn error handling", () => {
     expect(settled).toBe(true);
   });
 
+  test("normal prompt response rejection is typed as definitely rejected", async () => {
+    const neverYieldingStream: AsyncIterable<OpenCodeEvent> = {
+      [Symbol.asyncIterator]: () => ({ next: () => new Promise(() => {}) }),
+    };
+    const fakeClient = {
+      global: { event: vi.fn().mockResolvedValue({ stream: neverYieldingStream }) },
+      session: {
+        promptAsync: vi
+          .fn()
+          .mockResolvedValue({ data: undefined, error: { message: "Forbidden" } }),
+      },
+    } as never;
+    const session = new __openCodeInternals.OpenCodeAgentSession(
+      { provider: "opencode", cwd: "/tmp/test" },
+      fakeClient,
+      "ses_unit_test",
+      createTestLogger(),
+    );
+
+    await expect(session.startTurn("hello")).rejects.toThrow(
+      'PASEO_TURN_ACCEPTANCE_REJECTED: {"message":"Forbidden"}',
+    );
+  });
+
+  test("normal prompt header timeout is typed ambiguous without a false failed receipt", async () => {
+    const neverYieldingStream: AsyncIterable<OpenCodeEvent> = {
+      [Symbol.asyncIterator]: () => ({ next: () => new Promise(() => {}) }),
+    };
+    const headerTimeout = Object.assign(new Error("Headers Timeout Error"), {
+      code: "UND_ERR_HEADERS_TIMEOUT",
+    });
+    const fakeClient = {
+      global: { event: vi.fn().mockResolvedValue({ stream: neverYieldingStream }) },
+      session: { promptAsync: vi.fn().mockRejectedValue(headerTimeout) },
+    } as never;
+    const session = new __openCodeInternals.OpenCodeAgentSession(
+      { provider: "opencode", cwd: "/tmp/test" },
+      fakeClient,
+      "ses_unit_test",
+      createTestLogger(),
+    );
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+
+    await expect(session.startTurn("hello")).rejects.toThrow(
+      "PASEO_TURN_ACCEPTANCE_AMBIGUOUS: Headers Timeout Error",
+    );
+    expect(events.some((event) => event.type === "turn_failed")).toBe(false);
+  });
+
   test("startTurn awaits slash-command acceptance before reporting success", async () => {
     const runtime = new TestOpenCodeHarness();
     const openCode = new TestOpenCodeClient();
