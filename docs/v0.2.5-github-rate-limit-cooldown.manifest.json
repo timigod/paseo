@@ -17,11 +17,11 @@
     "conditions": [
       "Keep the cooldown scoped to GitHub service instances and resolved GitHub hosts.",
       "Use Retry-After before X-RateLimit-Reset, and retain a bounded fallback only for confirmed rate-limit failures.",
-      "Preserve raw gh api response headers through command-error normalization."
+      "Extract rate-limit metadata from the final gh api response envelope without retaining raw response bodies."
     ],
     "dropConditions": [
       "Drop this correction when upstream Paseo includes equivalent host-scoped shared GitHub cooldown behavior with deterministic coverage for these cases.",
-      "Drop the raw stdout preservation only when the upstream GitHub transport exposes response headers directly."
+      "Drop the error metadata extraction only when the upstream GitHub transport exposes rate-limit headers directly without retaining raw response bodies."
     ]
   },
   "candidate": {
@@ -29,7 +29,7 @@
     "sha": null
   },
   "receipt": {
-    "commit": null,
-    "pushedAt": null
+    "commit": "4db5e64a162bb8b10c65320b4a85857095b8da7e",
+    "pushedAt": "2026-08-01T02:12:09Z"
   }
 }
