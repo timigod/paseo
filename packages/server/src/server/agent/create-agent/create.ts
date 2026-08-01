@@ -24,7 +24,7 @@ import type { ProviderSnapshotManager } from "../provider-snapshot-manager.js";
 import { ensureAgentLoaded } from "../agent-loading.js";
 import { setupFinishNotification, startCreatedAgentInitialPrompt } from "../agent-prompt.js";
 import { resolveCreateAgentTitles } from "../create-agent-title.js";
-import { buildAgentPrompt } from "../prompt-attachments.js";
+import { buildAgentPrompt, renderPromptAttachmentAsText } from "../prompt-attachments.js";
 import { normalizeClientMessageId, resolveClientMessageId } from "../../client-message-id.js";
 import { resolveRequiredProviderModel, type ResolvedProviderModel } from "../mcp-shared.js";
 import {
@@ -53,6 +53,10 @@ export interface CreateAgentCommandDependencies {
   // Mints a fresh directory workspace for a cwd and returns its id.
   ensureWorkspaceForCreate?: EnsureWorkspaceForCreate;
   runWorktreeBootstrap?: typeof runAsyncWorktreeBootstrap;
+  registerAutoArchive?: (
+    agentId: string,
+    target: NonNullable<PendingCreateContinuation["autoArchive"]>,
+  ) => void;
 }
 
 export type EnsureWorkspaceForCreate = (
@@ -77,6 +81,7 @@ export interface CreateAgentFromSessionInput {
   env?: Record<string, string>;
   provisionalTitle: string | null;
   firstAgentContext: FirstAgentContext;
+  autoArchiveTarget?: NonNullable<PendingCreateContinuation["autoArchive"]>;
   buildSessionConfig: (
     config: AgentSessionConfig,
     gitOptions?: GitSetupOptions,
@@ -185,6 +190,7 @@ interface ResolvedCreateAgent {
   promptFailure: CreateAgentPromptFailureMode;
   promptLogger?: Logger;
   createdWorktree?: CreatePaseoWorktreeWorkflowResult;
+  autoArchiveTarget?: NonNullable<PendingCreateContinuation["autoArchive"]>;
 }
 
 export async function createAgentCommand(
@@ -209,7 +215,7 @@ export async function beginCreateAgentCommand(
   const creation = await dependencies.agentManager.beginAgentCreation(
     resolved.config,
     input.agentId,
-    resolved.createOptions,
+    { ...resolved.createOptions, deferPublication: true },
   );
   const snapshot = creation.snapshot;
   const pendingContinuation = buildPendingCreateContinuation(resolved);
@@ -279,21 +285,14 @@ async function completeCreateAgentCommand(
   snapshot: ManagedAgent,
   options?: { persistedContinuation?: boolean },
 ): Promise<CreateAgentCommandResult> {
-  const setupCompletion = resolved.setupContinuation
-    ? Promise.resolve(
-        resolved.setupContinuation.startAfterAgentCreate({
-          agentId: snapshot.id,
-        }),
-      ).then(async () => {
-        if (options?.persistedContinuation) {
-          await dependencies.agentStorage.completePendingCreateContinuationStep(
-            snapshot.id,
-            "setup",
-          );
-        }
-        return undefined;
-      })
-    : null;
+  const persistedContinuation = options?.persistedContinuation ?? false;
+  registerCreateAutoArchive(dependencies, input, snapshot.id);
+  const setupCompletion = startCreateSetupCompletion({
+    dependencies,
+    resolved,
+    agentId: snapshot.id,
+    persistedContinuation,
+  });
   void setupCompletion?.catch(() => undefined);
 
   let liveSnapshot = snapshot;
@@ -303,38 +302,27 @@ async function completeCreateAgentCommand(
     input.onCreated?.({ agentId: snapshot.id, createdWorktree: resolved.createdWorktree ?? null });
   }
   if (resolved.prompt !== undefined) {
-    const sendResult = await sendInitialPrompt(dependencies, resolved, snapshot);
+    const sendResult = await dispatchCreatedAgentPrompt({
+      dependencies,
+      resolved,
+      snapshot,
+      persistedContinuation,
+    });
     initialPromptStarted = sendResult.started;
     liveSnapshot = sendResult.liveSnapshot;
     initialPromptError = sendResult.error ?? null;
-    if (options?.persistedContinuation) {
+    if (persistedContinuation && sendResult.started && !sendResult.error) {
       await dependencies.agentStorage.completePendingCreateContinuationStep(snapshot.id, "prompt");
     }
   }
 
-  if (input.kind === "mcp" && input.notifyOnFinish && input.callerAgentId && initialPromptStarted) {
-    setupFinishNotification({
-      agentManager: dependencies.agentManager,
-      agentStorage: dependencies.agentStorage,
-      childAgentId: snapshot.id,
-      callerAgentId: input.callerAgentId,
-      requireParentOwnership: true,
-      logger: dependencies.logger,
-    });
-  }
-
-  if (setupCompletion) {
-    if (options?.persistedContinuation) {
-      await setupCompletion;
-    } else {
-      void setupCompletion.catch((error) => {
-        dependencies.logger.error(
-          { err: error, agentId: snapshot.id },
-          "Failed to finish worktree setup after agent creation",
-        );
-      });
-    }
-  }
+  notifyCreateAgentReady(dependencies, input, snapshot.id, initialPromptStarted);
+  await settleCreateSetupCompletion(
+    dependencies,
+    snapshot.id,
+    setupCompletion,
+    persistedContinuation,
+  );
 
   return {
     snapshot,
@@ -346,37 +334,142 @@ async function completeCreateAgentCommand(
   };
 }
 
+function registerCreateAutoArchive(
+  dependencies: CreateAgentCommandDependencies,
+  input: CreateAgentCommandInput,
+  agentId: string,
+): void {
+  if (input.kind === "session" && input.autoArchiveTarget) {
+    dependencies.registerAutoArchive?.(agentId, input.autoArchiveTarget);
+  }
+}
+
+function startCreateSetupCompletion(input: {
+  dependencies: CreateAgentCommandDependencies;
+  resolved: ResolvedCreateAgent;
+  agentId: string;
+  persistedContinuation: boolean;
+}): Promise<void> | null {
+  const continuation = input.resolved.setupContinuation;
+  if (!continuation) return null;
+  const task = input.persistedContinuation
+    ? runPendingCreateSetup(input.dependencies, input.agentId, continuation.recovery)
+    : Promise.resolve(continuation.startAfterAgentCreate({ agentId: input.agentId }));
+  return task.then(async () => {
+    if (input.persistedContinuation) {
+      await input.dependencies.agentStorage.completePendingCreateContinuationStep(
+        input.agentId,
+        "setup",
+      );
+    }
+    return undefined;
+  });
+}
+
+function notifyCreateAgentReady(
+  dependencies: CreateAgentCommandDependencies,
+  input: CreateAgentCommandInput,
+  agentId: string,
+  initialPromptStarted: boolean,
+): void {
+  if (
+    input.kind !== "mcp" ||
+    !input.notifyOnFinish ||
+    !input.callerAgentId ||
+    !initialPromptStarted
+  ) {
+    return;
+  }
+  setupFinishNotification({
+    agentManager: dependencies.agentManager,
+    agentStorage: dependencies.agentStorage,
+    childAgentId: agentId,
+    callerAgentId: input.callerAgentId,
+    requireParentOwnership: true,
+    logger: dependencies.logger,
+  });
+}
+
+async function settleCreateSetupCompletion(
+  dependencies: CreateAgentCommandDependencies,
+  agentId: string,
+  setupCompletion: Promise<void> | null,
+  persistedContinuation: boolean,
+): Promise<void> {
+  if (!setupCompletion) return;
+  if (persistedContinuation) {
+    await setupCompletion;
+    return;
+  }
+  void setupCompletion.catch((error) => {
+    dependencies.logger.error(
+      { err: error, agentId },
+      "Failed to finish worktree setup after agent creation",
+    );
+  });
+}
+
+async function dispatchCreatedAgentPrompt(input: {
+  dependencies: CreateAgentCommandDependencies;
+  resolved: ResolvedCreateAgent;
+  snapshot: ManagedAgent;
+  persistedContinuation: boolean;
+}): Promise<Awaited<ReturnType<typeof sendInitialPrompt>>> {
+  if (input.persistedContinuation) {
+    await input.dependencies.agentStorage.updatePendingCreateContinuation(
+      input.snapshot.id,
+      (pending) => ({
+        ...pending,
+        prompt: pending.prompt ? { ...pending.prompt, status: "dispatching" } : undefined,
+      }),
+    );
+  }
+  return await sendInitialPrompt(input.dependencies, input.resolved, input.snapshot);
+}
+
 function buildPendingCreateContinuation(
   resolved: ResolvedCreateAgent,
 ): PendingCreateContinuation | null {
   const prompt = resolved.prompt
     ? {
+        status: "pending" as const,
         input: resolved.prompt,
         ...(resolved.runOptions ? { runOptions: resolved.runOptions } : {}),
       }
     : undefined;
   const setup = resolved.setupContinuation?.recovery;
-  if (!prompt && !setup) {
+  const autoArchive = inputAutoArchiveTarget(resolved);
+  if (!prompt && !setup && !autoArchive) {
     return null;
   }
   return {
     phase: "awaiting_dispatch",
     ...(prompt ? { prompt } : {}),
     ...(setup ? { setup } : {}),
+    ...(autoArchive ? { autoArchive } : {}),
   };
+}
+
+function inputAutoArchiveTarget(
+  resolved: ResolvedCreateAgent,
+): NonNullable<PendingCreateContinuation["autoArchive"]> | undefined {
+  return resolved.autoArchiveTarget;
 }
 
 export async function recoverPendingCreateAgentCommands(
   dependencies: CreateAgentCommandDependencies,
+  options?: { signal?: AbortSignal },
 ): Promise<void> {
+  if (options?.signal?.aborted) return;
   const records = await dependencies.agentStorage.list();
   const pendingRecords = records.filter(
     (record) => !record.archivedAt && record.pendingCreateContinuation,
   );
   await Promise.all(
     pendingRecords.map(async (record) => {
+      if (options?.signal?.aborted) return;
       try {
-        await recoverPendingCreateAgentCommand(dependencies, record);
+        await recoverPendingCreateAgentCommand(dependencies, record, options?.signal);
       } catch (error) {
         dependencies.logger.error(
           { err: error, agentId: record.id },
@@ -387,10 +480,40 @@ export async function recoverPendingCreateAgentCommands(
   );
 }
 
+const pendingCreateRecoveries = new WeakMap<AgentStorage, Map<string, Promise<void>>>();
+
+export async function recoverPendingCreateAgentCommandById(
+  dependencies: CreateAgentCommandDependencies,
+  agentId: string,
+  options?: { signal?: AbortSignal },
+): Promise<void> {
+  let recoveries = pendingCreateRecoveries.get(dependencies.agentStorage);
+  if (!recoveries) {
+    recoveries = new Map();
+    pendingCreateRecoveries.set(dependencies.agentStorage, recoveries);
+  }
+  const existing = recoveries.get(agentId);
+  if (existing) return await existing;
+  const task = (async () => {
+    if (options?.signal?.aborted) return;
+    const record = await dependencies.agentStorage.get(agentId);
+    if (!record?.pendingCreateContinuation || record.archivedAt) return;
+    await recoverPendingCreateAgentCommand(dependencies, record, options?.signal);
+  })();
+  recoveries.set(agentId, task);
+  try {
+    await task;
+  } finally {
+    if (recoveries.get(agentId) === task) recoveries.delete(agentId);
+  }
+}
+
 async function recoverPendingCreateAgentCommand(
   dependencies: CreateAgentCommandDependencies,
   record: StoredAgentRecord,
+  signal?: AbortSignal,
 ): Promise<void> {
+  if (signal?.aborted) return;
   const pending = record.pendingCreateContinuation;
   if (!pending) {
     return;
@@ -400,36 +523,37 @@ async function recoverPendingCreateAgentCommand(
     agentStorage: dependencies.agentStorage,
     logger: dependencies.logger,
   });
+  if (signal?.aborted) return;
+  if (pending.autoArchive) {
+    dependencies.registerAutoArchive?.(record.id, pending.autoArchive);
+  }
   const setupCompletion = pending.setup
-    ? (dependencies.runWorktreeBootstrap ?? runAsyncWorktreeBootstrap)({
-        agentId: record.id,
-        workspaceId: pending.setup.workspaceId,
-        worktree: pending.setup.worktree,
-        workspaceCwd: pending.setup.workspaceCwd,
-        shouldBootstrap: pending.setup.shouldBootstrap,
-        terminalManager: dependencies.terminalManager ?? null,
-        appendTimelineItem: (item) =>
-          appendTimelineItemIfAgentKnown({
-            agentManager: dependencies.agentManager,
-            agentId: record.id,
-            item,
-          }),
-        emitLiveTimelineItem: (item) =>
-          emitLiveTimelineItemIfAgentKnown({
-            agentManager: dependencies.agentManager,
-            agentId: record.id,
-            item,
-          }),
-        logger: dependencies.logger,
-      }).then(() =>
+    ? runPendingCreateSetup(dependencies, record.id, pending.setup).then(() =>
         dependencies.agentStorage.completePendingCreateContinuationStep(record.id, "setup"),
       )
     : null;
   void setupCompletion?.catch(() => undefined);
 
-  if (pending.prompt && pendingCreatePromptWasAlreadyDispatched(dependencies, snapshot, pending)) {
+  if (pending.prompt?.status === "dispatching") {
+    await dependencies.agentManager.hydrateTimelineFromProvider(record.id, { force: true });
+    if (pendingCreatePromptWasAlreadyDispatched(dependencies, snapshot, pending)) {
+      await dependencies.agentStorage.completePendingCreateContinuationStep(record.id, "prompt");
+    } else {
+      throw new Error(
+        "Initial prompt dispatch has no provider receipt; refusing an ambiguous duplicate retry",
+      );
+    }
+  } else if (
+    pending.prompt &&
+    pendingCreatePromptWasAlreadyDispatched(dependencies, snapshot, pending)
+  ) {
     await dependencies.agentStorage.completePendingCreateContinuationStep(record.id, "prompt");
   } else if (pending.prompt) {
+    if (signal?.aborted) return;
+    await dependencies.agentStorage.updatePendingCreateContinuation(record.id, (current) => ({
+      ...current,
+      prompt: current.prompt ? { ...current.prompt, status: "dispatching" } : undefined,
+    }));
     await startCreatedAgentInitialPrompt({
       agentManager: dependencies.agentManager,
       agentId: record.id,
@@ -441,6 +565,81 @@ async function recoverPendingCreateAgentCommand(
     await dependencies.agentStorage.completePendingCreateContinuationStep(record.id, "prompt");
   }
   await setupCompletion;
+}
+
+type PendingCreateSetup = NonNullable<PendingCreateContinuation["setup"]>;
+
+async function runPendingCreateSetup(
+  dependencies: CreateAgentCommandDependencies,
+  agentId: string,
+  setup: PendingCreateSetup,
+): Promise<void> {
+  if (!setup.shouldBootstrap) {
+    return;
+  }
+  const progress = setup.progress;
+  if (!progress) {
+    throw new Error("Cannot safely recover worktree setup without a persisted step boundary");
+  }
+  if (progress.inFlightCommandIndex !== null) {
+    throw new Error(
+      `Worktree setup stopped with command ${progress.inFlightCommandIndex + 1} in flight; refusing to replay it`,
+    );
+  }
+  if (progress.terminals === "running") {
+    throw new Error("Worktree terminal bootstrap stopped in flight; refusing to replay it");
+  }
+  if (progress.terminals === "completed") {
+    return;
+  }
+
+  const updateProgress = async (
+    update: (
+      current: NonNullable<PendingCreateSetup["progress"]>,
+    ) => NonNullable<PendingCreateSetup["progress"]>,
+  ): Promise<void> => {
+    await dependencies.agentStorage.updatePendingCreateContinuation(agentId, (pending) => {
+      if (!pending.setup?.progress) {
+        throw new Error(`Agent ${agentId} lost its persisted worktree setup boundary`);
+      }
+      return {
+        ...pending,
+        setup: { ...pending.setup, progress: update(pending.setup.progress) },
+      };
+    });
+  };
+
+  await (dependencies.runWorktreeBootstrap ?? runAsyncWorktreeBootstrap)({
+    agentId,
+    workspaceId: setup.workspaceId,
+    worktree: setup.worktree,
+    workspaceCwd: setup.workspaceCwd,
+    shouldBootstrap: true,
+    terminalManager: dependencies.terminalManager ?? null,
+    setupProgress: progress,
+    beforeSetupCommand: async (index) => {
+      await updateProgress((current) => ({ ...current, inFlightCommandIndex: index }));
+    },
+    afterSetupCommand: async (index) => {
+      await updateProgress((current) => ({
+        ...current,
+        nextCommandIndex: index + 1,
+        inFlightCommandIndex: null,
+      }));
+    },
+    beforeTerminalBootstrap: async () => {
+      await updateProgress((current) => ({ ...current, terminals: "running" }));
+    },
+    afterTerminalBootstrap: async () => {
+      await updateProgress((current) => ({ ...current, terminals: "completed" }));
+    },
+    throwOnFailure: true,
+    appendTimelineItem: (item) =>
+      appendTimelineItemIfAgentKnown({ agentManager: dependencies.agentManager, agentId, item }),
+    emitLiveTimelineItem: (item) =>
+      emitLiveTimelineItemIfAgentKnown({ agentManager: dependencies.agentManager, agentId, item }),
+    logger: dependencies.logger,
+  });
 }
 
 function pendingCreatePromptWasAlreadyDispatched(
@@ -461,8 +660,34 @@ function pendingCreatePromptWasAlreadyDispatched(
     if (clientMessageId && item.clientMessageId === clientMessageId) {
       return true;
     }
-    return typeof prompt.input === "string" && item.text === prompt.input;
+    if (clientMessageId && item.messageId === clientMessageId) {
+      return true;
+    }
+    return renderPendingPromptText(prompt.input).some((text) => item.text === text);
   });
+}
+
+function renderPendingPromptText(
+  input: PendingCreateContinuation["prompt"] extends infer Prompt
+    ? Prompt extends { input: infer Input }
+      ? Input
+      : never
+    : never,
+): string[] {
+  if (typeof input === "string") return [input];
+  const withoutImages = input
+    .filter((block) => block.type !== "image")
+    .map((block) => (block.type === "text" ? block.text : renderPromptAttachmentAsText(block)))
+    .filter((text) => text.trim().length > 0)
+    .join("\n");
+  const withImageMarkers = input
+    .map((block) => {
+      if (block.type === "image") return "[Image]";
+      return block.type === "text" ? block.text : renderPromptAttachmentAsText(block);
+    })
+    .filter((text) => text.trim().length > 0)
+    .join("\n");
+  return [...new Set([withoutImages, withImageMarkers].filter(Boolean))];
 }
 
 async function resolveSessionCreateAgent(
@@ -542,6 +767,7 @@ async function resolveSessionCreateAgent(
     promptLogger: dependencies.logger.child({
       clientMessageId: clientMessageId ?? resolveClientMessageId(undefined),
     }),
+    autoArchiveTarget: input.autoArchiveTarget,
   };
 }
 

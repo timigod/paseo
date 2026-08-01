@@ -1050,9 +1050,6 @@ export async function createPaseoDaemon(
     createPaseoWorktree: createPaseoWorktreeForTools,
     ensureWorkspaceForCreate: ensureWorkspaceForCreateAndBroadcastExternal,
   };
-  void recoverPendingCreateAgentCommands(createAgentCommandDependencies).catch((error) => {
-    logger.error({ err: error }, "Pending create-agent continuation recovery failed");
-  });
   const createAgent = (input: Parameters<typeof createAgentCommand>[1]) =>
     createAgentCommand(createAgentCommandDependencies, input);
   const archiveWorkspaceByIdExternal = (workspaceId: string, requestId: string) =>
@@ -1097,6 +1094,16 @@ export async function createPaseoDaemon(
     killTerminalsForWorkspace: (workspaceId) =>
       killTerminalsForWorkspace({ terminalManager, sessionLogger: logger }, workspaceId),
     logger,
+  });
+  createAgentCommandDependencies.registerAutoArchive = (agentId, target) => {
+    hubAgentLifecycle.registerPersistedAutoArchive(agentId, target);
+  };
+  const pendingCreateRecoveryAbort = new AbortController();
+  const pendingCreateRecoveryTask = recoverPendingCreateAgentCommands(
+    createAgentCommandDependencies,
+    { signal: pendingCreateRecoveryAbort.signal },
+  ).catch((error) => {
+    logger.error({ err: error }, "Pending create-agent continuation recovery failed");
   });
   const hubRelationships = new HubRelationshipController({
     paseoHome: config.paseoHome,
@@ -1610,6 +1617,8 @@ export async function createPaseoDaemon(
     // Freeze both ingress and registration before taking the agent closure snapshot.
     wsServer?.prepareForShutdown();
     agentManager.prepareForShutdown();
+    pendingCreateRecoveryAbort.abort();
+    await pendingCreateRecoveryTask;
     await closeAllAgents(logger, agentManager);
     await agentManager.flushForShutdown().catch(() => undefined);
     detachAgentStoragePersistence();

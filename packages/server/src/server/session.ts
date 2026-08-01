@@ -78,7 +78,11 @@ import type {
   AgentTimelineFetchResult,
   ManagedAgent,
 } from "./agent/agent-manager.js";
-import { beginCreateAgentCommand } from "./agent/create-agent/create.js";
+import {
+  beginCreateAgentCommand,
+  recoverPendingCreateAgentCommandById,
+  type CreateAgentCommandDependencies,
+} from "./agent/create-agent/create.js";
 import { resolveCreateAgentIntent, type CreateAgentIntent } from "./agent/create-agent/intent.js";
 import {
   archiveAgentCommand,
@@ -3238,8 +3242,8 @@ export class Session {
     requestId: string,
     createRequestFingerprint: string,
   ): Promise<AgentCreateRequestOutcome | null> {
-    const liveAgent = this.agentManager.getAgent(agentId);
-    const storedAgent = await this.agentStorage.get(agentId);
+    let liveAgent = this.agentManager.getAgent(agentId);
+    let storedAgent = await this.agentStorage.get(agentId);
     if (!liveAgent && !storedAgent) {
       return null;
     }
@@ -3261,6 +3265,18 @@ export class Session {
       };
       this.emitCreateAgentRequestOutcome(requestId, outcome);
       return outcome;
+    }
+    if (storedAgent?.pendingCreateContinuation) {
+      try {
+        await recoverPendingCreateAgentCommandById(this.createAgentCommandDependencies(), agentId);
+      } catch (error) {
+        this.sessionLogger.warn(
+          { err: error, agentId },
+          "Online create-agent continuation recovery did not settle",
+        );
+      }
+      liveAgent = this.agentManager.getAgent(agentId);
+      storedAgent = await this.agentStorage.get(agentId);
     }
 
     const agent = liveAgent
@@ -3355,36 +3371,37 @@ export class Session {
         throw new Error(`Working directory does not exist or is not a directory: ${resolvedCwd}`);
       }
 
-      const creation = await beginCreateAgentCommand(
-        {
-          agentManager: this.agentManager,
-          agentStorage: this.agentStorage,
-          logger: this.sessionLogger,
-          paseoHome: this.paseoHome,
-          worktreesRoot: this.worktreesRoot,
-          providerSnapshotManager: this.providerSnapshotManager,
-        },
-        {
-          kind: "session",
-          agentId: requestedAgentId,
-          createRequestFingerprint,
-          config: resolvedIntent.config,
-          workspaceId: resolvedIntent.intent.workspaceId,
-          worktreeName,
-          initialPrompt,
-          clientMessageId,
-          outputSchema,
-          images,
-          attachments,
-          git,
-          labels: resolvedIntent.intent.labels,
-          env,
-          provisionalTitle,
-          firstAgentContext,
-          buildSessionConfig: (sessionConfig, gitOptions, legacyWorktreeName, ctx) =>
-            this.buildAgentSessionConfig(sessionConfig, gitOptions, legacyWorktreeName, ctx),
-        },
-      );
+      const creation = await beginCreateAgentCommand(this.createAgentCommandDependencies(), {
+        kind: "session",
+        agentId: requestedAgentId,
+        createRequestFingerprint,
+        config: resolvedIntent.config,
+        workspaceId: resolvedIntent.intent.workspaceId,
+        worktreeName,
+        initialPrompt,
+        clientMessageId,
+        outputSchema,
+        images,
+        attachments,
+        git,
+        labels: resolvedIntent.intent.labels,
+        env,
+        provisionalTitle,
+        firstAgentContext,
+        ...(autoArchive
+          ? {
+              autoArchiveTarget: createdWorktree
+                ? {
+                    kind: "created-worktree" as const,
+                    workspaceId: createdWorktree.workspace.workspaceId,
+                    worktreePath: createdWorktree.worktree.worktreePath,
+                  }
+                : { kind: "agent-only" as const },
+            }
+          : {}),
+        buildSessionConfig: (sessionConfig, gitOptions, legacyWorktreeName, ctx) =>
+          this.buildAgentSessionConfig(sessionConfig, gitOptions, legacyWorktreeName, ctx),
+      });
       const snapshot = creation.snapshot;
       createdAgentId = snapshot.id;
       void creation.completion.then(
@@ -3400,6 +3417,15 @@ export class Session {
             { err: error, agentId: snapshot.id, provider: snapshot.provider },
             "Agent startup failed after its creation acknowledgement",
           );
+          void recoverPendingCreateAgentCommandById(
+            this.createAgentCommandDependencies(),
+            snapshot.id,
+          ).catch((recoveryError) => {
+            this.sessionLogger.error(
+              { err: recoveryError, agentId: snapshot.id },
+              "Online create-agent continuation recovery failed",
+            );
+          });
           return undefined;
         },
       );
@@ -3414,11 +3440,6 @@ export class Session {
             { currentSelection: this.getFocusedAgentSelectionForCwd(resolvedIntent.config.cwd) },
           );
         }
-        this.createAgentLifecycleDispatch.registerAutoArchiveIfRequested({
-          autoArchive,
-          agentId: snapshot.id,
-          createdWorktree,
-        });
         const agentPayload = await this.buildAgentPayload(snapshot);
         await creation.prepareForAcknowledgement();
         creation.acknowledge(() => {
@@ -3468,6 +3489,21 @@ export class Session {
       });
       return outcome;
     }
+  }
+
+  private createAgentCommandDependencies(): CreateAgentCommandDependencies {
+    return {
+      agentManager: this.agentManager,
+      agentStorage: this.agentStorage,
+      logger: this.sessionLogger,
+      paseoHome: this.paseoHome,
+      worktreesRoot: this.worktreesRoot,
+      providerSnapshotManager: this.providerSnapshotManager,
+      terminalManager: this.terminalManager,
+      registerAutoArchive: (agentId, target) => {
+        this.createAgentLifecycleDispatch.registerPersistedAutoArchive(agentId, target);
+      },
+    };
   }
 
   private async resolveSessionCreateAgentIntent(input: {
@@ -4207,7 +4243,10 @@ export class Session {
     const labelEntries = filter?.labels ? Object.entries(filter.labels) : [];
 
     // Get live agents with session modes
-    const agentSnapshots = this.agentManager.listAgents();
+    const allAgentSnapshots = this.agentManager.listAgents();
+    const agentSnapshots = allAgentSnapshots.filter((agent) =>
+      this.agentManager.isAgentPublished(agent.id),
+    );
     const liveAgents = await Promise.all(
       agentSnapshots.map((agent) => this.buildAgentPayload(agent)),
     );
@@ -4215,7 +4254,7 @@ export class Session {
     // Add persisted agents that have not been lazily initialized yet
     // (excluding internal agents which are for ephemeral system tasks)
     const registryRecords = await this.agentStorage.list();
-    const liveIds = new Set(agentSnapshots.map((a) => a.id));
+    const liveIds = new Set(allAgentSnapshots.map((agent) => agent.id));
     const registeredProviderIds = new Set(this.providerSnapshotManager.listRegisteredProviderIds());
     const persistedAgents = registryRecords
       .filter((record) => !liveIds.has(record.id) && !record.internal)

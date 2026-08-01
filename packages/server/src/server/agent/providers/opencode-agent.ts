@@ -3334,77 +3334,91 @@ class OpenCodeAgentSession implements AgentSession {
           );
         });
     } else {
-      // Wrap in an async IIFE so a synchronous throw from promptAsync (e.g.
-      // SDK input validation) is caught alongside async rejections. A plain
-      // `.then().catch()` chain would let a sync throw escape unhandled.
-      void (async () => {
-        this.traceOpenCode("provider.opencode.prompt_async.start", {
-          turnId,
-          sessionId: this.sessionId,
-          model,
-          effectiveMode,
-          effectiveVariant,
-          partTypes: parts.map((p) => p.type),
-        });
-        try {
-          const systemPrompt = composeSystemPromptParts(
-            this.config.systemPrompt,
-            this.config.daemonAppendSystemPrompt,
-          );
-          const promptResponse = await this.client.session.promptAsync({
-            sessionID: this.sessionId,
-            directory: this.config.cwd,
-            parts,
-            ...(options?.outputSchema
-              ? {
-                  format: {
-                    type: "json_schema" as const,
-                    schema: options.outputSchema as Record<string, unknown>,
-                  },
-                }
-              : {}),
-            ...(systemPrompt ? { system: systemPrompt } : {}),
-            ...(model ? { model } : {}),
-            ...(effectiveMode ? { agent: effectiveMode } : {}),
-            ...(effectiveVariant ? { variant: effectiveVariant } : {}),
-          });
-          this.traceOpenCode("provider.opencode.prompt_async.response", {
-            turnId,
-            hasError: promptResponse.error !== undefined,
-            error: promptResponse.error,
-            data: promptResponse.data,
-          });
-          if (promptResponse.error) {
-            this.finishForegroundTurn(
-              {
-                type: "turn_failed",
-                provider: "opencode",
-                error: toDiagnosticErrorMessage(promptResponse.error),
-              },
-              turnId,
-            );
-          }
-        } catch (error) {
-          this.traceOpenCode("provider.opencode.prompt_async.throw", {
-            turnId,
-            error:
-              error instanceof Error
-                ? { name: error.name, message: error.message, stack: error.stack }
-                : String(error),
-          });
-          this.finishForegroundTurn(
-            {
-              type: "turn_failed",
-              provider: "opencode",
-              error: toDiagnosticErrorMessage(error),
-            },
-            turnId,
-          );
-        }
-      })();
+      await this.dispatchPromptForTurn({
+        turnId,
+        parts,
+        options,
+        model,
+        effectiveMode,
+        effectiveVariant,
+      });
     }
 
     return { turnId };
+  }
+
+  private async dispatchPromptForTurn(input: {
+    turnId: string;
+    parts: ReturnType<typeof buildOpenCodePromptParts>;
+    options: AgentRunOptions | undefined;
+    model: { providerID: string; modelID: string } | undefined;
+    effectiveMode: string | undefined;
+    effectiveVariant: string | undefined;
+  }): Promise<void> {
+    this.traceOpenCode("provider.opencode.prompt_async.start", {
+      turnId: input.turnId,
+      sessionId: this.sessionId,
+      model: input.model,
+      effectiveMode: input.effectiveMode,
+      effectiveVariant: input.effectiveVariant,
+      partTypes: input.parts.map((part) => part.type),
+    });
+    let promptResponse;
+    try {
+      const systemPrompt = composeSystemPromptParts(
+        this.config.systemPrompt,
+        this.config.daemonAppendSystemPrompt,
+      );
+      promptResponse = await this.client.session.promptAsync({
+        sessionID: this.sessionId,
+        directory: this.config.cwd,
+        parts: input.parts,
+        ...(input.options?.clientMessageId ? { messageID: input.options.clientMessageId } : {}),
+        ...(input.options?.outputSchema
+          ? {
+              format: {
+                type: "json_schema" as const,
+                schema: input.options.outputSchema as Record<string, unknown>,
+              },
+            }
+          : {}),
+        ...(systemPrompt ? { system: systemPrompt } : {}),
+        ...(input.model ? { model: input.model } : {}),
+        ...(input.effectiveMode ? { agent: input.effectiveMode } : {}),
+        ...(input.effectiveVariant ? { variant: input.effectiveVariant } : {}),
+      });
+    } catch (error) {
+      this.traceOpenCode("provider.opencode.prompt_async.throw", {
+        turnId: input.turnId,
+        error:
+          error instanceof Error
+            ? { name: error.name, message: error.message, stack: error.stack }
+            : String(error),
+      });
+      this.finishForegroundTurn(
+        {
+          type: "turn_failed",
+          provider: "opencode",
+          error: toDiagnosticErrorMessage(error),
+        },
+        input.turnId,
+      );
+      throw error;
+    }
+    this.traceOpenCode("provider.opencode.prompt_async.response", {
+      turnId: input.turnId,
+      hasError: promptResponse.error !== undefined,
+      error: promptResponse.error,
+      data: promptResponse.data,
+    });
+    if (promptResponse.error) {
+      const error = new Error(toDiagnosticErrorMessage(promptResponse.error));
+      this.finishForegroundTurn(
+        { type: "turn_failed", provider: "opencode", error: error.message },
+        input.turnId,
+      );
+      throw error;
+    }
   }
   subscribe(callback: (event: AgentStreamEvent) => void): () => void {
     this.subscribers.add(callback);

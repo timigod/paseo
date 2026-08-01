@@ -50,7 +50,7 @@ const inactiveRegistration: LifecycleRegistration = { cancel: async () => undefi
 
 type AutoArchiveTarget =
   | { kind: "agent-only" }
-  | { kind: "created-worktree"; result: CreatePaseoWorktreeWorkflowResult };
+  | { kind: "created-worktree"; workspaceId: string; worktreePath?: string };
 
 export class CreateAgentLifecycleDispatch {
   private readonly autoArchiveAgentIds = new Set<string>();
@@ -86,6 +86,15 @@ export class CreateAgentLifecycleDispatch {
       input.agentId,
       toAutoArchiveTarget(input.createdWorktree),
     );
+  }
+
+  registerPersistedAutoArchive(
+    agentId: string,
+    target:
+      | { kind: "agent-only" }
+      | { kind: "created-worktree"; workspaceId: string; worktreePath: string },
+  ): LifecycleRegistration {
+    return this.registerAutoArchiveOnTerminalState(agentId, target);
   }
 
   async cleanupCreatedWorktreeAfterFailedAgentCreate(input: {
@@ -171,10 +180,7 @@ export class CreateAgentLifecycleDispatch {
 
     try {
       if (target.kind === "created-worktree") {
-        await this.archiveAutoCreatedWorktree({
-          agentId,
-          createdWorktree: target.result,
-        });
+        await this.archivePersistedAutoCreatedWorktree(agentId, target);
         return;
       }
 
@@ -184,12 +190,17 @@ export class CreateAgentLifecycleDispatch {
     }
   }
 
-  private async archiveAutoCreatedWorktree(options: {
-    agentId: string | null;
-    createdWorktree: CreatePaseoWorktreeWorkflowResult;
-  }): Promise<void> {
-    const { createdWorktree } = options;
-    const worktreePath = createdWorktree.worktree.worktreePath;
+  private async archivePersistedAutoCreatedWorktree(
+    agentId: string,
+    target: Extract<AutoArchiveTarget, { kind: "created-worktree" }>,
+  ): Promise<void> {
+    const workspace = (await this.dependencies.listActiveWorkspaces()).find(
+      (candidate) => candidate.workspaceId === target.workspaceId,
+    );
+    const worktreePath = target.worktreePath ?? workspace?.cwd;
+    if (!worktreePath) {
+      throw new Error(`Auto-created workspace ${target.workspaceId} is no longer active`);
+    }
     const ownership = await isPaseoOwnedWorktreeCwd(worktreePath, {
       paseoHome: this.dependencies.paseoHome,
       worktreesRoot: this.dependencies.worktreesRoot,
@@ -198,6 +209,11 @@ export class CreateAgentLifecycleDispatch {
       throw new Error("Auto-created worktree is not a Paseo-owned worktree");
     }
 
+    await this.archiveWorkspaceById(target.workspaceId);
+    this.dependencies.emitAgentRemove(agentId);
+  }
+
+  private async archiveWorkspaceById(workspaceId: string): Promise<void> {
     await archiveByScope(
       {
         paseoHome: this.dependencies.paseoHome,
@@ -215,11 +231,25 @@ export class CreateAgentLifecycleDispatch {
         killTerminalsForWorkspace: this.dependencies.killTerminalsForWorkspace,
         sessionLogger: this.dependencies.logger,
       },
-      {
-        scope: { kind: "workspace", workspaceId: createdWorktree.workspace.workspaceId },
-        requestId: randomUUID(),
-      },
+      { scope: { kind: "workspace", workspaceId }, requestId: randomUUID() },
     );
+  }
+
+  private async archiveAutoCreatedWorktree(options: {
+    agentId: string | null;
+    createdWorktree: CreatePaseoWorktreeWorkflowResult;
+  }): Promise<void> {
+    const { createdWorktree } = options;
+    const worktreePath = createdWorktree.worktree.worktreePath;
+    const ownership = await isPaseoOwnedWorktreeCwd(worktreePath, {
+      paseoHome: this.dependencies.paseoHome,
+      worktreesRoot: this.dependencies.worktreesRoot,
+    });
+    if (!ownership.allowed) {
+      throw new Error("Auto-created worktree is not a Paseo-owned worktree");
+    }
+
+    await this.archiveWorkspaceById(createdWorktree.workspace.workspaceId);
 
     if (options.agentId) {
       this.dependencies.emitAgentRemove(options.agentId);
@@ -268,6 +298,10 @@ function toAutoArchiveTarget(
   createdWorktree: CreatePaseoWorktreeWorkflowResult | null,
 ): AutoArchiveTarget {
   return createdWorktree
-    ? { kind: "created-worktree", result: createdWorktree }
+    ? {
+        kind: "created-worktree",
+        workspaceId: createdWorktree.workspace.workspaceId,
+        worktreePath: createdWorktree.worktree.worktreePath,
+      }
     : { kind: "agent-only" };
 }

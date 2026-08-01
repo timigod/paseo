@@ -1905,7 +1905,7 @@ describe("OpenCode adapter startTurn error handling", () => {
     const events: AgentStreamEvent[] = [];
     session.subscribe((event) => events.push(event));
 
-    await session.startTurn("hello");
+    await expect(session.startTurn("hello")).rejects.toThrow("boom: synchronous throw");
 
     const failed = events.find((event) => event.type === "turn_failed");
     expect(failed).toBeDefined();
@@ -1913,6 +1913,56 @@ describe("OpenCode adapter startTurn error handling", () => {
     if (failed?.type === "turn_failed") {
       expect(failed.error).toContain("boom: synchronous throw");
     }
+  });
+
+  test("startTurn awaits prompt acceptance and uses clientMessageId as the provider message id", async () => {
+    const neverYieldingStream: AsyncIterable<OpenCodeEvent> = {
+      [Symbol.asyncIterator]: () => {
+        let emittedConnected = false;
+        return {
+          next: () => {
+            if (!emittedConnected) {
+              emittedConnected = true;
+              return Promise.resolve({
+                done: false,
+                value: { type: "server.connected", properties: {} } as OpenCodeEvent,
+              });
+            }
+            return new Promise(() => {});
+          },
+        };
+      },
+    };
+    let acceptPrompt!: () => void;
+    const promptAsync = vi.fn(
+      () =>
+        new Promise<{ data: object; error: undefined }>((resolve) => {
+          acceptPrompt = () => resolve({ data: {}, error: undefined });
+        }),
+    );
+    const fakeClient = {
+      global: { event: vi.fn().mockResolvedValue({ stream: neverYieldingStream }) },
+      session: { promptAsync },
+    } as never;
+    const session = new __openCodeInternals.OpenCodeAgentSession(
+      { provider: "opencode", cwd: "/tmp/test" },
+      fakeClient,
+      "ses_unit_test",
+      createTestLogger(),
+    );
+
+    let settled = false;
+    const start = session
+      .startTurn("hello", { clientMessageId: "msg-create-1" })
+      .then(() => (settled = true));
+    await vi.waitFor(() => expect(promptAsync).toHaveBeenCalledOnce());
+    expect(settled).toBe(false);
+    expect(promptAsync).toHaveBeenCalledWith(
+      expect.objectContaining({ messageID: "msg-create-1" }),
+    );
+    acceptPrompt();
+    await start;
+    expect(settled).toBe(true);
   });
 
   test("waits for the stop abort and provider idle before starting the next prompt", async () => {

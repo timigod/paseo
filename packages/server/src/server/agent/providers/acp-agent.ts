@@ -1325,6 +1325,13 @@ export class ACPAgentSession implements AgentSession, ACPClient {
   private readonly extensionCommandsParser?: ACPExtensionCommandsParser;
   private currentTurnUsage: AgentUsage | undefined;
   private activeForegroundTurnId: string | null = null;
+  private activePromptAcceptance: {
+    turnId: string;
+    promise: Promise<void>;
+    resolve: () => void;
+    reject: (error: unknown) => void;
+  } | null = null;
+  private readonly promptAcceptances = new Map<string, Promise<void>>();
   private fallbackAssistantMessageId: string | null = null;
   private closed = false;
   private historyPending = false;
@@ -1498,6 +1505,21 @@ export class ACPAgentSession implements AgentSession, ACPClient {
     this.pushEvent({ type: "turn_started", provider: this.provider, turnId });
     this.emitSubmittedUserMessage(prompt, messageId, turnId, options?.clientMessageId);
 
+    let resolveAcceptance!: () => void;
+    let rejectAcceptance!: (error: unknown) => void;
+    const acceptance = new Promise<void>((resolve, reject) => {
+      resolveAcceptance = resolve;
+      rejectAcceptance = reject;
+    });
+    this.activePromptAcceptance = {
+      turnId,
+      promise: acceptance,
+      resolve: resolveAcceptance,
+      reject: rejectAcceptance,
+    };
+    this.promptAcceptances.set(turnId, acceptance);
+    void acceptance.catch(() => undefined);
+
     void this.connection
       .prompt({
         sessionId: this.sessionId,
@@ -1505,10 +1527,18 @@ export class ACPAgentSession implements AgentSession, ACPClient {
         prompt: toACPContentBlocks(prompt),
       })
       .then((response) => {
+        if (this.activePromptAcceptance?.turnId === turnId) {
+          this.activePromptAcceptance.resolve();
+          this.activePromptAcceptance = null;
+        }
         this.handlePromptResponse(response, turnId);
         return;
       })
       .catch((error) => {
+        if (this.activePromptAcceptance?.turnId === turnId) {
+          this.activePromptAcceptance.reject(error);
+          this.activePromptAcceptance = null;
+        }
         const summary = summarizeACPRequestError(error);
         this.finishTurn({
           type: "turn_failed",
@@ -1521,6 +1551,18 @@ export class ACPAgentSession implements AgentSession, ACPClient {
       });
 
     return { turnId };
+  }
+
+  async waitForTurnAcceptance(turnId: string): Promise<void> {
+    const acceptance = this.promptAcceptances.get(turnId);
+    if (!acceptance) {
+      return;
+    }
+    try {
+      await acceptance;
+    } finally {
+      this.promptAcceptances.delete(turnId);
+    }
   }
 
   subscribe(callback: (event: AgentStreamEvent) => void): () => void {
@@ -2038,6 +2080,10 @@ export class ACPAgentSession implements AgentSession, ACPClient {
       return;
     }
     this.closed = true;
+    this.activePromptAcceptance?.reject(
+      new Error(`${this.provider} session closed before prompt acceptance`),
+    );
+    this.activePromptAcceptance = null;
 
     this.deliverTranslatedEvents(this.flushPendingUserMessage());
     this.settleCommandsReady();
@@ -2127,6 +2173,10 @@ export class ACPAgentSession implements AgentSession, ACPClient {
     }
 
     const events = this.translateSessionUpdate(params.update);
+    if (events.some(isPromptAcceptanceEvent)) {
+      this.activePromptAcceptance?.resolve();
+      this.activePromptAcceptance = null;
+    }
     this.logger.trace(
       {
         agentId: this.agentId,
@@ -2831,6 +2881,15 @@ export class ACPAgentSession implements AgentSession, ACPClient {
     }
     return entry;
   }
+}
+
+function isPromptAcceptanceEvent(event: AgentStreamEvent): boolean {
+  return (
+    event.type === "timeline" ||
+    event.type === "turn_completed" ||
+    event.type === "turn_failed" ||
+    event.type === "turn_canceled"
+  );
 }
 
 function findSelectConfigOption({

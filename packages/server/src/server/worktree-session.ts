@@ -144,6 +144,12 @@ export interface AgentWorktreeSetupContinuation {
     worktree: WorktreeConfig;
     workspaceCwd?: string;
     shouldBootstrap: boolean;
+    progress?: {
+      commands: string[];
+      nextCommandIndex: number;
+      inFlightCommandIndex: number | null;
+      terminals: "pending" | "running" | "completed";
+    };
   };
   startAfterAgentCreate: (input: { agentId: string }) => Promise<void> | void;
 }
@@ -648,6 +654,16 @@ export async function createPaseoWorktreeWorkflow(
           worktree: createdWorktree.worktree,
           workspaceCwd: workspace.cwd,
           shouldBootstrap: createdWorktree.created,
+          ...(createdWorktree.created
+            ? {
+                progress: {
+                  commands: getWorktreeSetupCommands(workspace.cwd),
+                  nextCommandIndex: 0,
+                  inFlightCommandIndex: null,
+                  terminals: "pending" as const,
+                },
+              }
+            : {}),
         },
         startAfterAgentCreate: ({ agentId }) =>
           runAsyncWorktreeBootstrap({
