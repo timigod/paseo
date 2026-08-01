@@ -18,6 +18,7 @@ import type { Logger } from "pino";
 import { z } from "zod";
 
 import {
+  AgentTurnStartRejectedError,
   getAgentStreamEventTurnId,
   type AgentCapabilityFlags,
   type AgentClient,
@@ -3060,11 +3061,26 @@ class OpenCodeAgentSession implements AgentSession {
     // OpenCode creates prompts before joining its single session runner. Sending
     // while that runner is stopping can strand the new prompt behind the old
     // run, so only provider-confirmed idle makes the session reusable.
-    await withTimeout(
-      this.observeProviderStopBoundary(stopping),
-      OPENCODE_PENDING_ABORT_START_TIMEOUT_MS,
-      "OpenCode previous turn to stop",
-    );
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        this.observeProviderStopBoundary(stopping),
+        new Promise<never>((_, reject) => {
+          timeout = setTimeout(() => {
+            reject(
+              new AgentTurnStartRejectedError(
+                "previous_turn_still_stopping",
+                "OpenCode previous turn to stop",
+              ),
+            );
+          }, OPENCODE_PENDING_ABORT_START_TIMEOUT_MS);
+        }),
+      ]);
+    } finally {
+      if (timeout) {
+        clearTimeout(timeout);
+      }
+    }
   }
 
   private async observeProviderStopBoundary(
@@ -3118,7 +3134,10 @@ class OpenCodeAgentSession implements AgentSession {
     }
     await this.waitUntilProviderIdle();
     if (this.turnState.status !== "idle") {
-      throw new Error("OpenCode is still stopping the previous turn");
+      throw new AgentTurnStartRejectedError(
+        "previous_turn_still_stopping",
+        "OpenCode is still stopping the previous turn",
+      );
     }
 
     this.runningToolCalls.clear();

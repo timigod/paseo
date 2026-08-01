@@ -1,0 +1,80 @@
+{
+  "schemaVersion": 1,
+  "patches": [
+    {
+      "id": "paseo-v025-opencode-stop-boundary-recovery",
+      "category": "stable-core-opencode-lifecycle",
+      "base": {
+        "tag": "v0.2.5",
+        "tagObject": "8d143abc43e2b257c4fc2f77606bb11734ba3da4",
+        "commit": "6fc491e6220fba6543bbbe4bf1b1f58cfe59228b"
+      },
+      "candidate": {
+        "branch": "review/v025-opencode-stop-boundary",
+        "baseCommit": "6fc491e6220fba6543bbbe4bf1b1f58cfe59228b",
+        "commit": null,
+        "pullRequest": null,
+        "receipt": "patches/receipts/paseo-v025-opencode-stop-boundary-recovery.json"
+      },
+      "upstream": {
+        "repository": "https://github.com/getpaseo/paseo.git",
+        "branch": "main",
+        "commit": null,
+        "pullRequest": null
+      },
+      "references": {
+        "priorLocalRepairCommit": "f161141b9ce6de7e7df8b997faa3937a641ac71c",
+        "opencodeVersion": "v1.14.46",
+        "opencodeCommit": "d802b0a277f4e7f113b5efd8d5446fc1db22f4a4"
+      },
+      "sources": [
+        "packages/server/src/server/agent/agent-sdk-types.ts",
+        "packages/server/src/server/agent/agent-manager.ts",
+        "packages/server/src/server/agent/providers/opencode-agent.ts"
+      ],
+      "tests": [
+        "packages/server/src/server/agent/agent-manager.test.ts",
+        "packages/server/src/server/agent/providers/opencode-agent.test.ts"
+      ],
+      "testCases": [
+        "the OpenCode adapter emits a typed pre-submit rejection and does not call promptAsync while the previous turn is still stopping",
+        "one typed OpenCode stop-boundary rejection reloads the owned runtime and retries the same structured prompt and run-options objects once",
+        "the durable OpenCode session handle is reused across runtime replacement",
+        "a second typed rejection fails without a second reload",
+        "ambiguous HTTP, overload, text-matched, and other-provider errors never reload or retry",
+        "the original pending-run lock survives reload so start waiters continue and duplicate prompts remain rejected",
+        "interrupt and close during reload cancel the unsent prompt whether runtime reload succeeds or fails"
+      ],
+      "verification": {
+        "receipt": "patches/receipts/paseo-v025-opencode-stop-boundary-recovery.json",
+        "completedAt": "2026-08-01T00:28:20Z",
+        "runtime": {
+          "node": "v24.18.1"
+        },
+        "commands": [
+          "cd packages/server && ../../node_modules/.bin/vitest run src/server/agent/agent-manager.test.ts --bail=1",
+          "cd packages/server && ../../node_modules/.bin/vitest run src/server/agent/providers/opencode-agent.test.ts --bail=1",
+          "npm run build:server",
+          "npm run typecheck",
+          "npm run lint -- packages/server/src/server/agent/agent-manager.test.ts packages/server/src/server/agent/agent-manager.ts packages/server/src/server/agent/agent-sdk-types.ts packages/server/src/server/agent/providers/opencode-agent.test.ts packages/server/src/server/agent/providers/opencode-agent.ts",
+          "npm run format:check",
+          "git diff --check",
+          "jq -e '.schemaVersion == 1 and (.patches | length == 1) and .patches[0].base.tag == \"v0.2.5\" and .patches[0].base.commit == \"6fc491e6220fba6543bbbe4bf1b1f58cfe59228b\"' patches/local-patches.json"
+        ],
+        "result": {
+          "agentManagerTests": "154 passed",
+          "openCodeAdapterTests": "68 passed",
+          "serverBuild": "passed",
+          "workspaceTypecheck": "passed",
+          "lint": "0 warnings, 0 errors",
+          "formatDiffAndManifest": "passed"
+        }
+      },
+      "upstreamable": true,
+      "upstreamCondition": "Submit independently while a typed OpenCode pre-submit stop-boundary rejection can leave an owned runtime unusable without one bounded reload and retry.",
+      "dropCondition": "Remove when the latest stable release provides equivalent typed pre-submit OpenCode stop-boundary recovery with exactly one owned-runtime reload and retry, preserved prompt and run-options identity, durable session reuse, pending-run exclusion, and interrupt/close safety without retrying ambiguous failures.",
+      "deployedReceipt": null,
+      "deployedAt": null
+    }
+  ]
+}
