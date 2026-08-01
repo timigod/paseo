@@ -326,6 +326,31 @@ process.stdin.on("data", (chunk) => {
 }
 
 describe("Codex app-server provider", () => {
+  test("daemon shutdown aborts an in-flight app-server startup and terminates its child", async () => {
+    let markInitializeStarted!: () => void;
+    const initializeStarted = new Promise<void>((resolve) => {
+      markInitializeStarted = resolve;
+    });
+    const appServer = createFakeCodexAppServer({
+      initialize: () => {
+        markInitializeStarted();
+        return new Promise(() => undefined);
+      },
+    });
+    const originalKill = appServer.child.kill.bind(appServer.child);
+    appServer.child.kill = vi.fn(originalKill) as ChildProcessWithoutNullStreams["kill"];
+    const provider = createProviderWithFakeAppServer(appServer);
+    const abort = new AbortController();
+    const shutdown = new Error("daemon shutdown during Codex startup");
+    const startup = provider.createSession(createConfig(), undefined, { signal: abort.signal });
+    await initializeStarted;
+
+    abort.abort(shutdown);
+
+    await expect(startup).rejects.toBe(shutdown);
+    await vi.waitFor(() => expect(appServer.child.kill).toHaveBeenCalled());
+  });
+
   test("getAvailableModes includes auto-review when the Codex version supports it", async () => {
     const session = createSession({}, { autoReviewEnabled: true });
 

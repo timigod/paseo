@@ -3472,15 +3472,18 @@ class OpenCodeAgentSession implements AgentSession {
             ? { name: error.name, message: error.message, stack: error.stack }
             : String(error),
       });
-      this.finishForegroundTurn(
-        {
-          type: "turn_failed",
-          provider: "opencode",
-          error: toDiagnosticErrorMessage(error),
-        },
-        input.turnId,
-      );
-      throw error;
+      const acceptance = isOpenCodeHeadersTimeoutFailure(error) ? "ambiguous" : "rejected";
+      if (acceptance === "rejected") {
+        this.finishForegroundTurn(
+          {
+            type: "turn_failed",
+            provider: "opencode",
+            error: toDiagnosticErrorMessage(error),
+          },
+          input.turnId,
+        );
+      }
+      throw new AgentTurnAcceptanceError(acceptance, toDiagnosticErrorMessage(error));
     }
     this.traceOpenCode("provider.opencode.prompt_async.response", {
       turnId: input.turnId,
@@ -3494,7 +3497,7 @@ class OpenCodeAgentSession implements AgentSession {
         { type: "turn_failed", provider: "opencode", error: error.message },
         input.turnId,
       );
-      throw error;
+      throw new AgentTurnAcceptanceError("rejected", error.message);
     }
   }
   subscribe(callback: (event: AgentStreamEvent) => void): () => void {
