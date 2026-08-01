@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type pino from "pino";
+import type { TerminalManager } from "../../terminal/terminal-manager.js";
 
 import type { ForgeService } from "../../services/forge-service.js";
 import { isPaseoOwnedWorktreeCwd } from "../../utils/worktree.js";
@@ -16,12 +17,17 @@ import type {
 } from "../messages.js";
 import type { AgentManager, AgentSubscriber, SubscribeOptions } from "./agent-manager.js";
 import type { AgentStorage } from "./agent-storage.js";
+import {
+  appendTimelineItemIfAgentKnown,
+  emitLiveTimelineItemIfAgentKnown,
+} from "./timeline-append.js";
 
 interface CreateAgentLifecycleDispatchDependencies {
   paseoHome: string;
   worktreesRoot?: string;
   agentManager: AgentManager;
   agentStorage: AgentStorage;
+  terminalManager?: TerminalManager | null;
   github: ForgeService;
   workspaceGitService: WorkspaceGitService;
   createPaseoWorktreeWorkflow: CreatePaseoWorktreeWorkflowFn;
@@ -53,7 +59,8 @@ type AutoArchiveTarget =
   | { kind: "created-worktree"; workspaceId: string; worktreePath?: string };
 
 export class CreateAgentLifecycleDispatch {
-  private readonly autoArchiveAgentIds = new Set<string>();
+  private readonly completedAutoArchiveAgentIds = new Set<string>();
+  private readonly autoArchiveTasks = new Map<string, Promise<void>>();
 
   constructor(private readonly dependencies: CreateAgentLifecycleDispatchDependencies) {}
 
@@ -132,6 +139,36 @@ export class CreateAgentLifecycleDispatch {
       paseoHome: this.dependencies.paseoHome,
       worktreesRoot: this.dependencies.worktreesRoot,
     } as const;
+    const setupContinuation = {
+      kind: "agent" as const,
+      terminalManager: this.dependencies.terminalManager ?? null,
+      appendTimelineItem: ({
+        agentId,
+        item,
+      }: {
+        agentId: string;
+        item: Parameters<AgentManager["appendTimelineItem"]>[1];
+      }) =>
+        appendTimelineItemIfAgentKnown({
+          agentManager: this.dependencies.agentManager,
+          agentId,
+          item,
+        }),
+      emitLiveTimelineItem: ({
+        agentId,
+        item,
+      }: {
+        agentId: string;
+        item: Parameters<AgentManager["emitLiveTimelineItem"]>[1];
+      }) =>
+        emitLiveTimelineItemIfAgentKnown({
+          agentManager: this.dependencies.agentManager,
+          agentId,
+          item,
+        }),
+      logger: this.dependencies.logger,
+    };
+    const serviceOptions = { setupContinuation };
 
     switch (target.mode) {
       case "branch-off":
@@ -142,20 +179,20 @@ export class CreateAgentLifecycleDispatch {
             action: "branch-off",
             ...(target.base ? { refName: target.base } : {}),
           },
-          target.base ? { resolveDefaultBranch: async () => target.base! } : undefined,
+          target.base
+            ? { ...serviceOptions, resolveDefaultBranch: async () => target.base! }
+            : serviceOptions,
         );
       case "checkout-branch":
-        return this.dependencies.createPaseoWorktreeWorkflow({
-          ...baseInput,
-          action: "checkout",
-          refName: target.branch,
-        });
+        return this.dependencies.createPaseoWorktreeWorkflow(
+          { ...baseInput, action: "checkout", refName: target.branch },
+          serviceOptions,
+        );
       case "checkout-pr":
-        return this.dependencies.createPaseoWorktreeWorkflow({
-          ...baseInput,
-          action: "checkout",
-          githubPrNumber: target.prNumber,
-        });
+        return this.dependencies.createPaseoWorktreeWorkflow(
+          { ...baseInput, action: "checkout", githubPrNumber: target.prNumber },
+          serviceOptions,
+        );
       default:
         throw new Error("Unsupported create_agent_request worktree target");
     }
@@ -169,24 +206,28 @@ export class CreateAgentLifecycleDispatch {
       agentManager: this.dependencies.agentManager,
       agentId,
       archive: () => this.autoArchiveAgentOnce(agentId, target),
+      onError: (error) =>
+        this.dependencies.logger.warn({ err: error, agentId }, "Failed to auto-archive agent"),
     });
   }
 
   private async autoArchiveAgentOnce(agentId: string, target: AutoArchiveTarget): Promise<void> {
-    if (this.autoArchiveAgentIds.has(agentId)) {
-      return;
-    }
-    this.autoArchiveAgentIds.add(agentId);
-
-    try {
+    if (this.completedAutoArchiveAgentIds.has(agentId)) return;
+    const existing = this.autoArchiveTasks.get(agentId);
+    if (existing) return await existing;
+    const task = (async () => {
       if (target.kind === "created-worktree") {
         await this.archivePersistedAutoCreatedWorktree(agentId, target);
-        return;
+      } else {
+        await this.dependencies.archiveAgentForClose(agentId);
       }
-
-      await this.dependencies.archiveAgentForClose(agentId);
-    } catch (error) {
-      this.dependencies.logger.warn({ err: error, agentId }, "Failed to auto-archive agent");
+      this.completedAutoArchiveAgentIds.add(agentId);
+    })();
+    this.autoArchiveTasks.set(agentId, task);
+    try {
+      await task;
+    } finally {
+      if (this.autoArchiveTasks.get(agentId) === task) this.autoArchiveTasks.delete(agentId);
     }
   }
 
@@ -261,11 +302,16 @@ export function registerAgentAutoArchive(input: {
   agentManager: AgentLifecycleEvents;
   agentId: string;
   archive: () => Promise<unknown>;
+  onError?: (error: unknown) => void;
 }): LifecycleRegistration {
   let unsubscribe: (() => void) | null = null;
   let archiveTask: Promise<unknown> | null = null;
+  let releaseRequested = false;
   const release = () => {
-    if (!unsubscribe) return;
+    if (!unsubscribe) {
+      releaseRequested = true;
+      return;
+    }
     const subscribed = unsubscribe;
     unsubscribe = null;
     subscribed();
@@ -278,19 +324,32 @@ export function registerAgentAutoArchive(input: {
   };
   unsubscribe = input.agentManager.subscribe(
     (event) => {
-      if (event.type !== "agent_stream") return;
-      if (
-        event.event.type !== "turn_completed" &&
-        event.event.type !== "turn_failed" &&
-        event.event.type !== "turn_canceled"
-      ) {
-        return;
-      }
-      release();
-      archiveTask = input.archive();
+      const terminalStream =
+        event.type === "agent_stream" &&
+        (event.event.type === "turn_completed" ||
+          event.event.type === "turn_failed" ||
+          event.event.type === "turn_canceled");
+      const terminalState =
+        event.type === "agent_state" &&
+        event.agent.id === input.agentId &&
+        event.agent.lastTurnOutcome != null &&
+        event.agent.lifecycle !== "running" &&
+        event.agent.lifecycle !== "initializing";
+      if (!terminalStream && !terminalState) return;
+      if (archiveTask) return;
+      const task = Promise.resolve().then(input.archive);
+      archiveTask = task;
+      void task.then(
+        () => release(),
+        (error) => {
+          if (archiveTask === task) archiveTask = null;
+          input.onError?.(error);
+        },
+      );
     },
-    { agentId: input.agentId, replayState: false },
+    { agentId: input.agentId, replayState: true },
   );
+  if (releaseRequested) release();
   return registration;
 }
 

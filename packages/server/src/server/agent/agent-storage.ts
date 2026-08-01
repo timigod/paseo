@@ -56,7 +56,7 @@ const PENDING_CREATE_CONTINUATION_SCHEMA = z.object({
   phase: z.literal("awaiting_dispatch"),
   prompt: z
     .object({
-      status: z.enum(["pending", "dispatching"]).default("pending"),
+      status: z.enum(["pending", "dispatching", "ambiguous"]).default("pending"),
       input: z.union([z.string(), z.array(AGENT_PROMPT_CONTENT_BLOCK_SCHEMA)]),
       runOptions: z
         .object({

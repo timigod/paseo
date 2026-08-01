@@ -145,6 +145,7 @@ export interface StartCreatedAgentInitialPromptParams {
   prompt: AgentPromptInput | null;
   runOptions?: AgentRunOptions;
   logger: Logger;
+  signal?: AbortSignal;
 }
 
 const AGENT_RUN_START_TIMEOUT_MS = 15_000;
@@ -152,14 +153,24 @@ const AGENT_RUN_START_TIMEOUT_MS = 15_000;
 export async function waitForAgentRunStartWithTimeout(
   agentManager: AgentManager,
   agentId: string,
+  signal?: AbortSignal,
 ): Promise<void> {
   const startAbort = new AbortController();
   const startTimeout = setTimeout(() => startAbort.abort("timeout"), AGENT_RUN_START_TIMEOUT_MS);
+  const abortFromCaller = () => startAbort.abort(signal?.reason);
+  signal?.addEventListener("abort", abortFromCaller, { once: true });
 
   try {
+    signal?.throwIfAborted();
     await agentManager.waitForAgentRunStart(agentId, { signal: startAbort.signal });
+  } catch (error) {
+    if (signal?.aborted) {
+      await agentManager.cancelAgentRun(agentId).catch(() => undefined);
+    }
+    throw error;
   } finally {
     clearTimeout(startTimeout);
+    signal?.removeEventListener("abort", abortFromCaller);
   }
 }
 
@@ -219,6 +230,7 @@ export async function startCreatedAgentInitialPrompt(
     return currentSnapshot;
   }
 
+  params.signal?.throwIfAborted();
   const dispatchResult = await startAgentRun(
     params.agentManager,
     params.agentId,
@@ -230,7 +242,7 @@ export async function startCreatedAgentInitialPrompt(
   );
 
   if (!dispatchResult.outOfBand) {
-    await waitForAgentRunStartWithTimeout(params.agentManager, params.agentId);
+    await waitForAgentRunStartWithTimeout(params.agentManager, params.agentId, params.signal);
   }
 
   const refreshedSnapshot = params.agentManager.getAgent(params.agentId) ?? params.snapshot ?? null;

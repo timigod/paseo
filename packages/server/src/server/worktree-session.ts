@@ -151,7 +151,7 @@ export interface AgentWorktreeSetupContinuation {
       terminals: "pending" | "running" | "completed";
     };
   };
-  startAfterAgentCreate: (input: { agentId: string }) => Promise<void> | void;
+  startAfterAgentCreate: (input: { agentId: string; signal?: AbortSignal }) => Promise<void> | void;
 }
 
 export type CreatePaseoWorktreeWorkflowResult = CreatePaseoWorktreeResult & {
@@ -665,7 +665,7 @@ export async function createPaseoWorktreeWorkflow(
               }
             : {}),
         },
-        startAfterAgentCreate: ({ agentId }) =>
+        startAfterAgentCreate: ({ agentId, signal }) =>
           runAsyncWorktreeBootstrap({
             agentId,
             workspaceId: workspace.workspaceId,
@@ -677,6 +677,7 @@ export async function createPaseoWorktreeWorkflow(
             emitLiveTimelineItem: (item) =>
               setupContinuation.emitLiveTimelineItem({ agentId, item }),
             logger: setupContinuation.logger,
+            signal,
           }),
       },
     };
