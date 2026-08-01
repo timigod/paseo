@@ -2,7 +2,7 @@ import { resolve } from "node:path";
 
 import type { Logger } from "pino";
 
-import type { AgentManager } from "./agent/agent-manager.js";
+import { AgentManager } from "./agent/agent-manager.js";
 import type { AgentStorage, StoredAgentRecord } from "./agent/agent-storage.js";
 import type { WorkspaceGitService } from "./workspace-git-service.js";
 import type { ForgeService } from "../services/forge-service.js";
@@ -27,7 +27,8 @@ export interface ArchiveDependencies {
   paseoWorktreesBaseRoot?: string;
   github: ForgeService;
   workspaceGitService: Pick<WorkspaceGitService, "getSnapshot">;
-  agentManager: Pick<AgentManager, "listAgents" | "archiveAgent" | "archiveSnapshot">;
+  agentManager: Pick<AgentManager, "listAgents" | "archiveAgent" | "archiveSnapshot"> &
+    Partial<Pick<AgentManager, "listAgentsInternal">>;
   agentStorage: Pick<AgentStorage, "list">;
   // Resolves the worktree at a path to its workspaceId for archive-by-path. The
   // path uniquely identifies a worktree workspace; this is a directory lookup for
@@ -60,6 +61,8 @@ export interface ArchiveResult {
   archivedAgentIds: string[];
   archivedWorkspaceIds: string[];
   removedDirectory: boolean;
+  /** True when any requested record, terminal, teardown, or owned-directory cleanup remains. */
+  cleanupPending?: boolean;
 }
 
 export interface ArchiveByScopeRequest {
@@ -161,6 +164,9 @@ export async function archiveByScope(
       archivedAgentIds: Array.from(archivedAgents),
       archivedWorkspaceIds,
       removedDirectory,
+      cleanupPending:
+        archivedWorkspaceIds.length !== targetWorkspaceIds.length ||
+        (target.backing?.isPaseoOwnedWorktree === true && !removedDirectory),
     };
   } finally {
     if (targetWorkspaceIds.length > 0) {
@@ -403,9 +409,11 @@ export async function archiveWorkspaceContents(
 ): Promise<Set<string>> {
   const archivedAgents = new Set<string>();
 
-  const liveAgents = dependencies.agentManager
-    .listAgents()
-    .filter((agent) => agent.workspaceId === workspaceId);
+  const liveAgents = (
+    dependencies.agentManager instanceof AgentManager
+      ? dependencies.agentManager.listAgentsInternal()
+      : dependencies.agentManager.listAgents()
+  ).filter((agent) => agent.workspaceId === workspaceId);
   for (const agent of liveAgents) {
     archivedAgents.add(agent.id);
   }
@@ -443,6 +451,16 @@ export async function archiveWorkspaceContents(
         "Workspace archive teardown step failed; continuing",
       );
     }
+  }
+
+  const failures = archiveResults.filter(
+    (result): result is PromiseRejectedResult => result.status === "rejected",
+  );
+  if (failures.length > 0) {
+    throw new AggregateError(
+      failures.map((failure) => failure.reason),
+      `Workspace ${workspaceId} archive teardown did not complete`,
+    );
   }
 
   return archivedAgents;
@@ -502,22 +520,30 @@ export async function killTerminalsForWorkspace(
     return;
   }
 
-  await Promise.allSettled(
+  const results = await Promise.allSettled(
     terminalIds.map(async (terminalId) => {
-      try {
-        dependencies.detachTerminalStream?.(terminalId, { emitExit: true });
-        await terminalManager.killTerminalAndWait(terminalId, {
-          gracefulTimeoutMs: 2000,
-          forceTimeoutMs: 1500,
-        });
-      } catch (error) {
-        dependencies.sessionLogger.warn(
-          { err: error, terminalId },
-          "Terminal kill escalation failed during archive; proceeding anyway",
-        );
-      }
+      dependencies.detachTerminalStream?.(terminalId, { emitExit: true });
+      await terminalManager.killTerminalAndWait(terminalId, {
+        gracefulTimeoutMs: 2000,
+        forceTimeoutMs: 1500,
+      });
     }),
   );
+  const failures = results.filter(
+    (result): result is PromiseRejectedResult => result.status === "rejected",
+  );
+  for (const failure of failures) {
+    dependencies.sessionLogger.warn(
+      { err: failure.reason, workspaceId },
+      "Terminal kill escalation failed during archive",
+    );
+  }
+  if (failures.length > 0) {
+    throw new AggregateError(
+      failures.map((failure) => failure.reason),
+      `Workspace ${workspaceId} terminal teardown did not complete`,
+    );
+  }
 }
 
 // Archiving the last workspace of a project leaves the project record active.

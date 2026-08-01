@@ -349,6 +349,23 @@ describe("emitStoredRecord", () => {
     expect(h.agentUpdates()).toEqual([{ kind: "remove", agentId: "a" }]);
   });
 
+  test("emits a remove for an unacknowledged durable create", async () => {
+    const h = buildHarness();
+    h.service.beginSubscription({ subscriptionId: "sub", filter: { includeArchived: true } });
+    h.service.flushBootstrapped("sub");
+    h.register(makeAgentPayload({ id: "a", workspaceId: "ws-1" }));
+
+    await h.service.emitStoredRecord({
+      ...h.stored("a"),
+      pendingCreateContinuation: {
+        phase: "awaiting_dispatch",
+        acknowledged: false,
+      },
+    });
+
+    expect(h.agentUpdates()).toEqual([{ kind: "remove", agentId: "a" }]);
+  });
+
   test("returns the payload but emits nothing when there is no subscription", async () => {
     const h = buildHarness();
     h.register(makeAgentPayload({ id: "a", workspaceId: "ws-1" }));

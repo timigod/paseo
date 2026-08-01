@@ -2001,6 +2001,33 @@ describe("OpenCode adapter startTurn error handling", () => {
     expect(events.some((event) => event.type === "turn_failed")).toBe(false);
   });
 
+  test("normal prompt socket reset is ambiguous and cannot authorize a duplicate first prompt", async () => {
+    const neverYieldingStream: AsyncIterable<OpenCodeEvent> = {
+      [Symbol.asyncIterator]: () => ({ next: () => new Promise(() => {}) }),
+    };
+    const socketReset = Object.assign(new TypeError("fetch failed"), {
+      cause: Object.assign(new Error("socket closed after request write"), { code: "ECONNRESET" }),
+    });
+    const fakeClient = {
+      global: { event: vi.fn().mockResolvedValue({ stream: neverYieldingStream }) },
+      session: { promptAsync: vi.fn().mockRejectedValue(socketReset) },
+    } as never;
+    const session = new __openCodeInternals.OpenCodeAgentSession(
+      { provider: "opencode", cwd: "/tmp/test" },
+      fakeClient,
+      "ses_unit_test",
+      createTestLogger(),
+    );
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+
+    await expect(session.startTurn("hello")).rejects.toThrow(
+      "PASEO_TURN_ACCEPTANCE_AMBIGUOUS: fetch failed",
+    );
+    expect(events.some((event) => event.type === "turn_failed")).toBe(false);
+    expect(fakeClient.session.promptAsync).toHaveBeenCalledOnce();
+  });
+
   test("startTurn awaits slash-command acceptance before reporting success", async () => {
     const runtime = new TestOpenCodeHarness();
     const openCode = new TestOpenCodeClient();

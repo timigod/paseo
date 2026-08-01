@@ -250,6 +250,27 @@ describe("agent lifecycle commands", () => {
     expect(manager.archivedAgentIds).toEqual([]);
   });
 
+  test("unacknowledged stored creates are not actionable through archive", async () => {
+    const storage = new FakeLifecycleAgentStorage();
+    const manager = new FakeLifecycleAgentManager(storage);
+    storage.records.set("agent-private", {
+      ...storedAgent("agent-private"),
+      pendingCreateContinuation: {
+        phase: "awaiting_dispatch",
+        acknowledged: false,
+      },
+    });
+
+    await expect(
+      archiveAgentCommand(
+        { agentManager: manager, agentStorage: storage, logger },
+        "agent-private",
+      ),
+    ).rejects.toThrow("Agent not found: agent-private");
+    expect(storage.upserts).toEqual([]);
+    expect(manager.archivedAgentIds).toEqual([]);
+  });
+
   test("normalizes metadata updates and rejects empty updates", async () => {
     const storage = new FakeLifecycleAgentStorage();
     storage.records.set("agent-1", storedAgent("agent-1"));

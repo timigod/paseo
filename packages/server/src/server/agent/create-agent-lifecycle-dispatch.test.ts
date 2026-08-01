@@ -49,7 +49,7 @@ test("auto-archive self-releases once and later cancellation waits harmlessly", 
   expect(agents.listenerCount()).toBe(0);
 });
 
-test("auto-archive remains subscribed and retries after an observable failure", async () => {
+test("auto-archive autonomously retries after an observable failure", async () => {
   const agentId = "4a7e2521-286d-4ad5-af35-e091c55302e4";
   const agents = new AgentLifecycleEvents();
   const onError = vi.fn();
@@ -62,12 +62,12 @@ test("auto-archive remains subscribed and retries after an observable failure", 
       if (archiveCount === 1) throw new Error("archive transport failed");
     },
     onError,
+    retryDelayMs: 1,
   });
 
   agents.completeTurn(agentId);
   await vi.waitFor(() => expect(onError).toHaveBeenCalledOnce());
-  expect(agents.listenerCount()).toBe(1);
-  agents.completeTurn(agentId);
+  await vi.waitFor(() => expect(archiveCount).toBe(2));
   await registration.cancel();
 
   expect(archiveCount).toBe(2);
@@ -77,10 +77,44 @@ test("auto-archive remains subscribed and retries after an observable failure", 
 test("actual-target auto-archive rejects a swallowed workspace teardown failure", () => {
   expect(() =>
     requireExactWorkspaceArchive(
-      { archivedAgentIds: [], archivedWorkspaceIds: [], removedDirectory: false },
+      {
+        archivedAgentIds: [],
+        archivedWorkspaceIds: [],
+        removedDirectory: false,
+        cleanupPending: true,
+      },
       "ws-requested",
+      "agent-1",
     ),
-  ).toThrow("Auto-archive did not archive requested workspace ws-requested");
+  ).toThrow("Auto-archive cleanup remains pending for workspace ws-requested");
+
+  expect(() =>
+    requireExactWorkspaceArchive(
+      {
+        archivedAgentIds: ["agent-1"],
+        archivedWorkspaceIds: ["ws-requested"],
+        removedDirectory: true,
+        cleanupPending: false,
+      },
+      "ws-requested",
+      "agent-1",
+    ),
+  ).not.toThrow();
+});
+
+test("auto-archive rejects partial agent and directory receipts", () => {
+  expect(() =>
+    requireExactWorkspaceArchive(
+      {
+        archivedAgentIds: [],
+        archivedWorkspaceIds: ["ws-requested"],
+        removedDirectory: true,
+        cleanupPending: false,
+      },
+      "ws-requested",
+      "agent-1",
+    ),
+  ).toThrow("Auto-archive did not archive requested agent agent-1");
 
   expect(() =>
     requireExactWorkspaceArchive(
@@ -88,8 +122,10 @@ test("actual-target auto-archive rejects a swallowed workspace teardown failure"
         archivedAgentIds: ["agent-1"],
         archivedWorkspaceIds: ["ws-requested"],
         removedDirectory: false,
+        cleanupPending: false,
       },
       "ws-requested",
+      "agent-1",
     ),
-  ).not.toThrow();
+  ).toThrow("Auto-archive did not remove workspace directory ws-requested");
 });
