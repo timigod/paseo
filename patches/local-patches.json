@@ -26,6 +26,7 @@
         "packages/server/src/server/persistence-hooks.ts",
         "packages/server/src/server/session.ts",
         "packages/server/src/server/session/agent-updates/agent-updates-service.ts",
+        "packages/server/src/server/websocket-server.ts",
         "packages/server/src/server/workspace-archive-service.ts",
         "packages/server/src/server/workspace-reference-coordinator.ts",
         "packages/server/src/server/workspace-registry.ts",
@@ -47,6 +48,7 @@
         "packages/server/src/server/agent/providers/acp-agent.test.ts",
         "packages/server/src/server/agent/providers/codex-app-server-agent.test.ts",
         "packages/server/src/server/agent/providers/opencode-agent.test.ts",
+        "packages/server/src/server/agent/providers/opencode-server-manager.test.ts",
         "packages/server/src/server/agent/providers/opencode/test-utils/test-opencode-harness.ts",
         "packages/server/src/server/session.test.ts",
         "packages/server/src/server/session.create-agent-worktree-autoarchive.e2e.test.ts",
@@ -58,9 +60,9 @@
       ],
       "upstreamable": true,
       "upstreamCondition": "Submit from this exact v0.2.5 reconstruction after its focused lifecycle matrix, current-main replay, and independent exact-tip review are green.",
-      "dropCondition": "Remove when an official stable release provides equivalent atomic acknowledged-create recovery, provider prompt and late-session cleanup, stepwise setup recovery, incarnation-fenced cleanup-only auto-archive with lifecycle rearming, and shutdown-owned recovery.",
+      "dropCondition": "Remove when an official stable release provides equivalent atomic acknowledged-create recovery, conditional legacy private-record recovery, provider prompt and shutdown-owned late-session cleanup, stepwise setup recovery, incarnation-fenced cleanup-only auto-archive with mutation-fenced lifecycle rearming, and daemon-owned lifecycle shutdown.",
       "candidateBranch": "review/v025-durable-create-direct-final",
-      "candidateCommit": "67e23daf21868648ec2a696c38a142b4af053bb6",
+      "candidateCommit": "5de7e1d0b246b688cc568041c66d56da46c86318",
       "deployedReceipt": null,
       "deployedAt": null
     }
