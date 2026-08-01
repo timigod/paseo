@@ -1,0 +1,39 @@
+{
+  "schemaVersion": 1,
+  "patchId": "paseo-v025-opencode-stop-boundary-recovery",
+  "base": {
+    "tag": "v0.2.5",
+    "tagObject": "8d143abc43e2b257c4fc2f77606bb11734ba3da4",
+    "commit": "6fc491e6220fba6543bbbe4bf1b1f58cfe59228b"
+  },
+  "candidate": {
+    "branch": "review/v025-opencode-stop-boundary",
+    "commit": "8e6d363b8dabbb000f78964a3bbe6cf0413b2e50",
+    "tree": "4d396dd1b7d82cc850f8f25e8ff70c618d4d7a6f"
+  },
+  "verification": {
+    "commit": "8e6d363b8dabbb000f78964a3bbe6cf0413b2e50",
+    "completedAt": "2026-08-01T00:28:20Z",
+    "runtime": {
+      "node": "v24.18.1"
+    },
+    "commands": [
+      "cd packages/server && ../../node_modules/.bin/vitest run src/server/agent/agent-manager.test.ts --bail=1",
+      "cd packages/server && ../../node_modules/.bin/vitest run src/server/agent/providers/opencode-agent.test.ts --bail=1",
+      "npm run build:server",
+      "npm run typecheck",
+      "npm run lint -- packages/server/src/server/agent/agent-manager.test.ts packages/server/src/server/agent/agent-manager.ts packages/server/src/server/agent/agent-sdk-types.ts packages/server/src/server/agent/providers/opencode-agent.test.ts packages/server/src/server/agent/providers/opencode-agent.ts",
+      "npm run format:check",
+      "git diff --check",
+      "jq -e '.schemaVersion == 1 and (.patches | length == 1) and .patches[0].base.tag == \"v0.2.5\" and .patches[0].base.commit == \"6fc491e6220fba6543bbbe4bf1b1f58cfe59228b\"' patches/local-patches.json"
+    ],
+    "result": {
+      "agentManagerTests": "154 passed",
+      "openCodeAdapterTests": "68 passed",
+      "serverBuild": "passed",
+      "workspaceTypecheck": "passed",
+      "lint": "0 warnings, 0 errors",
+      "formatDiffAndManifest": "passed"
+    }
+  }
+}
