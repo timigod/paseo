@@ -2,7 +2,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, test } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 import { terminateWithTreeKill } from "./tree-kill.js";
 
 const pollIntervalMs = 50;
@@ -131,6 +131,286 @@ afterEach(async () => {
 });
 
 describe("terminateWithTreeKill", () => {
+  test("skips a signal when its target can no longer be verified", async () => {
+    const signals: Array<NodeJS.Signals | number | undefined> = [];
+    const target = {
+      pid: -4101,
+      exitCode: null,
+      signalCode: null,
+      kill(signal?: NodeJS.Signals | number) {
+        signals.push(signal);
+        return true;
+      },
+      once() {},
+    };
+
+    const result = await terminateWithTreeKill(target, {
+      gracefulTimeoutMs: 1,
+      forceTimeoutMs: 1,
+      beforeSignal: async () => false,
+    });
+
+    expect(result).toBe("signal-skipped");
+    expect(signals).toEqual([]);
+  });
+
+  test("cancels exit observation when signaling is skipped", async () => {
+    let observationCancelled = false;
+    const target = {
+      pid: -4103,
+      exitCode: null,
+      signalCode: null,
+      kill() {
+        return true;
+      },
+      observeExit() {
+        return () => {
+          observationCancelled = true;
+        };
+      },
+    };
+
+    const result = await terminateWithTreeKill(target, {
+      gracefulTimeoutMs: 1,
+      forceTimeoutMs: 1,
+      beforeSignal: async () => false,
+    });
+
+    expect(result).toBe("signal-skipped");
+    expect(observationCancelled).toBe(true);
+  });
+
+  test("cancels exit observation after force cleanup times out", async () => {
+    let observationCancelled = false;
+    const target = {
+      pid: -4104,
+      exitCode: null,
+      signalCode: null,
+      kill() {
+        return true;
+      },
+      observeExit() {
+        return () => {
+          observationCancelled = true;
+        };
+      },
+    };
+
+    const result = await terminateWithTreeKill(target, {
+      gracefulTimeoutMs: 1,
+      forceTimeoutMs: 1,
+    });
+
+    expect(result).toBe("kill-timeout");
+    expect(observationCancelled).toBe(true);
+  });
+
+  test("preserves the root and reports incomplete cleanup when tree signaling fails", async () => {
+    const directSignals: Array<NodeJS.Signals | number | undefined> = [];
+    let observationCancelled = false;
+    const target = {
+      pid: 4105,
+      exitCode: null,
+      signalCode: null,
+      kill(signal?: NodeJS.Signals | number) {
+        directSignals.push(signal);
+        return true;
+      },
+      observeExit() {
+        return () => {
+          observationCancelled = true;
+        };
+      },
+    };
+
+    const result = await terminateWithTreeKill(target, {
+      gracefulTimeoutMs: 1,
+      forceTimeoutMs: 1,
+      preserveRootOnTreeFailure: true,
+      treeKiller: (_pid, _signal, callback) => callback(new Error("taskkill failed")),
+    });
+
+    expect(result).toBe("kill-timeout");
+    expect(directSignals).toEqual([]);
+    expect(observationCancelled).toBe(true);
+  });
+
+  test("falls back to the direct child when a non-retrying caller cannot signal the tree", async () => {
+    const directSignals: Array<NodeJS.Signals | number | undefined> = [];
+    let exitListener: () => void = () => undefined;
+    const target = {
+      pid: 4106,
+      exitCode: null,
+      signalCode: null,
+      kill(signal?: NodeJS.Signals | number) {
+        directSignals.push(signal);
+        exitListener();
+        return true;
+      },
+      once(_event: "exit", listener: () => void) {
+        exitListener = listener;
+      },
+      off() {},
+    };
+
+    const result = await terminateWithTreeKill(target, {
+      gracefulTimeoutMs: 1,
+      forceTimeoutMs: 1,
+      treeKiller: (_pid, _signal, callback) => callback(new Error("tree lookup failed")),
+    });
+
+    expect(result).toBe("terminated");
+    expect(directSignals).toEqual(["SIGTERM"]);
+  });
+
+  test("waits for an uncancellable tree-kill callback after termination is aborted", async () => {
+    const abortController = new AbortController();
+    const removeListener = vi.spyOn(abortController.signal, "removeEventListener");
+    let treeKillCallback: ((error?: Error) => void) | null = null;
+    let outcome: "pending" | "resolved" | "rejected" = "pending";
+    const target = {
+      pid: 4107,
+      exitCode: null,
+      signalCode: null,
+      kill() {
+        return true;
+      },
+      once() {},
+    };
+
+    const termination = terminateWithTreeKill(target, {
+      gracefulTimeoutMs: 1,
+      forceTimeoutMs: 1,
+      signal: abortController.signal,
+      treeKiller: (_pid, _signal, callback) => {
+        treeKillCallback = callback;
+      },
+    });
+    void termination.then(
+      () => {
+        outcome = "resolved";
+        return undefined;
+      },
+      () => {
+        outcome = "rejected";
+        return undefined;
+      },
+    );
+    await Promise.resolve();
+
+    abortController.abort();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    expect(outcome).toBe("pending");
+    expect(treeKillCallback).not.toBe(null);
+    expect(removeListener).not.toHaveBeenCalled();
+
+    treeKillCallback?.();
+    await expect(termination).rejects.toMatchObject({ name: "AbortError" });
+    expect(outcome).toBe("rejected");
+    expect(removeListener).toHaveBeenCalledOnce();
+  });
+
+  test.each([
+    ["success", undefined],
+    ["failure", new Error("tree-kill callback failed")],
+  ])("removes its abort listener after asynchronous tree-kill %s", async (_label, error) => {
+    const abortController = new AbortController();
+    const addListener = vi.spyOn(abortController.signal, "addEventListener");
+    const removeListener = vi.spyOn(abortController.signal, "removeEventListener");
+    let exitListener: () => void = () => undefined;
+    const target = {
+      pid: 4108,
+      exitCode: null,
+      signalCode: null,
+      kill() {
+        exitListener();
+        return true;
+      },
+      once(_event: "exit", listener: () => void) {
+        exitListener = listener;
+      },
+      off() {},
+    };
+
+    const result = await terminateWithTreeKill(target, {
+      gracefulTimeoutMs: 1,
+      forceTimeoutMs: 1,
+      signal: abortController.signal,
+      treeKiller: (_pid, _signal, callback) => {
+        setImmediate(() => {
+          if (!error) {
+            exitListener();
+          }
+          callback(error);
+        });
+      },
+    });
+
+    expect(result).toBe("terminated");
+    for (const call of addListener.mock.calls) {
+      expect(removeListener).toHaveBeenCalledWith("abort", call[1]);
+    }
+  });
+
+  test("removes its abort listener when tree-kill throws synchronously", async () => {
+    const abortController = new AbortController();
+    const addListener = vi.spyOn(abortController.signal, "addEventListener");
+    const removeListener = vi.spyOn(abortController.signal, "removeEventListener");
+    const failure = new Error("tree-kill failed synchronously");
+    const target = {
+      pid: 4108,
+      exitCode: null,
+      signalCode: null,
+      kill() {
+        return true;
+      },
+      once() {},
+    };
+
+    await expect(
+      terminateWithTreeKill(target, {
+        gracefulTimeoutMs: 1,
+        forceTimeoutMs: 1,
+        signal: abortController.signal,
+        treeKiller: () => {
+          throw failure;
+        },
+      }),
+    ).rejects.toBe(failure);
+
+    expect(addListener).toHaveBeenCalledOnce();
+    expect(removeListener).toHaveBeenCalledWith("abort", addListener.mock.calls[0]?.[1]);
+  });
+
+  test("revalidates the target before force escalation", async () => {
+    const verifiedSignals: NodeJS.Signals[] = [];
+    const deliveredSignals: Array<NodeJS.Signals | number | undefined> = [];
+    const target = {
+      pid: -4102,
+      exitCode: null,
+      signalCode: null,
+      kill(signal?: NodeJS.Signals | number) {
+        deliveredSignals.push(signal);
+        return true;
+      },
+      once() {},
+    };
+
+    const result = await terminateWithTreeKill(target, {
+      gracefulTimeoutMs: 1,
+      forceTimeoutMs: 1,
+      beforeSignal: async (signal) => {
+        verifiedSignals.push(signal);
+        return signal === "SIGTERM";
+      },
+    });
+
+    expect(result).toBe("signal-skipped");
+    expect(verifiedSignals).toEqual(["SIGTERM", "SIGKILL"]);
+    expect(deliveredSignals).toEqual(["SIGTERM"]);
+  });
+
   test.runIf(process.platform === "win32")(
     "kills Windows descendants through taskkill tree cleanup",
     async () => {

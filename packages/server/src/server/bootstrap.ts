@@ -449,6 +449,7 @@ export interface PaseoDaemonDependencies {
   hubRelationshipClock?: HubRelationshipClock;
   hubRelationshipRetryPolicy?: HubRelationshipRetryPolicy;
   createHubDaemonId?: () => string;
+  scheduleManagedProcessReapRetry?: (callback: () => void) => () => void;
 }
 
 function createBootstrapManagedProcessRegistry(
@@ -467,14 +468,111 @@ function createBootstrapManagedProcessRegistry(
   });
 }
 
-async function reconcileManagedProcessLedger(
+function scheduleManagedProcessReapRetry(callback: () => void): () => void {
+  const timer = setTimeout(callback, 1_000);
+  timer.unref();
+  return () => clearTimeout(timer);
+}
+
+interface ManagedProcessLedgerReconciliation {
+  start(): void;
+  stop(): Promise<void>;
+}
+
+function createManagedProcessLedgerReconciliation(
   managedProcesses: ManagedProcessRegistry,
+  initialRecordIds: ReadonlySet<string>,
   logger: Logger,
-): Promise<void> {
-  const reapResult = await managedProcesses.reapStale();
-  if (reapResult.checked > 0 || reapResult.errors.length > 0) {
-    logger.info(reapResult, "Managed helper process ledger reconciled");
-  }
+  scheduleRetry: (callback: () => void) => () => void,
+): ManagedProcessLedgerReconciliation {
+  const abortController = new AbortController();
+  let disposed = false;
+  let started = false;
+  let cancelRetry: (() => void) | null = null;
+  let unresolvedRecordIds = new Set(initialRecordIds);
+  let inFlight: Promise<void> | null = null;
+
+  const reconcile = async () => {
+    if (disposed) {
+      return;
+    }
+    let retry = false;
+    try {
+      const reapResult = await managedProcesses.reapStale({
+        recordIds: unresolvedRecordIds,
+        signal: abortController.signal,
+      });
+      if (disposed) {
+        return;
+      }
+      unresolvedRecordIds = new Set(reapResult.errors.map((error) => error.id));
+      retry = unresolvedRecordIds.size > 0;
+      if (reapResult.checked > 0 || retry) {
+        logger.info(reapResult, "Managed helper process ledger reconciled");
+      }
+    } catch (error) {
+      if (disposed) {
+        return;
+      }
+      retry = true;
+      logger.warn({ err: error }, "Failed to reconcile managed helper process ledger");
+    }
+
+    if (disposed || !retry) {
+      return;
+    }
+
+    try {
+      cancelRetry = scheduleRetry(() => {
+        if (disposed) {
+          return;
+        }
+        cancelRetry = null;
+        runReconcile();
+      });
+    } catch (error) {
+      logger.warn({ err: error }, "Failed to schedule managed helper process reconciliation");
+    }
+  };
+
+  const trackReconciliation = (current: Promise<void>): Promise<void> => {
+    inFlight = current;
+    const clear = () => {
+      if (inFlight === current) {
+        inFlight = null;
+      }
+    };
+    void current.then(clear, clear);
+    return current;
+  };
+
+  const runReconcile = (): Promise<void> =>
+    disposed ? Promise.resolve() : trackReconciliation(reconcile());
+
+  return {
+    start() {
+      if (started || disposed) {
+        return;
+      }
+      started = true;
+      if (unresolvedRecordIds.size > 0) {
+        void runReconcile();
+      }
+    },
+    async stop() {
+      if (!disposed) {
+        disposed = true;
+        abortController.abort();
+        try {
+          cancelRetry?.();
+        } catch (error) {
+          logger.warn({ err: error }, "Failed to cancel managed helper process reconciliation");
+        }
+        cancelRetry = null;
+      }
+      await Promise.allSettled(inFlight ? [inFlight] : []);
+    },
+  };
 }
 
 function mountWebUi(app: express.Application, config: PaseoDaemonConfig, logger: Logger): void {
@@ -534,6 +632,19 @@ export async function createPaseoDaemon(
   const bootstrapStart = performance.now();
   const elapsed = () => `${(performance.now() - bootstrapStart).toFixed(0)}ms`;
   const daemonVersion = config.daemonVersion ?? resolveDaemonVersion(import.meta.url);
+  const managedProcesses = createBootstrapManagedProcessRegistry(config, logger);
+  // Fix the cleanup scope before any daemon-owned service can create helpers.
+  // A later broad list could include helpers owned by this daemon generation.
+  let initialManagedProcessRecordIds: Set<string>;
+  try {
+    initialManagedProcessRecordIds = new Set(
+      (await managedProcesses.list()).map((record) => record.id),
+    );
+  } catch (error) {
+    throw new Error("Failed to capture managed helper processes before daemon startup", {
+      cause: error,
+    });
+  }
   const daemonConfigStore = new DaemonConfigStore(
     config.paseoHome,
     createInitialMutableDaemonConfig(config),
@@ -544,13 +655,12 @@ export async function createPaseoDaemon(
 
   const serverId = getOrCreateServerId(config.paseoHome, { logger });
   const daemonKeyPair = await loadOrCreateDaemonKeyPair(config.paseoHome, logger);
-  const managedProcesses = createBootstrapManagedProcessRegistry(config, logger);
-  // Reconcile the helper-process ledger in the background so it never blocks the
-  // daemon from coming up; terminating a live leftover can take a few seconds.
-  // Best-effort, so a failure is logged here rather than crashing startup.
-  void reconcileManagedProcessLedger(managedProcesses, logger).catch((error) => {
-    logger.warn({ err: error }, "Failed to reconcile managed helper process ledger");
-  });
+  const managedProcessReconciliation = createManagedProcessLedgerReconciliation(
+    managedProcesses,
+    initialManagedProcessRecordIds,
+    logger,
+    dependencies.scheduleManagedProcessReapRetry ?? scheduleManagedProcessReapRetry,
+  );
   let relayTransport: RelayTransportController | null = null;
 
   const staticDir = config.staticDir;
@@ -1598,7 +1708,12 @@ export async function createPaseoDaemon(
     }
   };
 
+  // Start only after construction succeeds so every retry has an owning daemon
+  // whose stop path can dispose it. Reaping remains background, best-effort work.
+  managedProcessReconciliation.start();
+
   const stop = async () => {
+    await managedProcessReconciliation.stop();
     await hubRelationships.stop();
     workspaceReconciliation.dispose();
     scriptHealthMonitor.stop();
