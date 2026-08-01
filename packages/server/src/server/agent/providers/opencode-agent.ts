@@ -1341,18 +1341,21 @@ export class OpenCodeAgentClient implements AgentClient {
       baseUrl: url,
       directory: openCodeConfig.cwd,
     });
-    let createResponsePromise: Promise<{
+    let rawCreateResponsePromise: Promise<{
       data?: { id: string };
       error?: unknown;
     }> | null = null;
     let createdSessionId: string | null = null;
 
     try {
-      createResponsePromise = withTimeout(
-        client.session.create({ directory: openCodeConfig.cwd }) as Promise<{
-          data?: { id: string };
-          error?: unknown;
-        }>,
+      rawCreateResponsePromise = client.session.create({
+        directory: openCodeConfig.cwd,
+      }) as Promise<{
+        data?: { id: string };
+        error?: unknown;
+      }>;
+      const createResponsePromise = withTimeout(
+        rawCreateResponsePromise,
         10_000,
         "OpenCode session.create timed out after 10s",
       );
@@ -1389,8 +1392,11 @@ export class OpenCodeAgentClient implements AgentClient {
         await client.session
           .delete({ sessionID: createdSessionId, directory: openCodeConfig.cwd })
           .catch(() => undefined);
-      } else if (options?.signal?.aborted && createResponsePromise) {
-        void createResponsePromise.then(
+      } else if (rawCreateResponsePromise) {
+        // Timeout and abort reject only the consumer-side race. The provider
+        // request can still succeed later, so retain the original promise and
+        // delete any late session instead of orphaning a worker.
+        void rawCreateResponsePromise.then(
           async (lateResponse) => {
             if (lateResponse.data?.id) {
               await client.session

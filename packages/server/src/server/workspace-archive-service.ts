@@ -1,3 +1,4 @@
+import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 
 import type { Logger } from "pino";
@@ -15,6 +16,8 @@ import {
 import type { TerminalManager } from "../terminal/terminal-manager.js";
 import type { PersistedWorkspaceRecord, WorkspaceRegistry } from "./workspace-registry.js";
 import { createRealpathAwarePathMatcher } from "../utils/path.js";
+import { readPaseoWorktreeIncarnationId } from "../utils/worktree-metadata.js";
+import { defaultWorkspaceReferenceCoordinator } from "./workspace-reference-coordinator.js";
 
 export type ActiveWorkspaceRef = Pick<
   PersistedWorkspaceRecord,
@@ -68,6 +71,121 @@ export interface ArchiveResult {
 export interface ArchiveByScopeRequest {
   scope: ArchiveScope;
   requestId: string;
+}
+
+export interface CleanupArchivedWorkspaceDirectoryRequest {
+  workspaceId: string;
+  targetPath: string;
+  worktreeIncarnationId?: string;
+  requestId: string;
+}
+
+export interface CleanupArchivedWorkspaceDirectoryResult {
+  completed: boolean;
+  removedDirectory: boolean;
+  reason: "removed" | "absent" | "superseded" | "referenced" | "unverifiable";
+}
+
+/**
+ * Cleanup-only retry for an already archived workspace. It never archives a
+ * workspace, agent, or terminal record and will only remove the exact Paseo
+ * worktree incarnation captured by the create continuation.
+ */
+export async function cleanupArchivedWorkspaceDirectory(
+  dependencies: Pick<
+    ArchiveDependencies,
+    "paseoHome" | "paseoWorktreesBaseRoot" | "github" | "listActiveWorkspaces" | "sessionLogger"
+  >,
+  request: CleanupArchivedWorkspaceDirectoryRequest,
+): Promise<CleanupArchivedWorkspaceDirectoryResult> {
+  return defaultWorkspaceReferenceCoordinator.runExclusive(async () => {
+    const targetPath = resolve(request.targetPath);
+    const activeWorkspaces = await dependencies.listActiveWorkspaces();
+    const targetIsActive = activeWorkspaces.some(
+      (workspace) => workspace.workspaceId === request.workspaceId,
+    );
+    if (targetIsActive) {
+      return { completed: false, removedDirectory: false, reason: "referenced" };
+    }
+    if (!existsSync(targetPath)) {
+      return { completed: true, removedDirectory: false, reason: "absent" };
+    }
+
+    const ownership = await isPaseoOwnedWorktreeCwd(targetPath, {
+      paseoHome: dependencies.paseoHome,
+      worktreesRoot: dependencies.paseoWorktreesBaseRoot,
+    });
+    if (!ownership.allowed || !ownership.worktreePath) {
+      return { completed: false, removedDirectory: false, reason: "unverifiable" };
+    }
+    const ownedPath = resolve(ownership.worktreePath);
+    if (!createRealpathAwarePathMatcher(targetPath)(ownedPath)) {
+      return { completed: false, removedDirectory: false, reason: "unverifiable" };
+    }
+    if (!request.worktreeIncarnationId) {
+      return { completed: false, removedDirectory: false, reason: "unverifiable" };
+    }
+
+    let currentIncarnationId: string | null;
+    try {
+      currentIncarnationId = readPaseoWorktreeIncarnationId(ownedPath);
+    } catch (error) {
+      dependencies.sessionLogger?.warn(
+        { err: error, targetPath: ownedPath, requestId: request.requestId },
+        "Could not verify cleanup-only worktree incarnation",
+      );
+      return { completed: false, removedDirectory: false, reason: "unverifiable" };
+    }
+    if (!currentIncarnationId) {
+      return { completed: false, removedDirectory: false, reason: "unverifiable" };
+    }
+    if (currentIncarnationId !== request.worktreeIncarnationId) {
+      return { completed: true, removedDirectory: false, reason: "superseded" };
+    }
+
+    if (await activeWorkspaceReferencesDirectory(activeWorkspaces, ownedPath, dependencies)) {
+      return { completed: false, removedDirectory: false, reason: "referenced" };
+    }
+
+    await runWorktreeTeardownCommands({
+      worktreePath: ownedPath,
+      teardownCwd: targetPath,
+      repoRootPath: ownership.repoRoot ?? undefined,
+    });
+
+    const finalIncarnationId = readPaseoWorktreeIncarnationId(ownedPath);
+    const finalActiveWorkspaces = await dependencies.listActiveWorkspaces();
+    if (
+      finalIncarnationId !== request.worktreeIncarnationId ||
+      (await activeWorkspaceReferencesDirectory(finalActiveWorkspaces, ownedPath, dependencies))
+    ) {
+      return { completed: false, removedDirectory: false, reason: "referenced" };
+    }
+
+    await deletePaseoWorktree({
+      cwd: ownership.repoRoot ?? null,
+      worktreePath: ownedPath,
+      teardownCwds: [],
+      worktreesRoot: ownership.worktreeRoot ?? undefined,
+      paseoHome: dependencies.paseoHome,
+      worktreesBaseRoot: dependencies.paseoWorktreesBaseRoot,
+    });
+    dependencies.github.invalidate({ cwd: ownedPath });
+    return { completed: true, removedDirectory: true, reason: "removed" };
+  });
+}
+
+async function activeWorkspaceReferencesDirectory(
+  activeWorkspaces: ActiveWorkspaceRef[],
+  targetPath: string,
+  dependencies: Pick<ArchiveDependencies, "paseoHome" | "paseoWorktreesBaseRoot">,
+): Promise<boolean> {
+  const matchesTarget = createRealpathAwarePathMatcher(targetPath);
+  for (const workspace of activeWorkspaces) {
+    const backing = await resolveWorkspaceBackingDirectory(workspace, dependencies);
+    if (matchesTarget(backing.path)) return true;
+  }
+  return false;
 }
 
 export async function requireActiveWorkspaceForArchive(

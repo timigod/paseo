@@ -10,6 +10,7 @@ import {
   type PersistedProjectKind,
   type PersistedWorkspaceKind,
 } from "./workspace-registry-model.js";
+import { defaultWorkspaceReferenceCoordinator } from "./workspace-reference-coordinator.js";
 
 const PersistedProjectRecordSchema = z.object({
   projectId: z.string(),
@@ -431,7 +432,9 @@ export class FileBackedWorkspaceRegistry
     workspaceId: string,
     updater: (record: PersistedWorkspaceRecord) => PersistedWorkspaceRecord,
   ): Promise<PersistedWorkspaceRecord | null> {
-    const workspace = await super.update(workspaceId, updater);
+    const workspace = await defaultWorkspaceReferenceCoordinator.runExclusive(() =>
+      super.update(workspaceId, updater),
+    );
     if (workspace) {
       await this.notifyMutation({ kind: "upsert", workspaceId, workspace });
     }
@@ -442,7 +445,7 @@ export class FileBackedWorkspaceRegistry
     record: PersistedWorkspaceRecord,
     context?: WorkspaceMutationContext,
   ): Promise<void> {
-    await super.upsert(record);
+    await defaultWorkspaceReferenceCoordinator.runExclusive(() => super.upsert(record));
     await this.notifyMutation({
       kind: "upsert",
       workspaceId: record.workspaceId,
@@ -452,13 +455,17 @@ export class FileBackedWorkspaceRegistry
   }
 
   override async archive(workspaceId: string, archivedAt: string): Promise<void> {
-    const workspace = await this.archiveIfPresent(workspaceId, archivedAt);
+    const workspace = await defaultWorkspaceReferenceCoordinator.runExclusive(() =>
+      this.archiveIfPresent(workspaceId, archivedAt),
+    );
     if (!workspace) return;
     await this.notifyMutation({ kind: "archive", workspaceId, workspace });
   }
 
   override async remove(workspaceId: string): Promise<void> {
-    const workspace = await this.removeIfPresent(workspaceId);
+    const workspace = await defaultWorkspaceReferenceCoordinator.runExclusive(() =>
+      this.removeIfPresent(workspaceId),
+    );
     if (!workspace) return;
     await this.notifyMutation({ kind: "remove", workspaceId, workspace: null });
   }

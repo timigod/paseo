@@ -871,6 +871,11 @@ async function resolveSessionCreateAgent(
           kind: "created-worktree" as const,
           workspaceId: setupContinuation.recovery.workspaceId,
           worktreePath: setupContinuation.recovery.worktree.worktreePath,
+          ...(setupContinuation.recovery.worktreeIncarnationId
+            ? {
+                worktreeIncarnationId: setupContinuation.recovery.worktreeIncarnationId,
+              }
+            : {}),
         }
       : { kind: "agent-only" as const };
   }

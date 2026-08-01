@@ -269,6 +269,77 @@ describe("OpenCodeAgentClient adapter smoke tests", () => {
     rmSync(cwd, { recursive: true, force: true });
   }, 60_000);
 
+  test("deletes a provider session that resolves after create is aborted", async () => {
+    const cwd = tmpCwd();
+    const runtime = new TestOpenCodeHarness();
+    const openCode = new TestOpenCodeClient();
+    const lateCreate = createTestDeferred<{ data: { id: string } }>();
+    openCode.sessionCreateImplementation = async () => lateCreate.promise;
+    runtime.enqueueClient(openCode);
+    const client = new OpenCodeAgentClient(logger, undefined, {
+      serverManager: runtime,
+      createClient: runtime.createClient,
+    });
+    const abort = new AbortController();
+
+    try {
+      const creating = client.createSession(buildConfig(cwd), undefined, {
+        signal: abort.signal,
+      });
+      await vi.waitFor(() => expect(openCode.calls.sessionCreate).toHaveLength(1));
+      abort.abort(new Error("cancel deferred create"));
+      await expect(creating).rejects.toThrow("cancel deferred create");
+
+      lateCreate.resolve({ data: { id: "session-created-after-abort" } });
+      await vi.waitFor(() =>
+        expect(openCode.calls.sessionDelete).toContainEqual({
+          sessionID: "session-created-after-abort",
+          directory: cwd,
+        }),
+      );
+      expect(runtime.acquisitions[0]?.releaseCount).toBe(1);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test("deletes a provider session that resolves after create times out", async () => {
+    vi.useFakeTimers();
+    const cwd = tmpCwd();
+    const runtime = new TestOpenCodeHarness();
+    const openCode = new TestOpenCodeClient();
+    const lateCreate = createTestDeferred<{ data: { id: string } }>();
+    openCode.sessionCreateImplementation = async () => lateCreate.promise;
+    runtime.enqueueClient(openCode);
+    const client = new OpenCodeAgentClient(logger, undefined, {
+      serverManager: runtime,
+      createClient: runtime.createClient,
+    });
+
+    try {
+      const creating = client.createSession(buildConfig(cwd));
+      const creationError = creating.then(
+        () => null,
+        (error: unknown) => error,
+      );
+      await vi.advanceTimersByTimeAsync(10_000);
+      await expect(creationError).resolves.toMatchObject({
+        message: "OpenCode session.create timed out after 10s",
+      });
+
+      lateCreate.resolve({ data: { id: "session-created-after-timeout" } });
+      await vi.advanceTimersByTimeAsync(1);
+      expect(openCode.calls.sessionDelete).toContainEqual({
+        sessionID: "session-created-after-timeout",
+        directory: cwd,
+      });
+      expect(runtime.acquisitions[0]?.releaseCount).toBe(1);
+    } finally {
+      vi.useRealTimers();
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
   test("archives and unarchives the durable native session through client hooks", async () => {
     const cwd = tmpCwd();
     const runtime = new TestOpenCodeHarness();

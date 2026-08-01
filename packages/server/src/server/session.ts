@@ -604,6 +604,37 @@ function describeRegistryTransition(record: ArchivedRecordSnapshot | null): Regi
   return record.archivedAt ? "unarchived" : "existing";
 }
 
+function resolveCreateAgentReplayPreflight(
+  liveAgent: ManagedAgent | null,
+  storedAgent: StoredAgentRecord | null,
+  createRequestFingerprint: string,
+): AgentCreateRequestOutcome | "not-found" | null {
+  if (!liveAgent && !storedAgent) return "not-found";
+
+  const durableFingerprint =
+    liveAgent?.createRequestFingerprint ?? storedAgent?.createRequestFingerprint;
+  if (durableFingerprint && durableFingerprint !== createRequestFingerprint) {
+    return {
+      status: "failed",
+      error: "This requestId was already used with different create-agent input.",
+    };
+  }
+  if (storedAgent?.archivedAt) {
+    return {
+      status: "failed",
+      error: `The agent from this create request was archived at ${storedAgent.archivedAt}.`,
+    };
+  }
+  if (storedAgent?.createAcknowledged === false && !storedAgent.pendingCreateContinuation) {
+    return {
+      status: "failed",
+      error:
+        "Agent creation has not reached its durable acknowledgement boundary; retry the same requestId.",
+    };
+  }
+  return null;
+}
+
 /**
  * Session represents a single connected client session.
  * It owns all state management, orchestration logic, and message processing.
@@ -980,6 +1011,7 @@ export class Session {
       clearWorkspaceArchiving: (workspaceIds) => this.clearWorkspaceArchiving(workspaceIds),
       killTerminalsForWorkspace: (workspaceId) =>
         this.terminalController.killTerminalsForWorkspace(workspaceId),
+      workspaceRegistry: this.workspaceRegistry,
       logger: this.sessionLogger,
     });
     this.providerSnapshotManager = providerSnapshotManager;
@@ -3173,27 +3205,17 @@ export class Session {
   ): Promise<AgentCreateRequestOutcome | null> {
     const liveAgent = this.agentManager.getAgent(agentId);
     let storedAgent = await this.agentStorage.get(agentId);
-    if (!liveAgent && !storedAgent) {
+    const preflight = resolveCreateAgentReplayPreflight(
+      liveAgent,
+      storedAgent,
+      createRequestFingerprint,
+    );
+    if (preflight === "not-found") {
       return null;
     }
-
-    const durableFingerprint =
-      liveAgent?.createRequestFingerprint ?? storedAgent?.createRequestFingerprint;
-    if (durableFingerprint && durableFingerprint !== createRequestFingerprint) {
-      const outcome: AgentCreateRequestOutcome = {
-        status: "failed",
-        error: "This requestId was already used with different create-agent input.",
-      };
-      this.emitCreateAgentRequestOutcome(requestId, outcome);
-      return outcome;
-    }
-    if (storedAgent?.archivedAt) {
-      const outcome: AgentCreateRequestOutcome = {
-        status: "failed",
-        error: `The agent from this create request was archived at ${storedAgent.archivedAt}.`,
-      };
-      this.emitCreateAgentRequestOutcome(requestId, outcome);
-      return outcome;
+    if (preflight) {
+      this.emitCreateAgentRequestOutcome(requestId, preflight);
+      return preflight;
     }
     const continuationNeedsAcknowledgement =
       storedAgent?.pendingCreateContinuation?.acknowledged === false;

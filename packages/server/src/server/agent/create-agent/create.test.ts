@@ -480,6 +480,8 @@ test("archived partial auto-archive intent is durably rearmed for immediate retr
         kind: "created-worktree",
         workspaceId: "ws-partial-autoarchive",
         worktreePath: workdir,
+        worktreeIncarnationId: "00000000-0000-4000-8000-000000000103",
+        cleanupOnly: true,
       },
     },
   });
@@ -499,6 +501,8 @@ test("archived partial auto-archive intent is durably rearmed for immediate retr
         kind: "created-worktree",
         workspaceId: "ws-partial-autoarchive",
         worktreePath: workdir,
+        worktreeIncarnationId: "00000000-0000-4000-8000-000000000103",
+        cleanupOnly: true,
       },
       { startImmediately: true },
     );
@@ -1019,6 +1023,7 @@ test("auto-archive intent is persisted before acknowledgement and restored with 
   const storage = new AgentStorage(join(workdir, "agents"), logger);
   const manager = createRealAgentManager(storage);
   const registerAutoArchive = vi.fn();
+  const worktreeIncarnationId = "00000000-0000-4000-8000-000000000101";
 
   try {
     const creation = await beginCreateAgentCommand(
@@ -1040,6 +1045,7 @@ test("auto-archive intent is persisted before acknowledgement and restored with 
           kind: "created-worktree",
           workspaceId: "ws-autoarchive-intent",
           worktreePath: workdir,
+          worktreeIncarnationId,
         },
         buildSessionConfig: async (config) => ({ sessionConfig: config }),
       },
@@ -1051,6 +1057,7 @@ test("auto-archive intent is persisted before acknowledgement and restored with 
           kind: "created-worktree",
           workspaceId: "ws-autoarchive-intent",
           worktreePath: workdir,
+          worktreeIncarnationId,
         },
       },
     });
@@ -1060,6 +1067,7 @@ test("auto-archive intent is persisted before acknowledgement and restored with 
       kind: "created-worktree",
       workspaceId: "ws-autoarchive-intent",
       worktreePath: workdir,
+      worktreeIncarnationId,
     });
   } finally {
     manager.prepareForShutdown();
@@ -1079,6 +1087,10 @@ test("modern explicit worktree setup and auto-archive use the durable continuati
   const setupContinuation = (
     await fakeWorktreeCreator({ repoRoot: workdir, createdWorkspaceId: workspaceId })()
   ).setupContinuation;
+  const worktreeIncarnationId = "00000000-0000-4000-8000-000000000102";
+  if (setupContinuation?.kind === "agent") {
+    setupContinuation.recovery.worktreeIncarnationId = worktreeIncarnationId;
+  }
 
   try {
     const creation = await beginCreateAgentCommand(
@@ -1111,6 +1123,7 @@ test("modern explicit worktree setup and auto-archive use the durable continuati
           kind: "created-worktree",
           workspaceId,
           worktreePath: setupContinuation.recovery.worktree.worktreePath,
+          worktreeIncarnationId,
         },
       },
     });
@@ -1121,6 +1134,7 @@ test("modern explicit worktree setup and auto-archive use the durable continuati
       kind: "created-worktree",
       workspaceId,
       worktreePath: setupContinuation.recovery.worktree.worktreePath,
+      worktreeIncarnationId,
     });
   } finally {
     manager.prepareForShutdown();
