@@ -1,0 +1,35 @@
+{
+  "schemaVersion": 1,
+  "base": {
+    "upstream": "https://github.com/getpaseo/paseo.git",
+    "version": "v0.2.5",
+    "commit": "6fc491e6220fba6543bbbe4bf1b1f58cfe59228b"
+  },
+  "change": "github-rate-limit-cooldown",
+  "touched": {
+    "source": [
+      "packages/server/src/services/forge-cli-command.ts",
+      "packages/server/src/services/github-service.ts"
+    ],
+    "tests": ["packages/server/src/services/github-service.test.ts"]
+  },
+  "upstream": {
+    "conditions": [
+      "Keep the cooldown scoped to GitHub service instances and resolved GitHub hosts.",
+      "Use Retry-After before X-RateLimit-Reset, and retain a bounded fallback only for confirmed rate-limit failures.",
+      "Preserve raw gh api response headers through command-error normalization."
+    ],
+    "dropConditions": [
+      "Drop this correction when upstream Paseo includes equivalent host-scoped shared GitHub cooldown behavior with deterministic coverage for these cases.",
+      "Drop the raw stdout preservation only when the upstream GitHub transport exposes response headers directly."
+    ]
+  },
+  "candidate": {
+    "url": null,
+    "sha": null
+  },
+  "receipt": {
+    "commit": null,
+    "pushedAt": null
+  }
+}
