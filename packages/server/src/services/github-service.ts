@@ -671,9 +671,19 @@ export class GitHubAuthenticationError extends ForgeAuthenticationError {
   }
 }
 
+interface GitHubRateLimitResponseMetadata {
+  statusCode: number;
+  retryAfter?: string;
+  rateLimitRemaining?: string;
+  rateLimitReset?: string;
+}
+
 export class GitHubCommandError extends ForgeCommandError {
+  readonly rateLimitResponse: GitHubRateLimitResponseMetadata | null;
+
   constructor(params: ForgeCommandFailureParams) {
-    super({ brand: "GitHub", binary: "gh" }, params);
+    super({ brand: "GitHub", binary: "gh" }, { ...params, stdout: "" });
+    this.rateLimitResponse = getGitHubRateLimitResponseMetadata(params.stdout ?? "");
     this.name = "GitHubCommandError";
   }
 }
@@ -1878,9 +1888,17 @@ function getGitHubRateLimitRetryAt(input: { error: Error; now: number }): number
     return null;
   }
 
-  const response = parseGitHubHttpResponse(input.error.stdout);
-  const output = `${input.error.stdout}\n${input.error.stderr}`;
-  const headers = response?.headers ?? parseGitHubHeaders(output);
+  const response = input.error.rateLimitResponse;
+  const output = input.error.stderr;
+  const headers = response
+    ? new Map(
+        Object.entries({
+          "retry-after": response.retryAfter,
+          "x-ratelimit-remaining": response.rateLimitRemaining,
+          "x-ratelimit-reset": response.rateLimitReset,
+        }).filter((entry): entry is [string, string] => entry[1] !== undefined),
+      )
+    : parseGitHubHeaders(output);
   const isRateLimited =
     response?.statusCode === 429 ||
     /\brate limit\b/i.test(output) ||
@@ -1924,22 +1942,45 @@ function parseRateLimitReset(value: string | undefined): number | null {
 
 function parseGitHubHttpResponse(output: string): GitHubHttpResponse | null {
   const normalized = output.replace(/\r\n/g, "\n");
-  const statusLines = [...normalized.matchAll(/^HTTP\/\S+\s+(\d{3})(?:\s|$).*$/gm)];
-  for (let index = statusLines.length - 1; index >= 0; index -= 1) {
-    const statusLine = statusLines[index];
-    const start = statusLine.index ?? 0;
-    const headerEnd = normalized.indexOf("\n\n", start);
-    if (headerEnd === -1) {
-      continue;
+  let offset = 0;
+  let response: GitHubHttpResponse | null = null;
+  while (offset < normalized.length) {
+    const statusLine = normalized.slice(offset).match(/^HTTP\/\S+\s+(\d{3})(?:\s|$).*$/m);
+    if (!statusLine || statusLine.index !== 0) {
+      return response;
     }
-    const headers = parseGitHubHeaders(normalized.slice(start, headerEnd));
-    return {
+    const headerEnd = normalized.indexOf("\n\n", offset);
+    if (headerEnd === -1) {
+      return response;
+    }
+    const headers = parseGitHubHeaders(normalized.slice(offset, headerEnd));
+    response = {
       statusCode: Number(statusLine[1]),
       headers,
-      body: normalized.slice(headerEnd + 2),
+      body: "",
     };
+    offset = headerEnd + 2;
+    if (!normalized.slice(offset).startsWith("HTTP/")) {
+      response.body = normalized.slice(offset);
+      return response;
+    }
   }
-  return null;
+  return response;
+}
+
+function getGitHubRateLimitResponseMetadata(
+  output: string,
+): GitHubRateLimitResponseMetadata | null {
+  const response = parseGitHubHttpResponse(output);
+  if (!response) {
+    return null;
+  }
+  return {
+    statusCode: response.statusCode,
+    retryAfter: response.headers.get("retry-after"),
+    rateLimitRemaining: response.headers.get("x-ratelimit-remaining"),
+    rateLimitReset: response.headers.get("x-ratelimit-reset"),
+  };
 }
 
 function parseGitHubHeaders(value: string): Map<string, string> {

@@ -1050,6 +1050,35 @@ describe("ForgeService", () => {
     });
   });
 
+  it("uses the final HTTP envelope to unwrap successful GitHub API JSON", async () => {
+    const runner = createRunner([
+      [
+        "HTTP/1.1 301 Moved Permanently",
+        "Location: https://api.github.com/graphql",
+        "",
+        "HTTP/2.0 200 OK",
+        "X-RateLimit-Remaining: 42",
+        "",
+        pullRequestTimelineJson(),
+      ].join("\n"),
+    ]);
+    const service = createGitHubService({
+      runner: runner.runner,
+      resolveGhPath: async () => "/usr/bin/gh",
+      now: () => 100,
+    });
+
+    const timeline = await service.getPullRequestTimeline({
+      cwd: "/repo",
+      prNumber: 42,
+      repoOwner: "parentOwner",
+      repoName: "parentRepo",
+    });
+
+    expect(timeline.error).toBeNull();
+    expect(timeline.items).not.toHaveLength(0);
+  });
+
   it("rewrites GitHub attachment image URLs in timeline comments", async () => {
     const privateAttachmentUrl =
       "https://private-user-images.githubusercontent.com/123/asset.png?jwt=abc&expires=123";
@@ -1655,6 +1684,45 @@ describe("ForgeService", () => {
       kind: "unknown",
       message: "GraphQL: API rate limit exceeded for user ID 123",
     });
+  });
+
+  it("retains only rate-limit metadata when a GitHub command fails", async () => {
+    const privateResponse = JSON.stringify({ data: { viewer: { login: "private-user" } } });
+    const runner = createScriptedRunner([
+      {
+        error: Object.assign(new Error("GitHub API request failed"), {
+          code: 1,
+          stderr: "HTTP 429: API rate limit exceeded",
+          stdout: [
+            "HTTP/2.0 429 Too Many Requests",
+            "Retry-After: 7",
+            "X-RateLimit-Reset: 999999",
+            "",
+            privateResponse,
+          ].join("\n"),
+        }),
+      },
+    ]);
+    const service = createGitHubService({
+      runner: runner.runner,
+      resolveGhPath: async () => "/usr/bin/gh",
+      now: () => 100,
+    });
+
+    const error = await service
+      .listIssues({ cwd: "/repo", query: "private" })
+      .catch((caught) => caught);
+
+    expect(error).toBeInstanceOf(GitHubCommandError);
+    expect(error).toMatchObject({
+      stdout: "",
+      rateLimitResponse: {
+        statusCode: 429,
+        retryAfter: "7",
+        rateLimitReset: "999999",
+      },
+    });
+    expect(JSON.stringify(error)).not.toContain(privateResponse);
   });
 
   it("shares a Retry-After cooldown across concurrent requests and recovers at its clock deadline", async () => {
