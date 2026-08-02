@@ -311,6 +311,68 @@ describe("OpenCodeServerManager generations", () => {
     expect(await runtime.managedProcesses.list()).toEqual([]);
   });
 
+  test("a forced waiter keeps its prerequisite startup alive when a current waiter cancels", async () => {
+    const { manager, runtime } = createTestManager([4489, 4490], { autoAnnounce: false });
+    const currentController = new AbortController();
+    const current = manager.acquireCurrent({
+      signal: currentController.signal,
+      abortMessage: "unrelated current acquisition aborted",
+    });
+    const currentFailure = expect(current).rejects.toThrow("unrelated current acquisition aborted");
+    const forced = manager.acquireNew();
+    const observeForced = forced.catch(() => undefined);
+
+    try {
+      await runtime.settle();
+      currentController.abort();
+      await currentFailure;
+
+      expect(runtime.terminatedPorts).toEqual([]);
+      expect(await runtime.managedProcesses.list()).toHaveLength(1);
+
+      runtime.processForPort(4489).announceListening();
+      await vi.waitFor(() => expect(runtime.launchedPorts).toEqual([4489, 4490]));
+
+      runtime.processForPort(4490).announceListening();
+      const acquisition = await forced;
+      expect(acquisition.server.url).toBe("http://127.0.0.1:4490");
+      await acquisition.release();
+      expect(runtime.terminatedPorts).toEqual([4489, 4490]);
+      expect(await runtime.managedProcesses.list()).toEqual([]);
+    } finally {
+      await manager.shutdown();
+      await observeForced;
+    }
+  });
+
+  test("startup handoff cancellation does not leave an unhandled readiness rejection", async () => {
+    const controller = new AbortController();
+    const { manager, runtime } = createTestManager([4488], {
+      autoAnnounce: false,
+      onSpawn: () => queueMicrotask(() => controller.abort()),
+    });
+    const unhandledRejections: unknown[] = [];
+    const captureUnhandledRejection = (reason: unknown) => unhandledRejections.push(reason);
+    process.on("unhandledRejection", captureUnhandledRejection);
+
+    try {
+      await expect(
+        manager.acquireCurrent({
+          signal: controller.signal,
+          abortMessage: "catalog acquisition aborted during startup handoff",
+        }),
+      ).rejects.toThrow("catalog acquisition aborted during startup handoff");
+      await new Promise((resolve) => setImmediate(resolve));
+
+      expect(unhandledRejections).toEqual([]);
+      expect(runtime.terminatedPorts).toEqual([4488]);
+      expect(await runtime.managedProcesses.list()).toEqual([]);
+    } finally {
+      process.off("unhandledRejection", captureUnhandledRejection);
+      await manager.shutdown().catch(() => undefined);
+    }
+  });
+
   test("an aborted forced catalog refresh keeps the previous current generation", async () => {
     const { manager, runtime } = createTestManager([4484, 4485], { autoAnnounce: false });
     const oldStart = manager.acquireCurrent();
@@ -857,6 +919,7 @@ function createTestManager(
     portAllocationPending?: boolean;
     processGroupInspectionPending?: boolean;
     managedProcessConfirmationPending?: boolean;
+    onSpawn?: () => void;
   } = {},
 ): {
   manager: OpenCodeServerManager;
@@ -874,6 +937,7 @@ function createTestManager(
     portAllocationPending: options.portAllocationPending ?? false,
     processGroupInspectionPending: options.processGroupInspectionPending ?? false,
     managedProcessConfirmationPending: options.managedProcessConfirmationPending ?? false,
+    onSpawn: options.onSpawn,
   });
   return {
     manager: new OpenCodeServerManager({
@@ -913,6 +977,7 @@ class FakeOpenCodeServerRuntime {
   private processGroupIdentityOwned: boolean;
   private processIdentityOwned: boolean;
   private readonly revalidateForceSignal: boolean;
+  private readonly onSpawn?: () => void;
   private readonly portAllocationGate: Promise<void> | null;
   private releasePortAllocationGate: () => void = () => undefined;
   private readonly processGroupInspectionGate: Promise<void> | null;
@@ -935,6 +1000,7 @@ class FakeOpenCodeServerRuntime {
       portAllocationPending: boolean;
       processGroupInspectionPending: boolean;
       managedProcessConfirmationPending: boolean;
+      onSpawn?: () => void;
     },
   ) {
     this.ports = [...ports];
@@ -943,6 +1009,7 @@ class FakeOpenCodeServerRuntime {
     this.processGroupIdentityOwned = options.processGroupIdentityOwned;
     this.processIdentityOwned = options.processIdentityOwned;
     this.revalidateForceSignal = options.revalidateForceSignal;
+    this.onSpawn = options.onSpawn;
     this.portAllocationGate = options.portAllocationPending
       ? new Promise<void>((resolve) => {
           this.releasePortAllocationGate = resolve;
@@ -989,6 +1056,7 @@ class FakeOpenCodeServerRuntime {
     const process = new FakeOpenCodeProcess({ port, pid: 10_000 + port });
     this.processesByChild.set(process.child, process);
     this.processesByPort.set(port, process);
+    this.onSpawn?.();
     if (this.autoAnnounce) {
       queueMicrotask(() => process.announceListening());
     }

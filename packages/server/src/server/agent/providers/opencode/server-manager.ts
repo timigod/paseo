@@ -270,8 +270,10 @@ export class OpenCodeServerManager implements OpenCodeServerManagerLike {
       await this.shutdownPromise;
     }
     this.throwIfAcquisitionCanceled(options);
-    if (this.currentStartup && !this.newServerStartup) {
-      await this.waitForStartupPromise(this.currentStartup.promise, options);
+    const currentStartup = this.currentStartup;
+    if (currentStartup && !this.newServerStartup) {
+      const prerequisite = await this.acquireFromStartup(currentStartup, options);
+      await prerequisite.release();
       this.throwIfAcquisitionCanceled(options);
     }
     const startup = this.getNewServerStartup();
@@ -391,10 +393,6 @@ export class OpenCodeServerManager implements OpenCodeServerManagerLike {
     startup.promise = generation
       .then(async (server) => {
         startup.server = server;
-        if (controller.signal.aborted) {
-          await this.killServer(server);
-          throw this.readStartupAbortReason(controller.signal);
-        }
         await server.ready;
         if (controller.signal.aborted) {
           await this.killServer(server);
