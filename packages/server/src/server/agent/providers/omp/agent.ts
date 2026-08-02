@@ -175,6 +175,17 @@ interface StartTurnResult {
   turnId: string;
 }
 
+interface OmpAutoCompactionCorrelation {
+  turnId: string;
+  generation: number;
+  action: string;
+}
+
+type OmpAutoCompactionEndAmbiguity =
+  | { status: "none" }
+  | { status: "actionless"; turnId: string; generation: number }
+  | { status: "any"; turnId: string; generation: number };
+
 interface OmpAgentSessionOptions {
   runtimeSession: OmpRuntimeSession;
   config: AgentSessionConfig;
@@ -346,7 +357,9 @@ function renderTextOnlyImageHint(image: { data: string; mimeType: string }): str
     });
     return `[Image available at: ${materialized.path}]`;
   } catch (error) {
-    return `[Image attachment omitted: failed to write local file (${toDiagnosticErrorMessage(error)})]`;
+    return `[Image attachment omitted: failed to write local file (${toDiagnosticErrorMessage(
+      error,
+    )})]`;
   }
 }
 
@@ -881,10 +894,18 @@ export class OmpAgentSession implements AgentSession {
   private activeTurnStarted = false;
   private activeTurnHasUserMessage = false;
   private activeNoTurnPromptText: string | null = null;
-  private readonly pendingNoTurnOutputs: Array<{ turnId: string; message: string }> = [];
+  private readonly pendingNoTurnOutputs: Array<{
+    turnId: string;
+    message: string;
+  }> = [];
   private activePromptRequestId: string | null = null;
   private activePromptAgentInvoked: boolean | null = null;
   private readonly pendingPromptResults = new Map<string, boolean>();
+  private autoCompactionGeneration = 0;
+  private activeAutoCompaction: OmpAutoCompactionCorrelation | null = null;
+  private autoCompactionEndAmbiguity: OmpAutoCompactionEndAmbiguity = {
+    status: "none",
+  };
   private pendingNoTurnCompletionAbort: AbortController | null = null;
   private lastKnownThinkingOptionId: string | null;
   private outOfBandCompactionEmit: ((event: AgentStreamEvent) => void) | null = null;
@@ -966,6 +987,7 @@ export class OmpAgentSession implements AgentSession {
 
     const payload = convertPromptInput(prompt, { model: this.state.model });
     const turnId = randomUUID();
+    this.retireAutoCompactions();
     this.live = true;
     this.activeTurnId = turnId;
     this.activeClientMessageId = options?.clientMessageId ?? null;
@@ -1000,6 +1022,7 @@ export class OmpAgentSession implements AgentSession {
         if (this.activeTurnId !== turnId) {
           return;
         }
+        this.retireAutoCompactions();
         this.activeTurnId = null;
         this.activeClientMessageId = null;
         this.activeTurnStarted = false;
@@ -1183,6 +1206,7 @@ export class OmpAgentSession implements AgentSession {
   }
 
   private clearOmpTurnState(): void {
+    this.retireAutoCompactions();
     clearOmpHostToolState(this.runtimeSession);
     this.subagentCardTracker.clear();
   }
@@ -1206,9 +1230,9 @@ export class OmpAgentSession implements AgentSession {
     return mapOmpRuntimeSlashCommands(commands);
   }
 
-  tryHandleOutOfBand(
-    prompt: AgentPromptInput,
-  ): { run(ctx: { emit: (event: AgentStreamEvent) => void }): Promise<void> } | null {
+  tryHandleOutOfBand(prompt: AgentPromptInput): {
+    run(ctx: { emit: (event: AgentStreamEvent) => void }): Promise<void>;
+  } | null {
     if (typeof prompt !== "string") {
       return null;
     }
@@ -1599,13 +1623,17 @@ export class OmpAgentSession implements AgentSession {
         ...pending,
         freeform: null,
       };
-      this.runtimeSession.respondToExtensionUiRequest(event.id, { value: pending.freeform });
+      this.runtimeSession.respondToExtensionUiRequest(event.id, {
+        value: pending.freeform,
+      });
       return true;
     }
 
     if (isOptionalInputPlaceholder(placeholder)) {
       this.pendingCombinedAskUserResponse = null;
-      this.runtimeSession.respondToExtensionUiRequest(event.id, { value: pending.comment });
+      this.runtimeSession.respondToExtensionUiRequest(event.id, {
+        value: pending.comment,
+      });
       return true;
     }
 
@@ -1654,6 +1682,9 @@ export class OmpAgentSession implements AgentSession {
       }
       return true;
     }
+    if (this.handleAutoCompactionEvent(event)) {
+      return true;
+    }
     if (event.type === "subagent_progress") {
       const payload = (event as Extract<OmpRuntimeEvent, { type: "subagent_progress" }>).payload;
       if (payload.parentToolCallId && this.activeToolCalls.has(payload.parentToolCallId)) {
@@ -1699,6 +1730,7 @@ export class OmpAgentSession implements AgentSession {
       this.emit({
         type: "timeline",
         provider: this.provider,
+        ...(mappedEvent.item.type === "compaction" ? { turnId: this.currentTurnIdForEvent() } : {}),
         item: mappedEvent.item,
       });
     } else {
@@ -1708,6 +1740,97 @@ export class OmpAgentSession implements AgentSession {
       );
     }
     return true;
+  }
+
+  private handleAutoCompactionEvent(event: OmpRuntimeEvent): boolean {
+    if (event.type === "auto_compaction_start") {
+      const turnId = this.currentTurnIdForEvent();
+      if (!turnId) {
+        this.logger.debug({ event }, "Dropped orphan OMP automatic compaction start");
+        return true;
+      }
+      const existing = this.activeAutoCompaction;
+      if (existing) {
+        this.autoCompactionEndAmbiguity = {
+          status: "any",
+          turnId: existing.turnId,
+          generation: existing.generation,
+        };
+        this.logger.debug({ event }, "Dropped overlapping OMP automatic compaction start");
+        return true;
+      }
+      this.autoCompactionGeneration += 1;
+      this.activeAutoCompaction = {
+        turnId,
+        generation: this.autoCompactionGeneration,
+        action: event.action,
+      };
+      this.emitMappedAutoCompactionEvent(event, turnId);
+      return true;
+    }
+    if (event.type !== "auto_compaction_end") return false;
+    const correlation = this.activeAutoCompaction;
+    const ambiguity = this.autoCompactionEndAmbiguity;
+    const isAmbiguousFromPriorGeneration =
+      ambiguity.status === "any" ||
+      (ambiguity.status === "actionless" && event.action === undefined);
+    if (!correlation) {
+      this.logger.debug({ event, ambiguity }, "Dropped orphan OMP automatic compaction end");
+      return true;
+    }
+    const isExplicitEndCompatible =
+      event.action === undefined ||
+      event.action === correlation.action ||
+      (event.action === "context-full" &&
+        (correlation.action === "handoff" || correlation.action === "snapcompact"));
+    if (!isExplicitEndCompatible) {
+      this.logger.debug(
+        { event, correlation },
+        "Dropped incompatible OMP automatic compaction end",
+      );
+      return true;
+    }
+    if (isAmbiguousFromPriorGeneration || this.activeTurnId !== correlation.turnId) {
+      this.activeAutoCompaction = null;
+      this.logger.debug(
+        { event, correlation, ambiguity },
+        "Dropped ambiguous or late OMP automatic compaction end",
+      );
+      return true;
+    }
+    this.activeAutoCompaction = null;
+    this.autoCompactionEndAmbiguity = {
+      status: "actionless",
+      turnId: correlation.turnId,
+      generation: correlation.generation,
+    };
+    this.emitMappedAutoCompactionEvent(event, correlation.turnId);
+    return true;
+  }
+
+  private retireAutoCompactions(): void {
+    const correlation = this.activeAutoCompaction;
+    if (!correlation) return;
+    this.activeAutoCompaction = null;
+    this.autoCompactionEndAmbiguity = {
+      status: "any",
+      turnId: correlation.turnId,
+      generation: correlation.generation,
+    };
+  }
+
+  private emitMappedAutoCompactionEvent(event: OmpRuntimeEvent, turnId: string): void {
+    const mappedEvent = mapOmpRuntimeEventToTimelineItem(event);
+    if (!mappedEvent.handled || !mappedEvent.item || mappedEvent.item.type !== "compaction") {
+      this.logger.debug({ event }, "Dropped malformed OMP automatic compaction event");
+      return;
+    }
+    this.emit({
+      type: "timeline",
+      provider: this.provider,
+      turnId,
+      item: mappedEvent.item,
+    });
   }
 
   private emitActiveToolCall(toolCallId: string): boolean {
@@ -2048,7 +2171,10 @@ export class OmpAgentSession implements AgentSession {
     if (!text) {
       return;
     }
-    const nativeMessage = event.message as OmpAgentMessage & { id?: unknown; entryId?: unknown };
+    const nativeMessage = event.message as OmpAgentMessage & {
+      id?: unknown;
+      entryId?: unknown;
+    };
     const messageId = readNativeMessageId(nativeMessage);
     const clientMessageId = this.activeClientMessageId;
     const emitUserMessage = (resolvedMessageId?: string): void => {
@@ -2133,6 +2259,7 @@ export class OmpAgentSession implements AgentSession {
   }
 
   private completeTurn(turnId: string | undefined, messages: OmpAgentMessage[]): void {
+    this.retireAutoCompactions();
     this.activeTurnId = null;
     this.activeClientMessageId = null;
     this.activeAssistantMessageId = null;

@@ -150,7 +150,10 @@ export class OmpHarness {
   async runPrompt(
     input: string,
     output: string,
-    providerStatesAfterEnd: Array<{ isStreaming: boolean; isCompacting: boolean }> = [],
+    providerStatesAfterEnd: Array<{
+      isStreaming: boolean;
+      isCompacting: boolean;
+    }> = [],
   ): Promise<unknown> {
     const session = this.requireSession();
     const promptStarted = this.omp.latestSession().nextPrompt();
@@ -391,6 +394,10 @@ export class OmpHarness {
     return this.events.flatMap((event) => (event.type === "timeline" ? [event.item] : []));
   }
 
+  timelineEvents(): Extract<AgentStreamEvent, { type: "timeline" }>[] {
+    return this.events.flatMap((event) => (event.type === "timeline" ? [event] : []));
+  }
+
   async history(): Promise<AgentTimelineItem[]> {
     const items: AgentTimelineItem[] = [];
     for await (const event of this.requireSession().streamHistory()) {
@@ -449,10 +456,11 @@ export class OmpHarness {
     await this.requireSession().interrupt();
   }
 
-  async requireStartTurn(message: string): Promise<void> {
+  async requireStartTurn(message: string): Promise<string> {
     const promptStarted = this.omp.latestSession().nextPrompt();
-    await this.requireSession().startTurn(message);
+    const { turnId } = await this.requireSession().startTurn(message);
     await promptStarted;
+    return turnId;
   }
 
   async interrupt(): Promise<void> {

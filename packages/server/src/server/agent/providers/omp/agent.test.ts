@@ -145,7 +145,11 @@ describe("OMP agent client and session", () => {
     });
     expect(omp.timeline()).toEqual([
       { type: "user_message", text: "hello OMP", messageId: "user-1" },
-      { type: "assistant_message", text: "hello from OMP", messageId: "omp-assistant-1" },
+      {
+        type: "assistant_message",
+        text: "hello from OMP",
+        messageId: "omp-assistant-1",
+      },
     ]);
     expect(omp.completedTurnCount()).toBe(1);
   });
@@ -190,7 +194,11 @@ describe("OMP agent client and session", () => {
         },
         error: null,
       },
-      { type: "assistant_message", text: "fixed", messageId: "omp-assistant-1" },
+      {
+        type: "assistant_message",
+        text: "fixed",
+        messageId: "omp-assistant-1",
+      },
     ]);
   });
 
@@ -242,7 +250,9 @@ describe("OMP agent client and session", () => {
 
     omp.reportProviderState({ isStreaming: false, isCompacting: false });
     scheduler.retry();
-    await expect(completion).resolves.toMatchObject({ finalText: "first done" });
+    await expect(completion).resolves.toMatchObject({
+      finalText: "first done",
+    });
   });
 
   test("stays active when OMP state checks fail", async () => {
@@ -262,7 +272,9 @@ describe("OMP agent client and session", () => {
     omp.failProviderStateChecks(null);
     omp.reportProviderState({ isStreaming: false, isCompacting: false });
     scheduler.retry();
-    await expect(completion).resolves.toMatchObject({ finalText: "first done" });
+    await expect(completion).resolves.toMatchObject({
+      finalText: "first done",
+    });
   });
 
   test("does not complete on OMP's extension-notice agent_end", async () => {
@@ -271,7 +283,9 @@ describe("OMP agent client and session", () => {
 
     await expect(
       omp.runPromptAfterExtensionNotice("hello OMP", "model turn completed"),
-    ).resolves.toMatchObject({ finalText: expect.stringContaining("model turn completed") });
+    ).resolves.toMatchObject({
+      finalText: expect.stringContaining("model turn completed"),
+    });
     expect(omp.completedTurnCount()).toBe(1);
   });
 
@@ -281,7 +295,9 @@ describe("OMP agent client and session", () => {
 
     await expect(
       omp.runPromptAfterExtensionNotice("hello OMP", "model turn completed", false),
-    ).resolves.toMatchObject({ finalText: expect.stringContaining("model turn completed") });
+    ).resolves.toMatchObject({
+      finalText: expect.stringContaining("model turn completed"),
+    });
     expect(omp.timeline()).toEqual([
       { type: "user_message", text: "hello OMP", messageId: "user-1" },
       {
@@ -312,7 +328,11 @@ describe("OMP agent client and session", () => {
     omp.runtime().acceptCustomMessage("plain custom status text");
 
     expect(omp.timeline().filter((item) => item.type === "tool_call")).toMatchObject([
-      { callId: "omp-notice:DocsSmokeTwo", name: "task_notification", status: "completed" },
+      {
+        callId: "omp-notice:DocsSmokeTwo",
+        name: "task_notification",
+        status: "completed",
+      },
     ]);
     // Non-notice custom messages still fall through as assistant messages.
     expect(omp.timeline().filter((item) => item.type === "assistant_message")).toMatchObject([
@@ -335,7 +355,9 @@ describe("OMP agent client and session", () => {
     const omp = new OmpHarness();
     await omp.start();
 
-    await expect(omp.runPromptWithoutTurn("/model")).resolves.toMatchObject({ finalText: "" });
+    await expect(omp.runPromptWithoutTurn("/model")).resolves.toMatchObject({
+      finalText: "",
+    });
     expect(omp.completedTurnCount()).toBe(1);
   });
 
@@ -349,7 +371,9 @@ describe("OMP agent client and session", () => {
     );
 
     expect(completion.completedBeforeTurn).toBe(false);
-    expect(completion.result).toMatchObject({ finalText: "delayed queued model turn completed" });
+    expect(completion.result).toMatchObject({
+      finalText: "delayed queued model turn completed",
+    });
     expect(omp.completedTurnCount()).toBe(1);
   });
 
@@ -388,7 +412,9 @@ describe("OMP agent client and session", () => {
     );
 
     expect(completion.completedBeforeTurn).toBe(false);
-    expect(completion.result).toMatchObject({ finalText: "correlated model turn completed" });
+    expect(completion.result).toMatchObject({
+      finalText: "correlated model turn completed",
+    });
     expect(omp.completedTurnCount()).toBe(1);
   });
 
@@ -434,7 +460,11 @@ describe("OMP agent client and session", () => {
       ],
     });
     await expect(omp.history()).resolves.toEqual([
-      { type: "user_message", text: "continue the audit", messageId: "user-history" },
+      {
+        type: "user_message",
+        text: "continue the audit",
+        messageId: "user-history",
+      },
       {
         type: "assistant_message",
         text: "audit context restored",
@@ -447,7 +477,11 @@ describe("OMP agent client and session", () => {
     const omp = new OmpHarness();
     await omp.start();
 
-    omp.requestToolApproval({ id: "approval-1", tool: "bash", detail: "git status" });
+    omp.requestToolApproval({
+      id: "approval-1",
+      tool: "bash",
+      detail: "git status",
+    });
     expect(omp.pendingPermissions()).toEqual([
       expect.objectContaining({ id: "approval-1", name: "bash", kind: "tool" }),
     ]);
@@ -563,8 +597,304 @@ describe("OMP agent client and session", () => {
     });
     expect(omp.timeline()).toEqual([
       { type: "user_message", text: "next step", messageId: "user-1" },
-      { type: "assistant_message", text: "on it", messageId: "omp-assistant-1" },
+      {
+        type: "assistant_message",
+        text: "on it",
+        messageId: "omp-assistant-1",
+      },
     ]);
+  });
+
+  test("attributes automatic compaction only to its active accepted turn", async () => {
+    const omp = new OmpHarness();
+    await omp.start();
+    const runtime = omp.runtime();
+    const turnId = await omp.requireStartTurn("continue");
+    runtime.emit({
+      type: "auto_compaction_start",
+      reason: "threshold",
+      action: "active",
+    });
+    runtime.emit({
+      type: "auto_compaction_end",
+      action: "active",
+      aborted: false,
+      willRetry: false,
+    });
+    expect(omp.timelineEvents()).toEqual([
+      expect.objectContaining({
+        turnId,
+        item: { type: "compaction", status: "loading", trigger: "auto" },
+      }),
+      expect.objectContaining({
+        turnId,
+        item: { type: "compaction", status: "completed", trigger: "auto" },
+      }),
+    ]);
+  });
+
+  test("treats repeated explicit compaction actions as reusable labels", async () => {
+    const omp = new OmpHarness();
+    await omp.start();
+    const runtime = omp.runtime();
+    await omp.requireStartTurn("continue");
+    for (let cycle = 0; cycle < 2; cycle += 1) {
+      runtime.emit({
+        type: "auto_compaction_start",
+        reason: "threshold",
+        action: "context-full",
+      });
+      runtime.emit({
+        type: "auto_compaction_end",
+        action: "context-full",
+        aborted: false,
+        willRetry: false,
+      });
+    }
+    expect(omp.timelineEvents().filter((event) => event.item.type === "compaction")).toHaveLength(
+      4,
+    );
+  });
+
+  test("an incompatible delayed end cannot consume the active compaction", async () => {
+    const omp = new OmpHarness();
+    await omp.start();
+    const runtime = omp.runtime();
+    await omp.requireStartTurn("continue");
+    runtime.emit({
+      type: "auto_compaction_start",
+      reason: "threshold",
+      action: "shake",
+    });
+    runtime.emit({
+      type: "auto_compaction_end",
+      action: "context-full",
+      aborted: false,
+      willRetry: false,
+    });
+    expect(omp.timelineEvents().filter((event) => event.item.type === "compaction")).toHaveLength(
+      1,
+    );
+    runtime.emit({
+      type: "auto_compaction_end",
+      action: "shake",
+      aborted: false,
+      willRetry: false,
+    });
+    expect(omp.timelineEvents().filter((event) => event.item.type === "compaction")).toHaveLength(
+      2,
+    );
+  });
+
+  test.each(["handoff", "snapcompact"])(
+    "completes a %s compaction through its context-full fallback",
+    async (action) => {
+      const omp = new OmpHarness();
+      await omp.start();
+      const runtime = omp.runtime();
+      const turnId = await omp.requireStartTurn("continue");
+      runtime.emit({
+        type: "auto_compaction_start",
+        reason: "threshold",
+        action,
+      });
+      runtime.emit({
+        type: "auto_compaction_end",
+        action: "context-full",
+        aborted: false,
+        willRetry: false,
+      });
+
+      expect(omp.timelineEvents()).toEqual([
+        expect.objectContaining({
+          turnId,
+          item: { type: "compaction", status: "loading", trigger: "auto" },
+        }),
+        expect.objectContaining({
+          turnId,
+          item: { type: "compaction", status: "completed", trigger: "auto" },
+        }),
+      ]);
+    },
+  );
+
+  test("accepts an actionless end only for one unambiguous current generation", async () => {
+    const omp = new OmpHarness();
+    await omp.start();
+    const runtime = omp.runtime();
+    await omp.requireStartTurn("continue");
+
+    runtime.emit({
+      type: "auto_compaction_start",
+      reason: "threshold",
+      action: "first",
+    });
+    runtime.emit({
+      type: "auto_compaction_end",
+      aborted: false,
+      willRetry: false,
+    });
+    runtime.emit({
+      type: "auto_compaction_start",
+      reason: "threshold",
+      action: "second",
+    });
+    runtime.emit({
+      type: "auto_compaction_end",
+      aborted: false,
+      willRetry: false,
+    });
+
+    expect(omp.timelineEvents().filter((event) => event.item.type === "compaction")).toHaveLength(
+      3,
+    );
+
+    runtime.emit({
+      type: "auto_compaction_start",
+      reason: "threshold",
+      action: "third",
+    });
+    runtime.emit({
+      type: "auto_compaction_end",
+      action: "third",
+      aborted: false,
+      willRetry: false,
+    });
+    expect(omp.timelineEvents().filter((event) => event.item.type === "compaction")).toHaveLength(
+      5,
+    );
+  });
+
+  test("an overlapping generation poisons later ends for the provider session", async () => {
+    const omp = new OmpHarness();
+    await omp.start();
+    const runtime = omp.runtime();
+    await omp.requireStartTurn("continue");
+
+    runtime.emit({
+      type: "auto_compaction_start",
+      reason: "threshold",
+      action: "first",
+    });
+    runtime.emit({
+      type: "auto_compaction_start",
+      reason: "threshold",
+      action: "overlap",
+    });
+    runtime.emit({
+      type: "auto_compaction_end",
+      action: "first",
+      aborted: false,
+      willRetry: false,
+    });
+    runtime.emit({
+      type: "auto_compaction_start",
+      reason: "threshold",
+      action: "later",
+    });
+    runtime.emit({
+      type: "auto_compaction_end",
+      action: "later",
+      aborted: false,
+      willRetry: false,
+    });
+
+    expect(omp.timelineEvents().filter((event) => event.item.type === "compaction")).toHaveLength(
+      2,
+    );
+  });
+
+  test("does not attribute a delayed automatic compaction end to a later turn", async () => {
+    const omp = new OmpHarness();
+    await omp.start();
+    const runtime = omp.runtime();
+
+    const firstTurnId = await omp.requireStartTurn("first turn");
+    runtime.beginTurn();
+    runtime.acceptPrompt("first turn", "user-1");
+    runtime.streamAssistantText("first response", "assistant-1");
+    runtime.emit({
+      type: "auto_compaction_start",
+      reason: "threshold",
+      action: "shared",
+    });
+    runtime.finishTurn();
+    await expect.poll(() => omp.completedTurnCount()).toBe(1);
+
+    const secondTurnId = await omp.requireStartTurn("second turn");
+    runtime.beginTurn();
+    runtime.emit({
+      type: "auto_compaction_start",
+      reason: "threshold",
+      action: "shared",
+    });
+    runtime.emit({
+      type: "auto_compaction_end",
+      action: "shared",
+      aborted: false,
+      willRetry: false,
+    });
+
+    expect(omp.timelineEvents().filter((event) => event.item.type === "compaction")).toEqual([
+      expect.objectContaining({
+        turnId: firstTurnId,
+        item: { type: "compaction", status: "loading", trigger: "auto" },
+      }),
+      expect.objectContaining({
+        turnId: secondTurnId,
+        item: { type: "compaction", status: "loading", trigger: "auto" },
+      }),
+    ]);
+  });
+
+  test("a fresh provider session resets retired compaction ambiguity", async () => {
+    const omp = new OmpHarness();
+    await omp.start();
+    const runtime = omp.runtime();
+    await omp.requireStartTurn("first turn");
+    runtime.beginTurn();
+    runtime.emit({
+      type: "auto_compaction_start",
+      reason: "threshold",
+      action: "first",
+    });
+    await omp.interrupt();
+
+    await omp.requireStartTurn("second turn");
+    runtime.emit({
+      type: "auto_compaction_start",
+      reason: "threshold",
+      action: "second",
+    });
+    runtime.emit({
+      type: "auto_compaction_end",
+      action: "second",
+      aborted: false,
+      willRetry: false,
+    });
+    expect(omp.timelineEvents().filter((event) => event.item.type === "compaction")).toHaveLength(
+      2,
+    );
+    await omp.close();
+
+    const freshOmp = new OmpHarness();
+    await freshOmp.start();
+    const freshRuntime = freshOmp.runtime();
+    await freshOmp.requireStartTurn("fresh turn");
+    freshRuntime.emit({
+      type: "auto_compaction_start",
+      reason: "threshold",
+      action: "fresh",
+    });
+    freshRuntime.emit({
+      type: "auto_compaction_end",
+      action: "fresh",
+      aborted: false,
+      willRetry: false,
+    });
+    expect(
+      freshOmp.timelineEvents().filter((event) => event.item.type === "compaction"),
+    ).toHaveLength(2);
   });
 
   test("re-emitted user message_end frames dedupe by native entry id", async () => {
