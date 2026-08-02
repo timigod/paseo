@@ -14,6 +14,7 @@ import { createWorkspaceCommand } from "./commands/workspace/index.js";
 import { createHeartbeatCommand } from "./commands/heartbeat/index.js";
 import { createHubCommand } from "./commands/hub/index.js";
 import { createHooksCommand } from "./commands/hooks.js";
+import { createFleetCommand } from "./commands/fleet/index.js";
 import { startCommand as daemonStartCommand } from "./commands/daemon/start.js";
 import { runStatusCommand as runDaemonStatusCommand } from "./commands/daemon/status.js";
 import { runRestartCommand as runDaemonRestartCommand } from "./commands/daemon/restart.js";
@@ -161,6 +162,7 @@ export function createCli(): Command {
 
   // Advanced agent commands (less common operations)
   program.addCommand(createAgentCommand());
+  program.addCommand(createFleetCommand());
 
   // Daemon commands
   program.addCommand(createDaemonCommand());

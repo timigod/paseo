@@ -18,11 +18,11 @@ import { buildWorkspaceSource } from "../workspace/create.js";
 
 export { resolveProviderAndModel } from "../../utils/provider-model.js";
 
-export function addRunOptions(cmd: Command): Command {
+export function addRunOptions(cmd: Command, options: { optionalPrompt?: boolean } = {}): Command {
   return (
     cmd
       .description("Create and start an agent with a task")
-      .argument("<prompt>", "The task/prompt for the agent")
+      .argument(options.optionalPrompt ? "[prompt]" : "<prompt>", "The task/prompt for the agent")
       .option("-d, --background", "Run in background")
       // COMPAT(detachRunFlag): --detach used to mean background execution, not
       // ownership transfer. Added in v0.2.0; remove after 2027-01-17.

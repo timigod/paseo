@@ -89,7 +89,7 @@ async function readImageFiles(
   );
 }
 
-async function resolvePromptInput(options: {
+export async function resolvePromptInput(options: {
   promptArgument: string | undefined;
   promptOption: string | undefined;
   promptFile: string | undefined;
@@ -126,8 +126,32 @@ async function resolvePromptInput(options: {
   }
 
   try {
-    return await readFile(resolve(promptFilePath), "utf8");
+    const contents = await readFile(resolve(promptFilePath));
+    let prompt: string;
+    try {
+      prompt = new TextDecoder("utf-8", { fatal: true }).decode(contents);
+    } catch {
+      throw {
+        code: "PROMPT_FILE_DECODE_ERROR",
+        message: `Prompt file is not valid UTF-8: ${promptFilePath}`,
+      } satisfies CommandError;
+    }
+    if (!prompt.trim()) {
+      throw {
+        code: "EMPTY_PROMPT_FILE",
+        message: `Prompt file is empty: ${promptFilePath}`,
+      } satisfies CommandError;
+    }
+    return prompt;
   } catch (err) {
+    if (
+      err &&
+      typeof err === "object" &&
+      "code" in err &&
+      (err.code === "PROMPT_FILE_DECODE_ERROR" || err.code === "EMPTY_PROMPT_FILE")
+    ) {
+      throw err;
+    }
     const message = err instanceof Error ? err.message : String(err);
     const error: CommandError = {
       code: "PROMPT_FILE_READ_ERROR",
