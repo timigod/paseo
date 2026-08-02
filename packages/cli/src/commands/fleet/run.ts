@@ -3,7 +3,7 @@ import { execFileSync } from "node:child_process";
 import path from "node:path";
 import type { CommandError } from "../../output/index.js";
 import { resolveProviderAndModel } from "../../utils/provider-model.js";
-import { FLEET_DEFAULT_MODEL, FLEET_DEFAULT_PROVIDER } from "./topology.js";
+import type { FleetDefaults } from "./topology.js";
 
 export interface FleetPromptOptions {
   prompt?: string;
@@ -64,9 +64,12 @@ export async function resolveFleetRunPrompt(
   return prompt;
 }
 
-export function resolveFleetProviderModelOptions(options: { provider?: string; model?: string }) {
-  const provider = options.provider ?? FLEET_DEFAULT_PROVIDER;
-  const model = options.model ?? (options.provider === undefined ? FLEET_DEFAULT_MODEL : undefined);
+export function resolveFleetProviderModelOptions(
+  options: { provider?: string; model?: string },
+  defaults: FleetDefaults,
+) {
+  const provider = options.provider ?? defaults.provider;
+  const model = options.model ?? (options.provider === undefined ? defaults.model : undefined);
   const resolved = resolveProviderAndModel({ provider, model });
   return {
     provider,

@@ -1,53 +1,121 @@
+import { readFileSync } from "node:fs";
+import os from "node:os";
 import path from "node:path";
+import { z } from "zod";
+import type { CommandError } from "../../output/index.js";
 
 export const FLEET_TOPOLOGY_VERSION = 1;
-export const FLEET_DEFAULT_PROVIDER = "opencode";
-export const FLEET_DEFAULT_MODEL = "plexer-openai/gpt-5.6-terra";
-export const FLEET_DEFAULT_THINKING = "high";
 
-export interface FleetHost {
-  id: "macbook" | "imac";
-  name: string;
-  endpoint: string;
-  codeRoot: string;
-  hostnamePrefixes: readonly string[];
-  capacity: number;
+const FleetHostSchema = z.object({
+  id: z.string().trim().min(1),
+  name: z.string().trim().min(1),
+  endpoint: z.string().trim().min(1),
+  codeRoot: z.string().trim().min(1),
+  hostnamePrefixes: z.array(z.string().trim().min(1)),
+  capacity: z.number().int().positive(),
+});
+
+const FleetDefaultsSchema = z.object({
+  provider: z.string().trim().min(1),
+  model: z.string().trim().min(1).optional(),
+  thinking: z.string().trim().min(1).optional(),
+});
+
+const FleetConfigSchema = z
+  .object({
+    version: z.literal(FLEET_TOPOLOGY_VERSION),
+    hosts: z.array(FleetHostSchema).min(1),
+    defaults: FleetDefaultsSchema,
+  })
+  .superRefine(({ hosts }, context) => {
+    const hostIds = new Set<string>();
+    const endpoints = new Set<string>();
+    for (const [index, host] of hosts.entries()) {
+      const normalizedId = host.id.toLowerCase();
+      if (hostIds.has(normalizedId)) {
+        context.addIssue({
+          code: "custom",
+          path: ["hosts", index, "id"],
+          message: "Fleet host IDs must be unique",
+        });
+      }
+      hostIds.add(normalizedId);
+
+      const normalizedEndpoint = host.endpoint.toLowerCase();
+      if (endpoints.has(normalizedEndpoint)) {
+        context.addIssue({
+          code: "custom",
+          path: ["hosts", index, "endpoint"],
+          message: "Fleet host endpoints must be unique",
+        });
+      }
+      endpoints.add(normalizedEndpoint);
+    }
+  });
+
+export type FleetHost = z.infer<typeof FleetHostSchema>;
+export type FleetDefaults = z.infer<typeof FleetDefaultsSchema>;
+export type FleetConfig = z.infer<typeof FleetConfigSchema>;
+
+function expandHomeDirectory(value: string): string {
+  if (value === "~") return os.homedir();
+  if (value.startsWith("~/")) return path.join(os.homedir(), value.slice(2));
+  return value;
 }
 
-export const FLEET_HOSTS: readonly FleetHost[] = [
-  {
-    id: "macbook",
-    name: "MacBook",
-    endpoint: "100.108.191.125:6767",
-    codeRoot: "/Users/timiajiboye/Code",
-    hostnamePrefixes: ["timis-macbook-pro"],
-    capacity: 10,
-  },
-  {
-    id: "imac",
-    name: "iMac",
-    endpoint: "imac.tail24bbb3.ts.net:6767",
-    codeRoot: "/Users/timi/Code",
-    hostnamePrefixes: ["imac"],
-    capacity: 10,
-  },
-] as const;
+export function resolveFleetConfigPath(env: NodeJS.ProcessEnv = process.env): string {
+  const configuredPath = env.PASEO_FLEET_CONFIG?.trim();
+  if (configuredPath) return path.resolve(expandHomeDirectory(configuredPath));
+  const paseoHome = expandHomeDirectory(env.PASEO_HOME?.trim() || path.join("~", ".paseo"));
+  return path.resolve(paseoHome, "fleet.json");
+}
 
-export function findFleetHost(
-  value: string,
-  hosts: readonly FleetHost[] = FLEET_HOSTS,
-): FleetHost | null {
+export function loadFleetConfig(env: NodeJS.ProcessEnv = process.env): FleetConfig {
+  let source: string;
+  try {
+    source = readFileSync(resolveFleetConfigPath(env), "utf8");
+  } catch {
+    throw {
+      code: "FLEET_CONFIG_UNAVAILABLE",
+      message: "Fleet configuration is unavailable",
+      details: "Create $PASEO_HOME/fleet.json or set PASEO_FLEET_CONFIG to a fleet JSON file.",
+    } satisfies CommandError;
+  }
+
+  let input: unknown;
+  try {
+    input = JSON.parse(source);
+  } catch {
+    throw {
+      code: "FLEET_CONFIG_INVALID",
+      message: "Fleet configuration is not valid JSON",
+    } satisfies CommandError;
+  }
+
+  const parsed = FleetConfigSchema.safeParse(input);
+  if (!parsed.success) {
+    throw {
+      code: "FLEET_CONFIG_INVALID",
+      message: "Fleet configuration does not match the supported schema",
+      details: parsed.error.issues.map((issue) => issue.message).join("; "),
+    } satisfies CommandError;
+  }
+  return parsed.data;
+}
+
+export function findFleetHost(value: string, hosts: readonly FleetHost[]): FleetHost | null {
   const normalized = value.trim().toLowerCase();
   if (!normalized) return null;
   return (
-    hosts.find((host) => host.id === normalized || host.endpoint.toLowerCase() === normalized) ??
-    null
+    hosts.find(
+      (host) => host.id.toLowerCase() === normalized || host.endpoint.toLowerCase() === normalized,
+    ) ?? null
   );
 }
 
 export function findFleetHostForHostname(
   hostname: string,
-  hosts: readonly FleetHost[] = FLEET_HOSTS,
+  hosts: readonly FleetHost[],
 ): FleetHost | null {
   const normalized = hostname.trim().toLowerCase();
   if (!normalized) return null;
@@ -58,10 +126,7 @@ export function findFleetHostForHostname(
   );
 }
 
-export function findFleetHostForCwd(
-  cwd: string,
-  hosts: readonly FleetHost[] = FLEET_HOSTS,
-): FleetHost | null {
+export function findFleetHostForCwd(cwd: string, hosts: readonly FleetHost[]): FleetHost | null {
   const resolvedCwd = path.resolve(cwd);
   return (
     hosts.find((host) => {

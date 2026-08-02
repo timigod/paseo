@@ -2,6 +2,7 @@ import path from "node:path";
 import type { Command } from "commander";
 import type { AgentSnapshotPayload } from "@getpaseo/protocol/messages";
 import { connectToDaemon, getDaemonHost } from "../../utils/client.js";
+import { fetchAllAgents, fetchAllWorkspaces } from "../../utils/inventory.js";
 import type {
   CommandError,
   CommandOptions,
@@ -75,24 +76,17 @@ async function workspaceStillExists(
   client: ConnectedDaemonClient,
   workspaceId: string,
 ): Promise<boolean> {
-  let cursor: string | undefined;
-  do {
-    const response = await client.fetchWorkspaces({
-      filter: { query: workspaceId },
-      page: { limit: 200, ...(cursor ? { cursor } : {}) },
-    });
-    if (response.entries.some((workspace) => workspace.id === workspaceId)) return true;
-    cursor = response.pageInfo.nextCursor ?? undefined;
-  } while (cursor);
-  return false;
+  const workspaces = await fetchAllWorkspaces(client, { query: workspaceId });
+  return workspaces.some((workspace) => workspace.id === workspaceId);
 }
 
 async function resolveExclusiveWorktreePath(
   client: ConnectedDaemonClient,
   agent: AgentSnapshotPayload,
 ): Promise<string | null> {
-  const [agentsResponse, worktreesResponse] = await Promise.all([
-    client.fetchAgents({ filter: { includeArchived: false } }),
+  const [agents, workspaces, worktreesResponse] = await Promise.all([
+    fetchAllAgents(client, { includeArchived: false }),
+    fetchAllWorkspaces(client),
     client.getPaseoWorktreeList({ cwd: agent.cwd }),
   ]);
   if (worktreesResponse.error) {
@@ -105,13 +99,18 @@ async function resolveExclusiveWorktreePath(
     .filter((candidate) => isWithin(candidate.worktreePath, agent.cwd))
     .sort((left, right) => right.worktreePath.length - left.worktreePath.length)[0];
   if (!worktree) return null;
-  const hasOtherOwner = agentsResponse.entries.some(
-    (entry) =>
-      entry.agent.id !== agent.id &&
-      !entry.agent.archivedAt &&
-      isWithin(worktree.worktreePath, entry.agent.cwd),
+  const hasOtherAgent = agents.some(
+    (candidate) =>
+      candidate.id !== agent.id &&
+      !candidate.archivedAt &&
+      isWithin(worktree.worktreePath, candidate.cwd),
   );
-  return hasOtherOwner ? null : worktree.worktreePath;
+  const hasOtherWorkspace = workspaces.some(
+    (workspace) =>
+      workspace.id !== agent.workspaceId &&
+      isWithin(worktree.worktreePath, workspace.workspaceDirectory),
+  );
+  return hasOtherAgent || hasOtherWorkspace ? null : worktree.worktreePath;
 }
 
 async function finishConnectedAgent(

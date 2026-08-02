@@ -10,42 +10,50 @@ import {
 
 const cleanup: string[] = [];
 const head = "0123456789abcdef0123456789abcdef01234567";
+const defaults = {
+  provider: "provider-a",
+  model: "model-a",
+  thinking: "balanced",
+};
 
 afterEach(async () => {
   await Promise.all(cleanup.splice(0).map((directory) => rm(directory, { recursive: true })));
 });
 
 describe("fleet run inputs", () => {
-  it("uses fleet defaults only when no provider or model was explicit", () => {
-    expect(resolveFleetProviderModelOptions({})).toEqual({
-      provider: "opencode",
-      model: "plexer-openai/gpt-5.6-terra",
-      effectiveProvider: "opencode",
-      effectiveModel: "plexer-openai/gpt-5.6-terra",
+  it("uses externally configured defaults only when no provider or model was explicit", () => {
+    expect(resolveFleetProviderModelOptions({}, defaults)).toEqual({
+      provider: "provider-a",
+      model: "model-a",
+      effectiveProvider: "provider-a",
+      effectiveModel: "model-a",
     });
   });
 
   it("lets an explicit embedded provider model replace the implicit default", () => {
-    expect(resolveFleetProviderModelOptions({ provider: "codex/gpt-5.4" })).toEqual({
-      provider: "codex/gpt-5.4",
+    expect(resolveFleetProviderModelOptions({ provider: "provider-b/model-b" }, defaults)).toEqual({
+      provider: "provider-b/model-b",
       model: undefined,
-      effectiveProvider: "codex",
-      effectiveModel: "gpt-5.4",
+      effectiveProvider: "provider-b",
+      effectiveModel: "model-b",
     });
   });
 
   it("uses the fleet provider with an explicit model", () => {
-    expect(resolveFleetProviderModelOptions({ model: "custom-model" })).toMatchObject({
-      provider: "opencode",
+    expect(resolveFleetProviderModelOptions({ model: "custom-model" }, defaults)).toMatchObject({
+      provider: "provider-a",
       model: "custom-model",
-      effectiveProvider: "opencode",
+      effectiveProvider: "provider-a",
       effectiveModel: "custom-model",
     });
   });
 
   it("keeps rejecting contradictory explicit model values", () => {
     expect(() =>
-      resolveFleetProviderModelOptions({ provider: "codex/gpt-5.4", model: "gpt-5.3" }),
+      resolveFleetProviderModelOptions(
+        { provider: "provider-b/model-b", model: "model-c" },
+        defaults,
+      ),
     ).toThrow(expect.objectContaining({ code: "CONFLICTING_MODEL_OPTIONS" }));
   });
 

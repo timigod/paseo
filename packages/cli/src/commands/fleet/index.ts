@@ -1,11 +1,11 @@
 import os from "node:os";
 import type { Command } from "commander";
 import { Command as CommanderCommand } from "commander";
-import type { AgentSnapshotPayload } from "@getpaseo/protocol/messages";
 import { withOutput } from "../../output/index.js";
 import type { CommandError, ListResult, OutputSchema, SingleResult } from "../../output/index.js";
 import { addJsonOption } from "../../utils/command-options.js";
 import { connectToDaemon } from "../../utils/client.js";
+import { fetchAllAgents } from "../../utils/inventory.js";
 import {
   addRunOptions,
   runRunCommand,
@@ -20,13 +20,18 @@ import {
 } from "../agent/finish.js";
 import { findFleetAgentMatches, selectFleetAgentLocation } from "./lifecycle.js";
 import { selectFleetHost, selectFleetWorkspaceHost, type FleetRouteReason } from "./routing.js";
-import { buildFleetDoctorResult, collectFleetStatus, type FleetHostStatus } from "./status.js";
 import {
-  FLEET_DEFAULT_THINKING,
-  FLEET_HOSTS,
+  buildFleetDoctorResult,
+  collectFleetStatus,
+  summarizeFleetHostStatus,
+  type FleetHostSummary,
+} from "./status.js";
+import {
   findFleetHost,
   findFleetHostForCwd,
   findFleetHostForHostname,
+  loadFleetConfig,
+  type FleetHost,
 } from "./topology.js";
 import {
   resolveFleetProviderModelOptions,
@@ -42,22 +47,20 @@ interface FleetRunOptions extends AgentRunOptions {
 
 interface FleetRunResult extends AgentRunResult {
   fleetHost: string;
-  fleetEndpoint: string;
   routeReason: FleetRouteReason;
   effectiveModel: string | undefined;
-  effectiveThinking: string;
+  effectiveThinking: string | undefined;
 }
 
-const fleetStatusSchema: OutputSchema<FleetHostStatus> = {
-  idField: (status) => status.host.id,
+const fleetStatusSchema: OutputSchema<FleetHostSummary> = {
+  idField: "host",
   columns: [
-    { header: "HOST", field: (status) => status.host.name },
+    { header: "HOST", field: "host" },
     { header: "STATE", field: "state" },
     { header: "ACTIVE", field: "activeAgents", align: "right" },
     {
       header: "PERMISSIONS",
-      field: (status) =>
-        status.activeTasks.reduce((count, task) => count + task.pendingPermissionCount, 0),
+      field: (status) => status.pendingPermissions,
       align: "right",
     },
     { header: "DETAIL", field: (status) => status.issue ?? "healthy" },
@@ -75,27 +78,28 @@ const fleetRunSchema: OutputSchema<FleetRunResult> = {
   ],
 };
 
-function requireFleetHost(value: string | undefined) {
+function requireFleetHost(value: string | undefined, hosts: readonly FleetHost[]) {
   if (!value) return null;
-  const host = findFleetHost(value);
+  const host = findFleetHost(value, hosts);
   if (!host) {
     throw {
       code: "INVALID_FLEET_HOST",
       message: `Unknown fleet host: ${value}`,
-      details: "Use --host macbook or --host imac.",
+      details: `Configured hosts: ${hosts.map(({ id }) => id).join(", ")}.`,
     } satisfies CommandError;
   }
   return host;
 }
 
-async function runFleetStatusCommand(): Promise<ListResult<FleetHostStatus>> {
-  return { type: "list", data: await collectFleetStatus(), schema: fleetStatusSchema };
+async function runFleetStatusCommand(): Promise<ListResult<FleetHostSummary>> {
+  const statuses = await collectFleetStatus(loadFleetConfig());
+  return { type: "list", data: statuses.map(summarizeFleetHostStatus), schema: fleetStatusSchema };
 }
 
 async function runFleetDoctorCommand(): Promise<
   SingleResult<ReturnType<typeof buildFleetDoctorResult>>
 > {
-  const result = buildFleetDoctorResult(await collectFleetStatus());
+  const result = buildFleetDoctorResult(await collectFleetStatus(loadFleetConfig()));
   return {
     type: "single",
     data: result,
@@ -114,13 +118,14 @@ async function runFleetRunCommand(
   options: FleetRunOptions,
   command: Command,
 ): Promise<SingleResult<FleetRunResult>> {
+  const config = loadFleetConfig();
   const prompt = await resolveFleetRunPrompt(positionalPrompt, options);
-  const pinnedHost = requireFleetHost(options.host);
-  const statuses = await collectFleetStatus();
+  const pinnedHost = requireFleetHost(options.host, config.hosts);
+  const statuses = await collectFleetStatus(config);
   const workspaceId = options.workspace ?? process.env.PASEO_WORKSPACE_ID;
   const cwd = options.cwd ?? process.cwd();
-  const sourceHost = findFleetHostForCwd(cwd);
-  const localHost = findFleetHostForHostname(os.hostname());
+  const sourceHost = findFleetHostForCwd(cwd, config.hosts);
+  const localHost = findFleetHostForHostname(os.hostname(), config.hosts);
   const plan = workspaceId
     ? {
         ...selectFleetWorkspaceHost({
@@ -138,8 +143,8 @@ async function runFleetRunCommand(
         pinnedHost,
         requiresLocalContext: Boolean(process.env.PASEO_AGENT_ID),
       });
-  const model = resolveFleetProviderModelOptions(options);
-  const thinking = options.thinking ?? FLEET_DEFAULT_THINKING;
+  const model = resolveFleetProviderModelOptions(options, config.defaults);
+  const thinking = options.thinking ?? config.defaults.thinking;
   const result = await runRunCommand(
     prompt,
     {
@@ -158,7 +163,6 @@ async function runFleetRunCommand(
     data: {
       ...result.data,
       fleetHost: plan.host.id,
-      fleetEndpoint: plan.host.endpoint,
       routeReason: plan.reason,
       effectiveModel: model.effectiveModel,
       effectiveThinking: thinking,
@@ -172,15 +176,15 @@ async function runFleetFinishCommand(
   options: AgentFinishOptions & { host?: string },
   command: Command,
 ): Promise<SingleResult<AgentFinishResult>> {
-  const pinnedHost = requireFleetHost(options.host);
-  const hosts = pinnedHost ? [pinnedHost] : FLEET_HOSTS;
+  const config = loadFleetConfig();
+  const pinnedHost = requireFleetHost(options.host, config.hosts);
+  const hosts = pinnedHost ? [pinnedHost] : config.hosts;
   const results = await Promise.all(
     hosts.map(async (host) => {
       let client: Awaited<ReturnType<typeof connectToDaemon>> | null = null;
       try {
         client = await connectToDaemon({ host: host.endpoint });
-        const response = await client.fetchAgents({ filter: { includeArchived: true } });
-        const agents = response.entries.map(({ agent }) => agent as AgentSnapshotPayload);
+        const agents = await fetchAllAgents(client, { includeArchived: true });
         return { matches: findFleetAgentMatches(query, host, agents) };
       } catch (error) {
         return { failure: { host, error: error instanceof Error ? error.message : String(error) } };
@@ -211,10 +215,13 @@ export function createFleetCommand(): Command {
     addRunOptions(fleet.command("run"), { optionalPrompt: true })
       .option("--prompt <text>", "Provide the task inline as a flag")
       .option("--prompt-file <path>", "Read the task from a UTF-8 text file")
-      .option("--host <host>", "Pin macbook or imac"),
+      .option("--host <host>", "Pin a configured fleet host"),
   ).action(withOutput(runFleetRunCommand));
   addJsonOption(
-    addFinishOptions(fleet.command("finish")).option("--host <host>", "Pin macbook or imac"),
+    addFinishOptions(fleet.command("finish")).option(
+      "--host <host>",
+      "Pin a configured fleet host",
+    ),
   ).action(withOutput(runFleetFinishCommand));
   return fleet;
 }

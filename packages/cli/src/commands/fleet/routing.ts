@@ -5,7 +5,7 @@ import { translateFleetCwd } from "./topology.js";
 export interface FleetHostObservation {
   host: FleetHost;
   reachable: boolean;
-  openCodeReady: boolean;
+  providerReady: boolean;
   agentInventoryReady: boolean;
   workspaceInventoryReady: boolean;
   activeAgents: number;
@@ -34,8 +34,8 @@ export function selectFleetHost(input: {
 }): FleetRunPlan {
   const { observations, cwd, sourceHost, localHost, pinnedHost, requiresLocalContext } = input;
   const candidates = observations.filter(
-    ({ host, reachable, openCodeReady, agentInventoryReady, activeAgents }) => {
-      if (!reachable || !openCodeReady || !agentInventoryReady || activeAgents >= host.capacity) {
+    ({ host, reachable, providerReady, agentInventoryReady, activeAgents }) => {
+      if (!reachable || !providerReady || !agentInventoryReady || activeAgents >= host.capacity) {
         return false;
       }
       if (requiresLocalContext && localHost && host.id !== localHost.id) return false;
@@ -84,6 +84,13 @@ export function selectFleetWorkspaceHost(input: {
   pinnedHost: FleetHost | null;
 }): Pick<FleetRunPlan, "host" | "reason"> {
   const workspaceId = input.workspaceId.trim();
+  if (input.observations.some(({ workspaceInventoryReady }) => !workspaceInventoryReady)) {
+    throw commandError(
+      "FLEET_WORKSPACE_OWNER_UNPROVED",
+      `Cannot prove a unique owner for workspace ${workspaceId}`,
+      "Wait until every configured host has a complete workspace inventory.",
+    );
+  }
   const matches = input.observations.filter((observation) =>
     observation.workspaceIds.includes(workspaceId),
   );
@@ -97,9 +104,6 @@ export function selectFleetWorkspaceHost(input: {
   }
 
   if (input.pinnedHost) {
-    const pinnedObservation = input.observations.find(
-      ({ host }) => host.id === input.pinnedHost?.id,
-    );
     const match = matches[0];
     if (match && match.host.id !== input.pinnedHost.id) {
       throw commandError(
@@ -108,18 +112,12 @@ export function selectFleetWorkspaceHost(input: {
       );
     }
     if (!match) {
-      if (!pinnedObservation?.workspaceInventoryReady) {
-        throw commandError(
-          "FLEET_WORKSPACE_OWNER_UNPROVED",
-          `Cannot prove that pinned host ${input.pinnedHost.id} owns workspace ${workspaceId}`,
-        );
-      }
       throw commandError(
         "FLEET_WORKSPACE_NOT_FOUND",
         `Workspace ${workspaceId} is absent from pinned host ${input.pinnedHost.id}`,
       );
     }
-    if (!match.reachable || !match.openCodeReady || !match.workspaceInventoryReady) {
+    if (!match.reachable || !match.providerReady || !match.workspaceInventoryReady) {
       throw commandError(
         "FLEET_WORKSPACE_OWNER_UNHEALTHY",
         `Workspace owner ${match.host.id} is not healthy enough to run this task`,
@@ -128,13 +126,6 @@ export function selectFleetWorkspaceHost(input: {
     return { host: match.host, reason: "workspace_owner" };
   }
 
-  if (input.observations.some(({ workspaceInventoryReady }) => !workspaceInventoryReady)) {
-    throw commandError(
-      "FLEET_WORKSPACE_OWNER_UNPROVED",
-      `Cannot prove a unique owner for workspace ${workspaceId}`,
-      "Pin the known owner with --host only after confirming its workspace inventory is healthy.",
-    );
-  }
   if (matches.length === 0) {
     throw commandError(
       "FLEET_WORKSPACE_NOT_FOUND",
@@ -143,7 +134,7 @@ export function selectFleetWorkspaceHost(input: {
   }
 
   const owner = matches[0]!;
-  if (!owner.reachable || !owner.openCodeReady || !owner.workspaceInventoryReady) {
+  if (!owner.reachable || !owner.providerReady || !owner.workspaceInventoryReady) {
     throw commandError(
       "FLEET_WORKSPACE_OWNER_UNHEALTHY",
       `Workspace owner ${owner.host.id} is not healthy enough to run this task`,

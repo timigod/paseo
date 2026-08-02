@@ -1,22 +1,31 @@
 import type { AgentSnapshotPayload } from "@getpaseo/protocol/messages";
 import { connectToDaemon } from "../../utils/client.js";
+import { fetchAllAgents, fetchAllWorkspaces } from "../../utils/inventory.js";
 import type { FleetHostObservation } from "./routing.js";
-import { FLEET_HOSTS, type FleetHost } from "./topology.js";
+import type { FleetConfig, FleetHost } from "./topology.js";
 
 export type FleetTaskState = "running" | "idle" | "needs_permission";
 
-export interface FleetActiveTask {
-  agentId: string;
-  name: string | null;
-  status: string;
+interface FleetActiveTask {
   state: FleetTaskState;
   pendingPermissionCount: number;
-  permissionTools: string[];
 }
 
 export interface FleetHostStatus extends FleetHostObservation {
   state: "ready" | "degraded" | "needs_permission";
   activeTasks: FleetActiveTask[];
+  issue: string | null;
+}
+
+export interface FleetHostSummary {
+  host: string;
+  state: FleetHostStatus["state"];
+  reachable: boolean;
+  providerReady: boolean;
+  agentInventoryReady: boolean;
+  workspaceInventoryReady: boolean;
+  activeAgents: number;
+  pendingPermissions: number;
   issue: string | null;
 }
 
@@ -28,25 +37,16 @@ type FleetClient = Pick<
 export type FleetConnect = (options: { host: string; timeout?: number }) => Promise<FleetClient>;
 
 function resolveTaskState(agent: AgentSnapshotPayload): FleetTaskState {
-  if ((agent.pendingPermissions?.length ?? 0) > 0) return "needs_permission";
+  if (agent.pendingPermissions.length > 0) return "needs_permission";
   if (agent.status === "running") return "running";
   return "idle";
 }
 
 function mapAgent(agent: AgentSnapshotPayload): FleetActiveTask {
-  const pendingPermissions = agent.pendingPermissions ?? [];
   return {
-    agentId: agent.id,
-    name: agent.title,
-    status: agent.status,
     state: resolveTaskState(agent),
-    pendingPermissionCount: pendingPermissions.length,
-    permissionTools: pendingPermissions.map((permission) => permission.name),
+    pendingPermissionCount: agent.pendingPermissions.length,
   };
-}
-
-function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
 }
 
 function resolveFleetState(needsPermission: boolean, degraded: boolean): FleetHostStatus["state"] {
@@ -57,75 +57,66 @@ function resolveFleetState(needsPermission: boolean, degraded: boolean): FleetHo
 
 function readDaemonProbe(
   result: PromiseSettledResult<Awaited<ReturnType<FleetClient["getDaemonStatus"]>>>,
+  provider: string,
   issues: string[],
 ): boolean {
   if (result.status === "rejected") {
-    issues.push(`readiness probe failed: ${errorMessage(result.reason)}`);
+    issues.push("readiness probe failed");
     return false;
   }
-  const openCode = result.value.providers.find(({ provider }) => provider === "opencode");
-  if (openCode?.available === true) return true;
-  issues.push(openCode?.error ?? "OpenCode is unavailable");
+  const providerStatus = result.value.providers.find((entry) => entry.provider === provider);
+  if (providerStatus?.available === true) return true;
+  issues.push("configured provider is unavailable");
   return false;
 }
 
 function readAgentProbe(
-  result: PromiseSettledResult<Awaited<ReturnType<FleetClient["fetchAgents"]>>>,
+  result: PromiseSettledResult<AgentSnapshotPayload[]>,
   issues: string[],
 ): FleetActiveTask[] {
   if (result.status === "rejected") {
-    issues.push(`agent inventory probe failed: ${errorMessage(result.reason)}`);
+    issues.push("agent inventory probe failed");
     return [];
   }
-  return result.value.entries
-    .map(({ agent }) => mapAgent(agent))
-    .filter(({ status }) => ["initializing", "running", "idle"].includes(status));
+  return result.value
+    .map((agent) => ({ agent, task: mapAgent(agent) }))
+    .filter(({ agent }) => ["initializing", "running", "idle"].includes(agent.status))
+    .map(({ task }) => task);
 }
 
-async function readWorkspaceProbe(
-  client: FleetClient,
-  result: PromiseSettledResult<Awaited<ReturnType<FleetClient["fetchWorkspaces"]>>>,
+function readWorkspaceProbe(
+  result: PromiseSettledResult<Awaited<ReturnType<typeof fetchAllWorkspaces>>>,
   issues: string[],
-): Promise<{ ready: boolean; workspaceIds: string[] }> {
+): { ready: boolean; workspaceIds: string[] } {
   if (result.status === "rejected") {
-    issues.push(`workspace inventory probe failed: ${errorMessage(result.reason)}`);
+    issues.push("workspace inventory probe failed");
     return { ready: false, workspaceIds: [] };
   }
-  const workspaceIds = result.value.entries.map(({ id }) => id);
-  let cursor = result.value.pageInfo.nextCursor ?? undefined;
-  try {
-    while (cursor) {
-      const page = await client.fetchWorkspaces({ page: { limit: 200, cursor } });
-      workspaceIds.push(...page.entries.map(({ id }) => id));
-      cursor = page.pageInfo.nextCursor ?? undefined;
-    }
-    return { ready: true, workspaceIds };
-  } catch (error) {
-    issues.push(`workspace inventory probe failed: ${errorMessage(error)}`);
-    return { ready: false, workspaceIds: [] };
-  }
+  return { ready: true, workspaceIds: result.value.map(({ id }) => id) };
 }
 
-async function inspectConnectedFleetHost(
-  host: FleetHost,
-  client: FleetClient,
-): Promise<FleetHostStatus> {
+async function inspectConnectedFleetHost(input: {
+  host: FleetHost;
+  provider: string;
+  client: FleetClient;
+}): Promise<FleetHostStatus> {
+  const { host, provider, client } = input;
   const [daemonResult, agentsResult, workspacesResult] = await Promise.allSettled([
     client.getDaemonStatus({ timeout: 15_000 }),
-    client.fetchAgents({ filter: { includeArchived: false }, timeout: 15_000 }),
-    client.fetchWorkspaces({ page: { limit: 200 } }),
+    fetchAllAgents(client, { includeArchived: false, scope: "active", timeout: 15_000 }),
+    fetchAllWorkspaces(client),
   ]);
   const issues: string[] = [];
-  const openCodeReady = readDaemonProbe(daemonResult, issues);
+  const providerReady = readDaemonProbe(daemonResult, provider, issues);
   const activeTasks = readAgentProbe(agentsResult, issues);
-  const workspaceProbe = await readWorkspaceProbe(client, workspacesResult, issues);
+  const workspaceProbe = readWorkspaceProbe(workspacesResult, issues);
   const agentInventoryReady = agentsResult.status === "fulfilled";
-  const degraded = !openCodeReady || !agentInventoryReady || !workspaceProbe.ready;
+  const degraded = !providerReady || !agentInventoryReady || !workspaceProbe.ready;
   const needsPermission = activeTasks.some(({ state }) => state === "needs_permission");
   return {
     host,
     reachable: true,
-    openCodeReady,
+    providerReady,
     agentInventoryReady,
     workspaceInventoryReady: workspaceProbe.ready,
     activeAgents: activeTasks.length,
@@ -136,53 +127,84 @@ async function inspectConnectedFleetHost(
   };
 }
 
-export async function inspectFleetHost(
-  host: FleetHost,
-  connect: FleetConnect = connectToDaemon,
-): Promise<FleetHostStatus> {
+export async function inspectFleetHost(input: {
+  host: FleetHost;
+  provider: string;
+  connect?: FleetConnect;
+}): Promise<FleetHostStatus> {
+  const connect = input.connect ?? connectToDaemon;
   let client: FleetClient;
   try {
-    client = await connect({ host: host.endpoint, timeout: 1_500 });
-  } catch (error) {
+    client = await connect({ host: input.host.endpoint, timeout: 1_500 });
+  } catch {
     return {
-      host,
+      host: input.host,
       reachable: false,
-      openCodeReady: false,
+      providerReady: false,
       agentInventoryReady: false,
       workspaceInventoryReady: false,
       activeAgents: 0,
       workspaceIds: [],
       state: "degraded",
       activeTasks: [],
-      issue: errorMessage(error),
+      issue: "connection failed",
     };
   }
   try {
-    return await inspectConnectedFleetHost(host, client);
+    return await inspectConnectedFleetHost({
+      host: input.host,
+      provider: input.provider,
+      client,
+    });
   } finally {
     await client.close().catch(() => {});
   }
 }
 
+export function summarizeFleetHostStatus(status: FleetHostStatus): FleetHostSummary {
+  return {
+    host: status.host.id,
+    state: status.state,
+    reachable: status.reachable,
+    providerReady: status.providerReady,
+    agentInventoryReady: status.agentInventoryReady,
+    workspaceInventoryReady: status.workspaceInventoryReady,
+    activeAgents: status.activeAgents,
+    pendingPermissions: status.activeTasks.reduce(
+      (count, task) => count + task.pendingPermissionCount,
+      0,
+    ),
+    issue: status.issue,
+  };
+}
+
 export function buildFleetDoctorResult(hosts: readonly FleetHostStatus[]) {
   const needsPermission = hosts.some(({ state }) => state === "needs_permission");
   const degraded = hosts.some(
-    ({ reachable, openCodeReady, agentInventoryReady, workspaceInventoryReady }) =>
-      !reachable || !openCodeReady || !agentInventoryReady || !workspaceInventoryReady,
+    ({ reachable, providerReady, agentInventoryReady, workspaceInventoryReady }) =>
+      !reachable || !providerReady || !agentInventoryReady || !workspaceInventoryReady,
   );
   let recommendation = "Fleet is ready for dispatch.";
   if (needsPermission) {
-    recommendation =
-      "Review the named permission tools in Paseo; fleet doctor does not approve requests.";
+    recommendation = "Review pending permissions in Paseo; fleet doctor does not approve requests.";
   } else if (degraded) {
-    recommendation = "Resolve the named host inventory or provider issue before dispatching work.";
+    recommendation =
+      "Restore every configured host inventory and provider before dispatching work.";
   }
-  return { state: resolveFleetState(needsPermission, degraded), hosts, recommendation };
+  return {
+    state: resolveFleetState(needsPermission, degraded),
+    hosts: hosts.map(summarizeFleetHostStatus),
+    recommendation,
+  };
 }
 
 export async function collectFleetStatus(
-  hosts: readonly FleetHost[] = FLEET_HOSTS,
+  config: FleetConfig,
   connect: FleetConnect = connectToDaemon,
 ): Promise<FleetHostStatus[]> {
-  return Promise.all(hosts.map((host) => inspectFleetHost(host, connect)));
+  return Promise.all(
+    config.hosts.map((host) =>
+      inspectFleetHost({ host, provider: config.defaults.provider, connect }),
+    ),
+  );
 }

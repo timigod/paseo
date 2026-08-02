@@ -409,6 +409,44 @@ Use `--host <host:port>` to point the CLI at a different daemon:
 npm run cli -- --host localhost:7777 ls -a
 ```
 
+### Fleet CLI configuration
+
+`paseo fleet` has no built-in machines, endpoints, paths, capacities, providers, models, or
+thinking policy. Configure the local fleet in `$PASEO_HOME/fleet.json`, or set
+`PASEO_FLEET_CONFIG` to another JSON file. This file is machine-local state and must not be checked
+into the repository.
+
+```json
+{
+  "version": 1,
+  "hosts": [
+    {
+      "id": "builder-a",
+      "name": "Builder A",
+      "endpoint": "builder-a.internal:6767",
+      "codeRoot": "/srv/code",
+      "hostnamePrefixes": ["builder-a"],
+      "capacity": 8
+    }
+  ],
+  "defaults": {
+    "provider": "provider-id",
+    "model": "model-id",
+    "thinking": "thinking-option-id"
+  }
+}
+```
+
+`defaults.provider` is required so `fleet run` and provider readiness checks use the same configured
+provider. `defaults.model` and `defaults.thinking` are optional. Command-line flags override these
+defaults for one run.
+
+`fleet status --json` and `fleet doctor --json` are safe-by-default summaries. They include logical
+host IDs, health booleans, aggregate agent and permission counts, and generic issue categories. They
+do not include endpoints, code roots, workspace IDs, agent IDs, task titles, permission arguments, or
+raw transport/provider errors. There is no detailed diagnostic mode; use the existing single-daemon
+CLI inspection commands against a deliberately selected host when private diagnostics are required.
+
 Desktop integrations can focus an existing agent without creating one or
 sending a message. Use `paseo://h/<server-id>/agent/<agent-id>`, or run
 `paseo agent open <agent-id>`. The CLI reads the local daemon's server ID by

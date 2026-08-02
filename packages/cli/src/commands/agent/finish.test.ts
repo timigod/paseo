@@ -19,10 +19,13 @@ function installClient(overrides: Record<string, unknown> = {}) {
       .fn()
       .mockResolvedValueOnce({ agent })
       .mockResolvedValue({ agent: archivedAgent }),
-    fetchAgents: vi.fn().mockResolvedValue({ entries: [{ agent }] }),
+    fetchAgents: vi.fn().mockResolvedValue({
+      entries: [{ agent }],
+      pageInfo: { nextCursor: null, hasMore: false },
+    }),
     fetchWorkspaces: vi.fn().mockResolvedValue({
       entries: [],
-      pageInfo: { nextCursor: null },
+      pageInfo: { nextCursor: null, hasMore: false },
     }),
     getPaseoWorktreeList: vi.fn().mockResolvedValue({
       worktrees: [{ worktreePath: "/repo/.paseo/worktrees/task-a", branchName: "task-a" }],
@@ -60,6 +63,7 @@ describe("runFinishCommand", () => {
     });
     expect(client.fetchWorkspaces).toHaveBeenCalledWith({
       filter: { query: "workspace-1" },
+      sort: [{ key: "project_id", direction: "asc" }],
       page: { limit: 200 },
     });
   });
@@ -83,12 +87,60 @@ describe("runFinishCommand", () => {
     expect(client.archivePaseoWorktree).not.toHaveBeenCalled();
   });
 
+  it("keeps a worktree when another active workspace shares it without an agent", async () => {
+    const { connectToDaemon } = await import("../../utils/client.js");
+    const firstPage = Array.from({ length: 200 }, (_, index) => ({
+      id: index === 0 ? "workspace-1" : `workspace-${index + 1}`,
+      workspaceDirectory:
+        index === 0 ? "/repo/.paseo/worktrees/task-a/src" : `/other/workspace-${index + 1}`,
+    }));
+    const fetchWorkspaces = vi
+      .fn()
+      .mockImplementation(({ page }: { page: { cursor?: string } }) => {
+        if (page.cursor === "page-2") {
+          return Promise.resolve({
+            entries: [
+              {
+                id: "workspace-shared",
+                workspaceDirectory: "/repo/.paseo/worktrees/task-a/other",
+              },
+            ],
+            pageInfo: { nextCursor: null, hasMore: false },
+          });
+        }
+        return Promise.resolve({
+          entries: firstPage,
+          pageInfo: { nextCursor: "page-2", hasMore: true },
+        });
+      });
+    const client = installClient({ fetchWorkspaces });
+    vi.mocked(connectToDaemon).mockResolvedValue(client as never);
+
+    const result = await runFinishCommand("agent-1", {}, {} as never);
+
+    expect(result.data).toMatchObject({
+      status: "finished",
+      agent: "archived",
+      workspace: "kept",
+      worktree: "not-paseo-owned",
+    });
+    expect(fetchWorkspaces).toHaveBeenNthCalledWith(1, {
+      sort: [{ key: "project_id", direction: "asc" }],
+      page: { limit: 200 },
+    });
+    expect(fetchWorkspaces).toHaveBeenNthCalledWith(2, {
+      sort: [{ key: "project_id", direction: "asc" }],
+      page: { limit: 200, cursor: "page-2" },
+    });
+    expect(client.archivePaseoWorktree).not.toHaveBeenCalled();
+  });
+
   it("reports a residual workspace instead of claiming finish succeeded", async () => {
     const { connectToDaemon } = await import("../../utils/client.js");
     const client = installClient({
       fetchWorkspaces: vi.fn().mockResolvedValue({
         entries: [{ id: "workspace-1" }],
-        pageInfo: { nextCursor: null },
+        pageInfo: { nextCursor: null, hasMore: false },
       }),
     });
     vi.mocked(connectToDaemon).mockResolvedValue(client as never);
