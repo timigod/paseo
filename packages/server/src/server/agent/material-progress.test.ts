@@ -3,6 +3,8 @@ import type { AgentTimelineItem } from "./agent-sdk-types.js";
 import type { AgentTimelineRow } from "./agent-timeline-store-types.js";
 import {
   advanceMaterialProgressCheckpoint,
+  boundMaterialProgressCheckpoint,
+  MaterialProgressCheckpointSchema,
   materialProgressPayload,
   openMaterialProgressContinuation,
   restoreMaterialProgressCheckpoint,
@@ -169,6 +171,11 @@ describe("material progress checkpoint", () => {
     ["jest", "npx jest", "Test Suites: 1 failed, 2 passed, 3 total"],
     ["npm", "npm test", "npm error Lifecycle script `test` failed with error:"],
     ["typecheck", "npm run typecheck", "src/main.ts(1,1): error TS2322: Type mismatch"],
+    [
+      "mixed-typecheck",
+      "npm run typecheck",
+      "\u001b[33mFound 1 warning and \u001b[31m1 error.\u001b[0m",
+    ],
     ["lint", "npm run lint", "2 problems (2 errors, 0 warnings)"],
     ["build", "npm run build", "Build failed with 1 error:"],
     ["standard-fail", "npm test", "FAIL src/main.test.ts"],
@@ -495,5 +502,156 @@ describe("material progress checkpoint", () => {
     expect(restored.seenMaterialProgressFingerprints).toHaveLength(256);
     expect(restored.seenMaterialProgressFingerprints[0]).toBe("write:legacy-44");
     expect(restored.seenMaterialProgressFingerprints.at(-1)).toBe("write:legacy-299");
+  });
+
+  it("rotates bounded fingerprint Bloom generations without re-admitting old replays", () => {
+    let checkpoint = acceptedCheckpoint();
+    for (let seq = 1; seq <= 257; seq += 1) {
+      checkpoint = advanceMaterialProgressCheckpoint(
+        checkpoint,
+        row(seq, {
+          type: "tool_call",
+          callId: `write-for-rotation-${seq}`,
+          name: "write",
+          status: "completed",
+          error: null,
+          detail: { type: "write", filePath: "proof.txt", content: `proof-${seq}` },
+        }),
+        "epoch-1",
+      );
+    }
+
+    const rotationReadyBloom = Buffer.from(
+      checkpoint.seenMaterialProgressFingerprintBloom!,
+      "base64",
+    );
+    rotationReadyBloom.fill(0xff, 0, 1_434);
+    checkpoint = boundMaterialProgressCheckpoint({
+      ...checkpoint,
+      seenMaterialProgressFingerprintBloom: rotationReadyBloom.toString("base64"),
+    });
+
+    expect(checkpoint.seenMaterialProgressFingerprintBloomArchive).toHaveLength(1);
+    expect(
+      Buffer.from(checkpoint.seenMaterialProgressFingerprintBloom!, "base64").every(Boolean),
+    ).toBe(false);
+
+    checkpoint = restoreMaterialProgressCheckpoint(checkpoint, {
+      timelineEpoch: "epoch-1",
+      nextSeq: 258,
+    });
+    checkpoint = advanceMaterialProgressCheckpoint(
+      checkpoint,
+      row(258, { type: "compaction", status: "completed" }),
+      "epoch-1",
+    );
+    checkpoint = advanceMaterialProgressCheckpoint(
+      checkpoint,
+      row(259, {
+        type: "tool_call",
+        callId: "write-old-evicted-replay",
+        name: "write",
+        status: "completed",
+        error: null,
+        detail: { type: "write", filePath: "proof.txt", content: "proof-1" },
+      }),
+      "epoch-1",
+    );
+    expect(materialProgressPayload(checkpoint)).toMatchObject({
+      state: "warning",
+      completedCompactionsSinceMaterialProgress: 1,
+    });
+
+    const oldestGeneration = checkpoint.seenMaterialProgressFingerprintBloomArchive![0];
+    for (let generation = 0; generation < 4; generation += 1) {
+      checkpoint = boundMaterialProgressCheckpoint({
+        ...checkpoint,
+        seenMaterialProgressFingerprintBloom: rotationReadyBloom.toString("base64"),
+      });
+    }
+    expect(checkpoint.seenMaterialProgressFingerprintBloomArchive).toHaveLength(3);
+    expect(checkpoint.seenMaterialProgressFingerprintBloomArchive![0]).toBe(oldestGeneration);
+  });
+
+  it("fails closed when a persisted fingerprint Bloom filter is saturated", () => {
+    const saturatedBloom = Buffer.alloc(4096, 0xff).toString("base64");
+    const restored = restoreMaterialProgressCheckpoint(
+      {
+        ...acceptedCheckpoint(),
+        seenMaterialProgressFingerprints: ["write:recent"],
+        seenMaterialProgressFingerprintBloom: saturatedBloom,
+      },
+      { timelineEpoch: "epoch-1", nextSeq: 1 },
+    );
+
+    expect(materialProgressPayload(restored)).toMatchObject({
+      state: "none",
+      continuationBoundarySeq: null,
+      lastMaterialProgressKind: null,
+    });
+    expect(materialProgressPayload(restored).reason).toMatch(/fingerprint history.*saturated/i);
+
+    const afterReplay = advanceMaterialProgressCheckpoint(
+      restored,
+      row(1, {
+        type: "tool_call",
+        callId: "write-after-saturation",
+        name: "write",
+        status: "completed",
+        error: null,
+        detail: { type: "write", filePath: "proof.txt", content: "new proof" },
+      }),
+      "epoch-1",
+    );
+    expect(materialProgressPayload(afterReplay)).toMatchObject({
+      state: "none",
+      continuationBoundarySeq: null,
+      lastMaterialProgressKind: null,
+    });
+
+    const nextContinuation = openMaterialProgressContinuation({
+      timelineEpoch: "epoch-1",
+      boundarySeq: 2,
+      turnId: "turn-2",
+    });
+    const recovered = advanceMaterialProgressCheckpoint(
+      nextContinuation,
+      {
+        ...row(2, {
+          type: "tool_call",
+          callId: "write-after-new-continuation",
+          name: "write",
+          status: "completed",
+          error: null,
+          detail: { type: "write", filePath: "proof.txt", content: "new proof" },
+        }),
+        turnId: "turn-2",
+      },
+      "epoch-1",
+    );
+    expect(materialProgressPayload(recovered)).toMatchObject({
+      state: "progressing",
+      continuationBoundarySeq: 2,
+      lastMaterialProgressKind: "write",
+    });
+  });
+
+  it("fails closed when a length-valid persisted Bloom encoding is malformed", () => {
+    const malformedBloom = "!".repeat(Buffer.alloc(4096).toString("base64").length);
+    const parsed = MaterialProgressCheckpointSchema.parse({
+      ...acceptedCheckpoint(),
+      seenMaterialProgressFingerprintBloom: malformedBloom,
+    });
+    const restored = restoreMaterialProgressCheckpoint(parsed, {
+      timelineEpoch: "epoch-1",
+      nextSeq: 1,
+    });
+
+    expect(materialProgressPayload(restored)).toMatchObject({
+      state: "none",
+      continuationBoundarySeq: null,
+      lastMaterialProgressKind: null,
+    });
+    expect(materialProgressPayload(restored).reason).toMatch(/fingerprint history.*invalid/i);
   });
 });

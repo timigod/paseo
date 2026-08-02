@@ -1221,6 +1221,36 @@ function buildOpenCodeReplayTimelineEvents(
   return events;
 }
 
+function findCurrentOpenCodeAssistantMessageId(
+  messages: OpenCodeSessionMessage[],
+  userMessageId: string,
+): string | undefined {
+  let current: { id: string; created: number } | undefined;
+  let latestGenerationIsAmbiguous = false;
+  for (const message of messages) {
+    const { info } = message;
+    const created = info.time?.created;
+    if (
+      info.role !== "assistant" ||
+      info.parentID !== userMessageId ||
+      typeof created !== "number" ||
+      info.time?.completed !== undefined ||
+      info.error !== undefined ||
+      info.finish !== undefined ||
+      isOpenCodeCompactionSummaryMessage(info)
+    ) {
+      continue;
+    }
+    if (!current || created > current.created) {
+      current = { id: info.id, created };
+      latestGenerationIsAmbiguous = false;
+    } else if (created === current.created && info.id !== current.id) {
+      latestGenerationIsAmbiguous = true;
+    }
+  }
+  return latestGenerationIsAmbiguous ? undefined : current?.id;
+}
+
 export const __openCodeInternals = {
   buildOpenCodePromptParts,
   buildOpenCodeSessionTimeline,
@@ -4030,11 +4060,7 @@ class OpenCodeAgentSession implements AgentSession {
       this.turnState.status === "running" &&
       this.turnState.turnId === activeTurn.turnId &&
       this.turnState.userMessageId === activeTurn.userMessageId
-        ? messages.findLast(
-            (message) =>
-              message.info.role === "assistant" &&
-              message.info.parentID === activeTurn.userMessageId,
-          )?.info.id
+        ? findCurrentOpenCodeAssistantMessageId(messages, activeTurn.userMessageId)
         : undefined;
     for (const message of messages) {
       for (const event of buildOpenCodeReplayTimelineEvents(message)) {

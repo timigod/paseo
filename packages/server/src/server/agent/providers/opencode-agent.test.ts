@@ -1719,8 +1719,8 @@ describe("OpenCode adapter startTurn error handling", () => {
     ]);
   });
 
-  test.each(["foreground-first", "foreground-last"] as const)(
-    "streamHistory attributes only the correlated in-progress assistant when it is %s",
+  test.each(["chronological", "reversed"] as const)(
+    "streamHistory attributes only the current correlated assistant when history is %s",
     async (order) => {
       const openCode = new TestOpenCodeClient();
       openCode.sessionPromptAsyncEvents = [];
@@ -1766,6 +1766,69 @@ describe("OpenCode adapter startTurn error handling", () => {
             },
           ],
         };
+        const supersededAssistant = {
+          info: {
+            ...foregroundAssistant.info,
+            id: "msg_superseded_assistant_running",
+            time: { created: 1778762475883 },
+          },
+          parts: [
+            {
+              ...foregroundAssistant.parts[0],
+              id: "part_superseded_apply_patch_running",
+              messageID: "msg_superseded_assistant_running",
+              callID: "call_superseded_apply_patch_running",
+            },
+          ],
+        };
+        const staleCompletedAssistant = {
+          info: {
+            ...foregroundAssistant.info,
+            id: "msg_stale_assistant_completed",
+            time: { created: 1778762475882, completed: 1778762475883 },
+          },
+          parts: [
+            {
+              ...foregroundAssistant.parts[0],
+              id: "part_stale_apply_patch_completed",
+              messageID: "msg_stale_assistant_completed",
+              callID: "call_stale_apply_patch_completed",
+            },
+          ],
+        };
+        const compactionSummary = {
+          info: {
+            ...foregroundAssistant.info,
+            id: "msg_compaction_summary_running",
+            time: { created: 1778762475886 },
+            summary: true,
+            mode: "compaction",
+            agent: "compaction",
+          },
+          parts: [
+            {
+              ...foregroundAssistant.parts[0],
+              id: "part_compaction_summary_running",
+              messageID: "msg_compaction_summary_running",
+              callID: "call_compaction_summary_running",
+            },
+          ],
+        };
+        const undatedAssistant = {
+          info: {
+            ...foregroundAssistant.info,
+            id: "msg_undated_assistant_running",
+            time: undefined,
+          },
+          parts: [
+            {
+              ...foregroundAssistant.parts[0],
+              id: "part_undated_apply_patch_running",
+              messageID: "msg_undated_assistant_running",
+              callID: "call_undated_apply_patch_running",
+            },
+          ],
+        };
         const unrelatedAssistant = {
           info: {
             id: "msg_unrelated_assistant_running",
@@ -1793,11 +1856,16 @@ describe("OpenCode adapter startTurn error handling", () => {
             },
           ],
         };
+        const messages = [
+          staleCompletedAssistant,
+          supersededAssistant,
+          foregroundAssistant,
+          compactionSummary,
+          undatedAssistant,
+          unrelatedAssistant,
+        ];
         openCode.sessionMessagesResponse = {
-          data:
-            order === "foreground-first"
-              ? [foregroundAssistant, unrelatedAssistant]
-              : [unrelatedAssistant, foregroundAssistant],
+          data: order === "chronological" ? messages : messages.toReversed(),
         };
         const history: AgentStreamEvent[] = [];
         for await (const event of session.streamHistory()) {
@@ -1818,6 +1886,9 @@ describe("OpenCode adapter startTurn error handling", () => {
         const toolsByCallId = Object.fromEntries(tools.map((tool) => [tool.callId, tool]));
         expect(toolsByCallId).toMatchObject({
           call_foreground_apply_patch_running: { detailType: "edit", turnId },
+          call_superseded_apply_patch_running: { detailType: "edit", turnId: undefined },
+          call_stale_apply_patch_completed: { detailType: "edit", turnId: undefined },
+          call_undated_apply_patch_running: { detailType: "edit", turnId: undefined },
           call_unrelated_apply_patch_running: { detailType: "edit", turnId: undefined },
         });
       } finally {

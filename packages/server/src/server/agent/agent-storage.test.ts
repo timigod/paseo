@@ -218,6 +218,8 @@ describe("AgentStorage", () => {
   });
 
   test("applySnapshot stores and reloads the epoch-bound material progress checkpoint", async () => {
+    const archivedBloom = Buffer.alloc(4096);
+    archivedBloom[0] = 1;
     const checkpoint = {
       ...createMaterialProgressCheckpoint({ timelineEpoch: "epoch-persisted", nextSeq: 1 }),
       continuationBoundarySeq: 1,
@@ -227,6 +229,8 @@ describe("AgentStorage", () => {
       lastMaterialProgressAt: "2026-08-01T00:00:03.000Z",
       lastMaterialProgressKind: "write" as const,
       seenMaterialProgressFingerprints: ["write:proof"],
+      seenMaterialProgressFingerprintBloom: Buffer.alloc(4096).toString("base64"),
+      seenMaterialProgressFingerprintBloomArchive: [archivedBloom.toString("base64")],
     };
 
     await storage.applySnapshot(
@@ -256,6 +260,30 @@ describe("AgentStorage", () => {
     expect(persisted?.seenMaterialProgressFingerprints[0]).toBe("write:proof-44");
     expect(persisted?.seenMaterialProgressFingerprints.at(-1)).toBe("write:proof-299");
     expect(persisted?.seenMaterialProgressFingerprintBloom).toEqual(expect.any(String));
+  });
+
+  test("applySnapshot persists saturated material progress fingerprint history fail-closed", async () => {
+    const checkpoint = {
+      ...createMaterialProgressCheckpoint({ timelineEpoch: "epoch-saturated", nextSeq: 1 }),
+      continuationBoundarySeq: 1,
+      acceptedTurnId: "turn-saturated",
+      seenMaterialProgressFingerprintBloom: Buffer.alloc(4096, 0xff).toString("base64"),
+    };
+
+    await storage.applySnapshot(
+      createManagedAgent({ id: "agent-saturated-progress", materialProgress: checkpoint }),
+    );
+
+    const reloaded = new AgentStorage(storagePath, logger);
+    const persisted = (await reloaded.get("agent-saturated-progress"))?.materialProgress;
+    expect(persisted).toMatchObject({
+      timelineEpoch: "epoch-saturated",
+      continuationBoundarySeq: null,
+      acceptedTurnId: null,
+      seenMaterialProgressFingerprints: [],
+    });
+    expect(persisted?.seenMaterialProgressFingerprintBloom).toBeUndefined();
+    expect(persisted?.unavailableReason).toMatch(/fingerprint history.*saturated/i);
   });
 
   test("applySnapshot keeps featureValues absent when they were never set", async () => {
