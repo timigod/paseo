@@ -501,7 +501,7 @@ export async function handlePaseoWorktreeArchiveRequest(
     emitWorkspaceUpdatesForWorkspaceIds: (workspaceIds: Iterable<string>) => Promise<void>;
   },
   msg: Extract<SessionInboundMessage, { type: "paseo_worktree_archive_request" }>,
-  caller?: ArchiveCallerContext,
+  caller: ArchiveCallerContext,
 ): Promise<void> {
   const { requestId } = msg;
 

@@ -586,6 +586,7 @@ describe("archiveIfSafe", () => {
       {
         scope: { kind: "workspace", workspaceId: "ws-auto-archive" },
         requestId: "auto-archive-on-merge",
+        caller: expect.objectContaining({ kind: "coordinator" }),
       },
     );
     expect(harness.log.info).toHaveBeenCalledWith(

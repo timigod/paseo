@@ -141,7 +141,7 @@ export interface ProjectRegistry {
   }): Promise<PersistedProjectRecord>;
   upsert(record: PersistedProjectRecord): Promise<void>;
   archive(projectId: string, archivedAt: string): Promise<void>;
-  remove(projectId: string): Promise<void>;
+  remove(projectId: string, options: RegistryArchiveOptions): Promise<void>;
   /** Central lifecycle seam for daemon-global project observers. */
   subscribeToMutations?(listener: (mutation: ProjectMutation) => void | Promise<void>): () => void;
 }
@@ -157,7 +157,7 @@ export interface WorkspaceRegistry {
   ): Promise<PersistedWorkspaceRecord | null>;
   upsert(record: PersistedWorkspaceRecord, context?: WorkspaceMutationContext): Promise<void>;
   archive(workspaceId: string, archivedAt: string, options?: RegistryArchiveOptions): Promise<void>;
-  remove(workspaceId: string): Promise<void>;
+  remove(workspaceId: string, options?: RegistryArchiveOptions): Promise<void>;
   /** Central lifecycle seam for daemon-global workspace observers. */
   subscribeToMutations?(
     listener: (mutation: WorkspaceMutation) => void | Promise<void>,
@@ -246,7 +246,7 @@ class FileBackedRegistry<TRecord extends RegistryRecord> {
     const existing = this.cache.get(id);
     if (!existing) return null;
     await options?.recheck?.();
-    return this.persistArchive(existing, archivedAt, options);
+    return this.persistArchive(id, archivedAt, options);
   }
 
   protected async archiveIfActive(id: string, archivedAt: string): Promise<TRecord | null> {
@@ -255,45 +255,60 @@ class FileBackedRegistry<TRecord extends RegistryRecord> {
     if (!existing || existing.archivedAt) {
       return null;
     }
-    return this.persistArchive(existing, archivedAt);
+    return this.persistArchive(id, archivedAt, undefined, { onlyIfActive: true });
   }
 
   private async persistArchive(
-    existing: TRecord,
+    id: string,
     archivedAt: string,
     options?: RegistryArchiveOptions,
-  ): Promise<TRecord> {
-    const next = this.schema.parse({
-      ...existing,
-      updatedAt: archivedAt,
-      archivedAt,
-    });
-    const id = this.getId(next);
-    this.cache.set(id, next);
-    try {
-      await this.enqueuePersist(options?.recheck);
-    } catch (error) {
-      if (this.cache.get(id) === next) {
-        this.cache.set(id, existing);
+    behavior?: { onlyIfActive?: boolean },
+  ): Promise<TRecord | null> {
+    return this.enqueueOperation(async () => {
+      const current = this.cache.get(id);
+      if (!current || (behavior?.onlyIfActive && current.archivedAt)) {
+        return null;
       }
-      throw error;
-    }
-    return next;
+      await options?.recheck?.();
+      const next = this.schema.parse({
+        ...current,
+        updatedAt: archivedAt,
+        archivedAt,
+      });
+      const records = Array.from(this.cache.values(), (record) =>
+        this.getId(record) === id ? next : record,
+      );
+      await this.persistRecords(records, options?.recheck);
+      this.cache.set(id, next);
+      return next;
+    });
   }
 
-  async remove(id: string): Promise<void> {
-    await this.removeIfPresent(id);
+  async remove(id: string, options?: RegistryArchiveOptions): Promise<void> {
+    await this.removeIfPresent(id, options);
   }
 
-  protected async removeIfPresent(id: string): Promise<TRecord | null> {
+  protected async removeIfPresent(
+    id: string,
+    options?: RegistryArchiveOptions,
+  ): Promise<TRecord | null> {
     await this.load();
     const existing = this.cache.get(id);
     if (!existing) {
       return null;
     }
-    this.cache.delete(id);
-    await this.enqueuePersist();
-    return existing;
+    await options?.recheck?.();
+    return this.enqueueOperation(async () => {
+      const current = this.cache.get(id);
+      if (!current) {
+        return null;
+      }
+      await options?.recheck?.();
+      const records = Array.from(this.cache.values()).filter((record) => this.getId(record) !== id);
+      await this.persistRecords(records, options?.recheck);
+      this.cache.delete(id);
+      return current;
+    });
   }
 
   private async load(): Promise<void> {
@@ -319,13 +334,27 @@ class FileBackedRegistry<TRecord extends RegistryRecord> {
 
   private async persist(recheck?: () => void | Promise<void>): Promise<void> {
     const records = Array.from(this.cache.values());
+    await this.persistRecords(records, recheck);
+  }
+
+  private async persistRecords(
+    records: readonly TRecord[],
+    recheck?: () => void | Promise<void>,
+  ): Promise<void> {
     await writeJsonFileAtomic(this.filePath, records, { beforeCommit: recheck });
   }
 
+  private async enqueueOperation<TResult>(operation: () => Promise<TResult>): Promise<TResult> {
+    const nextOperation = this.persistQueue.then(operation);
+    this.persistQueue = nextOperation.then(
+      () => undefined,
+      () => undefined,
+    );
+    return nextOperation;
+  }
+
   private async enqueuePersist(recheck?: () => void | Promise<void>): Promise<void> {
-    const nextPersist = this.persistQueue.then(() => this.persist(recheck));
-    this.persistQueue = nextPersist.catch(() => {});
-    await nextPersist;
+    await this.enqueueOperation(() => this.persist(recheck));
   }
 }
 
@@ -430,8 +459,12 @@ export class FileBackedProjectRegistry
     await this.notifyMutation({ kind: "archive", projectId, project });
   }
 
-  override async remove(projectId: string): Promise<void> {
-    const project = await this.removeIfPresent(projectId);
+  override async remove(projectId: string, options: RegistryArchiveOptions): Promise<void> {
+    const recheck = options?.recheck;
+    if (typeof recheck !== "function") {
+      throw new Error("Project removal requires a commit-time authority recheck");
+    }
+    const project = await this.removeIfPresent(projectId, { recheck });
     if (!project) return;
     await this.notifyMutation({ kind: "remove", projectId, project: null });
   }
@@ -504,8 +537,8 @@ export class FileBackedWorkspaceRegistry
     await this.notifyMutation({ kind: "archive", workspaceId, workspace });
   }
 
-  override async remove(workspaceId: string): Promise<void> {
-    const workspace = await this.removeIfPresent(workspaceId);
+  override async remove(workspaceId: string, options?: RegistryArchiveOptions): Promise<void> {
+    const workspace = await this.removeIfPresent(workspaceId, options);
     if (!workspace) return;
     await this.notifyMutation({ kind: "remove", workspaceId, workspace: null });
   }

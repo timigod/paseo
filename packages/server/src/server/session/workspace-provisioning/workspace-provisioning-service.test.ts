@@ -610,7 +610,7 @@ test.each(["missing", "archived"] as const)(
     if (state === "archived") {
       await projectRegistry.archive(workspace.projectId, ARCHIVED_AT);
     } else {
-      await projectRegistry.remove(workspace.projectId);
+      await projectRegistry.remove(workspace.projectId, { recheck: () => undefined });
     }
     let imported = false;
 

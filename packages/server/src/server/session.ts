@@ -100,9 +100,13 @@ import {
   detachAgentCommand,
   setAgentModeCommand,
   updateAgentCommand,
+  resolveAgentArchiveCascadeTarget,
 } from "./agent/lifecycle-command.js";
 import {
+  agentCheckoutIsWithinTarget,
+  assertDestructiveActionAuthorized,
   createCoordinatorDestructiveCaller,
+  createUncertainDestructiveCaller,
   DestructiveActionAuthorizationError,
   type DestructiveActionRecheck,
   type DestructiveCallerContext,
@@ -1009,6 +1013,7 @@ export class Session {
     this.terminalManager = terminalManager;
     this.terminalController = new TerminalSessionController({
       terminalManager,
+      agentAuthority: this.agentManager,
       emit: (msg) => this.emit(msg),
       emitBinary: (frame) => this.emitBinary(frame),
       hasBinaryChannel: () => this.onBinaryMessage !== null,
@@ -1044,6 +1049,7 @@ export class Session {
       serviceProxy: this.serviceProxy,
       scriptRuntimeStore: this.scriptRuntimeStore,
       terminalManager: this.terminalManager,
+      agentAuthority: this.agentManager,
       workspaceRegistry: this.workspaceRegistry,
       projectRegistry: this.projectRegistry,
       workspaceGitService: this.workspaceGitService,
@@ -1954,7 +1960,7 @@ export class Session {
       this.dispatchWorkspaceAndProjectMessage(msg, source) ??
       this.dispatchWorkspaceFileMessage(msg, source) ??
       this.dispatchProviderMessage(msg) ??
-      this.dispatchTerminalMessage(msg) ??
+      this.dispatchTerminalMessage(msg, source) ??
       this.dispatchChatScheduleLoopMessage(msg) ??
       this.dispatchMiscMessage(msg);
     if (promise) await promise;
@@ -2264,7 +2270,7 @@ export class Session {
       case "archive_workspace_request":
         return this.handleArchiveWorkspaceRequest(msg, source);
       case "project.remove.request":
-        return this.handleProjectRemoveRequest(msg);
+        return this.handleProjectRemoveRequest(msg, source);
       case "workspace.create.request":
         return this.handleWorkspaceCreateRequest(msg);
       case "workspace.clear_attention.request":
@@ -2338,7 +2344,10 @@ export class Session {
     }
   }
 
-  private dispatchTerminalMessage(msg: SessionInboundMessage): Promise<void> | undefined {
+  private dispatchTerminalMessage(
+    msg: SessionInboundMessage,
+    source?: object,
+  ): Promise<void> | undefined {
     switch (msg.type) {
       case "start_workspace_script_request":
         return this.handleStartWorkspaceScriptRequest(msg);
@@ -2347,9 +2356,9 @@ export class Session {
       case "workspace.script.start.request":
         return this.handleWorkspaceScriptStartRequest(msg);
       case "workspace.script.stop.request":
-        return this.handleWorkspaceScriptStopRequest(msg);
+        return this.handleWorkspaceScriptStopRequest(msg, source);
       default:
-        return this.terminalController.dispatch(msg);
+        return this.terminalController.dispatch(msg, this.getDestructiveCaller(source));
     }
   }
 
@@ -2601,7 +2610,7 @@ export class Session {
 
   private async archiveAgentForClose(
     agentId: string,
-    caller?: DestructiveCallerContext,
+    caller: DestructiveCallerContext,
     action: "agent.archive" | "agent.finish" = "agent.archive",
   ): Promise<{ agentId: string; archivedAt: string }> {
     const { archivedAt, record: archivedRecord } = await archiveAgentCommand(
@@ -2721,7 +2730,7 @@ export class Session {
     for (const terminalId of msg.terminalIds) {
       try {
         await authorize();
-        terminals.push(this.terminalController.killTerminalForClose(terminalId));
+        terminals.push(await this.terminalController.killTerminalForClose(terminalId, authorize));
       } catch (error) {
         if (error instanceof DestructiveActionAuthorizationError) {
           throw error;
@@ -2941,22 +2950,75 @@ export class Session {
 
   private async handleProjectRemoveRequest(
     request: Extract<SessionInboundMessage, { type: "project.remove.request" }>,
+    source?: object,
   ): Promise<void> {
     const { projectId, requestId } = request;
+    const caller = this.getDestructiveCaller(source);
     this.sessionLogger.info({ projectId, requestId }, "session: project.remove.request");
 
     try {
-      const project = await this.projectRegistry.get(projectId);
-      const resolvedProjectId = project?.projectId ?? projectId;
-      const projectWorkspaces = (await this.workspaceRegistry.list()).filter(
-        (workspace) => workspace.projectId === resolvedProjectId,
-      );
+      const authorizeRemoval = async () => {
+        const project = await this.projectRegistry.get(projectId);
+        const resolvedProjectId = project?.projectId ?? projectId;
+        const projectWorkspaces = (await this.workspaceRegistry.list()).filter(
+          (workspace) => workspace.projectId === resolvedProjectId,
+        );
+        const projectWorkspaceIds = projectWorkspaces.map((workspace) => workspace.workspaceId);
+        const targetPaths = Array.from(
+          new Set([
+            ...(project?.rootPath ? [project.rootPath] : []),
+            ...projectWorkspaces.map((workspace) => workspace.cwd),
+          ]),
+        );
+        const liveAgents = this.agentManager.listAgents();
+        const storedRecords = await this.agentStorage.list();
+        const directAgentIds = [
+          ...liveAgents
+            .filter(
+              (agent) =>
+                (agent.workspaceId && projectWorkspaceIds.includes(agent.workspaceId)) ||
+                agentCheckoutIsWithinTarget(agent, targetPaths),
+            )
+            .map((agent) => agent.id),
+          ...storedRecords
+            .filter(
+              (record) =>
+                !record.archivedAt &&
+                ((record.workspaceId && projectWorkspaceIds.includes(record.workspaceId)) ||
+                  agentCheckoutIsWithinTarget(record, targetPaths)),
+            )
+            .map((record) => record.id),
+        ];
+        const cascadePlan = await resolveAgentArchiveCascadeTarget(
+          { agentManager: this.agentManager, agentStorage: this.agentStorage },
+          directAgentIds,
+        );
+        assertDestructiveActionAuthorized(this.agentManager, caller, {
+          action: "project.remove",
+          targetAgentIds: cascadePlan.targetAgentIds,
+          targetWorkspaceIds: Array.from(
+            new Set([...projectWorkspaceIds, ...cascadePlan.targetWorkspaceIds]),
+          ),
+          targetPaths,
+          hasLiveTarget:
+            project !== null ||
+            projectWorkspaces.length > 0 ||
+            cascadePlan.targetAgentIds.length > 0,
+        });
+        return { project, resolvedProjectId, projectWorkspaces };
+      };
+      const authorizedTarget = await authorizeRemoval();
+      const recheck: DestructiveActionRecheck = async () => {
+        await authorizeRemoval();
+      };
+      const { resolvedProjectId, projectWorkspaces } = authorizedTarget;
       const workspaceIdsToArchive = projectWorkspaces
         .filter((workspace) => !workspace.archivedAt || workspace.cleanupPending)
         .map((workspace) => workspace.workspaceId);
 
       const removedWorkspaceIds: string[] = [];
       for (const workspaceId of workspaceIdsToArchive) {
+        await recheck();
         const archiveResult = await archiveByScope(
           {
             paseoHome: this.paseoHome,
@@ -2967,27 +3029,30 @@ export class Session {
             agentStorage: this.agentStorage,
             findWorkspaceIdForCwd: (cwd) => this.findWorkspaceIdForCwd(cwd),
             listActiveWorkspaces: () => this.listActiveWorkspaceRefs(),
-            archiveWorkspaceRecord: (id) => this.archiveWorkspaceRecord(id),
+            archiveWorkspaceRecord: (id, archiveRecheck) =>
+              this.archiveWorkspaceRecord(id, undefined, archiveRecheck),
             workspaceRegistry: this.workspaceRegistry,
             emitWorkspaceUpdatesForWorkspaceIds: (workspaceIds) =>
               this.emitWorkspaceUpdatesForWorkspaceIds(workspaceIds),
             markWorkspaceArchiving: (workspaceIds, archivingAt) =>
               this.markWorkspaceArchiving(workspaceIds, archivingAt),
             clearWorkspaceArchiving: (workspaceIds) => this.clearWorkspaceArchiving(workspaceIds),
-            killTerminalsForWorkspace: (id) =>
-              this.terminalController.killTerminalsForWorkspace(id),
+            killTerminalsForWorkspace: (id, terminalRecheck) =>
+              this.terminalController.killTerminalsForWorkspace(id, terminalRecheck),
             sessionLogger: this.sessionLogger,
           },
           {
             scope: { kind: "workspace", workspaceId },
             requestId,
+            caller,
           },
         );
         requireArchiveCleanupComplete(archiveResult, "Project workspace archive");
         removedWorkspaceIds.push(workspaceId);
       }
 
-      await this.projectRegistry.remove(resolvedProjectId);
+      await recheck();
+      await this.projectRegistry.remove(resolvedProjectId, { recheck });
 
       const updateIds =
         removedWorkspaceIds.length > 0
@@ -6236,9 +6301,12 @@ export class Session {
 
   private async handleWorkspaceScriptStopRequest(
     request: WorkspaceScriptStopRequest,
+    source?: object,
   ): Promise<void> {
     try {
-      const script = await this.workspaceScripts.stop(request);
+      const script = await this.workspaceScripts.stop(request, {
+        caller: this.getDestructiveCaller(source),
+      });
       this.emit({
         type: "workspace.script.stop.response",
         payload: {
@@ -7308,7 +7376,9 @@ export class Session {
    * Emit a message to the client
    */
   private getDestructiveCaller(source?: object): DestructiveCallerContext {
-    return source ? this.resolveDestructiveCaller(source) : createCoordinatorDestructiveCaller();
+    return source
+      ? this.resolveDestructiveCaller(source)
+      : createUncertainDestructiveCaller("Destructive request source was unavailable");
   }
 
   private emit(msg: SessionOutboundMessage): void {

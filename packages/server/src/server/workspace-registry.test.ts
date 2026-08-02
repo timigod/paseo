@@ -48,6 +48,7 @@ describe("workspace registries", () => {
   let projectRegistry: FileBackedProjectRegistry;
   let workspaceRegistry: FileBackedWorkspaceRegistry;
   const logger = createTestLogger();
+  const allowProjectRemoval = { recheck: () => undefined };
 
   beforeEach(() => {
     tmpDir = mkdtempSync(path.join(os.tmpdir(), "workspace-registry-"));
@@ -94,7 +95,7 @@ describe("workspace registries", () => {
     expect(archived?.archivedAt).toBe("2026-03-03T00:00:00.000Z");
     expect(await projectRegistry.list()).toHaveLength(1);
 
-    await projectRegistry.remove("remote:github.com/acme/repo");
+    await projectRegistry.remove("remote:github.com/acme/repo", allowProjectRemoval);
     expect(await projectRegistry.get("remote:github.com/acme/repo")).toBeNull();
     expect(await projectRegistry.list()).toEqual([]);
   });
@@ -143,6 +144,56 @@ describe("workspace registries", () => {
     ).toBeUndefined();
   });
 
+  test("does not remove a project when authority is revoked before rename", async () => {
+    await projectRegistry.initialize();
+    const project = createPersistedProjectRecord({
+      projectId: "project-guarded-remove",
+      rootPath: "/tmp/project-guarded-remove",
+      kind: "git",
+      displayName: "guarded",
+      createdAt: "2026-03-01T00:00:00.000Z",
+      updatedAt: "2026-03-01T00:00:00.000Z",
+    });
+    await projectRegistry.upsert(project);
+    let recheckCount = 0;
+
+    await expect(
+      projectRegistry.remove(project.projectId, {
+        recheck: () => {
+          recheckCount += 1;
+          if (recheckCount === 3) {
+            throw new Error("project removal authority revoked before rename");
+          }
+        },
+      }),
+    ).rejects.toThrow("project removal authority revoked before rename");
+
+    expect(await projectRegistry.get(project.projectId)).toEqual(project);
+    const reloaded = new FileBackedProjectRegistry(
+      path.join(tmpDir, "projects", "projects.json"),
+      logger,
+    );
+    expect(await reloaded.get(project.projectId)).toEqual(project);
+  });
+
+  test("does not remove a project without an explicit commit-time recheck", async () => {
+    const project = createPersistedProjectRecord({
+      projectId: "project-missing-remove-authority",
+      rootPath: "/tmp/project-missing-remove-authority",
+      kind: "git",
+      displayName: "missing authority",
+      createdAt: "2026-03-01T00:00:00.000Z",
+      updatedAt: "2026-03-01T00:00:00.000Z",
+    });
+    await projectRegistry.upsert(project);
+
+    await expect(projectRegistry.remove(project.projectId, undefined as never)).rejects.toThrow(
+      "Project removal requires a commit-time authority recheck",
+    );
+
+    expect(await projectRegistry.get(project.projectId)).toEqual(project);
+  });
+
   test("publishes only project mutations that change the persisted lifecycle", async () => {
     await projectRegistry.initialize();
     const mutations: Array<{
@@ -171,9 +222,9 @@ describe("workspace registries", () => {
     await projectRegistry.archive(active.projectId, archived.archivedAt);
     await projectRegistry.archive(active.projectId, "2026-03-03T00:00:00.000Z");
     await projectRegistry.archive("project-unknown", "2026-03-03T00:00:00.000Z");
-    await projectRegistry.remove(active.projectId);
-    await projectRegistry.remove(active.projectId);
-    await projectRegistry.remove("project-unknown");
+    await projectRegistry.remove(active.projectId, allowProjectRemoval);
+    await projectRegistry.remove(active.projectId, allowProjectRemoval);
+    await projectRegistry.remove("project-unknown", allowProjectRemoval);
 
     expect(mutations).toEqual([
       { kind: "upsert", projectId: active.projectId, project: active },
@@ -496,6 +547,74 @@ describe("workspace registries", () => {
       logger,
     );
     expect((await reloaded.get("workspace-guarded"))?.archivedAt).toBeNull();
+  });
+
+  test("serializes a rejected guarded archive without leaking archivedAt into a queued update", async () => {
+    await workspaceRegistry.initialize();
+    await workspaceRegistry.upsert(
+      createPersistedWorkspaceRecord({
+        workspaceId: "workspace-concurrent-guard",
+        projectId: "project-one",
+        cwd: "/tmp/repo",
+        kind: "local_checkout",
+        displayName: "main",
+        createdAt: "2026-03-01T00:00:00.000Z",
+        updatedAt: "2026-03-01T00:00:00.000Z",
+      }),
+    );
+    let recheckCount = 0;
+    let markTemporaryWriteReached = () => {};
+    let releaseTemporaryWrite = () => {};
+    const temporaryWriteReached = new Promise<void>((resolve) => {
+      markTemporaryWriteReached = resolve;
+    });
+    const temporaryWriteReleased = new Promise<void>((resolve) => {
+      releaseTemporaryWrite = resolve;
+    });
+    const archive = workspaceRegistry.archive(
+      "workspace-concurrent-guard",
+      "2026-03-03T00:00:00.000Z",
+      {
+        recheck: async () => {
+          recheckCount += 1;
+          if (recheckCount === 4) {
+            markTemporaryWriteReached();
+            await temporaryWriteReleased;
+            throw new Error("workspace archive revoked after temporary write");
+          }
+        },
+      },
+    );
+
+    await temporaryWriteReached;
+    expect((await workspaceRegistry.get("workspace-concurrent-guard"))?.archivedAt).toBeNull();
+    const update = workspaceRegistry.update("workspace-concurrent-guard", (record) => ({
+      ...record,
+      title: "Concurrent update",
+      updatedAt: "2026-03-04T00:00:00.000Z",
+    }));
+    await expect
+      .poll(async () => (await workspaceRegistry.get("workspace-concurrent-guard"))?.title)
+      .toBe("Concurrent update");
+    releaseTemporaryWrite();
+
+    await expect(archive).rejects.toThrow("workspace archive revoked after temporary write");
+    await expect(update).resolves.toMatchObject({
+      title: "Concurrent update",
+      archivedAt: null,
+    });
+    expect(await workspaceRegistry.get("workspace-concurrent-guard")).toMatchObject({
+      title: "Concurrent update",
+      archivedAt: null,
+    });
+    const reloaded = new FileBackedWorkspaceRegistry(
+      path.join(tmpDir, "projects", "workspaces.json"),
+      logger,
+    );
+    expect(await reloaded.get("workspace-concurrent-guard")).toMatchObject({
+      title: "Concurrent update",
+      archivedAt: null,
+    });
   });
 
   test("composes concurrent workspace field updates without losing either change", async () => {

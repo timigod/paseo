@@ -26,6 +26,12 @@ import {
 } from "../../script-status-projection.js";
 import { deriveProjectServiceSlug, deriveProjectSlug } from "../../workspace-git-metadata.js";
 import type { PaseoServicePortAllocation } from "@getpaseo/protocol/paseo-config-schema";
+import type {
+  DestructiveCallerContext,
+  LiveAgentAuthority,
+} from "../../agent/destructive-action-authority.js";
+import { requireDestructiveCaller } from "../../agent/destructive-action-authority.js";
+import { killTerminalWithAuthority } from "../../terminal-kill.js";
 
 type WorkspaceScriptsPayload = WorkspaceDescriptorPayload["scripts"];
 
@@ -46,7 +52,10 @@ export interface WorkspaceScriptsService {
   emitStatusUpdate(workspaceId: string, workspaceDirectory: string): Promise<void>;
   list(workspaceId: string): Promise<WorkspaceScriptPayload[]>;
   launch(input: { workspaceId: string; scriptName: string }): Promise<WorkspaceScriptPayload>;
-  stop(input: { workspaceId: string; scriptName: string }): Promise<WorkspaceScriptPayload>;
+  stop(
+    input: { workspaceId: string; scriptName: string },
+    authority: { caller: DestructiveCallerContext; signal?: AbortSignal },
+  ): Promise<WorkspaceScriptPayload>;
   start(request: StartWorkspaceScriptRequest): Promise<void>;
 }
 
@@ -56,6 +65,7 @@ export function createWorkspaceScriptsService(deps: {
   serviceProxy: ServiceProxySubsystem | null;
   scriptRuntimeStore: WorkspaceScriptRuntimeStore | null;
   terminalManager: TerminalManager | null;
+  agentAuthority: LiveAgentAuthority;
   workspaceRegistry: Pick<WorkspaceRegistry, "get">;
   projectRegistry: Pick<ProjectRegistry, "get">;
   workspaceGitService: WorkspaceScriptsGitSource;
@@ -72,6 +82,7 @@ export function createWorkspaceScriptsService(deps: {
     serviceProxy,
     scriptRuntimeStore,
     terminalManager,
+    agentAuthority,
     workspaceRegistry,
     projectRegistry,
     workspaceGitService,
@@ -207,10 +218,17 @@ export function createWorkspaceScriptsService(deps: {
     return script;
   }
 
-  async function stop(input: {
-    workspaceId: string;
-    scriptName: string;
-  }): Promise<WorkspaceScriptPayload> {
+  async function stop(
+    input: {
+      workspaceId: string;
+      scriptName: string;
+    },
+    authority: {
+      caller: DestructiveCallerContext;
+      signal?: AbortSignal;
+    },
+  ): Promise<WorkspaceScriptPayload> {
+    const caller = requireDestructiveCaller(authority?.caller);
     const available = requireAvailable();
     const workspace = await getWorkspace(input.workspaceId);
     const project = await projectRegistry.get(workspace.projectId);
@@ -223,7 +241,15 @@ export function createWorkspaceScriptsService(deps: {
     }
 
     // The launcher's terminal exit listener owns route removal and runtime state updates.
-    await available.terminalManager.killTerminalAndWait(runtime.terminalId);
+    const killed = await killTerminalWithAuthority(
+      { agentAuthority, terminalManager: available.terminalManager },
+      runtime.terminalId,
+      caller,
+      { signal: authority.signal, wait: true },
+    );
+    if (!killed) {
+      throw new Error(`Terminal for script '${input.scriptName}' is no longer available`);
+    }
 
     const script = buildSnapshot(workspace, project).find(
       (entry) => entry.scriptName === input.scriptName,

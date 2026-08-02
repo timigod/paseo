@@ -5,6 +5,7 @@ import { dirname, resolve } from "node:path";
 import type { Logger } from "pino";
 
 import type { AgentManager } from "./agent/agent-manager.js";
+import type { AgentArchiveCascadePlan } from "./agent/agent-archive-cascade.js";
 import type { AgentStorage, StoredAgentRecord } from "./agent/agent-storage.js";
 import { resolveAgentArchiveCascadeTarget } from "./agent/lifecycle-command.js";
 import type { WorkspaceGitService } from "./workspace-git-service.js";
@@ -71,16 +72,13 @@ export interface ArchiveDependencies {
   // break a same-cwd tie in favor of the worktree-kind record when archiving by
   // path (no explicit workspaceId).
   listActiveWorkspaces: () => Promise<ActiveWorkspaceRef[]>;
-  archiveWorkspaceRecord: (
-    workspaceId: string,
-    recheck?: DestructiveActionRecheck,
-  ) => Promise<void>;
+  archiveWorkspaceRecord: (workspaceId: string, recheck: DestructiveActionRecheck) => Promise<void>;
   emitWorkspaceUpdatesForWorkspaceIds: (workspaceIds: Iterable<string>) => Promise<void>;
   markWorkspaceArchiving: (workspaceIds: Iterable<string>, archivingAt: string) => void;
   clearWorkspaceArchiving: (workspaceIds: Iterable<string>) => void;
   killTerminalsForWorkspace: (
     workspaceId: string,
-    recheck?: DestructiveActionRecheck,
+    recheck: DestructiveActionRecheck,
   ) => Promise<void>;
   workspaceRegistry?: Pick<WorkspaceRegistry, "get" | "list" | "update">;
   lifecycleCoordinator?: WorkspaceLifecycleCoordinator;
@@ -155,7 +153,7 @@ export interface ArchiveByScopeRequest {
   scope: ArchiveScope;
   requestId: string;
   signal?: AbortSignal;
-  caller?: ArchiveCallerContext;
+  caller: ArchiveCallerContext;
 }
 
 export interface PendingWorkspaceCleanupRetryRequest {
@@ -407,7 +405,7 @@ async function archiveResolvedTarget(
   target: ArchiveTarget,
 ): Promise<ArchiveResult> {
   const targetWorkspaceIds = target.workspaceIds;
-  const authorizeCaller = () =>
+  const resolveCallerAuthorization = () =>
     assertCallerCanArchive(
       dependencies,
       request.caller,
@@ -415,9 +413,11 @@ async function archiveResolvedTarget(
       request.scope.kind === "worktree" ? "worktree.archive" : "workspace.archive",
       request.signal,
     );
-  const recheckCaller: DestructiveActionRecheck = authorizeCaller;
+  const recheckCaller: DestructiveActionRecheck = async () => {
+    await resolveCallerAuthorization();
+  };
 
-  await authorizeCaller();
+  await resolveCallerAuthorization();
 
   if (targetWorkspaceIds.length > 0) {
     dependencies.markWorkspaceArchiving(targetWorkspaceIds, new Date().toISOString());
@@ -430,15 +430,16 @@ async function archiveResolvedTarget(
       await dependencies.emitWorkspaceUpdatesForWorkspaceIds(targetWorkspaceIds);
     }
 
-    await authorizeCaller();
+    const cascadePlan = await resolveCallerAuthorization();
+    await recheckCaller();
     await persistTargetCleanupPending(dependencies, target);
 
     const { archivedAgents, archivedWorkspaceIds, failures } = await archiveTargetRecords(
       dependencies,
       targetWorkspaceIds,
       request.requestId,
-      authorizeCaller,
       recheckCaller,
+      cascadePlan,
     );
     await clearCleanupPendingForUnarchivedTargets(dependencies, target, archivedWorkspaceIds);
     if (failures.length > 0) {
@@ -466,7 +467,7 @@ async function archiveResolvedTarget(
     }
 
     if (target.backing !== null) {
-      await authorizeCaller();
+      await recheckCaller();
       removedDirectory = await maybeRemoveDirectory(
         dependencies,
         lifecycleCoordinator,
@@ -474,7 +475,7 @@ async function archiveResolvedTarget(
         target,
         archivedWorkspaceIds,
         request.signal,
-        authorizeCaller,
+        recheckCaller,
       );
     }
 
@@ -496,16 +497,13 @@ async function archiveResolvedTarget(
 
 async function assertCallerCanArchive(
   dependencies: Pick<ArchiveDependencies, "agentManager" | "agentStorage" | "workspaceGitService">,
-  caller: ArchiveCallerContext | undefined,
+  caller: ArchiveCallerContext,
   target: ArchiveTarget,
   action: "workspace.archive" | "worktree.archive",
   signal?: AbortSignal,
-): Promise<void> {
+): Promise<AgentArchiveCascadePlan> {
   try {
     assertDestructiveCallerActive(caller, signal);
-    if (!caller) {
-      return;
-    }
 
     const liveAgents = dependencies.agentManager.listAgents();
     const targetWorkspaceIds = target.workspaceIds;
@@ -581,6 +579,7 @@ async function assertCallerCanArchive(
       },
       signal,
     );
+    return cascadeTarget;
   } catch (error) {
     if (error instanceof DestructiveActionAuthorizationError) {
       throw new WorkspaceArchiveError(error.code, error.message);
@@ -770,8 +769,8 @@ async function archiveTargetRecords(
   dependencies: ArchiveDependencies,
   targetWorkspaceIds: string[],
   requestId: string,
-  authorizeCaller: () => Promise<void>,
   recheckCaller: DestructiveActionRecheck,
+  cascadePlan?: AgentArchiveCascadePlan,
 ): Promise<{
   archivedAgents: Set<string>;
   archivedWorkspaceIds: string[];
@@ -782,8 +781,13 @@ async function archiveTargetRecords(
 
   const results = await Promise.allSettled(
     targetWorkspaceIds.map(async (workspaceId) => {
-      const agents = await archiveWorkspaceContents(dependencies, workspaceId, recheckCaller);
-      await authorizeCaller();
+      const agents = await archiveWorkspaceContents(
+        dependencies,
+        workspaceId,
+        recheckCaller,
+        cascadePlan,
+      );
+      await recheckCaller();
       await dependencies.archiveWorkspaceRecord(workspaceId, recheckCaller);
       return { workspaceId, agents };
     }),
@@ -816,7 +820,7 @@ async function maybeRemoveDirectory(
   target: ArchiveTarget,
   archivedWorkspaceIds: string[],
   signal?: AbortSignal,
-  authorizeCaller?: () => Promise<void>,
+  authorizeCaller?: DestructiveActionRecheck,
 ): Promise<boolean> {
   const backing = target.backing;
   if (!backing?.isPaseoOwnedWorktree) {
@@ -846,7 +850,7 @@ async function maybeRemoveDirectoryExclusive(
   target: ArchiveTarget,
   archivedWorkspaceIds: string[],
   signal?: AbortSignal,
-  authorizeCaller?: () => Promise<void>,
+  authorizeCaller?: DestructiveActionRecheck,
 ): Promise<boolean> {
   const backing = target.backing;
   if (!backing) return false;
@@ -957,7 +961,7 @@ async function runPendingCleanupTeardown(
   backing: BackingDirectory,
   pendingCleanupTargets: PendingCleanupTarget[],
   signal?: AbortSignal,
-  authorizeCaller?: () => Promise<void>,
+  authorizeCaller?: DestructiveActionRecheck,
 ): Promise<void> {
   const teardownCwds = uniqueFilesystemPaths(
     pendingCleanupTargets.map((pendingCleanupTarget) => pendingCleanupTarget.teardownCwd),
@@ -990,7 +994,7 @@ async function removePendingCleanupDirectory(
   backing: BackingDirectory,
   pendingCleanupTargets: PendingCleanupTarget[],
   signal?: AbortSignal,
-  authorizeCaller?: () => Promise<void>,
+  authorizeCaller?: DestructiveActionRecheck,
 ): Promise<boolean> {
   try {
     const expectedWorktreeIncarnationId = pendingCleanupTargets[0]!.worktreeIncarnationId;
@@ -1390,7 +1394,8 @@ export type ArchiveWorkspaceContentsDependencies = Pick<
 export async function archiveWorkspaceContents(
   dependencies: ArchiveWorkspaceContentsDependencies,
   workspaceId: string,
-  recheckCaller?: DestructiveActionRecheck,
+  recheckCaller: DestructiveActionRecheck,
+  cascadePlan?: AgentArchiveCascadePlan,
 ): Promise<Set<string>> {
   const archivedAgents = new Set<string>();
 
@@ -1410,14 +1415,21 @@ export async function archiveWorkspaceContents(
     archivedAgents.add(record.id);
   }
 
-  await recheckCaller?.();
+  await recheckCaller();
   const archivedAt = new Date().toISOString();
   const archiveResults = await Promise.allSettled([
-    ...liveAgents.map((agent) => dependencies.agentManager.archiveAgent(agent.id, recheckCaller)),
+    ...liveAgents.map((agent) =>
+      dependencies.agentManager.archiveAgent(agent.id, recheckCaller, cascadePlan),
+    ),
     ...matchingStoredRecords
       .filter((record) => !liveAgentIds.has(record.id) && !record.archivedAt)
       .map((record) =>
-        dependencies.agentManager.archiveSnapshot(record.id, archivedAt, recheckCaller),
+        dependencies.agentManager.archiveSnapshot(
+          record.id,
+          archivedAt,
+          recheckCaller,
+          cascadePlan,
+        ),
       ),
     dependencies.killTerminalsForWorkspace(workspaceId, recheckCaller),
   ]);
@@ -1469,7 +1481,7 @@ async function isDirectoryUnreferenced(
 export async function killTerminalsForWorkspace(
   dependencies: KillTerminalsForWorkspaceDependencies,
   workspaceId: string,
-  recheck?: DestructiveActionRecheck,
+  recheck: DestructiveActionRecheck,
 ): Promise<void> {
   const terminalManager = dependencies.terminalManager;
   if (!terminalManager) {
@@ -1500,10 +1512,10 @@ export async function killTerminalsForWorkspace(
     return;
   }
 
-  await recheck?.();
+  await recheck();
   await Promise.allSettled(
     terminalIds.map(async (terminalId) => {
-      await recheck?.();
+      await recheck();
       dependencies.detachTerminalStream?.(terminalId, { emitExit: true });
       await terminalManager.killTerminalAndWait(terminalId, {
         gracefulTimeoutMs: 2000,

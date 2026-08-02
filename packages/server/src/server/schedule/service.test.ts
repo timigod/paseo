@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { AgentManager } from "../agent/agent-manager.js";
 import { AgentStorage } from "../agent/agent-storage.js";
 import { createAgentCommand } from "../agent/create-agent/create.js";
+import { createCoordinatorDestructiveCaller } from "../agent/destructive-action-authority.js";
 import type {
   AgentCapabilityFlags,
   AgentClient,
@@ -139,6 +140,7 @@ function createScheduleService(options: TestScheduleServiceOptions): ScheduleSer
         {
           scope: { kind: "workspace", workspaceId },
           requestId: "schedule-service-test",
+          caller: createCoordinatorDestructiveCaller(),
         },
       );
     } finally {
@@ -242,6 +244,7 @@ async function createRegistryBackedScheduleWorkspaceDeps(rootDir: string): Promi
             {
               scope: { kind: "workspace", workspaceId },
               requestId: "schedule-service-test",
+              caller: createCoordinatorDestructiveCaller(),
             },
           );
         } finally {

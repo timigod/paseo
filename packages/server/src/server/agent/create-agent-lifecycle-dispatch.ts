@@ -15,6 +15,7 @@ import {
   archiveByScope,
   requireArchiveCleanupComplete,
   type ActiveWorkspaceRef,
+  type ArchiveDependencies,
   WorkspaceCleanupPendingError,
 } from "../workspace-archive-service.js";
 import type { CreatePaseoWorktreeWorkflowResult } from "../worktree-session.js";
@@ -23,6 +24,7 @@ import type { WorkspaceRegistry } from "../workspace-registry.js";
 import type { SessionOutboundMessage } from "../messages.js";
 import type { AgentManager, AgentSubscriber, SubscribeOptions } from "./agent-manager.js";
 import type { AgentStorage, AutoArchiveObligation, PendingAgentCreation } from "./agent-storage.js";
+import { createCoordinatorDestructiveCaller } from "./destructive-action-authority.js";
 
 interface CreateAgentLifecycleDispatchDependencies {
   paseoHome: string;
@@ -36,14 +38,14 @@ interface CreateAgentLifecycleDispatchDependencies {
   drainWorkspaceLifecycleOperations: () => Promise<void>;
   findWorkspaceIdForCwd: (cwd: string) => Promise<string | null>;
   listActiveWorkspaces: () => Promise<ActiveWorkspaceRef[]>;
-  archiveWorkspaceRecord: (workspaceId: string) => Promise<void>;
+  archiveWorkspaceRecord: ArchiveDependencies["archiveWorkspaceRecord"];
   workspaceRegistry: Pick<WorkspaceRegistry, "get" | "list" | "update" | "subscribeToMutations">;
   emit: (message: SessionOutboundMessage) => void;
   emitAgentRemove: (agentId: string) => void;
   emitWorkspaceUpdatesForWorkspaceIds: (workspaceIds: Iterable<string>) => Promise<void>;
   markWorkspaceArchiving: (workspaceIds: Iterable<string>, archivingAt: string) => void;
   clearWorkspaceArchiving: (workspaceIds: Iterable<string>) => void;
-  killTerminalsForWorkspace: (workspaceId: string) => Promise<void>;
+  killTerminalsForWorkspace: ArchiveDependencies["killTerminalsForWorkspace"];
   logger: pino.Logger;
 }
 
@@ -485,6 +487,7 @@ export class CreateAgentLifecycleDispatch {
           ? { kind: "workspace", workspaceId }
           : { kind: "worktree", targetPath: worktreePath },
         requestId: randomUUID(),
+        caller: createCoordinatorDestructiveCaller(),
       },
     );
     requireArchiveCleanupComplete(archiveResult, "Auto-created worktree archive");

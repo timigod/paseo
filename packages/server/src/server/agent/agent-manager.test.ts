@@ -19,6 +19,8 @@ import { toAgentPayload } from "./agent-projections.js";
 import { PARENT_AGENT_ID_LABEL } from "@getpaseo/protocol/agent-labels";
 import { formatSystemNotificationPrompt } from "./agent-prompt.js";
 import { ensureAgentLoaded, ensureUnarchivedAgentLoaded } from "./agent-loading.js";
+import { archiveAgentCommand } from "./lifecycle-command.js";
+import { createAgentDestructiveCaller } from "./destructive-action-authority.js";
 import type { StoredAgentRecord } from "./agent-storage.js";
 import type {
   AgentClient,
@@ -7064,6 +7066,90 @@ test("archiveAgent cascade archives in-memory children with the full archive con
   expectArchivedAgentRecord(storedChild, "closed");
   expect(storedUnrelated?.archivedAt).toBeUndefined();
 });
+
+test.each([
+  { mutation: "detach" as const, nextParentAgentId: undefined },
+  { mutation: "update" as const, nextParentAgentId: "unrelated-parent" },
+])(
+  "archiveAgentCommand uses its authorized graph during a concurrent $mutation",
+  async ({ mutation, nextParentAgentId }) => {
+    const workdir = mkdtempSync(join(tmpdir(), `agent-manager-cascade-${mutation}-race-`));
+    const storagePath = join(workdir, "agents");
+    const storage = new AgentStorage(storagePath, logger);
+    const manager = new AgentManager({
+      clients: { codex: new TestAgentClient() },
+      registry: storage,
+      logger,
+    });
+    const root = await manager.createAgent(
+      { provider: "codex", cwd: workdir, title: "Root" },
+      undefined,
+      { workspaceId: "workspace-root" },
+    );
+    const middle = await manager.createAgent(
+      { provider: "codex", cwd: workdir, title: "Middle" },
+      undefined,
+      {
+        labels: { [PARENT_AGENT_ID_LABEL]: root.id },
+        workspaceId: "workspace-middle",
+      },
+    );
+    const callerAgent = await manager.createAgent(
+      { provider: "codex", cwd: workdir, title: "Caller" },
+      undefined,
+      {
+        labels: { [PARENT_AGENT_ID_LABEL]: middle.id },
+        workspaceId: "workspace-caller",
+      },
+    );
+    const callerIdentity = manager.getAgentCallerIdentity(callerAgent.id);
+    if (!callerIdentity) {
+      throw new Error("expected caller identity");
+    }
+
+    const persistenceReached = deferred<void>();
+    const releasePersistence = deferred<void>();
+    const originalUpsert = storage.upsert.bind(storage);
+    let holdMutationPersistence = true;
+    vi.spyOn(storage, "upsert").mockImplementation(async (record, options) => {
+      const parentAgentId = record.labels?.[PARENT_AGENT_ID_LABEL];
+      if (
+        holdMutationPersistence &&
+        record.id === callerAgent.id &&
+        parentAgentId === nextParentAgentId
+      ) {
+        holdMutationPersistence = false;
+        persistenceReached.resolve();
+        await releasePersistence.promise;
+      }
+      await originalUpsert(record, options);
+    });
+
+    const mutationPromise =
+      mutation === "detach"
+        ? manager.detachAgent(callerAgent.id)
+        : manager.updateAgentMetadata(callerAgent.id, {
+            labels: { [PARENT_AGENT_ID_LABEL]: nextParentAgentId! },
+          });
+    await persistenceReached.promise;
+    expect(manager.getAgent(callerAgent.id)?.labels[PARENT_AGENT_ID_LABEL]).toBe(nextParentAgentId);
+    expect((await storage.get(callerAgent.id))?.labels[PARENT_AGENT_ID_LABEL]).toBe(middle.id);
+
+    try {
+      await archiveAgentCommand({ agentManager: manager, agentStorage: storage, logger }, root.id, {
+        caller: createAgentDestructiveCaller(callerIdentity),
+      });
+    } finally {
+      releasePersistence.resolve();
+    }
+    await mutationPromise;
+
+    expectArchivedAgentRecord(await storage.get(root.id), "closed");
+    expectArchivedAgentRecord(await storage.get(middle.id), "closed");
+    expect((await storage.get(callerAgent.id))?.archivedAt).toBeUndefined();
+    expect(manager.getAgent(callerAgent.id)?.labels[PARENT_AGENT_ID_LABEL]).toBe(nextParentAgentId);
+  },
+);
 
 test("archiveAgent cascade closes a running child runtime", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-cascade-running-child-"));

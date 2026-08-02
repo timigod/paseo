@@ -6,6 +6,7 @@ import type { DaemonConfigStore } from "../daemon-config-store.js";
 import {
   archiveByScope,
   type ActiveWorkspaceRef,
+  type ArchiveDependencies,
   killTerminalsForWorkspace,
   resolveWorkspaceIdAtPath,
 } from "../workspace-archive-service.js";
@@ -17,6 +18,7 @@ import type { ForgeService } from "../../services/forge-service.js";
 import type { TerminalManager } from "../../terminal/terminal-manager.js";
 import type { WorkspaceRegistry } from "../workspace-registry.js";
 import { isPaseoOwnedWorktreeCwd } from "../../utils/worktree.js";
+import { createCoordinatorDestructiveCaller } from "../agent/destructive-action-authority.js";
 
 export interface AutoArchiveArchiveOptions {
   paseoHome: string;
@@ -30,7 +32,7 @@ export interface AutoArchiveArchiveOptions {
   workspaceRegistry: Pick<WorkspaceRegistry, "get" | "list" | "update">;
   findWorkspaceIdForCwd: (cwd: string) => Promise<string | null>;
   listActiveWorkspaces: () => Promise<ActiveWorkspaceRef[]>;
-  archiveWorkspaceRecord: (workspaceId: string) => Promise<void>;
+  archiveWorkspaceRecord: ArchiveDependencies["archiveWorkspaceRecord"];
   markWorkspaceArchiving: (workspaceIds: Iterable<string>, archivingAt: string) => void;
   clearWorkspaceArchiving: (workspaceIds: Iterable<string>) => void;
   emitWorkspaceUpdatesForWorkspaceIds: (workspaceIds: Iterable<string>) => Promise<void>;
@@ -143,19 +145,21 @@ export async function archiveIfSafe(input: {
           emitWorkspaceUpdatesForWorkspaceIds: options.emitWorkspaceUpdatesForWorkspaceIds,
           markWorkspaceArchiving: options.markWorkspaceArchiving,
           clearWorkspaceArchiving: options.clearWorkspaceArchiving,
-          killTerminalsForWorkspace: (workspaceIdToKill) =>
+          killTerminalsForWorkspace: (workspaceIdToKill, recheck) =>
             deps.killTerminalsForWorkspace(
               {
                 terminalManager: options.terminalManager,
                 sessionLogger: log,
               },
               workspaceIdToKill,
+              recheck,
             ),
           sessionLogger: log,
         },
         {
           scope: { kind: "workspace", workspaceId },
           requestId: "auto-archive-on-merge",
+          caller: createCoordinatorDestructiveCaller(),
         },
       );
       if (result.cleanupPendingWorkspaceIds.length > 0) {

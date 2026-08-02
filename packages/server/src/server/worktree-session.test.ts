@@ -39,7 +39,10 @@ import type { TerminalManager } from "../terminal/terminal-manager.js";
 import type { TerminalSession } from "../terminal/terminal.js";
 import type { AgentStorage, StoredAgentRecord } from "./agent/agent-storage.js";
 import type { ManagedAgent } from "./agent/agent-manager.js";
-import { createAgentDestructiveCaller } from "./agent/destructive-action-authority.js";
+import {
+  createAgentDestructiveCaller,
+  createCoordinatorDestructiveCaller,
+} from "./agent/destructive-action-authority.js";
 import {
   createPersistedProjectRecord,
   type PersistedProjectRecord,
@@ -2386,6 +2389,7 @@ describe("handlePaseoWorktreeArchiveRequest worktree scope", () => {
         repoRoot: repoDir,
         scope: "worktree",
       },
+      createCoordinatorDestructiveCaller(),
     );
 
     expect(archivedWorkspaceRecords).toContain(workspaceA);
@@ -2460,6 +2464,7 @@ describe("handlePaseoWorktreeArchiveRequest worktree scope", () => {
         worktreePath: created.worktreePath,
         repoRoot: repoDir,
       },
+      createCoordinatorDestructiveCaller(),
     );
 
     expect(archivedWorkspaceRecords).toEqual([workspaceId]);
@@ -2536,6 +2541,7 @@ describe("handlePaseoWorktreeArchiveRequest worktree scope", () => {
         worktreePath: sharedCwd,
         repoRoot: repoDir,
       },
+      createCoordinatorDestructiveCaller(),
     );
 
     expect(archivedWorkspaceRecords).toEqual([workspaceA]);
@@ -2605,15 +2611,19 @@ describe("handlePaseoWorktreeArchiveRequest worktree scope", () => {
 
     // First archive: a sibling workspace still references the directory, so the
     // retained deleteWorktreeFromDisk:true flag must NOT force removal.
-    await handlePaseoWorktreeArchiveRequest(deps, {
-      type: "paseo_worktree_archive_request",
-      requestId: "req-delete-flag-first",
-      worktreePath: sharedCwd,
-      repoRoot: repoDir,
-      workspaceId: workspaceA,
-      scope: "workspace",
-      deleteWorktreeFromDisk: true,
-    });
+    await handlePaseoWorktreeArchiveRequest(
+      deps,
+      {
+        type: "paseo_worktree_archive_request",
+        requestId: "req-delete-flag-first",
+        worktreePath: sharedCwd,
+        repoRoot: repoDir,
+        workspaceId: workspaceA,
+        scope: "workspace",
+        deleteWorktreeFromDisk: true,
+      },
+      createCoordinatorDestructiveCaller(),
+    );
 
     expect(archivedWorkspaceRecords).toEqual([workspaceA]);
     expect(activeWorkspaces).toHaveLength(1);
@@ -2624,13 +2634,19 @@ describe("handlePaseoWorktreeArchiveRequest worktree scope", () => {
 
     // Second archive: last reference, so removal is derived even though the flag
     // is still ignored.
-    await handlePaseoWorktreeArchiveRequest(deps, {
-      type: "paseo_worktree_archive_request",
-      requestId: "req-delete-flag-second",
-      workspaceId: workspaceB,
-      scope: "workspace",
-      deleteWorktreeFromDisk: true,
-    });
+    await handlePaseoWorktreeArchiveRequest(
+      deps,
+      {
+        type: "paseo_worktree_archive_request",
+        requestId: "req-delete-flag-second",
+        worktreePath: sharedCwd,
+        repoRoot: repoDir,
+        workspaceId: workspaceB,
+        scope: "workspace",
+        deleteWorktreeFromDisk: true,
+      },
+      createCoordinatorDestructiveCaller(),
+    );
 
     expect(archivedWorkspaceRecords).toEqual([workspaceB]);
     expect(existsSync(sharedCwd)).toBe(false);

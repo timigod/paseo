@@ -24,6 +24,7 @@ import type { TerminalManager } from "../terminal/terminal-manager.js";
 import { createTerminalManager } from "../terminal/terminal-manager.js";
 import { AgentManager, ManagedWorktreeWriterConflictError } from "./agent/agent-manager.js";
 import { AgentStorage, type StoredAgentRecord } from "./agent/agent-storage.js";
+import { createAgentDestructiveCaller } from "./agent/destructive-action-authority.js";
 import type {
   AgentClient,
   AgentCreateSessionOptions,
@@ -154,7 +155,7 @@ interface SessionTestAccess {
     [key: string]: unknown;
   }>;
   handleArchiveAgentRequest(agentId: string, requestId: string): Promise<unknown>;
-  handleMessage(message: unknown): Promise<unknown>;
+  handleMessage(message: unknown, source?: object): Promise<unknown>;
   handleCreatePaseoWorktreeRequest(params: unknown): Promise<unknown>;
   listAgentPayloads(...args: unknown[]): Promise<unknown[]>;
   listFetchWorkspacesEntries(params: unknown): Promise<ListFetchResult>;
@@ -551,6 +552,7 @@ function createSessionForWorkspaceTests(
     agentManager?: { [K in keyof SessionOptions["agentManager"]]?: unknown };
     agentStorage?: { [K in keyof SessionOptions["agentStorage"]]?: unknown };
     createAgentLifecycleDispatch?: SessionOptions["createAgentLifecycleDispatch"];
+    resolveDestructiveCaller?: SessionOptions["resolveDestructiveCaller"];
     projectRegistry?: SessionOptions["projectRegistry"];
     workspaceRegistry?: SessionOptions["workspaceRegistry"];
     github?: ForgeService;
@@ -740,6 +742,7 @@ function createSessionForWorkspaceTests(
       tts: null,
       providerSnapshotManager,
       terminalManager: options.terminalManager ?? null,
+      resolveDestructiveCaller: options.resolveDestructiveCaller,
     }),
   );
   return session;
@@ -866,6 +869,92 @@ test("create_agent_request returns the published agent when first-prompt start t
     obligation: { phase: "armed", target: { kind: "agent" } },
   });
   expect(streamAgent).toHaveBeenCalledWith(agentId, "start the assigned work", undefined);
+});
+
+test("kill_terminal_request blocks an agent-scoped terminal in the caller workspace", async () => {
+  const emitted: SessionOutboundMessage[] = [];
+  const source = {};
+  const caller = createAgentDestructiveCaller({
+    agentId: "terminal-caller",
+    incarnation: "terminal-caller-incarnation",
+  });
+  const killTerminal = vi.fn();
+  const callerAgent = {
+    id: "terminal-caller",
+    cwd: REPO_CWD,
+    workspaceId: "workspace-terminal-caller",
+    labels: {},
+  };
+  const session = createSessionForWorkspaceTests({
+    onMessage: (message) => emitted.push(message),
+    resolveDestructiveCaller: (candidateSource) =>
+      candidateSource === source
+        ? caller
+        : createAgentDestructiveCaller({ agentId: "invalid", incarnation: "invalid" }),
+    agentManager: asAgentManager({
+      subscribe: () => () => {},
+      listAgents: () => [callerAgent],
+      getAgent: (agentId: string) => (agentId === callerAgent.id ? callerAgent : null),
+      isCurrentAgentIncarnation: (agentId: string, incarnation: string) =>
+        agentId === callerAgent.id && incarnation === "terminal-caller-incarnation",
+    }),
+    terminalManager: asTerminalManager({
+      getTerminal: (terminalId: string) =>
+        terminalId === "terminal-owned"
+          ? {
+              id: terminalId,
+              cwd: REPO_CWD,
+              workspaceId: "workspace-terminal-caller",
+            }
+          : undefined,
+      killTerminal,
+      subscribeTerminalsChanged: () => () => {},
+    }),
+  });
+
+  await session.handleMessage(
+    {
+      type: "kill_terminal_request",
+      terminalId: "terminal-owned",
+      requestId: "req-agent-terminal-kill",
+    },
+    source,
+  );
+
+  expect(killTerminal).not.toHaveBeenCalled();
+  expect(findByType(emitted, "rpc_error")?.payload).toMatchObject({
+    requestId: "req-agent-terminal-kill",
+    code: "SELF_ARCHIVE_BLOCKED",
+  });
+});
+
+test("kill_terminal_request fails closed when its request source is missing", async () => {
+  const emitted: SessionOutboundMessage[] = [];
+  const killTerminal = vi.fn();
+  const session = createSessionForWorkspaceTests({
+    onMessage: (message) => emitted.push(message),
+    terminalManager: asTerminalManager({
+      getTerminal: () => ({
+        id: "terminal-without-source",
+        cwd: REPO_CWD,
+        workspaceId: "workspace-without-source",
+      }),
+      killTerminal,
+      subscribeTerminalsChanged: () => () => {},
+    }),
+  });
+
+  await session.handleMessage({
+    type: "kill_terminal_request",
+    terminalId: "terminal-without-source",
+    requestId: "req-terminal-without-source",
+  });
+
+  expect(killTerminal).not.toHaveBeenCalled();
+  expect(findByType(emitted, "rpc_error")?.payload).toMatchObject({
+    requestId: "req-terminal-without-source",
+    code: "INVALID_CALLER_IDENTITY",
+  });
 });
 
 test("create_agent_request keeps requested child cwd when grouped under an existing parent workspace", async () => {
@@ -1980,12 +2069,15 @@ test("close_items_request archives agents and kills terminals in one batch", asy
 
   activateAgentUpdatesSubscription(session, "sub-agents", { includeArchived: true });
 
-  await session.handleMessage({
-    type: "close_items_request",
-    agentIds: ["agent-1"],
-    terminalIds: ["term-1"],
-    requestId: "req-close-items",
-  });
+  await session.handleMessage(
+    {
+      type: "close_items_request",
+      agentIds: ["agent-1"],
+      terminalIds: ["term-1"],
+      requestId: "req-close-items",
+    },
+    {},
+  );
 
   expect(cancelAgentRun).toHaveBeenCalledWith("agent-1");
   expect(killTerminal).toHaveBeenCalledWith("term-1");
@@ -2322,12 +2414,15 @@ test("close_items_request continues after an archive failure", async () => {
 
   activateAgentUpdatesSubscription(session, "sub-agents", { includeArchived: true });
 
-  await session.handleMessage({
-    type: "close_items_request",
-    agentIds: ["agent-bad", "agent-good"],
-    terminalIds: ["term-1"],
-    requestId: "req-close-best-effort",
-  });
+  await session.handleMessage(
+    {
+      type: "close_items_request",
+      agentIds: ["agent-bad", "agent-good"],
+      terminalIds: ["term-1"],
+      requestId: "req-close-best-effort",
+    },
+    {},
+  );
 
   expect(killTerminalBestEffort).toHaveBeenCalledWith("term-1");
   expect(emitted.find((message) => message.type === "close_items_response")?.payload).toEqual({
@@ -3543,6 +3638,78 @@ test("archiving the last workspace emits a remove carrying the now-empty project
   });
 });
 
+test("project.remove.request blocks an agent whose workspace is in the project batch", async () => {
+  const emitted: SessionOutboundMessage[] = [];
+  const source = {};
+  const caller = createAgentDestructiveCaller({
+    agentId: "project-remove-caller",
+    incarnation: "project-remove-incarnation",
+  });
+  const project = createPersistedProjectRecord({
+    projectId: "proj-remove-self-blocked",
+    rootPath: REPO_CWD,
+    kind: "git",
+    displayName: "repo",
+    createdAt: "2026-03-01T12:00:00.000Z",
+    updatedAt: "2026-03-01T12:00:00.000Z",
+  });
+  const workspace = createPersistedWorkspaceRecord({
+    workspaceId: "ws-project-remove-caller",
+    projectId: project.projectId,
+    cwd: REPO_CWD,
+    kind: "local_checkout",
+    displayName: "main",
+    createdAt: "2026-03-01T12:00:00.000Z",
+    updatedAt: "2026-03-01T12:00:00.000Z",
+  });
+  const liveCaller = {
+    id: "project-remove-caller",
+    cwd: REPO_CWD,
+    workspaceId: workspace.workspaceId,
+    labels: {},
+  };
+  const removeProject = vi.fn();
+  const archiveWorkspace = vi.fn();
+  const session = createSessionForWorkspaceTests({
+    onMessage: (message) => emitted.push(message),
+    resolveDestructiveCaller: (candidateSource) =>
+      candidateSource === source
+        ? caller
+        : createAgentDestructiveCaller({ agentId: "invalid", incarnation: "invalid" }),
+    agentManager: asAgentManager({
+      subscribe: () => () => {},
+      listAgents: () => [liveCaller],
+      getAgent: (agentId: string) => (agentId === liveCaller.id ? liveCaller : null),
+      isCurrentAgentIncarnation: (agentId: string, incarnation: string) =>
+        agentId === liveCaller.id && incarnation === "project-remove-incarnation",
+    }),
+  });
+  session.projectRegistry.get = async () => project;
+  session.projectRegistry.list = async () => [project];
+  session.projectRegistry.remove = removeProject;
+  session.workspaceRegistry.get = async () => workspace;
+  session.workspaceRegistry.list = async () => [workspace];
+  session.workspaceRegistry.archive = archiveWorkspace;
+  session.agentStorage.list = async () => [];
+
+  await session.handleMessage(
+    {
+      type: "project.remove.request",
+      projectId: project.projectId,
+      requestId: "req-remove-project-self-blocked",
+    },
+    source,
+  );
+
+  expect(archiveWorkspace).not.toHaveBeenCalled();
+  expect(removeProject).not.toHaveBeenCalled();
+  expect(findByType(emitted, "project.remove.response")?.payload).toMatchObject({
+    accepted: false,
+    removedWorkspaceIds: [],
+    error: expect.stringMatching(/cannot target itself/i),
+  });
+});
+
 test("project.remove.request archives active workspaces and removes the project record", async () => {
   const emitted: SessionOutboundMessage[] = [];
   const session = createSessionForWorkspaceTests({
@@ -3616,11 +3783,14 @@ test("project.remove.request archives active workspaces and removes the project 
     return descriptors;
   };
 
-  await session.handleMessage({
-    type: "project.remove.request",
-    projectId: project.projectId,
-    requestId: "req-remove-project",
-  });
+  await session.handleMessage(
+    {
+      type: "project.remove.request",
+      projectId: project.projectId,
+      requestId: "req-remove-project",
+    },
+    {},
+  );
 
   expect(projects.has(project.projectId)).toBe(false);
   expect(workspaces.get(workspace.workspaceId)).toEqual({
@@ -3696,11 +3866,14 @@ test("project.remove.request removes an already-empty project", async () => {
   session.listAgentPayloads = async () => [];
   session.buildWorkspaceDescriptorMap = async () => new Map();
 
-  await session.handleMessage({
-    type: "project.remove.request",
-    projectId: project.projectId,
-    requestId: "req-remove-empty-project",
-  });
+  await session.handleMessage(
+    {
+      type: "project.remove.request",
+      projectId: project.projectId,
+      requestId: "req-remove-empty-project",
+    },
+    {},
+  );
 
   expect(projects.has(project.projectId)).toBe(false);
   expect(workspaces.get(archivedWorkspace.workspaceId)).toEqual(archivedWorkspace);
@@ -5700,11 +5873,14 @@ test("archive_workspace_request hides non-destructive workspace records", async 
   session.workspaceRegistry.list = async () => [workspace];
   session.projectRegistry.archive = async () => {};
 
-  await session.handleMessage({
-    type: "archive_workspace_request",
-    workspaceId: "ws-repo-archive",
-    requestId: "req-archive",
-  });
+  await session.handleMessage(
+    {
+      type: "archive_workspace_request",
+      workspaceId: "ws-repo-archive",
+      requestId: "req-archive",
+    },
+    {},
+  );
 
   expect(workspace.archivedAt).toBeTruthy();
   const response = emitted.find((message) => message.type === "archive_workspace_response") as
@@ -5878,11 +6054,14 @@ test("archive_workspace_request archives a worktree-kind workspace and removes t
   session.projectRegistry.list = async () => [project];
 
   try {
-    await session.handleMessage({
-      type: "archive_workspace_request",
-      workspaceId,
-      requestId: "req-worktree-kind-archive",
-    });
+    await session.handleMessage(
+      {
+        type: "archive_workspace_request",
+        workspaceId,
+        requestId: "req-worktree-kind-archive",
+      },
+      {},
+    );
 
     expect(workspace.archivedAt).toBeTruthy();
     expect(existsSync(worktree.worktreePath)).toBe(false);
@@ -7552,7 +7731,7 @@ test("project removal mutation broadcasts the final delta to another subscribed 
     ]),
   };
 
-  await projectRegistry.remove(project.projectId);
+  await projectRegistry.remove(project.projectId, { recheck: () => undefined });
 
   expect(filterByType(emitted, "workspace_update")).toEqual([
     {

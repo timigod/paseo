@@ -1373,7 +1373,12 @@ export async function createPaseoDaemon(
           workspaceRegistry,
           sessionLogger: logger,
         },
-        { scope: { kind: "workspace", workspaceId }, requestId, signal },
+        {
+          scope: { kind: "workspace", workspaceId },
+          requestId,
+          caller: createCoordinatorDestructiveCaller(),
+          signal,
+        },
       ),
       "Workspace archive",
     );
@@ -1395,10 +1400,11 @@ export async function createPaseoDaemon(
           emitWorkspaceUpdatesForWorkspaceIds: emitWorkspaceUpdatesExternal,
           markWorkspaceArchiving: markWorkspaceArchivingExternal,
           clearWorkspaceArchiving: clearWorkspaceArchivingExternal,
-          killTerminalsForWorkspace: (workspaceIdToKill) =>
+          killTerminalsForWorkspace: (workspaceIdToKill, recheck) =>
             killTerminalsForWorkspace(
               { terminalManager, sessionLogger: logger },
               workspaceIdToKill,
+              recheck,
             ),
           workspaceRegistry,
           sessionLogger: logger,
@@ -1430,7 +1436,9 @@ export async function createPaseoDaemon(
     github,
     workspaceGitService,
     archiveAgentForClose: (agentId) =>
-      archiveAgentCommand({ agentManager, agentStorage, logger }, agentId),
+      archiveAgentCommand({ agentManager, agentStorage, logger }, agentId, {
+        caller: createCoordinatorDestructiveCaller(),
+      }),
     archiveWorkspaceForClose: (workspaceId, signal) =>
       archiveWorkspaceByIdExternal(workspaceId, randomUUID(), signal),
     drainWorkspaceLifecycleOperations: () => defaultWorkspaceLifecycleCoordinator.drain(),
@@ -1443,8 +1451,8 @@ export async function createPaseoDaemon(
     emitWorkspaceUpdatesForWorkspaceIds: emitWorkspaceUpdatesExternal,
     markWorkspaceArchiving: markWorkspaceArchivingExternal,
     clearWorkspaceArchiving: clearWorkspaceArchivingExternal,
-    killTerminalsForWorkspace: (workspaceId) =>
-      killTerminalsForWorkspace({ terminalManager, sessionLogger: logger }, workspaceId),
+    killTerminalsForWorkspace: (workspaceId, recheck) =>
+      killTerminalsForWorkspace({ terminalManager, sessionLogger: logger }, workspaceId, recheck),
     logger,
   });
   const hubRelationships = new HubRelationshipController({
@@ -1478,7 +1486,9 @@ export async function createPaseoDaemon(
             agentId,
           ),
         archiveAgent: (agentId) =>
-          archiveAgentCommand({ agentManager, agentStorage, logger }, agentId),
+          archiveAgentCommand({ agentManager, agentStorage, logger }, agentId, {
+            caller: createCoordinatorDestructiveCaller(),
+          }),
         listActiveWorkspaces: listActiveWorkspacesExternal,
         archiveWorkspace: archiveWorkspaceByIdExternal,
         cleanupFailedCreate: (input) =>
@@ -1537,13 +1547,14 @@ export async function createPaseoDaemon(
         emitWorkspaceUpdatesForWorkspaceIds: emitWorkspaceUpdatesExternal,
         markWorkspaceArchiving: markWorkspaceArchivingExternal,
         clearWorkspaceArchiving: clearWorkspaceArchivingExternal,
-        killTerminalsForWorkspace: (workspaceIdToKill) =>
+        killTerminalsForWorkspace: (workspaceIdToKill, recheck) =>
           killTerminalsForWorkspace(
             {
               terminalManager,
               sessionLogger: logger,
             },
             workspaceIdToKill,
+            recheck,
           ),
         workspaceRegistry,
         sessionLogger: logger,
@@ -1551,6 +1562,7 @@ export async function createPaseoDaemon(
       {
         scope: { kind: "workspace", workspaceId },
         requestId: "schedule-run-finish",
+        caller: createCoordinatorDestructiveCaller(),
       },
     );
     requireArchiveCleanupComplete(archiveResult, "Schedule workspace archive");
@@ -1618,6 +1630,7 @@ export async function createPaseoDaemon(
       serviceProxy,
       scriptRuntimeStore,
       terminalManager,
+      agentAuthority: agentManager,
       workspaceRegistry,
       projectRegistry,
       workspaceGitService,

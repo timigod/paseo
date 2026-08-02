@@ -87,7 +87,11 @@ import {
 } from "../../worktree/commands.js";
 import { registerBrowserTools } from "../../browser-tools/tools.js";
 import type { BrowserToolsBroker } from "../../browser-tools/broker.js";
-import type { DestructiveCallerContext } from "../destructive-action-authority.js";
+import {
+  requireDestructiveCaller,
+  type DestructiveCallerContext,
+} from "../destructive-action-authority.js";
+import { killTerminalWithAuthority } from "../../terminal-kill.js";
 import type {
   PaseoToolCatalog,
   PaseoToolConfig,
@@ -609,6 +613,7 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
   } = options;
   const childLogger = logger.child({ module: "agent", component: "paseo-tool-catalog" });
   const callerContext = callerAgentId ? (resolveCallerContext?.(callerAgentId) ?? null) : null;
+  const destructiveCaller = () => requireDestructiveCaller(options.destructiveCaller);
 
   const parseToolInput = async (tool: PaseoToolDefinition, input: unknown): Promise<unknown> => {
     const inputSchema = tool.inputSchema;
@@ -1443,7 +1448,7 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
         {
           requestId: "mcp:archive_workspace",
           scope: { kind: "workspace", workspaceId: workspace.workspaceId },
-          caller: options.destructiveCaller,
+          caller: destructiveCaller(),
           signal: context.signal,
         },
       );
@@ -2201,7 +2206,7 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
           logger: childLogger,
         },
         agentId,
-        { caller: options.destructiveCaller, signal: context.signal },
+        { caller: destructiveCaller(), signal: context.signal },
       );
       return {
         content: [],
@@ -2224,7 +2229,7 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
     },
     async ({ agentId }, context) => {
       await closeAgentCommand({ agentManager }, agentId, {
-        caller: options.destructiveCaller,
+        caller: destructiveCaller(),
         signal: context.signal,
       });
       return {
@@ -2400,14 +2405,17 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
         script: WorkspaceScriptPayloadSchema,
       },
     },
-    async ({ workspaceId, scriptName }) => {
+    async ({ workspaceId, scriptName }, context) => {
       if (!workspaceScripts) {
         throw new Error("Workspace script management is not configured");
       }
       return {
         content: [],
         structuredContent: ensureValidJson({
-          script: await workspaceScripts.stop({ workspaceId, scriptName }),
+          script: await workspaceScripts.stop(
+            { workspaceId, scriptName },
+            { caller: destructiveCaller(), signal: context.signal },
+          ),
         }),
       };
     },
@@ -2518,7 +2526,7 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
         success: z.boolean(),
       },
     },
-    async ({ terminalId }) => {
+    async ({ terminalId }, context) => {
       if (!terminalManager) {
         throw new Error("Terminal manager is not configured");
       }
@@ -2528,7 +2536,12 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
         throw new Error(`Terminal ${terminalId} not found`);
       }
 
-      terminal.kill();
+      await killTerminalWithAuthority(
+        { agentAuthority: agentManager, terminalManager },
+        terminalId,
+        destructiveCaller(),
+        { signal: context.signal },
+      );
 
       return {
         content: [],

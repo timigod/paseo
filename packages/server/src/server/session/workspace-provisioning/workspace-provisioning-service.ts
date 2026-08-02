@@ -16,6 +16,10 @@ import {
 import type { WorkspaceGitService } from "../../workspace-git-service.js";
 import type { CreatePaseoWorktreeWorkflowResult } from "../../worktree-session.js";
 import { deriveProjectKey } from "../../project-key.js";
+import {
+  assertDestructiveCallerActive,
+  createCoordinatorDestructiveCaller,
+} from "../../agent/destructive-action-authority.js";
 import { areEquivalentPaths, createRealpathAwarePathMatcher } from "../../../utils/path.js";
 import {
   defaultWorkspaceLifecycleCoordinator,
@@ -164,7 +168,10 @@ export function createWorkspaceProvisioningService(deps: {
       if (previousProject?.archivedAt) {
         await projectRegistry.upsert(previousProject);
       } else if (!previousProject) {
-        await projectRegistry.remove(workspace.projectId);
+        const caller = createCoordinatorDestructiveCaller();
+        await projectRegistry.remove(workspace.projectId, {
+          recheck: () => assertDestructiveCallerActive(caller),
+        });
       }
     } catch (error) {
       logger.error(

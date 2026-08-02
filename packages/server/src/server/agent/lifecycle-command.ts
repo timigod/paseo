@@ -1,5 +1,4 @@
 import type { Logger } from "pino";
-import { PARENT_AGENT_ID_LABEL } from "@getpaseo/protocol/agent-labels";
 
 import {
   AgentRunCancellationError,
@@ -10,10 +9,15 @@ import type { StoredAgentRecord } from "./agent-storage.js";
 import type { AgentProviderNotice } from "./agent-sdk-types.js";
 import {
   assertDestructiveActionAuthorized,
+  requireDestructiveCaller,
   type DestructiveActionName,
   type DestructiveActionRecheck,
   type DestructiveCallerContext,
 } from "./destructive-action-authority.js";
+import {
+  buildAgentArchiveCascadePlan,
+  type AgentArchiveCascadePlan,
+} from "./agent-archive-cascade.js";
 
 export type LifecycleAgentSnapshot = Pick<
   ManagedAgent,
@@ -33,11 +37,13 @@ export interface LifecycleAgentManager {
   archiveAgent(
     agentId: string,
     recheck?: DestructiveActionRecheck,
+    cascadePlan?: AgentArchiveCascadePlan,
   ): Promise<{ archivedAt: string }>;
   archiveSnapshot(
     agentId: string,
     archivedAt: string,
     recheck?: DestructiveActionRecheck,
+    cascadePlan?: AgentArchiveCascadePlan,
   ): Promise<StoredAgentRecord>;
   closeAgent(agentId: string, recheck?: DestructiveActionRecheck): Promise<void>;
   setLabels(agentId: string, labels: Record<string, string>): Promise<void>;
@@ -190,11 +196,7 @@ export interface ArchiveAgentResult {
   record: StoredAgentRecord;
 }
 
-export interface AgentArchiveCascadeTarget {
-  targetAgentIds: string[];
-  targetWorkspaceIds: string[];
-  liveAgentIds: Set<string>;
-}
+export type AgentArchiveCascadeTarget = AgentArchiveCascadePlan;
 
 export async function resolveAgentArchiveCascadeTarget(
   dependencies: {
@@ -205,48 +207,7 @@ export async function resolveAgentArchiveCascadeTarget(
 ): Promise<AgentArchiveCascadeTarget> {
   const liveAgents = dependencies.agentManager.listAgents();
   const storedRecords = await dependencies.agentStorage.list();
-  const labelsById = new Map<string, Record<string, string>>();
-  const workspaceIdById = new Map<string, string>();
-  const liveAgentIds = new Set(liveAgents.map((agent) => agent.id));
-
-  for (const record of storedRecords) {
-    if (!record.archivedAt || liveAgentIds.has(record.id)) {
-      labelsById.set(record.id, record.labels ?? {});
-      if (record.workspaceId) {
-        workspaceIdById.set(record.id, record.workspaceId);
-      }
-    }
-  }
-  for (const agent of liveAgents) {
-    labelsById.set(agent.id, agent.labels ?? {});
-    if (agent.workspaceId) {
-      workspaceIdById.set(agent.id, agent.workspaceId);
-    }
-  }
-
-  const targetAgentIds = Array.from(new Set(seedAgentIds));
-  const targetAgentIdSet = new Set(targetAgentIds);
-  for (let index = 0; index < targetAgentIds.length; index += 1) {
-    const parentAgentId = targetAgentIds[index];
-    for (const [candidateAgentId, labels] of labelsById) {
-      if (
-        !targetAgentIdSet.has(candidateAgentId) &&
-        labels[PARENT_AGENT_ID_LABEL] === parentAgentId
-      ) {
-        targetAgentIdSet.add(candidateAgentId);
-        targetAgentIds.push(candidateAgentId);
-      }
-    }
-  }
-
-  const targetWorkspaceIds = Array.from(
-    new Set(
-      targetAgentIds
-        .map((targetAgentId) => workspaceIdById.get(targetAgentId))
-        .filter((workspaceId): workspaceId is string => typeof workspaceId === "string"),
-    ),
-  );
-  return { targetAgentIds, targetWorkspaceIds, liveAgentIds };
+  return buildAgentArchiveCascadePlan(seedAgentIds, liveAgents, storedRecords);
 }
 
 export async function assertAgentArchiveBatchAuthorized(
@@ -257,7 +218,7 @@ export async function assertAgentArchiveBatchAuthorized(
     >;
     agentStorage: Pick<LifecycleAgentStorage, "list">;
   },
-  caller: DestructiveCallerContext | undefined,
+  caller: DestructiveCallerContext,
   seedAgentIds: readonly string[],
   action: Extract<DestructiveActionName, "agent.archive" | "agent.finish">,
   options?: {
@@ -268,60 +229,65 @@ export async function assertAgentArchiveBatchAuthorized(
   },
 ): Promise<AgentArchiveCascadeTarget> {
   const target = await resolveAgentArchiveCascadeTarget(dependencies, seedAgentIds);
-  if (caller) {
-    assertDestructiveActionAuthorized(
-      {
-        getAgent: (agentId) => dependencies.agentManager.getAgent(agentId),
-        isCurrentAgentIncarnation: (agentId, incarnation) =>
-          dependencies.agentManager.isCurrentAgentIncarnation?.(agentId, incarnation) === true,
-      },
-      caller,
-      {
-        action,
-        targetAgentIds: target.targetAgentIds,
-        targetWorkspaceIds: Array.from(
-          new Set([...target.targetWorkspaceIds, ...(options?.additionalWorkspaceIds ?? [])]),
-        ),
-        targetPaths: options?.targetPaths,
-        hasLiveTarget:
-          options?.hasAdditionalLiveTarget === true ||
-          target.targetAgentIds.some((agentId) => target.liveAgentIds.has(agentId)),
-      },
-      options?.signal,
-    );
-  }
+  assertDestructiveActionAuthorized(
+    {
+      getAgent: (agentId) => dependencies.agentManager.getAgent(agentId),
+      isCurrentAgentIncarnation: (agentId, incarnation) =>
+        dependencies.agentManager.isCurrentAgentIncarnation?.(agentId, incarnation) === true,
+    },
+    caller,
+    {
+      action,
+      targetAgentIds: target.targetAgentIds,
+      targetWorkspaceIds: Array.from(
+        new Set([...target.targetWorkspaceIds, ...(options?.additionalWorkspaceIds ?? [])]),
+      ),
+      targetPaths: options?.targetPaths,
+      hasLiveTarget:
+        options?.hasAdditionalLiveTarget === true ||
+        target.targetAgentIds.some((agentId) => target.liveAgentIds.has(agentId)),
+    },
+    options?.signal,
+  );
   return target;
 }
 
 export async function archiveAgentCommand(
   dependencies: AgentLifecycleCommandDependencies,
   agentId: string,
-  options?: {
-    caller?: DestructiveCallerContext;
+  options: {
+    caller: DestructiveCallerContext;
     action?: "agent.archive" | "agent.finish";
     signal?: AbortSignal;
   },
 ): Promise<ArchiveAgentResult> {
   const liveAgent = dependencies.agentManager.getAgent(agentId);
+  const caller = requireDestructiveCaller(options?.caller);
+  const cascadePlan = await assertAgentArchiveBatchAuthorized(
+    dependencies,
+    caller,
+    [agentId],
+    options.action ?? "agent.archive",
+    { signal: options.signal },
+  );
   const authorize: DestructiveActionRecheck = async () => {
     await assertAgentArchiveBatchAuthorized(
       dependencies,
-      options?.caller,
+      caller,
       [agentId],
-      options?.action ?? "agent.archive",
-      { signal: options?.signal },
+      options.action ?? "agent.archive",
+      { signal: options.signal },
     );
   };
-  await authorize();
   let record: StoredAgentRecord | null;
   if (liveAgent) {
     await requestAgentRunCancellation(dependencies, agentId);
     await dependencies.agentManager.clearAgentAttention(agentId).catch(() => undefined);
     await authorize();
-    await dependencies.agentManager.archiveAgent(agentId, authorize);
+    await dependencies.agentManager.archiveAgent(agentId, authorize, cascadePlan);
     record = await dependencies.agentStorage.get(agentId);
   } else {
-    record = await archiveStoredAgent(dependencies, agentId, authorize);
+    record = await archiveStoredAgent(dependencies, agentId, authorize, cascadePlan);
   }
 
   if (!record) {
@@ -341,29 +307,30 @@ export async function archiveAgentCommand(
 export async function closeAgentCommand(
   dependencies: Pick<AgentLifecycleCommandDependencies, "agentManager">,
   agentId: string,
-  options?: { caller?: DestructiveCallerContext; signal?: AbortSignal },
+  options: { caller: DestructiveCallerContext; signal?: AbortSignal },
 ): Promise<void> {
+  const caller = requireDestructiveCaller(options?.caller);
   assertAgentDestructiveActionAuthorized(
     dependencies.agentManager,
-    options?.caller,
+    caller,
     agentId,
     "agent.kill",
-    options?.signal,
+    options.signal,
   );
   await dependencies.agentManager.closeAgent(agentId, () =>
     assertAgentDestructiveActionAuthorized(
       dependencies.agentManager,
-      options?.caller,
+      caller,
       agentId,
       "agent.kill",
-      options?.signal,
+      options.signal,
     ),
   );
 }
 
 export function assertAgentDestructiveActionAuthorized(
   agentManager: Pick<LifecycleAgentManager, "getAgent" | "isCurrentAgentIncarnation">,
-  caller: DestructiveCallerContext | undefined,
+  caller: DestructiveCallerContext,
   agentId: string,
   action: Extract<
     DestructiveActionName,
@@ -371,9 +338,6 @@ export function assertAgentDestructiveActionAuthorized(
   >,
   signal?: AbortSignal,
 ): void {
-  if (!caller) {
-    return;
-  }
   const target = agentManager.getAgent(agentId);
   assertDestructiveActionAuthorized(
     {
@@ -459,6 +423,7 @@ async function archiveStoredAgent(
   dependencies: Pick<AgentLifecycleCommandDependencies, "agentManager" | "agentStorage">,
   agentId: string,
   authorize: DestructiveActionRecheck,
+  cascadePlan: AgentArchiveCascadePlan,
 ): Promise<StoredAgentRecord> {
   const existing = await dependencies.agentStorage.get(agentId);
   if (!existing) {
@@ -471,5 +436,5 @@ async function archiveStoredAgent(
 
   await authorize();
   const archivedAt = new Date().toISOString();
-  return dependencies.agentManager.archiveSnapshot(agentId, archivedAt, authorize);
+  return dependencies.agentManager.archiveSnapshot(agentId, archivedAt, authorize, cascadePlan);
 }

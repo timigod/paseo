@@ -988,6 +988,7 @@ describe("archiveByScope", () => {
       {
         scope: { kind: "workspace", workspaceId },
         requestId: "req-last-ref-workspace",
+        caller: createCoordinatorDestructiveCaller(),
       },
     );
 
@@ -1031,6 +1032,7 @@ describe("archiveByScope", () => {
       {
         scope: { kind: "workspace", workspaceId: workspaceA },
         requestId: "req-sibling-workspace",
+        caller: createCoordinatorDestructiveCaller(),
       },
     );
 
@@ -1074,6 +1076,7 @@ describe("archiveByScope", () => {
       {
         scope: { kind: "workspace", workspaceId: sourceWorkspaceId },
         requestId: "req-subdirectory-sibling",
+        caller: createCoordinatorDestructiveCaller(),
       },
     );
 
@@ -1154,6 +1157,7 @@ describe("archiveByScope", () => {
       {
         scope: { kind: "workspace", workspaceId: subdirectoryWorkspaceId },
         requestId: "req-subdirectory-target",
+        caller: createCoordinatorDestructiveCaller(),
       },
     );
 
@@ -1208,6 +1212,7 @@ describe("archiveByScope", () => {
       {
         scope: { kind: "workspace", workspaceId },
         requestId: "req-nested-teardown",
+        caller: createCoordinatorDestructiveCaller(),
       },
     );
 
@@ -1288,6 +1293,7 @@ describe("archiveByScope", () => {
       {
         scope: { kind: "worktree", targetPath: worktree.worktreePath },
         requestId: "req-worktree-scope",
+        caller: createCoordinatorDestructiveCaller(),
       },
     );
 
@@ -1314,6 +1320,7 @@ describe("archiveByScope", () => {
       {
         scope: { kind: "workspace", workspaceId },
         requestId: "req-local-checkout",
+        caller: createCoordinatorDestructiveCaller(),
       },
     );
 
@@ -1350,6 +1357,7 @@ describe("archiveByScope", () => {
       archiveByScope(deps, {
         scope: { kind: "worktree", targetPath: worktree.worktreePath },
         requestId: "req-partial-failure",
+        caller: createCoordinatorDestructiveCaller(),
       }),
     ).rejects.toThrow("Failed to archive one or more workspaces");
 
@@ -2338,6 +2346,7 @@ describe("archiveByScope", () => {
       archiveByScope(deps, {
         scope: { kind: "workspace", workspaceId: "ws-does-not-exist" },
         requestId: "req-unknown-workspace",
+        caller: createCoordinatorDestructiveCaller(),
       }),
     ).rejects.toBeInstanceOf(WorkspaceArchiveTargetNotFoundError);
     expect(deps.markWorkspaceArchiving).not.toHaveBeenCalled();
@@ -2358,6 +2367,7 @@ describe("archiveByScope", () => {
       {
         scope: { kind: "worktree", targetPath: worktree.worktreePath },
         requestId: "req-zero-records",
+        caller: createCoordinatorDestructiveCaller(),
       },
     );
 
@@ -2437,6 +2447,7 @@ describe("archiveByScope", () => {
     await archiveByScope(deps, {
       scope: { kind: "workspace", workspaceId },
       requestId: "req-lifecycle",
+      caller: createCoordinatorDestructiveCaller(),
     });
 
     expect(events.map((event) => event.type)).toEqual(["mark", "emit", "archive", "clear", "emit"]);
@@ -2494,6 +2505,7 @@ describe("archiveByScope", () => {
     const result = await archiveByScope(deps, {
       scope: { kind: "workspace", workspaceId: targetWorkspaceId },
       requestId: "req-snapshot-scope",
+      caller: createCoordinatorDestructiveCaller(),
     });
 
     assertArchiveResult(result, {
@@ -2527,6 +2539,7 @@ describe("archiveByScope", () => {
       {
         scope: { kind: "worktree", targetPath: worktree.worktreePath },
         requestId: "req-worktree-scope-n3",
+        caller: createCoordinatorDestructiveCaller(),
       },
     );
 

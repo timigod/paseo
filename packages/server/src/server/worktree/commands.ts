@@ -107,7 +107,7 @@ export interface ArchiveCommandInput {
   branchName?: string;
   workspaceId?: string;
   scope?: ArchiveScope["kind"];
-  caller?: ArchiveByScopeRequest["caller"];
+  caller: ArchiveByScopeRequest["caller"];
 }
 
 export type ArchiveCommandResult =

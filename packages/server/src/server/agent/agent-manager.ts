@@ -86,6 +86,10 @@ import {
   type ProviderSubagentDescriptor,
   type ProviderSubagentStoreEvent,
 } from "./provider-subagents/store.js";
+import {
+  buildAgentArchiveCascadePlan,
+  type AgentArchiveCascadePlan,
+} from "./agent-archive-cascade.js";
 
 const RELOAD_SESSION_CLOSE_TIMEOUT_MS = 3_000;
 const INTERRUPT_SESSION_TIMEOUT_MS = 2_000;
@@ -1851,11 +1855,13 @@ export class AgentManager {
   async archiveAgent(
     agentId: string,
     recheck?: DestructiveActionRecheck,
+    cascadePlan?: AgentArchiveCascadePlan,
   ): Promise<{ archivedAt: string }> {
     this.requireAgent(agentId);
     if (!this.registry) {
       throw new Error("Agent storage is not configured");
     }
+    const resolvedCascadePlan = cascadePlan ?? (await this.resolveArchiveCascadePlan([agentId]));
 
     // Close first so a caller revoked during later storage preparation leaves a
     // durable, resumable closed agent instead of an archived record with a live runtime.
@@ -1869,7 +1875,7 @@ export class AgentManager {
     const { archivedAt } = await this.markRecordArchived(stored, recheck);
     this.discardRetainedAgentState(agentId);
 
-    await this.cascadeArchiveChildren(agentId, recheck);
+    await this.cascadeArchiveChildren(agentId, resolvedCascadePlan, recheck);
 
     return { archivedAt };
   }
@@ -1880,28 +1886,26 @@ export class AgentManager {
   // handoff agents omit this label, so they stand outside the cascade.
   private async cascadeArchiveChildren(
     parentAgentId: string,
+    cascadePlan: AgentArchiveCascadePlan,
     recheck?: DestructiveActionRecheck,
   ): Promise<void> {
-    const registry = this.registry;
-    if (!registry) {
-      return;
-    }
-    const records = await registry.list();
-    await recheck?.();
-    for (const record of records) {
-      if (record.archivedAt) {
-        continue;
-      }
-      if (record.labels?.[PARENT_AGENT_ID_LABEL] !== parentAgentId) {
-        continue;
-      }
+    for (const childAgentId of cascadePlan.childrenByParentAgentId.get(parentAgentId) ?? []) {
       await recheck?.();
-      if (this.agents.has(record.id)) {
-        await this.archiveAgent(record.id, recheck);
+      if (this.agents.has(childAgentId)) {
+        await this.archiveAgent(childAgentId, recheck, cascadePlan);
       } else {
-        await this.archiveSnapshot(record.id, new Date().toISOString(), recheck);
+        await this.archiveSnapshot(childAgentId, new Date().toISOString(), recheck, cascadePlan);
       }
     }
+  }
+
+  private async resolveArchiveCascadePlan(
+    seedAgentIds: readonly string[],
+  ): Promise<AgentArchiveCascadePlan> {
+    const registry = this.requireRegistry();
+    const liveAgents = this.listAgents();
+    const storedRecords = await registry.list();
+    return buildAgentArchiveCascadePlan(seedAgentIds, liveAgents, storedRecords);
   }
 
   private async markRecordArchived(
@@ -2176,8 +2180,10 @@ export class AgentManager {
     agentId: string,
     archivedAt: string,
     recheck?: DestructiveActionRecheck,
+    cascadePlan?: AgentArchiveCascadePlan,
   ): Promise<StoredAgentRecord> {
     const registry = this.requireRegistry();
+    const resolvedCascadePlan = cascadePlan ?? (await this.resolveArchiveCascadePlan([agentId]));
     const liveAgent = this.getAgent(agentId);
     if (liveAgent) {
       await this.persistSnapshot(liveAgent, {
@@ -2206,7 +2212,7 @@ export class AgentManager {
     }
 
     await this.fireAgentArchived(agentId);
-    await this.cascadeArchiveChildren(agentId, recheck);
+    await this.cascadeArchiveChildren(agentId, resolvedCascadePlan, recheck);
 
     return nextRecord;
   }

@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pino } from "pino";
-import { afterEach, describe, expect, test } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 import type { SessionOutboundMessage, StartWorkspaceScriptRequest } from "../../messages.js";
 import { createServiceProxySubsystem, type ServiceProxySubsystem } from "../../service-proxy.js";
 import type { TerminalManager } from "../../../terminal/terminal-manager.js";
@@ -21,6 +21,11 @@ import type {
 import type { WorkspaceGitService } from "../../workspace-git-service.js";
 import { createWorkspaceScriptsService } from "./workspace-scripts-service.js";
 import { deriveProjectServiceSlug } from "../../workspace-git-metadata.js";
+import {
+  createAgentDestructiveCaller,
+  createCoordinatorDestructiveCaller,
+  type LiveAgentAuthority,
+} from "../../agent/destructive-action-authority.js";
 
 // The production module reads only WorkspaceGitService.{peekSnapshot,getProjectSlug},
 // WorkspaceRegistry.get, and forwards the launcher + opaque managers to the injected
@@ -77,6 +82,7 @@ interface BuildOptions {
   project?: PersistedProjectRecord | null;
   spawnThrows?: string;
   gitService?: Pick<WorkspaceGitService, "peekSnapshot">;
+  agentAuthority?: LiveAgentAuthority;
 }
 
 function buildService(options: BuildOptions = {}) {
@@ -98,6 +104,10 @@ function buildService(options: BuildOptions = {}) {
         : options.scriptRuntimeStore,
     terminalManager:
       options.terminalManager === undefined ? availableTerminalManager : options.terminalManager,
+    agentAuthority: options.agentAuthority ?? {
+      getAgent: () => null,
+      isCurrentAgentIncarnation: () => false,
+    },
     workspaceRegistry: fakeWorkspaceRegistry(workspace),
     projectRegistry: fakeProjectRegistry(options.project ?? null),
     workspaceGitService: options.gitService ?? fakeGitService(),
@@ -257,7 +267,12 @@ describe("stop", () => {
       terminalManager,
     });
 
-    await expect(service.stop({ workspaceId: "ws-1", scriptName: "web" })).resolves.toMatchObject({
+    await expect(
+      service.stop(
+        { workspaceId: "ws-1", scriptName: "web" },
+        { caller: createCoordinatorDestructiveCaller() },
+      ),
+    ).resolves.toMatchObject({
       scriptName: "web",
       type: "service",
       port: 3000,
@@ -265,6 +280,53 @@ describe("stop", () => {
       exitCode: 143,
       terminalId: "terminal-1",
     });
+  });
+
+  test("blocks an agent from stopping a script terminal in its own workspace", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "workspace-scripts-authority-"));
+    tempDirs.push(dir);
+    writeFileSync(
+      join(dir, "paseo.json"),
+      JSON.stringify({ scripts: { web: { type: "service", command: "npm run web", port: 3000 } } }),
+    );
+    const runtimeStore = new WorkspaceScriptRuntimeStore();
+    runtimeStore.set({
+      workspaceId: "ws-1",
+      scriptName: "web",
+      type: "service",
+      lifecycle: "running",
+      terminalId: "terminal-1",
+      exitCode: null,
+    });
+    const killTerminalAndWait = vi.fn();
+    const terminalManager = {
+      getTerminal: () => ({ id: "terminal-1", cwd: dir, workspaceId: "ws-1" }),
+      killTerminalAndWait,
+    } as unknown as TerminalManager;
+    const { service } = buildService({
+      workspace: { workspaceId: "ws-1", cwd: dir } as PersistedWorkspaceRecord,
+      scriptRuntimeStore: runtimeStore,
+      terminalManager,
+      agentAuthority: {
+        getAgent: (agentId) =>
+          agentId === "caller" ? { id: agentId, cwd: dir, workspaceId: "ws-1" } : null,
+        isCurrentAgentIncarnation: (agentId, incarnation) =>
+          agentId === "caller" && incarnation === "caller-incarnation",
+      },
+    });
+
+    await expect(
+      service.stop(
+        { workspaceId: "ws-1", scriptName: "web" },
+        {
+          caller: createAgentDestructiveCaller({
+            agentId: "caller",
+            incarnation: "caller-incarnation",
+          }),
+        },
+      ),
+    ).rejects.toMatchObject({ code: "SELF_ARCHIVE_BLOCKED" });
+    expect(killTerminalAndWait).not.toHaveBeenCalled();
   });
 });
 

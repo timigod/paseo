@@ -282,7 +282,7 @@ async function killTerminalIfPresent(terminalId: string | null | undefined): Pro
     return;
   }
   try {
-    await agentScopedClient.callTool({ name: "kill_terminal", args: { terminalId } });
+    await topLevelClient.callTool({ name: "kill_terminal", args: { terminalId } });
   } catch {
     // ignore cleanup errors
   }
@@ -682,7 +682,7 @@ describe("Suite B: Terminal Tools", () => {
     }
   });
 
-  test("kill_terminal removes terminal", async () => {
+  test("kill_terminal blocks an agent-scoped self-workspace terminal and allows coordinator cleanup", async () => {
     let terminalId: string | null = null;
     try {
       const created = await callToolStructured(agentScopedClient, "create_terminal", {
@@ -690,7 +690,13 @@ describe("Suite B: Terminal Tools", () => {
       });
       terminalId = str(created.id);
 
-      await callToolStructured(agentScopedClient, "kill_terminal", { terminalId });
+      await expectToolError(
+        agentScopedClient,
+        "kill_terminal",
+        { terminalId },
+        /cannot target itself/i,
+      );
+      await callToolStructured(topLevelClient, "kill_terminal", { terminalId });
       terminalId = null;
 
       const listed = await waitFor({

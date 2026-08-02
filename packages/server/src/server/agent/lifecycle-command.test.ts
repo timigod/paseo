@@ -370,6 +370,7 @@ describe("agent lifecycle commands", () => {
     const result = await archiveAgentCommand(
       { agentManager: manager, agentStorage: storage, logger },
       "agent-1",
+      { caller: createCoordinatorDestructiveCaller() },
     );
 
     expect(result).toEqual({
@@ -569,7 +570,9 @@ describe("agent lifecycle commands", () => {
     storage.records.set("agent-1", storedAgent("agent-1"));
 
     await expect(
-      archiveAgentCommand({ agentManager: manager, agentStorage: storage, logger }, "agent-1"),
+      archiveAgentCommand({ agentManager: manager, agentStorage: storage, logger }, "agent-1", {
+        caller: createCoordinatorDestructiveCaller(),
+      }),
     ).resolves.toMatchObject({ agentId: "agent-1" });
     expect(manager.cancelledAgentIds).toEqual(["agent-1"]);
     expect(manager.archivedAgentIds).toEqual(["agent-1"]);
@@ -583,6 +586,7 @@ describe("agent lifecycle commands", () => {
     const result = await archiveAgentCommand(
       { agentManager: manager, agentStorage: storage, logger },
       "agent-1",
+      { caller: createCoordinatorDestructiveCaller() },
     );
 
     expect(result.agentId).toBe("agent-1");

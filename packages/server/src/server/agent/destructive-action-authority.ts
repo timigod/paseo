@@ -48,6 +48,8 @@ export type DestructiveActionName =
   | "agent.delete"
   | "agent.kill"
   | "agent.finish"
+  | "terminal.kill"
+  | "project.remove"
   | "workspace.archive"
   | "worktree.archive";
 
@@ -108,12 +110,21 @@ export function revokeDestructiveCaller(caller: DestructiveCallerContext): void 
 }
 
 export function assertDestructiveCallerActive(
-  caller: DestructiveCallerContext | undefined,
+  caller: DestructiveCallerContext,
   signal?: AbortSignal,
 ): void {
-  if (signal?.aborted || (caller && callerAuthorities.get(caller)?.active !== true)) {
+  if (signal?.aborted || callerAuthorities.get(caller)?.active !== true) {
     throw invalidCaller();
   }
+}
+
+export function requireDestructiveCaller(
+  caller: DestructiveCallerContext | undefined,
+): DestructiveCallerContext {
+  if (!caller) {
+    throw invalidCaller();
+  }
+  return caller;
 }
 
 export function assertDestructiveActionAuthorized(

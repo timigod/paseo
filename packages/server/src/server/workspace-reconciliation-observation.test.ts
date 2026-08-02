@@ -232,7 +232,7 @@ class ObservedPlacements {
   }
 
   async remove(projectId: string): Promise<void> {
-    await this.projects.remove(projectId);
+    await this.projects.remove(projectId, { recheck: () => undefined });
   }
 
   failNextWatch(root: string): void {

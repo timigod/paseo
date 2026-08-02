@@ -14,7 +14,13 @@ import type {
   UnsubscribeTerminalsRequest,
 } from "../server/messages.js";
 import { killTerminalsForWorkspace as killWorkspaceTerminals } from "../server/workspace-archive-service.js";
-import type { DestructiveActionRecheck } from "../server/agent/destructive-action-authority.js";
+import {
+  requireDestructiveCaller,
+  type DestructiveActionRecheck,
+  type DestructiveCallerContext,
+  type LiveAgentAuthority,
+} from "../server/agent/destructive-action-authority.js";
+import { killTerminalWithAuthority, killTerminalWithRecheck } from "../server/terminal-kill.js";
 import {
   defaultWorkspaceLifecycleCoordinator,
   type WorkspaceLifecycleCoordinator,
@@ -68,6 +74,7 @@ interface SnapshotSendResult {
 
 export interface TerminalSessionControllerOptions {
   terminalManager: TerminalManager | null;
+  agentAuthority: LiveAgentAuthority;
   emit: (msg: SessionOutboundMessage) => void;
   emitBinary: (frame: Uint8Array) => void;
   hasBinaryChannel: () => boolean;
@@ -127,6 +134,7 @@ const TERMINAL_MESSAGE_TYPES: ReadonlySet<TerminalDispatchableMessage["type"]> =
 
 export class TerminalSessionController {
   private readonly terminalManager: TerminalManager | null;
+  private readonly agentAuthority: LiveAgentAuthority;
   private readonly emit: (msg: SessionOutboundMessage) => void;
   private readonly emitBinary: (frame: Uint8Array) => void;
   private readonly hasBinaryChannel: () => boolean;
@@ -154,6 +162,7 @@ export class TerminalSessionController {
 
   constructor(options: TerminalSessionControllerOptions) {
     this.terminalManager = options.terminalManager;
+    this.agentAuthority = options.agentAuthority;
     this.emit = options.emit;
     this.emitBinary = options.emitBinary;
     this.hasBinaryChannel = options.hasBinaryChannel;
@@ -185,7 +194,10 @@ export class TerminalSessionController {
     };
   }
 
-  dispatch(msg: SessionInboundMessage): Promise<void> | undefined {
+  dispatch(
+    msg: SessionInboundMessage,
+    destructiveCaller?: DestructiveCallerContext,
+  ): Promise<void> | undefined {
     if (!isTerminalMessage(msg)) {
       return undefined;
     }
@@ -209,7 +221,7 @@ export class TerminalSessionController {
         this.handleTerminalInput(msg);
         return undefined;
       case "kill_terminal_request":
-        return this.handleKillTerminalRequest(msg);
+        return this.handleKillTerminalRequest(msg, requireDestructiveCaller(destructiveCaller));
       case "capture_terminal_request":
         return this.handleCaptureTerminalRequest(msg);
       case "terminal.rename.request":
@@ -257,12 +269,22 @@ export class TerminalSessionController {
     }
   }
 
-  killTerminalForClose(terminalId: string): { terminalId: string; success: boolean } {
+  async killTerminalForClose(
+    terminalId: string,
+    recheck: DestructiveActionRecheck,
+  ): Promise<{ terminalId: string; success: boolean }> {
     if (!this.terminalManager) {
       return { terminalId, success: false };
     }
-    this.killTracked(terminalId, { emitExit: true });
-    return { terminalId, success: true };
+    const success = await killTerminalWithRecheck(
+      {
+        terminalManager: this.terminalManager,
+        beforeKill: (id) => this.detachStream(id, { emitExit: true }),
+      },
+      terminalId,
+      recheck,
+    );
+    return { terminalId, success };
   }
 
   getTerminalForClose(
@@ -280,7 +302,7 @@ export class TerminalSessionController {
 
   async killTerminalsForWorkspace(
     workspaceId: string,
-    recheck?: DestructiveActionRecheck,
+    recheck: DestructiveActionRecheck,
   ): Promise<void> {
     return killWorkspaceTerminals(
       {
@@ -772,18 +794,26 @@ export class TerminalSessionController {
     session.send(msg.message);
   }
 
-  private killTracked(terminalId: string, options?: { emitExit: boolean }): void {
-    this.detachStream(terminalId, { emitExit: options?.emitExit ?? true });
-    this.terminalManager?.killTerminal(terminalId);
-  }
-
-  private async handleKillTerminalRequest(msg: KillTerminalRequest): Promise<void> {
-    const result = this.killTerminalForClose(msg.terminalId);
+  private async handleKillTerminalRequest(
+    msg: KillTerminalRequest,
+    caller: DestructiveCallerContext,
+  ): Promise<void> {
+    const success = this.terminalManager
+      ? await killTerminalWithAuthority(
+          {
+            agentAuthority: this.agentAuthority,
+            terminalManager: this.terminalManager,
+            beforeKill: (id) => this.detachStream(id, { emitExit: true }),
+          },
+          msg.terminalId,
+          caller,
+        )
+      : false;
     this.emit({
       type: "kill_terminal_response",
       payload: {
-        terminalId: result.terminalId,
-        success: result.success,
+        terminalId: msg.terminalId,
+        success,
         requestId: msg.requestId,
       },
     });
