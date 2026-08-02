@@ -8,11 +8,13 @@ import { getProviderIcon } from "@/components/provider-icons";
 import type { AgentScreenAgent } from "@/hooks/use-agent-screen-state-machine";
 import { usePaneContext } from "@/panels/pane-context";
 import type { PanelDescriptor, PanelRegistration } from "@/panels/panel-registry";
+import { useHostRuntimeSnapshot } from "@/runtime/host-runtime";
 import { useSessionStore } from "@/stores/session-store";
 import {
   providerSubagentKey,
   providerSubagentLifecycleStatus,
   refreshProviderSubagents,
+  refreshProviderSubagentTimeline,
   useProviderSubagentStore,
 } from "@/subagents/provider-store";
 import { useTranslation } from "react-i18next";
@@ -81,48 +83,55 @@ function ProviderSubagentPanel() {
   );
   const client = useSessionStore((state) => state.sessions[serverId]?.client ?? null);
   const serverInfo = useSessionStore((state) => state.sessions[serverId]?.serverInfo ?? null);
+  const connectionEpoch = useHostRuntimeSnapshot(serverId)?.connectionEpoch ?? 0;
   // COMPAT(providerSubagents): added in v0.2.11, remove after 2027-01-12.
   const supported = serverInfo?.features?.providerSubagents === true;
   const [isLoadingOlder, setIsLoadingOlder] = useState(false);
 
   useEffect(() => {
     if (!client || !supported) return;
-    void refreshProviderSubagents(client, serverId, target.parentAgentId).catch(() => undefined);
-  }, [client, serverId, supported, target.parentAgentId]);
+    void refreshProviderSubagents(client, serverId, target.parentAgentId, connectionEpoch).catch(
+      () => undefined,
+    );
+  }, [client, connectionEpoch, serverId, supported, target.parentAgentId]);
 
   useEffect(() => {
     if (!client || !supported) return;
-    void client
-      .fetchProviderSubagentTimeline(target.parentAgentId, target.subagentId, {
+    void refreshProviderSubagentTimeline(
+      client,
+      serverId,
+      target.parentAgentId,
+      target.subagentId,
+      connectionEpoch,
+      {
         direction: "tail",
         limit: TIMELINE_FETCH_PAGE_SIZE,
-      })
-      .then((payload) => {
-        useProviderSubagentStore.getState().replaceTimeline(serverId, payload);
-        return undefined;
-      })
-      .catch(() => undefined);
-  }, [client, serverId, supported, target.parentAgentId, target.subagentId]);
+      },
+    ).catch(() => undefined);
+  }, [client, connectionEpoch, serverId, supported, target.parentAgentId, target.subagentId]);
 
   const loadOlder = useCallback(() => {
     if (!client || !supported || isLoadingOlder || !timeline?.hasOlder || !timeline.epoch) return;
     const firstSeq = timeline.rows.size ? Math.min(...timeline.rows.keys()) : null;
     if (firstSeq === null) return;
     setIsLoadingOlder(true);
-    void client
-      .fetchProviderSubagentTimeline(target.parentAgentId, target.subagentId, {
+    void refreshProviderSubagentTimeline(
+      client,
+      serverId,
+      target.parentAgentId,
+      target.subagentId,
+      connectionEpoch,
+      {
         direction: "before",
         cursor: { epoch: timeline.epoch, seq: firstSeq },
         limit: TIMELINE_FETCH_PAGE_SIZE,
-      })
-      .then((payload) => {
-        useProviderSubagentStore.getState().replaceTimeline(serverId, payload);
-        return undefined;
-      })
+      },
+    )
       .catch(() => undefined)
       .finally(() => setIsLoadingOlder(false));
   }, [
     client,
+    connectionEpoch,
     isLoadingOlder,
     serverId,
     supported,

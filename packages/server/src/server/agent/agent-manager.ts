@@ -2032,11 +2032,15 @@ export class AgentManager {
   async emitLiveTimelineItem(agentId: string, item: AgentTimelineItem): Promise<void> {
     const agent = this.requireAgent(agentId);
     this.touchUpdatedAt(agent);
-    this.dispatchStream(agentId, {
-      type: "timeline",
-      item,
-      provider: agent.provider,
-    });
+    this.dispatchStream(
+      agentId,
+      {
+        type: "timeline",
+        item,
+        provider: agent.provider,
+      },
+      { epoch: this.timelineStore.getEpoch(agentId) },
+    );
   }
 
   streamAgent(

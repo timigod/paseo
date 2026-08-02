@@ -343,6 +343,8 @@ function createSessionForTest(options: SessionForTestOptions = {}): Session {
     resolveRepoRemoteUrl: vi.fn(),
     resolveRepoRoot: vi.fn(),
     getWorkspaceGitMetadata: vi.fn(),
+    invalidateCheckoutDiff: vi.fn(),
+    invalidateRepositoryFacts: vi.fn(),
     resolveForge: vi.fn().mockResolvedValue({ forge: "github", service: github }),
     // Mirror production: invalidateForge resolves the forge and busts the
     // adapter's cache. The resolved forge here is github, so delegate to it.
@@ -4827,6 +4829,113 @@ test("unions viewed timelines across socket sources and removes detached sources
       message.type === "agent_stream" ? [message.payload.agentId] : [],
     ),
   ).toEqual(["agent-b"]);
+});
+
+test("does not register provider child interest when loading finishes after disconnect", async () => {
+  const parentAgentId = "99999999-9999-4999-8999-999999999999";
+  const source = {};
+  const targetedMessages: Array<{ source: object; message: SessionOutboundMessage }> = [];
+  const resume = deferred<unknown>();
+  const agentEventListeners: Array<(event: AgentManagerEvent) => void> = [];
+  const managedAgent = { id: parentAgentId, provider: "codex", lifecycle: "idle" };
+  let loaded = false;
+  const resumeAgentFromPersistence = vi.fn(async () => {
+    await resume.promise;
+    loaded = true;
+    return managedAgent;
+  });
+  const session = createSessionForTest({
+    targetedMessages,
+    agentStorage: {
+      get: vi.fn().mockResolvedValue({
+        id: parentAgentId,
+        provider: "codex",
+        cwd: "/tmp",
+        createdAt: "2026-07-12T10:00:00.000Z",
+        updatedAt: "2026-07-12T10:00:00.000Z",
+        labels: {},
+        lastStatus: "closed",
+        persistence: { provider: "codex", sessionId: "provider-parent" },
+      } satisfies StoredAgentRecord),
+    },
+    agentManager: {
+      subscribe: vi.fn((listener: (event: AgentManagerEvent) => void) => {
+        agentEventListeners.push(listener);
+        return () => {};
+      }),
+      waitForAgentClose: vi.fn(async () => undefined),
+      getAgent: vi.fn(() => (loaded ? managedAgent : undefined)),
+      getAgentInitializationState: vi.fn(() => ({
+        agent: loaded ? managedAgent : null,
+        closeInFlight: false,
+      })),
+      getRegisteredProviderIds: vi.fn(() => ["codex"]),
+      resumeAgentFromPersistence,
+      hydrateTimelineFromProvider: vi.fn(async () => undefined),
+      closeAgent: vi.fn(async () => undefined),
+      listProviderSubagents: vi.fn(() => []),
+    },
+  });
+  session.updateClientCapabilities({ [CLIENT_CAPS.providerSubagents]: true }, source);
+
+  const staleRequest = session.handleMessage(
+    {
+      type: "agent.provider_subagents.list.request",
+      parentAgentId,
+      requestId: "stale-provider-child-list",
+    },
+    source,
+  );
+  await vi.waitFor(() => {
+    expect(resumeAgentFromPersistence).toHaveBeenCalledOnce();
+  });
+  session.clearAgentTimelineSubscription(source);
+  resume.resolve(undefined);
+  await staleRequest;
+
+  session.updateClientCapabilities({ [CLIENT_CAPS.providerSubagents]: true }, source);
+  const emitProviderChild = (id: string): void => {
+    for (const listener of agentEventListeners) {
+      listener({
+        type: "provider_subagent",
+        event: {
+          type: "upsert",
+          subagent: {
+            id,
+            parentAgentId,
+            provider: "codex",
+            title: id,
+            description: null,
+            status: "running",
+            createdAt: "2026-07-12T10:00:00.000Z",
+            updatedAt: "2026-07-12T10:00:00.000Z",
+            toolCallId: null,
+          },
+        },
+      });
+    }
+  };
+  emitProviderChild("before-resubscribe");
+  expect(
+    targetedMessages.filter(({ message }) => message.type === "agent.provider_subagents.update"),
+  ).toEqual([]);
+
+  await session.handleMessage(
+    {
+      type: "agent.provider_subagents.list.request",
+      parentAgentId,
+      requestId: "current-provider-child-list",
+    },
+    source,
+  );
+  emitProviderChild("after-resubscribe");
+  expect(
+    targetedMessages.flatMap(({ source: target, message }) =>
+      message.type === "agent.provider_subagents.update" && message.payload.kind === "upsert"
+        ? [{ target, id: message.payload.subagent.id }]
+        : [],
+    ),
+  ).toEqual([{ target: source, id: "after-resubscribe" }]);
 });
 
 test("keeps selective delivery scoped per socket when a retained session also has a legacy socket", async () => {
