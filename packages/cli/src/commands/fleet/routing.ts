@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import type { DaemonGetStatusResponse } from "@getpaseo/protocol/messages";
+import type { DaemonRuntimeCapacityStatus } from "@getpaseo/protocol/messages";
 import type { CommandError } from "../../output/index.js";
 import type { FleetHost } from "./topology.js";
 import { translateFleetCwd } from "./topology.js";
@@ -15,9 +15,7 @@ export interface FleetHostObservation {
   workspaceIds: readonly string[];
 }
 
-export type FleetRuntimeCapacityStatus = NonNullable<
-  DaemonGetStatusResponse["payload"]["runtimeCapacity"]
->;
+export type FleetRuntimeCapacityStatus = DaemonRuntimeCapacityStatus;
 
 export function getFleetCapacityUsed(observation: FleetHostObservation): number {
   return observation.runtimeCapacity

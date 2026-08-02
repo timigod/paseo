@@ -3795,6 +3795,7 @@ export const DaemonRuntimeCapacityStatusSchema = z.object({
   reserved: z.number().int().nonnegative(),
   free: z.number().int().nonnegative().nullable(),
 });
+export type DaemonRuntimeCapacityStatus = z.infer<typeof DaemonRuntimeCapacityStatusSchema>;
 
 export const DaemonGetStatusResponseSchema = z.object({
   type: z.literal("daemon.get_status.response"),
