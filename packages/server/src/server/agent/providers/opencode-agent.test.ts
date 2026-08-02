@@ -1787,6 +1787,49 @@ describe("OpenCode adapter startTurn error handling", () => {
     await expect(consume()).rejects.toThrow(/Failed to read OpenCode session history.*Forbidden/);
   });
 
+  test("streamHistory rejects an OpenCode session metadata error before replaying messages", async () => {
+    const fakeClient = {
+      session: {
+        get: vi.fn().mockResolvedValue({
+          data: undefined,
+          error: { name: "APIError", data: { message: "Forbidden", statusCode: 403 } },
+        }),
+        messages: vi.fn().mockResolvedValue({
+          data: [
+            {
+              info: { id: "stale", sessionID: "ses_history_metadata_error", role: "assistant" },
+              parts: [
+                {
+                  id: "stale-part",
+                  sessionID: "ses_history_metadata_error",
+                  messageID: "stale",
+                  type: "text",
+                  text: "stale unreverted message",
+                },
+              ],
+            },
+          ],
+          error: undefined,
+        }),
+      },
+    } as never;
+    const session = new __openCodeInternals.OpenCodeAgentSession(
+      { provider: "opencode", cwd: "/tmp/test" },
+      fakeClient,
+      "ses_history_metadata_error",
+      createTestLogger(),
+    );
+
+    const consume = async () => {
+      for await (const _event of session.streamHistory()) {
+        // Missing revert metadata must fail closed before yielding stale messages.
+      }
+    };
+    await expect(consume()).rejects.toThrow(
+      /Failed to read OpenCode session metadata for history.*Forbidden/,
+    );
+  });
+
   test("streamHistory omits replay timestamps when OpenCode omits times", async () => {
     const fakeClient = {
       session: {

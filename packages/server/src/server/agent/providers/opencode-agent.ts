@@ -3998,11 +3998,17 @@ class OpenCodeAgentSession implements AgentSession {
       sessionID: this.sessionId,
       directory: this.config.cwd,
     });
+    if (sessionResponse.error || !sessionResponse.data) {
+      throw new Error(
+        `Failed to read OpenCode session metadata for history: ${toDiagnosticErrorMessage(
+          sessionResponse.error ?? "session response contained no data",
+        )}`,
+      );
+    }
     const response = await this.client.session.messages({
       sessionID: this.sessionId,
       directory: this.config.cwd,
     });
-
     if (response.error || !response.data) {
       throw new Error(
         `Failed to read OpenCode session history: ${toDiagnosticErrorMessage(
@@ -4011,10 +4017,7 @@ class OpenCodeAgentSession implements AgentSession {
       );
     }
 
-    const messages = filterOpenCodeRevertedMessages(
-      response.data,
-      sessionResponse.error ? null : sessionResponse.data?.revert,
-    );
+    const messages = filterOpenCodeRevertedMessages(response.data, sessionResponse.data.revert);
     for (const message of messages) {
       for (const event of buildOpenCodeReplayTimelineEvents(message)) {
         yield event;
