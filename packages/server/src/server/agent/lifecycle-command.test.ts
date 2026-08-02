@@ -229,7 +229,10 @@ describe("agent lifecycle commands", () => {
     expect(manager.cancelledAgentIds).toEqual([]);
   });
 
-  test("resumes and interrupts an unloaded persisted-running agent", async () => {
+  test.each([
+    { terminalLifecycle: "idle" as const, terminalName: "completion" },
+    { terminalLifecycle: "error" as const, terminalName: "failure" },
+  ])("does not interrupt after restoration-time $terminalName", async ({ terminalLifecycle }) => {
     const storage = new FakeLifecycleAgentStorage();
     const manager = new FakeLifecycleAgentManager(storage);
     const record = {
@@ -241,10 +244,45 @@ describe("agent lifecycle commands", () => {
       },
     };
     storage.records.set("agent-1", record);
-    const resumedAgent = managedAgent("agent-1", "idle");
+    const restoredAgent = managedAgent("agent-1", terminalLifecycle);
+    const loadAgent = vi.fn(async () => {
+      manager.liveAgents.set(restoredAgent.id, restoredAgent);
+      return restoredAgent;
+    });
+
+    await expect(
+      cancelAgentRunCommand(
+        { agentManager: manager, agentStorage: storage, loadAgent, logger },
+        "agent-1",
+      ),
+    ).resolves.toEqual({
+      agent: restoredAgent,
+      cancelled: false,
+      outcome: "not_running",
+    });
+    expect(loadAgent).toHaveBeenCalledWith("agent-1");
+    expect(manager.cancelledAgentIds).toEqual([]);
+    expect(manager.inFlightAgentIds).toEqual(new Set());
+    expect(manager.liveAgents.get("agent-1")?.lifecycle).toBe(terminalLifecycle);
+  });
+
+  test("resumes and interrupts an unloaded persisted-running agent with a tracked run", async () => {
+    const storage = new FakeLifecycleAgentStorage();
+    const manager = new FakeLifecycleAgentManager(storage);
+    const record = {
+      ...storedAgent("agent-1"),
+      lastStatus: "running" as const,
+      persistence: {
+        provider: "codex",
+        sessionId: "provider-session-1",
+      },
+    };
+    storage.records.set("agent-1", record);
+    const resumedAgent = managedAgent("agent-1", "running");
     const loadAgent = vi.fn(async () => {
       const agent = resumedAgent;
       manager.liveAgents.set(agent.id, agent);
+      manager.inFlightAgentIds.add(agent.id);
       return agent;
     });
 
@@ -260,7 +298,7 @@ describe("agent lifecycle commands", () => {
     });
     expect(loadAgent).toHaveBeenCalledWith("agent-1");
     expect(manager.cancelledAgentIds).toEqual(["agent-1"]);
-    expect(manager.cancelOptions).toEqual([{ assumeRunning: true }]);
+    expect(manager.cancelOptions).toEqual([undefined]);
   });
 
   test("preserves the exact provider resume error", async () => {

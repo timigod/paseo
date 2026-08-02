@@ -122,7 +122,6 @@ export async function cancelAgentRunCommand(
   agentId: string,
 ): Promise<CancelAgentRunResult> {
   let agent = dependencies.agentManager.getAgent(agentId);
-  let assumeRunning = false;
 
   if (!agent) {
     const record = await dependencies.agentStorage.get(agentId);
@@ -139,20 +138,17 @@ export async function cancelAgentRunCommand(
       return { agent: null, cancelled: false, outcome: "not_resumable" };
     }
 
-    agent = await dependencies.loadAgent(agentId);
-    assumeRunning = true;
+    const loadedAgent = await dependencies.loadAgent(agentId);
+    agent = dependencies.agentManager.getAgent(agentId) ?? loadedAgent;
   } else if (agent.lifecycle === "initializing") {
     const record = await dependencies.agentStorage.get(agentId);
     if (record?.lastStatus === "running" && record.persistence && !record.archivedAt) {
-      agent = await dependencies.loadAgent(agentId);
-      assumeRunning = true;
+      const loadedAgent = await dependencies.loadAgent(agentId);
+      agent = dependencies.agentManager.getAgent(agentId) ?? loadedAgent;
     }
   }
 
-  const result = await requestAgentRunCancellation(dependencies, agentId, {
-    agent,
-    ...(assumeRunning ? { assumeRunning: true } : {}),
-  });
+  const result = await requestAgentRunCancellation(dependencies, agentId, { agent });
   if (result.cancellation.status === "refused") {
     dependencies.logger.warn(
       { agentId },
