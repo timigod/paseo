@@ -21,12 +21,47 @@ function isMacSigningArgument(argument) {
   );
 }
 
-function targetsMac(builderArgs, hostPlatform) {
-  if (builderArgs.some((argument) => argument === "--mac" || argument === "-m")) {
-    return true;
+const MAC_TARGET_ALIASES = ["--mac", "--macos", "-m", "-o"];
+
+function parseMacTargetSelection(builderArgs) {
+  const targets = [];
+  let selected = false;
+
+  for (let index = 0; index < builderArgs.length; index += 1) {
+    const argument = builderArgs[index];
+    const inlineAlias = MAC_TARGET_ALIASES.find((alias) => argument.startsWith(`${alias}=`));
+    if (inlineAlias) {
+      selected = true;
+      const target = argument.slice(inlineAlias.length + 1);
+      if (target) targets.push(target);
+      continue;
+    }
+
+    if (MAC_TARGET_ALIASES.includes(argument)) {
+      selected = true;
+      while (index + 1 < builderArgs.length && !builderArgs[index + 1].startsWith("-")) {
+        targets.push(builderArgs[index + 1]);
+        index += 1;
+      }
+      continue;
+    }
+
+    if (/^-[mowl]{2,}$/.test(argument) && (argument.includes("m") || argument.includes("o"))) {
+      selected = true;
+    }
   }
+
+  return { selected, targets };
+}
+
+function targetsMac(builderArgs, hostPlatform) {
+  if (parseMacTargetSelection(builderArgs).selected) return true;
   if (
-    builderArgs.some((argument) => ["--linux", "-l", "--win", "--windows", "-w"].includes(argument))
+    builderArgs.some(
+      (argument) =>
+        /^(?:--linux|-l|--win|--windows|-w)(?:=|$)/.test(argument) ||
+        (/^-[mowl]{2,}$/.test(argument) && (argument.includes("w") || argument.includes("l"))),
+    )
   ) {
     return false;
   }
@@ -44,11 +79,13 @@ function hasAlternateConfigArgument(builderArgs) {
 }
 
 function targetsMacAppStore(builderArgs) {
-  return builderArgs.some(
-    (argument) =>
-      argument === "mas" ||
-      argument === "mas-dev" ||
+  const targetIsMas = (target) =>
+    ["mas", "mas-dev"].includes(target.split(":", 1)[0].toLowerCase());
+  return (
+    parseMacTargetSelection(builderArgs).targets.some(targetIsMas) ||
+    builderArgs.some((argument) =>
       /^(?:-c|--config)\.mac\.target=.*\bmas(?:-dev)?\b/.test(argument),
+    )
   );
 }
 

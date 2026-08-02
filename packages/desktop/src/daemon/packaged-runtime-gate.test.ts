@@ -168,6 +168,7 @@ describe("explicit unsigned mac build contract", () => {
       expect(plan.childEnv[INTERNAL_MAC_BUILD_MODE_ENV]).toBe(MAC_BUILD_MODE.SIGNED);
     }
     expect(resolveExtraBuilderArgs({}, ["--linux"], "darwin")).toEqual([]);
+    expect(resolveExtraBuilderArgs({}, ["-wl"], "darwin")).toEqual([]);
     expect(SIGNED_MAC_BUILD_FAILURE_HINT).toContain(`${UNSIGNED_MAC_BUILD_ENV}=1`);
   });
 
@@ -230,9 +231,29 @@ describe("explicit unsigned mac build contract", () => {
         "linux",
       ),
     ).toThrow(/Alternate Electron Builder --config/);
-    expect(() =>
-      resolveBuilderPlan({ [UNSIGNED_MAC_BUILD_ENV]: "1" }, ["--mac", "mas"], "linux"),
-    ).toThrow(/Mac App Store target/);
+    for (const arguments_ of [
+      ["--mac=mas"],
+      ["--macos=mas"],
+      ["-m=mas"],
+      ["-o=mas"],
+      ["--mac", "zip", "mas"],
+      ["--macos", "zip", "mas-dev"],
+      ["-m", "zip", "mas:arm64"],
+      ["-o", "mas-dev:arm64", "zip"],
+      ["--mac=zip", "--mac=mas"],
+      ["--macos=zip", "-o=mas-dev"],
+    ]) {
+      expect(() =>
+        resolveBuilderPlan({ [UNSIGNED_MAC_BUILD_ENV]: "1" }, arguments_, "linux"),
+      ).toThrow(/Mac App Store target/);
+    }
+
+    const unsignedZip = resolveBuilderPlan(
+      { [UNSIGNED_MAC_BUILD_ENV]: "1" },
+      ["--macos=zip"],
+      "linux",
+    );
+    expect(unsignedZip.macBuildMode).toBe(MAC_BUILD_MODE.UNSIGNED);
   });
 
   it("rejects resolved custom signing configuration in validated unsigned mode", () => {
