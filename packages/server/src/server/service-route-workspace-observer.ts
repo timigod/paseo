@@ -1,10 +1,7 @@
 import { resolve } from "node:path";
 import type { Logger } from "pino";
 
-import type {
-  WorkspaceGitRuntimeSnapshot,
-  WorkspaceGitService,
-} from "./workspace-git-service.js";
+import type { WorkspaceGitRuntimeSnapshot, WorkspaceGitService } from "./workspace-git-service.js";
 import type { WorkspaceRegistry } from "./workspace-registry.js";
 import type { WorkspaceScriptRuntimeStore } from "./workspace-script-runtime-store.js";
 
@@ -47,6 +44,7 @@ export class ServiceRouteWorkspaceObserver {
       for (const workspaceId of uniqueWorkspaceIds) {
         await this.syncWorkspaceId(workspaceId);
       }
+      return undefined;
     });
     this.queue = run.catch((error) => {
       this.options.logger.warn(
@@ -93,15 +91,20 @@ export class ServiceRouteWorkspaceObserver {
     let target = this.targets.get(cwd);
     if (!target) {
       const workspaceIdsForTarget = new Set<string>();
-      const subscription = this.options.workspaceGitService.registerWorkspace(
-        { cwd },
-        (snapshot) => this.handleSnapshot(cwd, snapshot),
-      );
       target = {
         workspaceIds: workspaceIdsForTarget,
-        unsubscribe: subscription.unsubscribe,
+        unsubscribe: () => {},
       };
       this.targets.set(cwd, target);
+      try {
+        target.unsubscribe = this.options.workspaceGitService.registerWorkspace(
+          { cwd },
+          (snapshot) => this.handleSnapshot(cwd, snapshot),
+        ).unsubscribe;
+      } catch (error) {
+        this.targets.delete(cwd);
+        throw error;
+      }
     }
     target.workspaceIds.add(workspaceId);
     this.workspaces.set(workspaceId, {

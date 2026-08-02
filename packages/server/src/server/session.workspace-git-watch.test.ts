@@ -27,6 +27,7 @@ import {
 } from "./workspace-registry.js";
 import { createNoopWorkspaceGitService } from "./test-utils/workspace-git-service-stub.js";
 import type { WorkspaceGitObserverService } from "./session/workspace-git-observer/workspace-git-observer-service.js";
+import { ServiceRouteWorkspaceObserver } from "./service-route-workspace-observer.js";
 
 interface SessionInternals {
   workspaceUpdatesSubscription: {
@@ -478,13 +479,11 @@ describe("workspace git watch targets", () => {
       serviceProxy,
       onRoutesChanged: vi.fn(),
     });
-    const { session, projects, workspaces, subscriptions } = createSessionForWorkspaceGitWatchTests(
-      {
+    const { session, projects, workspaces, subscriptions, workspaceGitService } =
+      createSessionForWorkspaceGitWatchTests({
         serviceProxy,
         scriptRuntimeStore: runtimeStore,
-        onBranchChanged: handleBranchChange,
-      },
-    );
+      });
     seedGitWorkspace({
       projects,
       workspaces,
@@ -494,7 +493,16 @@ describe("workspace git watch targets", () => {
       name: "old-branch",
     });
 
-    await session.syncWorkspaceGitObserversForExternalWorkspaceIds(["ws-10"]);
+    const serviceRouteObserver = new ServiceRouteWorkspaceObserver({
+      workspaceGitService,
+      workspaceRegistry: {
+        get: async (workspaceId) => workspaces.get(workspaceId) ?? null,
+      },
+      runtimeStore,
+      onBranchChanged: handleBranchChange,
+      logger: createTestLogger(),
+    });
+    await serviceRouteObserver.syncWorkspaceIds(["ws-10"]);
 
     subscriptions[0]?.listener(
       createWorkspaceRuntimeSnapshot("/tmp/repo", {
@@ -510,6 +518,7 @@ describe("workspace git watch targets", () => {
         scriptName: "app",
       }),
     ]);
+    serviceRouteObserver.dispose();
     await session.cleanup();
   });
 
