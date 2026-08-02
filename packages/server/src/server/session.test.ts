@@ -154,6 +154,41 @@ test("cancel_agent_request reports refusal only through its response", async () 
   ]);
 });
 
+test("cancel_agent_request reports an explicit no-op outcome", async () => {
+  const agentId = "11111111-1111-4111-8111-111111111111";
+  const messages: SessionOutboundMessage[] = [];
+  const getAgent = vi
+    .fn()
+    .mockReturnValueOnce({ id: agentId, provider: "codex", lifecycle: "idle" })
+    .mockReturnValue(null);
+  const session = createSessionForTest({
+    messages,
+    agentManager: {
+      getAgent,
+      hasInFlightRun: vi.fn(() => false),
+    },
+  });
+
+  await session.handleMessage({
+    type: "cancel_agent_request",
+    agentId,
+    requestId: "cancel-idle",
+  });
+
+  expect(messages).toEqual([
+    {
+      type: "cancel_agent_response",
+      payload: {
+        requestId: "cancel-idle",
+        agentId,
+        agent: null,
+        outcome: "not_running",
+        error: null,
+      },
+    },
+  ]);
+});
+
 test("legacy cancel_agent_request reports refusal through the activity log", async () => {
   const agentId = "11111111-1111-4111-8111-111111111111";
   const messages: SessionOutboundMessage[] = [];

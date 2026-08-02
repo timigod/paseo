@@ -500,6 +500,7 @@ class TestAgentSession implements AgentSession {
 
 class ControlledInterruptSession extends TestAgentSession {
   interruptCalled = false;
+  interruptCallCount = 0;
 
   constructor(
     config: AgentSessionConfig,
@@ -518,6 +519,7 @@ class ControlledInterruptSession extends TestAgentSession {
 
   override async interrupt(): Promise<void> {
     this.interruptCalled = true;
+    this.interruptCallCount += 1;
     await this.interruptBehavior(this);
   }
 }
@@ -2180,6 +2182,36 @@ test("cancelAgentRun preserves running state when the provider interrupt hangs",
     });
     expect(fixture.session.interruptCalled).toBe(true);
     expect(fixture.manager.getAgent(fixture.agentId)?.lifecycle).toBe("running");
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("cancelAgentRun coalesces cancellation for a resumed run that was persisted as running", async () => {
+  const fixture = await createControlledInterruptFixture({
+    name: "persisted-running",
+    agentId: "00000000-0000-4000-8000-000000000307",
+    turnId: "persisted-running-turn",
+    interrupt: async (session) => {
+      session.pushEvent({
+        type: "turn_canceled",
+        provider: "codex",
+        reason: "interrupted",
+      });
+    },
+  });
+
+  try {
+    expect(fixture.manager.getAgent(fixture.agentId)?.lifecycle).toBe("idle");
+
+    await expect(
+      Promise.all([
+        fixture.manager.cancelAgentRun(fixture.agentId, { assumeRunning: true }),
+        fixture.manager.cancelAgentRun(fixture.agentId, { assumeRunning: true }),
+      ]),
+    ).resolves.toEqual([{ status: "settled" }, { status: "settled" }]);
+    expect(fixture.session.interruptCallCount).toBe(1);
+    expect(fixture.manager.hasInFlightRun(fixture.agentId)).toBe(false);
   } finally {
     fixture.cleanup();
   }

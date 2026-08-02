@@ -161,6 +161,52 @@ afterEach(async () => {
   vi.unstubAllGlobals();
 });
 
+test("cancelAgent returns explicit outcomes and marks legacy receipts unknown", async () => {
+  const mock = createMockTransport();
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "cancel_outcome_unit_test",
+    transportFactory: () => mock.transport,
+    reconnect: { enabled: false },
+  });
+  clients.push(client);
+
+  const connectPromise = client.connect();
+  mock.triggerOpen();
+  await connectPromise;
+
+  const explicitPromise = client.cancelAgent("agent-1");
+  const explicitRequest = parseSentFrame(mock.sent.at(-1));
+  mock.triggerMessage(
+    wrapSessionMessage({
+      type: "cancel_agent_response",
+      payload: {
+        requestId: explicitRequest.requestId,
+        agentId: "agent-1",
+        agent: null,
+        outcome: "not_running",
+        error: null,
+      },
+    }),
+  );
+  await expect(explicitPromise).resolves.toBe("not_running");
+
+  const legacyPromise = client.cancelAgent("agent-1");
+  const legacyRequest = parseSentFrame(mock.sent.at(-1));
+  mock.triggerMessage(
+    wrapSessionMessage({
+      type: "cancel_agent_response",
+      payload: {
+        requestId: legacyRequest.requestId,
+        agentId: "agent-1",
+        agent: null,
+        error: null,
+      },
+    }),
+  );
+  await expect(legacyPromise).resolves.toBe("unknown");
+});
+
 test("does not infer browser automation capabilities from Electron runtime", async () => {
   vi.stubGlobal("navigator", {
     userAgent:

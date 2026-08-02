@@ -3599,19 +3599,36 @@ export class Session {
     this.sessionLogger.info({ agentId }, `Cancel request received for agent ${agentId}`);
 
     try {
-      await cancelAgentRunCommand(
-        { agentManager: this.agentManager, logger: this.sessionLogger },
+      const result = await cancelAgentRunCommand(
+        {
+          agentManager: this.agentManager,
+          agentStorage: this.agentStorage,
+          loadAgent: (id) =>
+            ensureUnarchivedAgentLoaded(id, {
+              agentManager: this.agentManager,
+              agentStorage: this.agentStorage,
+              logger: this.sessionLogger,
+            }),
+          logger: this.sessionLogger,
+        },
         agentId,
       );
       if (requestId) {
         const agent = this.agentManager.getAgent(agentId);
-        const payload = agent ? await this.buildAgentPayload(agent) : null;
+        const record = agent ? null : await this.agentStorage.get(agentId);
+        let payload: AgentSnapshotPayload | null = null;
+        if (agent) {
+          payload = await this.buildAgentPayload(agent);
+        } else if (record) {
+          payload = this.buildStoredAgentPayload(record);
+        }
         this.emit({
           type: "cancel_agent_response",
           payload: {
             requestId,
             agentId,
             agent: payload,
+            outcome: result.outcome,
             error: null,
           },
         });
@@ -6737,7 +6754,7 @@ export class Session {
     }
 
     const agentId = resolved.agentId;
-    const live = this.agentManager.getAgent(agentId);
+    let live = this.agentManager.getAgent(agentId);
     if (!live) {
       const record = await this.agentStorage.get(agentId);
       if (!record || record.internal) {
@@ -6753,21 +6770,27 @@ export class Session {
         });
         return;
       }
-      const final = this.buildStoredAgentPayload(record);
-      let status: "permission" | "error" | "idle";
-      if (record.attentionReason === "permission") {
-        status = "permission";
-      } else if (record.lastStatus === "error") {
-        status = "error";
-      } else {
-        status = "idle";
+      if (record.lastStatus === "running" && !record.archivedAt) {
+        try {
+          live = await this.resumeStoredAgentForWait(agentId, record);
+        } catch (error) {
+          this.emit({
+            type: "wait_for_finish_response",
+            payload: {
+              requestId,
+              status: "error",
+              final: this.buildStoredAgentPayload(record),
+              error: errorToFriendlyMessage(error),
+              lastMessage: null,
+            },
+          });
+          return;
+        }
       }
-      const error = resolveWaitForFinishError({ status, final });
-      this.emit({
-        type: "wait_for_finish_response",
-        payload: { requestId, status, final, error, lastMessage: null },
-      });
-      return;
+      if (!live) {
+        this.emitStoredWaitForFinishResponse(requestId, record);
+        return;
+      }
     }
 
     const abortController = new AbortController();
@@ -6836,6 +6859,37 @@ export class Session {
         clearTimeout(timeoutHandle);
       }
     }
+  }
+
+  private async resumeStoredAgentForWait(
+    agentId: string,
+    record: StoredAgentRecord,
+  ): Promise<ManagedAgent> {
+    if (!record.persistence) {
+      throw new Error(`Agent ${agentId} was running but cannot be resumed`);
+    }
+    return await ensureUnarchivedAgentLoaded(agentId, {
+      agentManager: this.agentManager,
+      agentStorage: this.agentStorage,
+      logger: this.sessionLogger,
+    });
+  }
+
+  private emitStoredWaitForFinishResponse(requestId: string, record: StoredAgentRecord): void {
+    const final = this.buildStoredAgentPayload(record);
+    let status: "permission" | "error" | "idle";
+    if (record.attentionReason === "permission") {
+      status = "permission";
+    } else if (record.lastStatus === "error") {
+      status = "error";
+    } else {
+      status = "idle";
+    }
+    const error = resolveWaitForFinishError({ status, final });
+    this.emit({
+      type: "wait_for_finish_response",
+      payload: { requestId, status, final, error, lastMessage: null },
+    });
   }
 
   /**

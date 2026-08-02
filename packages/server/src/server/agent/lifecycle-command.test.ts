@@ -1,4 +1,4 @@
-import { describe, expect, test } from "vitest";
+import { describe, expect, test, vi } from "vitest";
 import { getParentAgentIdFromLabels, PARENT_AGENT_ID_LABEL } from "@getpaseo/protocol/agent-labels";
 
 import { createTestLogger } from "../../test-utils/test-logger.js";
@@ -42,6 +42,7 @@ class FakeLifecycleAgentManager implements LifecycleAgentManager {
   readonly notifiedAgentIds: string[] = [];
   readonly modeUpdates: Array<{ agentId: string; modeId: string }> = [];
   readonly detachedAgentIds: string[] = [];
+  readonly cancelOptions: Array<{ assumeRunning?: boolean } | undefined> = [];
   inFlightAgentIds = new Set<string>();
   readonly settledDuringCancellationAgentIds = new Set<string>();
   readonly rejectedCancellationAgentIds = new Set<string>();
@@ -56,8 +57,9 @@ class FakeLifecycleAgentManager implements LifecycleAgentManager {
     return this.inFlightAgentIds.has(agentId);
   }
 
-  async cancelAgentRun(agentId: string) {
+  async cancelAgentRun(agentId: string, options?: { assumeRunning?: boolean }) {
     this.cancelledAgentIds.push(agentId);
+    this.cancelOptions.push(options);
     if (this.settledDuringCancellationAgentIds.delete(agentId)) {
       this.inFlightAgentIds.delete(agentId);
       return { status: "not_running" } as const;
@@ -65,7 +67,7 @@ class FakeLifecycleAgentManager implements LifecycleAgentManager {
     if (this.rejectedCancellationAgentIds.has(agentId)) {
       return { status: "refused" } as const;
     }
-    return this.inFlightAgentIds.delete(agentId)
+    return this.inFlightAgentIds.delete(agentId) || options?.assumeRunning
       ? ({ status: "settled" } as const)
       : ({ status: "not_running" } as const);
   }
@@ -170,11 +172,12 @@ describe("agent lifecycle commands", () => {
     manager.liveAgents.set("agent-1", managedAgent("agent-1", "running"));
     manager.inFlightAgentIds.add("agent-1");
 
-    const result = await cancelAgentRunCommand({ agentManager: manager, logger }, "agent-1");
+    const result = await cancelAgentRunCommand(cancelDependencies(manager, storage), "agent-1");
 
     expect(result).toEqual({
       agent: manager.liveAgents.get("agent-1"),
       cancelled: true,
+      outcome: "cancelled",
     });
     expect(manager.cancelledAgentIds).toEqual(["agent-1"]);
   });
@@ -187,11 +190,101 @@ describe("agent lifecycle commands", () => {
     manager.settledDuringCancellationAgentIds.add("agent-1");
 
     await expect(
-      cancelAgentRunCommand({ agentManager: manager, logger }, "agent-1"),
+      cancelAgentRunCommand(cancelDependencies(manager, storage), "agent-1"),
     ).resolves.toEqual({
       agent: manager.liveAgents.get("agent-1"),
       cancelled: false,
+      outcome: "not_running",
     });
+  });
+
+  test.each([
+    { name: "missing", record: null, outcome: "not_found" },
+    {
+      name: "archived",
+      record: { ...storedAgent("agent-1"), archivedAt: "2026-05-10T10:00:00.000Z" },
+      outcome: "archived",
+    },
+    { name: "idle", record: storedAgent("agent-1"), outcome: "not_running" },
+    {
+      name: "non-resumable",
+      record: { ...storedAgent("agent-1"), lastStatus: "running" as const },
+      outcome: "not_resumable",
+    },
+  ])("classifies an unloaded $name agent without loading it", async ({ record, outcome }) => {
+    const storage = new FakeLifecycleAgentStorage();
+    const manager = new FakeLifecycleAgentManager(storage);
+    if (record) {
+      storage.records.set("agent-1", record);
+    }
+    const loadAgent = vi.fn();
+
+    await expect(
+      cancelAgentRunCommand(
+        { agentManager: manager, agentStorage: storage, loadAgent, logger },
+        "agent-1",
+      ),
+    ).resolves.toEqual({ agent: null, cancelled: false, outcome });
+    expect(loadAgent).not.toHaveBeenCalled();
+    expect(manager.cancelledAgentIds).toEqual([]);
+  });
+
+  test("resumes and interrupts an unloaded persisted-running agent", async () => {
+    const storage = new FakeLifecycleAgentStorage();
+    const manager = new FakeLifecycleAgentManager(storage);
+    const record = {
+      ...storedAgent("agent-1"),
+      lastStatus: "running" as const,
+      persistence: {
+        provider: "codex",
+        sessionId: "provider-session-1",
+      },
+    };
+    storage.records.set("agent-1", record);
+    const resumedAgent = managedAgent("agent-1", "idle");
+    const loadAgent = vi.fn(async () => {
+      const agent = resumedAgent;
+      manager.liveAgents.set(agent.id, agent);
+      return agent;
+    });
+
+    await expect(
+      cancelAgentRunCommand(
+        { agentManager: manager, agentStorage: storage, loadAgent, logger },
+        "agent-1",
+      ),
+    ).resolves.toEqual({
+      agent: resumedAgent,
+      cancelled: true,
+      outcome: "cancelled",
+    });
+    expect(loadAgent).toHaveBeenCalledWith("agent-1");
+    expect(manager.cancelledAgentIds).toEqual(["agent-1"]);
+    expect(manager.cancelOptions).toEqual([{ assumeRunning: true }]);
+  });
+
+  test("preserves the exact provider resume error", async () => {
+    const storage = new FakeLifecycleAgentStorage();
+    const manager = new FakeLifecycleAgentManager(storage);
+    storage.records.set("agent-1", {
+      ...storedAgent("agent-1"),
+      lastStatus: "running",
+      persistence: {
+        provider: "codex",
+        sessionId: "provider-session-1",
+      },
+    });
+    const loadAgent = vi.fn(async () => {
+      throw new Error("provider session provider-session-1 no longer exists");
+    });
+
+    await expect(
+      cancelAgentRunCommand(
+        { agentManager: manager, agentStorage: storage, loadAgent, logger },
+        "agent-1",
+      ),
+    ).rejects.toThrow("provider session provider-session-1 no longer exists");
+    expect(manager.cancelledAgentIds).toEqual([]);
   });
 
   test("archives a live agent after canceling and clearing attention", async () => {
@@ -357,5 +450,23 @@ function storedAgent(id: string): StoredAgentRecord {
     config: null,
     persistence: null,
     archivedAt: null,
+  };
+}
+
+function cancelDependencies(
+  agentManager: FakeLifecycleAgentManager,
+  agentStorage: FakeLifecycleAgentStorage,
+) {
+  return {
+    agentManager,
+    agentStorage,
+    loadAgent: async (agentId: string) => {
+      const agent = agentManager.getAgent(agentId);
+      if (!agent) {
+        throw new Error(`Agent ${agentId} not found`);
+      }
+      return agent;
+    },
+    logger,
   };
 }

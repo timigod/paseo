@@ -100,8 +100,8 @@ export async function runStopCommand(
       agents.map(async (agent) => {
         if (agent.status !== "running") return { ok: true as const, id: agent.id, stopped: false };
         try {
-          await client.cancelAgent(agent.id);
-          return { ok: true as const, id: agent.id, stopped: true };
+          const outcome = await client.cancelAgent(agent.id);
+          return { ok: true as const, id: agent.id, stopped: outcome === "cancelled" };
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
           return { ok: false as const, id: agent.id, message };

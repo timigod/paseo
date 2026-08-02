@@ -636,6 +636,10 @@ export class AgentManager {
   private readonly backgroundTasks = new Set<Promise<void>>();
   private readonly agentRegistrationTasks = new Set<Promise<void>>();
   private readonly inFlightAgentCloses = new Map<string, Promise<void>>();
+  private readonly inFlightAgentRunCancellations = new Map<
+    string,
+    Promise<AgentRunCancellationResult>
+  >();
   private readonly retainedAgentRuntimeCleanups = new Set<AgentSession>();
   private retainedAgentRuntimeCleanupRetry: Promise<void> | null = null;
   private readonly agentStreamCoalescer: AgentStreamCoalescer;
@@ -1358,6 +1362,7 @@ export class AgentManager {
       workspaceId?: string;
       owner?: AgentOwner;
       autoArchiveObligation?: AutoArchiveObligation;
+      resumeRunning?: boolean;
     },
     resumeOptions?: AgentResumeSessionOptions,
   ): Promise<ManagedAgent> {
@@ -1388,6 +1393,7 @@ export class AgentManager {
       workspaceId?: string;
       owner?: AgentOwner;
       autoArchiveObligation?: AutoArchiveObligation;
+      resumeRunning?: boolean;
     },
     resumeOptions?: AgentResumeSessionOptions,
   ): Promise<ManagedAgent> {
@@ -2629,11 +2635,36 @@ export class AgentManager {
     }
   }
 
-  async cancelAgentRun(agentId: string): Promise<AgentRunCancellationResult> {
+  async cancelAgentRun(
+    agentId: string,
+    options?: { assumeRunning?: boolean },
+  ): Promise<AgentRunCancellationResult> {
+    const inFlight = this.inFlightAgentRunCancellations.get(agentId);
+    if (inFlight) {
+      return inFlight;
+    }
+
+    const cancellation = this.cancelAgentRunInternal(agentId, options);
+    this.inFlightAgentRunCancellations.set(agentId, cancellation);
+    try {
+      return await cancellation;
+    } finally {
+      if (this.inFlightAgentRunCancellations.get(agentId) === cancellation) {
+        this.inFlightAgentRunCancellations.delete(agentId);
+      }
+    }
+  }
+
+  private async cancelAgentRunInternal(
+    agentId: string,
+    options?: { assumeRunning?: boolean },
+  ): Promise<AgentRunCancellationResult> {
     const agent = this.requireSessionAgent(agentId);
     const run =
       this.runs.getRun(agentId) ??
-      (agent.lifecycle === "running" ? this.runs.trackAutonomousRun(agentId, null) : null);
+      (agent.lifecycle === "running" || options?.assumeRunning
+        ? this.runs.trackAutonomousRun(agentId, null)
+        : null);
     if (!run) {
       return { status: "not_running" };
     }
@@ -3049,6 +3080,7 @@ export class AgentManager {
           workspaceId?: string;
           owner?: AgentOwner;
           autoArchiveObligation?: AutoArchiveObligation;
+          resumeRunning?: boolean;
         }
       | undefined,
   ): Promise<ManagedAgent> {
@@ -3089,10 +3121,12 @@ export class AgentManager {
       this.previousStatuses.set(resolvedAgentId, managed.lifecycle);
       await this.refreshRuntimeInfo(managed, { emit: false });
       this.assertAgentRegistrationActive(managed);
-      await this.persistSnapshot(managed, {
-        title: initialPersistedTitle,
-        autoArchiveObligation: options?.autoArchiveObligation,
-      });
+      if (!options?.resumeRunning) {
+        await this.persistSnapshot(managed, {
+          title: initialPersistedTitle,
+          autoArchiveObligation: options?.autoArchiveObligation,
+        });
+      }
       this.assertAgentRegistrationActive(managed);
       if (!options?.publishWhenReady) {
         this.emitState(managed, { persist: false });
@@ -3100,7 +3134,10 @@ export class AgentManager {
 
       await this.refreshSessionState(managed, { emit: false });
       this.assertAgentRegistrationActive(managed);
-      managed.lifecycle = "idle";
+      managed.lifecycle = options?.resumeRunning ? "running" : "idle";
+      if (options?.resumeRunning) {
+        this.runs.trackAutonomousRun(managed.id, null);
+      }
       this.touchUpdatedAt(managed);
       await this.persistSnapshot(managed);
       this.assertAgentRegistrationActive(managed);

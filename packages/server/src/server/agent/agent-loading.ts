@@ -111,6 +111,7 @@ export async function ensureAgentLoaded(
         {
           ...extractTimestamps(record),
           autoArchiveObligation: record.autoArchiveObligation,
+          resumeRunning: record.lastStatus === "running",
         },
         record.archivedAt ? { purpose: "history" } : undefined,
       );

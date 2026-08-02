@@ -28,6 +28,12 @@ action such as archive, replacement, reload, workspace teardown, or daemon shutd
 
 Cancellation changes lifecycle state only after the provider acknowledges the interrupt or emits a terminal turn event. If the interrupt is rejected or times out, the agent remains `running` with its active foreground turn intact. Follow-up actions such as replacement, reload, rewind, and Stop must report that failure instead of accepting work they cannot perform. Synthesizing a local cancellation without provider acknowledgment creates a split-brain session: Paseo accepts a new prompt while the provider still owns the previous foreground turn.
 
+After daemon restart, a resumable record persisted as `running` keeps that state while its provider
+session is restored. Concurrent timeline and cancellation requests join the same initialization, and
+the running claim is cleared only after the restored provider acknowledges cancellation or emits a
+terminal turn event. This prevents a read request from turning a still-running persisted agent into a
+false idle result before Stop reaches the provider.
+
 ## Relationships
 
 Agents can launch other agents via the agent-scoped `create_agent` MCP tool. Agent-scoped creation is always asynchronous and always stamps `paseo.parent-agent-id`, pointing back at the caller. Omit `workspaceId` to use the caller's workspace, or pass an existing workspace ID returned by `create_workspace`. Placement never changes parentage.

@@ -206,6 +206,7 @@ import {
   type CreateAgentCommandDependencies,
 } from "./agent/create-agent/create.js";
 import { archiveAgentCommand, cancelAgentRunCommand } from "./agent/lifecycle-command.js";
+import { ensureUnarchivedAgentLoaded } from "./agent/agent-loading.js";
 import { CreateAgentLifecycleDispatch } from "./agent/create-agent-lifecycle-dispatch.js";
 import {
   HubRelationshipController,
@@ -1386,7 +1387,17 @@ export async function createPaseoDaemon(
         agentManager,
         agentStorage,
         createAgent,
-        interruptAgent: (agentId) => cancelAgentRunCommand({ agentManager, logger }, agentId),
+        interruptAgent: (agentId) =>
+          cancelAgentRunCommand(
+            {
+              agentManager,
+              agentStorage,
+              loadAgent: (id) =>
+                ensureUnarchivedAgentLoaded(id, { agentManager, agentStorage, logger }),
+              logger,
+            },
+            agentId,
+          ),
         archiveAgent: (agentId) =>
           archiveAgentCommand({ agentManager, agentStorage, logger }, agentId),
         listActiveWorkspaces: listActiveWorkspacesExternal,

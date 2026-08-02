@@ -21,6 +21,7 @@ import type {
   AgentSnapshotPayload,
   ProjectPlacementPayload,
   AgentPermissionResolvedMessage,
+  CancelAgentResponseMessage,
   CreateAgentRequestMessage,
   CreatePaseoWorktreeRequest,
   FileDownloadTokenResponse,
@@ -545,6 +546,9 @@ type ScheduleUpdatePayload = Extract<
 >["payload"];
 export type FetchAgentTimelinePayload = FetchAgentTimelineResponseMessage["payload"];
 export type AgentForkContextPayload = AgentForkContextResponseMessage["payload"];
+export type CancelAgentOutcome =
+  | NonNullable<CancelAgentResponseMessage["payload"]["outcome"]>
+  | "unknown";
 
 export type FetchAgentTimelineDirection = FetchAgentTimelinePayload["direction"];
 export type FetchAgentTimelineProjection = FetchAgentTimelinePayload["projection"];
@@ -2965,7 +2969,7 @@ export class DaemonClient {
     return payload;
   }
 
-  async cancelAgent(agentId: string): Promise<void> {
+  async cancelAgent(agentId: string): Promise<CancelAgentOutcome> {
     const requestId = this.createRequestId();
     const message = SessionInboundMessageSchema.parse({
       type: "cancel_agent_request",
@@ -2989,6 +2993,8 @@ export class DaemonClient {
     if (payload.error) {
       throw new Error(payload.error);
     }
+    // COMPAT(cancelAgentOutcome): added in v0.2.6, remove after 2027-02-02.
+    return payload.outcome ?? "unknown";
   }
 
   async setAgentMode(agentId: string, modeId: string): Promise<AgentProviderNotice | null> {

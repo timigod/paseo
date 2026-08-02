@@ -3679,12 +3679,21 @@ export const AgentForkContextResponseMessageSchema = z.object({
   }),
 });
 
+export const CancelAgentOutcomeSchema = z.enum([
+  "cancelled",
+  "not_running",
+  "not_found",
+  "archived",
+  "not_resumable",
+]);
+
 export const CancelAgentResponseMessageSchema = z.object({
   type: z.literal("cancel_agent_response"),
   payload: z.object({
     requestId: z.string(),
     agentId: z.string(),
     agent: AgentSnapshotPayloadSchema.nullable(),
+    outcome: CancelAgentOutcomeSchema.optional(),
     error: z.string().nullable().optional(),
   }),
 });

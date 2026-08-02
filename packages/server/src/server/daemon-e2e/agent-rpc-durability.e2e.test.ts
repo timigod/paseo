@@ -4,6 +4,7 @@ import path from "node:path";
 import { expect, test } from "vitest";
 
 import { DaemonClient } from "../test-utils/daemon-client.js";
+import { createTestAgentClients, type TestAgentSession } from "../test-utils/fake-agent-client.js";
 import { createTestPaseoDaemon, type TestPaseoDaemon } from "../test-utils/paseo-daemon.js";
 
 const CREATED_AT = "2026-06-29T11:12:42.000Z";
@@ -18,6 +19,11 @@ interface StaleAgentFixture {
   orphanAgentId: string;
   paseoHomeRoot: string;
   cleanupPaths: string[];
+}
+
+interface Deferred {
+  promise: Promise<void>;
+  resolve: () => void;
 }
 
 test("agent fetch RPCs tolerate an agent whose workspace project record is gone", async () => {
@@ -74,7 +80,73 @@ test("agent fetch RPCs tolerate an agent whose workspace project record is gone"
   }
 });
 
-function seedStaleAgentFixture(): StaleAgentFixture {
+test("persisted-running agent stays controllable while restart requests load it concurrently", async () => {
+  const fixture = seedStaleAgentFixture({ healthyLastStatus: "running", resumable: true });
+  const initializationEntered = deferred();
+  const releaseInitialization = deferred();
+  let resumedSessionCount = 0;
+  let interruptCount = 0;
+  let daemon: TestPaseoDaemon | null = null;
+  let client: DaemonClient | null = null;
+
+  const agentClients = createTestAgentClients({
+    onSessionCreated(session) {
+      resumedSessionCount += 1;
+      holdSessionInitialization(session, initializationEntered, releaseInitialization);
+      acknowledgeInterrupt(session, () => {
+        interruptCount += 1;
+      });
+    },
+  });
+
+  try {
+    daemon = await createTestPaseoDaemon({
+      paseoHomeRoot: fixture.paseoHomeRoot,
+      cleanup: false,
+      agentClients,
+    });
+    client = new DaemonClient({ url: `ws://127.0.0.1:${daemon.port}/ws` });
+    await client.connect();
+
+    const before = await client.fetchAgents({ requestId: "req-persisted-running-list" });
+    expect(findAgentStatus(before.entries, fixture.healthyAgentId)).toBe("running");
+
+    const finishPromise = client.waitForFinish(fixture.healthyAgentId, 5_000);
+    await initializationEntered.promise;
+    const timelinePromise = client.fetchAgentTimeline(fixture.healthyAgentId, {
+      requestId: "req-persisted-running-timeline",
+    });
+    const cancelPromise = client.cancelAgent(fixture.healthyAgentId);
+    releaseInitialization.resolve();
+
+    const [finish, cancelOutcome] = await Promise.all([
+      finishPromise,
+      cancelPromise,
+      timelinePromise,
+    ]);
+
+    expect(cancelOutcome).toBe("cancelled");
+    expect(finish.status).toBe("idle");
+    expect(finish.final?.status).toBe("idle");
+    expect(resumedSessionCount).toBe(1);
+    expect(interruptCount).toBe(1);
+
+    const after = await client.fetchAgents({ requestId: "req-persisted-running-after" });
+    expect(findAgentStatus(after.entries, fixture.healthyAgentId)).toBe("idle");
+  } finally {
+    releaseInitialization.resolve();
+    await client?.close().catch(() => undefined);
+    await daemon?.close().catch(() => undefined);
+    for (const target of fixture.cleanupPaths) {
+      rmSync(target, { recursive: true, force: true });
+    }
+  }
+});
+
+function seedStaleAgentFixture(options?: {
+  healthyLastStatus?: "idle" | "running";
+  resumable?: boolean;
+}): StaleAgentFixture {
   const healthyCwd = mkdtempSync(path.join(os.tmpdir(), "paseo-healthy-agent-"));
   const orphanCwd = mkdtempSync(path.join(os.tmpdir(), "paseo-orphan-agent-"));
   const paseoHomeRoot = mkdtempSync(path.join(os.tmpdir(), "paseo-orphan-agent-home-"));
@@ -85,7 +157,7 @@ function seedStaleAgentFixture(): StaleAgentFixture {
   const healthyWorkspaceId = "ws-healthy-agent-rpc";
   const orphanWorkspaceId = "c:\\Users\\paseo\\stale-project";
   const orphanProjectId = "proj-removed-agent-rpc";
-  const healthyAgentId = "agent-healthy-rpc";
+  const healthyAgentId = "00000000-0000-4000-8000-000000000401";
   const orphanAgentId = "agent-orphan-rpc";
 
   mkdirSync(projectsDir, { recursive: true });
@@ -141,10 +213,12 @@ function seedStaleAgentFixture(): StaleAgentFixture {
     lastUserMessageAt: null,
     title: "Healthy Agent",
     labels: {},
-    lastStatus: "idle",
+    lastStatus: options?.healthyLastStatus ?? "idle",
     lastModeId: "full-access",
     config: null,
-    persistence: null,
+    persistence: options?.resumable
+      ? { provider: "codex", sessionId: "provider-session-persisted-running" }
+      : null,
   });
   writeJson(path.join(agentsDir, `${orphanAgentId}.json`), {
     id: orphanAgentId,
@@ -173,6 +247,47 @@ function seedStaleAgentFixture(): StaleAgentFixture {
     paseoHomeRoot,
     cleanupPaths: [healthyCwd, orphanCwd, paseoHomeRoot],
   };
+}
+
+function deferred(): Deferred {
+  let resolve!: () => void;
+  const promise = new Promise<void>((resolvePromise) => {
+    resolve = resolvePromise;
+  });
+  return { promise, resolve };
+}
+
+function holdSessionInitialization(
+  session: TestAgentSession,
+  entered: Deferred,
+  release: Deferred,
+): void {
+  const getAvailableModes = session.getAvailableModes.bind(session);
+  session.getAvailableModes = async () => {
+    entered.resolve();
+    await release.promise;
+    return await getAvailableModes();
+  };
+}
+
+function acknowledgeInterrupt(session: TestAgentSession, onInterrupt: () => void): void {
+  const interrupt = session.interrupt.bind(session);
+  session.interrupt = async () => {
+    onInterrupt();
+    await interrupt();
+    session.emit({
+      type: "turn_canceled",
+      provider: "codex",
+      reason: "interrupted",
+    });
+  };
+}
+
+function findAgentStatus(
+  entries: Array<{ agent: { id: string; status: string } }>,
+  agentId: string,
+): string | undefined {
+  return entries.find((entry) => entry.agent.id === agentId)?.agent.status;
 }
 
 function writeJson(filePath: string, value: unknown): void {

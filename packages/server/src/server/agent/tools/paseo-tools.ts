@@ -22,7 +22,7 @@ import { curateAgentActivity } from "../activity-curator.js";
 import { selectItemsByProjectedLimit } from "../timeline-projection.js";
 import type { AgentStorage } from "../agent-storage.js";
 import type { CreateAgentLifecycleDispatch } from "../create-agent-lifecycle-dispatch.js";
-import { ensureAgentLoaded } from "../agent-loading.js";
+import { ensureAgentLoaded, ensureUnarchivedAgentLoaded } from "../agent-loading.js";
 import { isStoredAgentProviderAvailable } from "../../persistence-hooks.js";
 import {
   archiveByScope,
@@ -2150,16 +2150,27 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
       },
       outputSchema: {
         success: z.boolean(),
+        outcome: z.enum(["cancelled", "not_running", "not_found", "archived", "not_resumable"]),
       },
     },
     async ({ agentId }) => {
-      const { cancelled } = await cancelAgentRunCommand(
-        { agentManager, logger: childLogger },
+      const { cancelled, outcome } = await cancelAgentRunCommand(
+        {
+          agentManager,
+          agentStorage,
+          loadAgent: (id) =>
+            ensureUnarchivedAgentLoaded(id, {
+              agentManager,
+              agentStorage,
+              logger: childLogger,
+            }),
+          logger: childLogger,
+        },
         agentId,
       );
       return {
         content: [],
-        structuredContent: ensureValidJson({ success: cancelled }),
+        structuredContent: ensureValidJson({ success: cancelled, outcome }),
       };
     },
   );

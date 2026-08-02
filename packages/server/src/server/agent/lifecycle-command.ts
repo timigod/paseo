@@ -13,7 +13,10 @@ export type LifecycleAgentSnapshot = Pick<ManagedAgent, "id" | "cwd" | "lifecycl
 export interface LifecycleAgentManager {
   getAgent(agentId: string): LifecycleAgentSnapshot | null;
   hasInFlightRun(agentId: string): boolean;
-  cancelAgentRun(agentId: string): Promise<AgentRunCancellationResult>;
+  cancelAgentRun(
+    agentId: string,
+    options?: { assumeRunning?: boolean },
+  ): Promise<AgentRunCancellationResult>;
   clearAgentAttention(agentId: string): Promise<void>;
   archiveAgent(agentId: string): Promise<{ archivedAt: string }>;
   archiveSnapshot(agentId: string, archivedAt: string): Promise<StoredAgentRecord>;
@@ -47,27 +50,45 @@ export interface AgentLifecycleCommandDependencies {
 }
 
 export interface CancelAgentRunResult {
-  agent: LifecycleAgentSnapshot;
+  agent: LifecycleAgentSnapshot | null;
   cancelled: boolean;
+  outcome: CancelAgentRunOutcome;
 }
 
-interface RequestedAgentRunCancellation extends CancelAgentRunResult {
+export type CancelAgentRunOutcome =
+  | "cancelled"
+  | "not_running"
+  | "not_found"
+  | "archived"
+  | "not_resumable";
+
+export interface CancelAgentRunCommandDependencies {
+  agentManager: LifecycleAgentManager;
+  agentStorage: LifecycleAgentStorage;
+  loadAgent(agentId: string): Promise<LifecycleAgentSnapshot>;
+  logger: Logger;
+}
+
+interface RequestedAgentRunCancellation {
+  agent: LifecycleAgentSnapshot;
+  cancelled: boolean;
   cancellation: AgentRunCancellationResult;
 }
 
 async function requestAgentRunCancellation(
   dependencies: Pick<AgentLifecycleCommandDependencies, "agentManager" | "logger">,
   agentId: string,
+  options?: { assumeRunning?: boolean; agent?: LifecycleAgentSnapshot },
 ): Promise<RequestedAgentRunCancellation> {
   const { agentManager, logger } = dependencies;
-  const agent = agentManager.getAgent(agentId);
+  const agent = options?.agent ?? agentManager.getAgent(agentId);
   if (!agent) {
     logger.trace({ agentId }, "cancelAgentRunCommand: agent not found");
     throw new Error(`Agent ${agentId} not found`);
   }
 
   const hasInFlightRun = agentManager.hasInFlightRun(agentId);
-  if (!hasInFlightRun) {
+  if (!hasInFlightRun && !options?.assumeRunning) {
     logger.trace(
       { agentId, lifecycle: agent.lifecycle, hasInFlightRun },
       "cancelAgentRunCommand: skipping because agent is not running",
@@ -80,7 +101,10 @@ async function requestAgentRunCancellation(
     "cancelAgentRunCommand: interrupting",
   );
   const startedAt = Date.now();
-  const cancellation = await agentManager.cancelAgentRun(agentId);
+  const cancellation = await agentManager.cancelAgentRun(
+    agentId,
+    options?.assumeRunning ? { assumeRunning: true } : undefined,
+  );
   logger.debug(
     { agentId, cancellation: cancellation.status, durationMs: Date.now() - startedAt },
     "cancelAgentRunCommand: cancelAgentRun completed",
@@ -94,10 +118,41 @@ async function requestAgentRunCancellation(
 }
 
 export async function cancelAgentRunCommand(
-  dependencies: Pick<AgentLifecycleCommandDependencies, "agentManager" | "logger">,
+  dependencies: CancelAgentRunCommandDependencies,
   agentId: string,
 ): Promise<CancelAgentRunResult> {
-  const result = await requestAgentRunCancellation(dependencies, agentId);
+  let agent = dependencies.agentManager.getAgent(agentId);
+  let assumeRunning = false;
+
+  if (!agent) {
+    const record = await dependencies.agentStorage.get(agentId);
+    if (!record) {
+      return { agent: null, cancelled: false, outcome: "not_found" };
+    }
+    if (record.archivedAt) {
+      return { agent: null, cancelled: false, outcome: "archived" };
+    }
+    if (record.lastStatus !== "running") {
+      return { agent: null, cancelled: false, outcome: "not_running" };
+    }
+    if (!record.persistence) {
+      return { agent: null, cancelled: false, outcome: "not_resumable" };
+    }
+
+    agent = await dependencies.loadAgent(agentId);
+    assumeRunning = true;
+  } else if (agent.lifecycle === "initializing") {
+    const record = await dependencies.agentStorage.get(agentId);
+    if (record?.lastStatus === "running" && record.persistence && !record.archivedAt) {
+      agent = await dependencies.loadAgent(agentId);
+      assumeRunning = true;
+    }
+  }
+
+  const result = await requestAgentRunCancellation(dependencies, agentId, {
+    agent,
+    ...(assumeRunning ? { assumeRunning: true } : {}),
+  });
   if (result.cancellation.status === "refused") {
     dependencies.logger.warn(
       { agentId },
@@ -106,7 +161,11 @@ export async function cancelAgentRunCommand(
     throw new AgentRunCancellationError(agentId, "stop");
   }
 
-  return { agent: result.agent, cancelled: result.cancelled };
+  return {
+    agent: result.agent,
+    cancelled: result.cancelled,
+    outcome: result.cancelled ? "cancelled" : "not_running",
+  };
 }
 
 export interface ArchiveAgentResult {

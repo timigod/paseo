@@ -75,6 +75,35 @@ function fetchWorkspacesResponse(workspace: Record<string, unknown>) {
   };
 }
 
+describe("cancel agent response compatibility", () => {
+  test("accepts both legacy responses and explicit cancellation outcomes", () => {
+    const legacy = SessionOutboundMessageSchema.parse({
+      type: "cancel_agent_response",
+      payload: {
+        requestId: "req-legacy",
+        agentId: "agent-1",
+        agent: null,
+        error: null,
+      },
+    });
+    const explicit = SessionOutboundMessageSchema.parse({
+      type: "cancel_agent_response",
+      payload: {
+        requestId: "req-explicit",
+        agentId: "agent-1",
+        agent: null,
+        outcome: "not_running",
+        error: null,
+      },
+    });
+
+    expect(legacy.type === "cancel_agent_response" && legacy.payload.outcome).toBeUndefined();
+    expect(explicit.type === "cancel_agent_response" && explicit.payload.outcome).toBe(
+      "not_running",
+    );
+  });
+});
+
 describe("workspace descriptor message compatibility", () => {
   test("old-shaped fetch_workspaces_response without project still parses", () => {
     const parsed = SessionOutboundMessageSchema.parse(
