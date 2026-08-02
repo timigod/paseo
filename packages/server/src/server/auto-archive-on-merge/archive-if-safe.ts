@@ -32,6 +32,7 @@ export interface AutoArchiveArchiveOptions {
   workspaceRegistry: Pick<WorkspaceRegistry, "get" | "list" | "update">;
   findWorkspaceIdForCwd: (cwd: string) => Promise<string | null>;
   listActiveWorkspaces: () => Promise<ActiveWorkspaceRef[]>;
+  getWorkspaceMembershipVersion?: () => number;
   archiveWorkspaceRecord: ArchiveDependencies["archiveWorkspaceRecord"];
   markWorkspaceArchiving: (workspaceIds: Iterable<string>, archivingAt: string) => void;
   clearWorkspaceArchiving: (workspaceIds: Iterable<string>) => void;
@@ -140,6 +141,8 @@ export async function archiveIfSafe(input: {
           agentStorage: options.agentStorage,
           findWorkspaceIdForCwd: options.findWorkspaceIdForCwd,
           listActiveWorkspaces: options.listActiveWorkspaces,
+          getWorkspaceMembershipVersion: options.getWorkspaceMembershipVersion,
+          getTerminalMembershipVersion: () => options.terminalManager.getMembershipVersion?.() ?? 0,
           archiveWorkspaceRecord: options.archiveWorkspaceRecord,
           workspaceRegistry: options.workspaceRegistry,
           emitWorkspaceUpdatesForWorkspaceIds: options.emitWorkspaceUpdatesForWorkspaceIds,

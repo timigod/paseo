@@ -1,5 +1,8 @@
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { BrowserWindow } from "electron";
 import { WebSocket, type RawData } from "ws";
+import { resolvePaseoHome } from "@getpaseo/server";
 
 interface TransportTarget {
   transportType: "socket" | "pipe";
@@ -23,6 +26,7 @@ interface Session {
 }
 
 const WS_ENDPOINT_PATH = "/ws";
+const COORDINATOR_CAPABILITY_FILENAME = "coordinator-auth-token";
 
 let nextSessionId = 0;
 const sessions = new Map<string, Session>();
@@ -64,12 +68,24 @@ function decodeTransportMessage(input: { text?: string; binaryBase64?: string })
   throw new Error("Local transport send requires text or binary payload.");
 }
 
+function readCoordinatorCapability(paseoHome: string): string | null {
+  try {
+    return readFileSync(join(paseoHome, COORDINATOR_CAPABILITY_FILENAME), "utf8").trim() || null;
+  } catch {
+    return null;
+  }
+}
+
 export function openLocalTransportSession(target: TransportTarget): Promise<string> {
   const sessionId = `local-session-${++nextSessionId}`;
   const url = buildLocalWebSocketUrl(target);
+  const coordinatorToken = readCoordinatorCapability(resolvePaseoHome(process.env));
 
   return new Promise((resolve, reject) => {
-    const ws = new WebSocket(url);
+    const ws = new WebSocket(
+      url,
+      coordinatorToken ? { headers: { Authorization: `Bearer ${coordinatorToken}` } } : {},
+    );
     const session: Session = {
       id: sessionId,
       ws,

@@ -317,7 +317,7 @@ export interface AgentManagerOptions {
   durableTimelineStore?: AgentTimelineStore;
   terminalManager?: TerminalManager | null;
   mcpBaseUrl?: string;
-  mcpAuthToken?: string;
+  issueAgentAuthToken?: (identity: AgentCallerIdentity) => string;
   paseoToolsEnabled?: boolean;
   paseoToolCatalogFactory?: PaseoToolCatalogFactory;
   appendSystemPrompt?: string;
@@ -651,9 +651,10 @@ export class AgentManager {
   >();
   private readonly retainedAgentRuntimeCleanups = new Set<AgentSession>();
   private retainedAgentRuntimeCleanupRetry: Promise<void> | null = null;
+  private membershipVersion = 0;
   private readonly agentStreamCoalescer: AgentStreamCoalescer;
   private mcpBaseUrl: string | null;
-  private readonly mcpAuthToken: string | null;
+  private readonly issueAgentAuthToken: ((identity: AgentCallerIdentity) => string) | null;
   private paseoToolsEnabled = true;
   private paseoToolCatalogFactory: PaseoToolCatalogFactory | null = null;
   private appendSystemPrompt: string;
@@ -673,7 +674,7 @@ export class AgentManager {
     this.onAgentAttention = options?.onAgentAttention;
     this.onWorkspaceStateMayHaveChanged = options?.onWorkspaceStateMayHaveChanged;
     this.mcpBaseUrl = options?.mcpBaseUrl ?? null;
-    this.mcpAuthToken = options?.mcpAuthToken ?? null;
+    this.issueAgentAuthToken = options?.issueAgentAuthToken ?? null;
     this.configurePaseoTools(options);
     this.appendSystemPrompt = options.appendSystemPrompt ?? "";
     this.logger = options.logger.child({ module: "agent", component: "agent-manager" });
@@ -781,14 +782,14 @@ export class AgentManager {
     this.paseoToolCatalogFactory = factory;
   }
 
-  /**
-   * Capability token the daemon's own MCP clients must present to the Agent MCP
-   * endpoint when a daemon password is configured. Read by the per-client
-   * session to authenticate its own MCP connection. Stays in the daemon — never
-   * sent to remote clients.
-   */
-  getMcpAuthToken(): string | null {
-    return this.mcpAuthToken;
+  /** Issue the current identity-bound ingress capability for a managed agent. */
+  getAgentIngressAuthToken(agentId: string): string | null {
+    const identity = this.getAgentCallerIdentity(agentId);
+    return identity && this.issueAgentAuthToken ? this.issueAgentAuthToken(identity) : null;
+  }
+
+  getMembershipVersion(): number {
+    return this.membershipVersion;
   }
 
   getAgentCallerIdentity(agentId: string): AgentCallerIdentity | null {
@@ -2085,7 +2086,14 @@ export class AgentManager {
   private async writeLabels(agentId: string, patch: AgentLabelPatch): Promise<WriteLabelsResult> {
     const liveAgent = this.agents.get(agentId);
     if (liveAgent) {
+      const previousParentAgentId = getParentAgentIdFromLabels(liveAgent.labels);
       liveAgent.labels = applyLabelPatch(liveAgent.labels, patch);
+      if (
+        !liveAgent.internal &&
+        getParentAgentIdFromLabels(liveAgent.labels) !== previousParentAgentId
+      ) {
+        this.membershipVersion += 1;
+      }
       this.touchUpdatedAt(liveAgent);
       await this.persistSnapshot(liveAgent);
       this.emitState(liveAgent, { persist: false });
@@ -2114,6 +2122,12 @@ export class AgentManager {
       updatedAt: this.nextStoredUpdatedAt(record),
     };
     await registry.upsert(nextRecord);
+    if (
+      !record.internal &&
+      getParentAgentIdFromLabels(record.labels) !== getParentAgentIdFromLabels(nextRecord.labels)
+    ) {
+      this.membershipVersion += 1;
+    }
     return nextRecord;
   }
 
@@ -2236,6 +2250,9 @@ export class AgentManager {
       archivedAt: null,
       updatedAt: new Date().toISOString(),
     });
+    if (!record.internal) {
+      this.membershipVersion += 1;
+    }
 
     if (this.getAgent(agentId)) {
       this.notifyAgentState(agentId);
@@ -2267,8 +2284,15 @@ export class AgentManager {
   ): Promise<void> {
     const liveAgent = this.agents.get(agentId);
     if (liveAgent) {
+      const previousParentAgentId = getParentAgentIdFromLabels(liveAgent.labels);
       if (updates.labels) {
         liveAgent.labels = applyLabelPatch(liveAgent.labels, updates.labels);
+      }
+      if (
+        !liveAgent.internal &&
+        getParentAgentIdFromLabels(liveAgent.labels) !== previousParentAgentId
+      ) {
+        this.membershipVersion += 1;
       }
       const title = updates.title?.trim();
       this.touchUpdatedAt(liveAgent);
@@ -3196,6 +3220,9 @@ export class AgentManager {
       this.assertAcceptingAgentRegistrations();
       this.agents.set(resolvedAgentId, managed);
       this.agentIncarnations.set(resolvedAgentId, options.incarnation);
+      if (!managed.internal) {
+        this.membershipVersion += 1;
+      }
       registered = true;
       if (options?.resumeRunning) {
         managed.lifecycle = "running";
@@ -4740,7 +4767,11 @@ export class AgentManager {
         agentId,
         agentIncarnation,
         mcpBaseUrl: this.mcpBaseUrl,
-        mcpAuthToken: this.mcpAuthToken,
+        mcpAuthToken:
+          this.issueAgentAuthToken?.({
+            agentId,
+            incarnation: agentIncarnation,
+          }) ?? null,
       }),
     );
     return { storedConfig, launchConfig };
@@ -4766,6 +4797,10 @@ export class AgentManager {
     agentIncarnation: string,
     env?: Record<string, string>,
   ): Promise<AgentLaunchContext> {
+    const agentAuthToken = this.issueAgentAuthToken?.({
+      agentId,
+      incarnation: agentIncarnation,
+    });
     const context: AgentLaunchContext = {
       agentId,
       env: {
@@ -4773,6 +4808,7 @@ export class AgentManager {
         PASEO_AGENT_ID: agentId,
         PASEO_AGENT_INCARNATION: agentIncarnation,
         PASEO_AGENT_CWD: cwd,
+        ...(agentAuthToken ? { PASEO_AGENT_AUTH_TOKEN: agentAuthToken } : {}),
       },
     };
     if (

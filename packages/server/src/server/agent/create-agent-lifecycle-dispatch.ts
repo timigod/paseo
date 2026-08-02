@@ -38,6 +38,8 @@ interface CreateAgentLifecycleDispatchDependencies {
   drainWorkspaceLifecycleOperations: () => Promise<void>;
   findWorkspaceIdForCwd: (cwd: string) => Promise<string | null>;
   listActiveWorkspaces: () => Promise<ActiveWorkspaceRef[]>;
+  getWorkspaceMembershipVersion?: () => number;
+  getTerminalMembershipVersion?: () => number;
   archiveWorkspaceRecord: ArchiveDependencies["archiveWorkspaceRecord"];
   workspaceRegistry: Pick<WorkspaceRegistry, "get" | "list" | "update" | "subscribeToMutations">;
   emit: (message: SessionOutboundMessage) => void;
@@ -474,6 +476,8 @@ export class CreateAgentLifecycleDispatch {
         agentStorage: this.dependencies.agentStorage,
         findWorkspaceIdForCwd: this.dependencies.findWorkspaceIdForCwd,
         listActiveWorkspaces: this.dependencies.listActiveWorkspaces,
+        getWorkspaceMembershipVersion: this.dependencies.getWorkspaceMembershipVersion,
+        getTerminalMembershipVersion: this.dependencies.getTerminalMembershipVersion,
         archiveWorkspaceRecord: this.dependencies.archiveWorkspaceRecord,
         workspaceRegistry: this.dependencies.workspaceRegistry,
         emitWorkspaceUpdatesForWorkspaceIds: this.dependencies.emitWorkspaceUpdatesForWorkspaceIds,

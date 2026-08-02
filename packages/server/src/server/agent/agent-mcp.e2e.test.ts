@@ -218,7 +218,10 @@ describe("agent MCP end-to-end (offline)", () => {
     const daemon = await createPaseoDaemon(daemonConfig, pino({ level: "silent" }));
     await daemon.start();
 
-    const client = await createMcpClient(`http://127.0.0.1:${port}/mcp/agents`);
+    const client = await createMcpClient(
+      `http://127.0.0.1:${port}/mcp/agents`,
+      daemon.getCoordinatorAuthToken(),
+    );
 
     let agentId: string | null = null;
     try {
@@ -267,7 +270,7 @@ describe("agent MCP end-to-end (offline)", () => {
     }
   }, 30_000);
 
-  test("default passwordless top-level MCP can archive, kill, and archive a workspace", async () => {
+  test("passwordless MCP keeps managed and explicit coordinator authority distinct", async () => {
     const paseoHome = await mkdtemp(path.join(os.tmpdir(), "paseo-home-"));
     const staticDir = await mkdtemp(path.join(os.tmpdir(), "paseo-static-"));
     const archiveAgentCwd = await mkdtemp(path.join(os.tmpdir(), "paseo-archive-agent-"));
@@ -289,7 +292,14 @@ describe("agent MCP end-to-end (offline)", () => {
       pino({ level: "silent" }),
     );
     await daemon.start();
-    const client = await createMcpClient(`http://127.0.0.1:${port}/mcp/agents`);
+    const mcpUrl = `http://127.0.0.1:${port}/mcp/agents`;
+    const unauthorized = await fetch(mcpUrl, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "{}",
+    });
+    expect(unauthorized.status).toBe(401);
+    const client = await createMcpClient(mcpUrl, daemon.getCoordinatorAuthToken());
     let agentScopedClient: McpClient | null = null;
 
     const createAgent = async (cwd: string, title: string): Promise<string> => {
@@ -314,18 +324,34 @@ describe("agent MCP end-to-end (offline)", () => {
       const archiveAgentId = await createAgent(archiveAgentCwd, "Passwordless archive target");
       const killAgentId = await createAgent(killAgentCwd, "Passwordless kill target");
 
-      const callerIdentity = daemon.agentManager.getAgentCallerIdentity(archiveAgentId);
-      if (!callerIdentity) throw new Error("Expected current passwordless MCP caller identity");
       const agentScopedUrl = new URL(`http://127.0.0.1:${port}/mcp/agents`);
-      agentScopedUrl.searchParams.set("callerAgentId", callerIdentity.agentId);
-      agentScopedUrl.searchParams.set("callerAgentIncarnation", callerIdentity.incarnation);
-      agentScopedClient = await createMcpClient(agentScopedUrl.toString());
+      agentScopedClient = await createMcpClient(
+        agentScopedUrl.toString(),
+        daemon.agentManager.getAgentIngressAuthToken(archiveAgentId)!,
+      );
       const selfArchiveResult = await agentScopedClient.callTool({
         name: "archive_agent",
         args: { agentId: archiveAgentId },
       });
       expect(selfArchiveResult.isError).toBe(true);
+      const selfKillResult = await agentScopedClient.callTool({
+        name: "kill_agent",
+        args: { agentId: archiveAgentId },
+      });
+      expect(selfKillResult.isError).toBe(true);
       expect(daemon.agentManager.getAgent(archiveAgentId)).not.toBeNull();
+
+      const spoofedIdentity = daemon.agentManager.getAgentCallerIdentity(killAgentId);
+      if (!spoofedIdentity) throw new Error("Expected spoof target identity");
+      const spoofedUrl = new URL(mcpUrl);
+      spoofedUrl.searchParams.set("callerAgentId", spoofedIdentity.agentId);
+      spoofedUrl.searchParams.set("callerAgentIncarnation", spoofedIdentity.incarnation);
+      await expect(
+        createMcpClient(
+          spoofedUrl.toString(),
+          daemon.agentManager.getAgentIngressAuthToken(archiveAgentId)!,
+        ),
+      ).rejects.toThrow(/Unauthorized/);
 
       const archiveAgentResult = await client.callTool({
         name: "archive_agent",
@@ -428,7 +454,7 @@ describe("agent MCP end-to-end (offline)", () => {
     const requestController = new AbortController();
     const client = await createMcpClient(
       `http://127.0.0.1:${port}/mcp/agents`,
-      undefined,
+      daemon.getCoordinatorAuthToken(),
       requestController.signal,
     );
     const revokeCallerSpy = vi.spyOn(destructiveAuthority, "revokeDestructiveCaller");
@@ -517,7 +543,7 @@ describe("agent MCP end-to-end (offline)", () => {
     const requestController = new AbortController();
     const client = await createMcpClient(
       `http://127.0.0.1:${port}/mcp/agents`,
-      undefined,
+      daemon.getCoordinatorAuthToken(),
       requestController.signal,
     );
     const archiveSpy = vi.spyOn(AgentManager.prototype, "archiveAgent");
@@ -616,7 +642,7 @@ describe("agent MCP end-to-end (offline)", () => {
     const requestController = new AbortController();
     const client = await createMcpClient(
       `http://127.0.0.1:${port}/mcp/agents`,
-      undefined,
+      daemon.getCoordinatorAuthToken(),
       requestController.signal,
     );
     const revokeCallerSpy = vi.spyOn(destructiveAuthority, "revokeDestructiveCaller");
@@ -674,7 +700,7 @@ describe("agent MCP end-to-end (offline)", () => {
     await daemon.start();
 
     const mcpUrl = `http://127.0.0.1:${port}/mcp/agents`;
-    const capabilityToken = daemon.agentManager.getMcpAuthToken();
+    const capabilityToken = daemon.getCoordinatorAuthToken();
     expect(typeof capabilityToken).toBe("string");
 
     let agentId: string | null = null;
@@ -743,7 +769,10 @@ describe("agent MCP end-to-end (offline)", () => {
     const daemon = await createPaseoDaemon(daemonConfig, pino({ level: "silent" }));
     await daemon.start();
 
-    const client = await createMcpClient(`http://127.0.0.1:${port}/mcp/agents`);
+    const client = await createMcpClient(
+      `http://127.0.0.1:${port}/mcp/agents`,
+      daemon.getCoordinatorAuthToken(),
+    );
 
     const disabledPaseoHome = await mkdtemp(path.join(os.tmpdir(), "paseo-home-disabled-"));
     const disabledStaticDir = await mkdtemp(path.join(os.tmpdir(), "paseo-static-disabled-"));
@@ -765,7 +794,10 @@ describe("agent MCP end-to-end (offline)", () => {
     const disabledDaemon = await createPaseoDaemon(disabledDaemonConfig, pino({ level: "silent" }));
     await disabledDaemon.start();
 
-    const disabledClient = await createMcpClient(`http://127.0.0.1:${disabledPort}/mcp/agents`);
+    const disabledClient = await createMcpClient(
+      `http://127.0.0.1:${disabledPort}/mcp/agents`,
+      disabledDaemon.getCoordinatorAuthToken(),
+    );
 
     let agentId: string | null = null;
     let disabledAgentId: string | null = null;
@@ -855,7 +887,10 @@ describe("agent MCP end-to-end (offline)", () => {
     const daemon = await createPaseoDaemon(daemonConfig, pino({ level: "silent" }));
     await daemon.start();
 
-    const client = await createMcpClient(`http://127.0.0.1:${port}/mcp/agents`);
+    const client = await createMcpClient(
+      `http://127.0.0.1:${port}/mcp/agents`,
+      daemon.getCoordinatorAuthToken(),
+    );
 
     let agentId: string | null = null;
     try {
@@ -915,7 +950,10 @@ describe("agent MCP end-to-end (offline)", () => {
     const daemon = await createPaseoDaemon(daemonConfig, pino({ level: "silent" }));
     await daemon.start();
 
-    const client = await createMcpClient(`http://127.0.0.1:${port}/mcp/agents`);
+    const client = await createMcpClient(
+      `http://127.0.0.1:${port}/mcp/agents`,
+      daemon.getCoordinatorAuthToken(),
+    );
 
     let agentId: string | null = null;
     try {
@@ -1096,7 +1134,10 @@ describe("agent MCP end-to-end (offline)", () => {
     const daemon = await createPaseoDaemon(daemonConfig, pino({ level: "silent" }));
     await daemon.start();
 
-    const client = await createMcpClient(`http://127.0.0.1:${port}/mcp/agents`);
+    const client = await createMcpClient(
+      `http://127.0.0.1:${port}/mcp/agents`,
+      daemon.getCoordinatorAuthToken(),
+    );
 
     let agentId: string | null = null;
     try {
@@ -1160,7 +1201,10 @@ describe("agent MCP end-to-end (offline)", () => {
     const daemon = await createPaseoDaemon(daemonConfig, pino({ level: "silent" }));
     await daemon.start();
 
-    const client = await createMcpClient(`http://127.0.0.1:${port}/mcp/agents`);
+    const client = await createMcpClient(
+      `http://127.0.0.1:${port}/mcp/agents`,
+      daemon.getCoordinatorAuthToken(),
+    );
 
     let agentId: string | null = null;
     try {

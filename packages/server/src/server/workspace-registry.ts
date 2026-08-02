@@ -147,6 +147,7 @@ export interface ProjectRegistry {
 }
 
 export interface WorkspaceRegistry {
+  getMembershipVersion?(): number;
   initialize(): Promise<void>;
   existsOnDisk(): Promise<boolean>;
   list(): Promise<PersistedWorkspaceRecord[]>;
@@ -174,6 +175,8 @@ class FileBackedRegistry<TRecord extends RegistryRecord> {
   private loaded = false;
   private readonly cache = new Map<string, TRecord>();
   private persistQueue: Promise<void> = Promise.resolve();
+  private membershipVersion = 0;
+  private membershipMutationsInFlight = 0;
 
   constructor(options: {
     filePath: string;
@@ -214,23 +217,55 @@ class FileBackedRegistry<TRecord extends RegistryRecord> {
     return this.cache.get(id) ?? null;
   }
 
+  getMembershipVersion(): number {
+    return this.membershipMutationsInFlight > 0 ? Number.NaN : this.membershipVersion;
+  }
+
   async upsert(record: TRecord): Promise<void> {
     await this.load();
     const parsed = this.schema.parse(record);
-    this.cache.set(this.getId(parsed), parsed);
-    await this.enqueuePersist();
+    this.membershipVersion += 1;
+    this.membershipMutationsInFlight += 1;
+    try {
+      await this.enqueueOperation(async () => {
+        const id = this.getId(parsed);
+        const records = Array.from(this.cache.values(), (current) =>
+          this.getId(current) === id ? parsed : current,
+        );
+        if (!this.cache.has(id)) {
+          records.push(parsed);
+        }
+        await this.persistRecords(records);
+        this.cache.set(id, parsed);
+      });
+    } finally {
+      this.membershipVersion += 1;
+      this.membershipMutationsInFlight -= 1;
+    }
   }
 
   async update(id: string, updater: (record: TRecord) => TRecord): Promise<TRecord | null> {
     await this.load();
-    const existing = this.cache.get(id);
-    if (!existing) {
-      return null;
+    this.membershipVersion += 1;
+    this.membershipMutationsInFlight += 1;
+    try {
+      return await this.enqueueOperation(async () => {
+        const existing = this.cache.get(id);
+        if (!existing) {
+          return null;
+        }
+        const next = this.schema.parse(updater(existing));
+        const records = Array.from(this.cache.values(), (current) =>
+          this.getId(current) === id ? next : current,
+        );
+        await this.persistRecords(records);
+        this.cache.set(id, next);
+        return next;
+      });
+    } finally {
+      this.membershipVersion += 1;
+      this.membershipMutationsInFlight -= 1;
     }
-    const next = this.schema.parse(updater(existing));
-    this.cache.set(id, next);
-    await this.enqueuePersist();
-    return next;
   }
 
   async archive(id: string, archivedAt: string, options?: RegistryArchiveOptions): Promise<void> {
@@ -243,19 +278,14 @@ class FileBackedRegistry<TRecord extends RegistryRecord> {
     options?: RegistryArchiveOptions,
   ): Promise<TRecord | null> {
     await this.load();
-    const existing = this.cache.get(id);
-    if (!existing) return null;
-    await options?.recheck?.();
     return this.persistArchive(id, archivedAt, options);
   }
 
   protected async archiveIfActive(id: string, archivedAt: string): Promise<TRecord | null> {
     await this.load();
-    const existing = this.cache.get(id);
-    if (!existing || existing.archivedAt) {
-      return null;
-    }
-    return this.persistArchive(id, archivedAt, undefined, { onlyIfActive: true });
+    return this.persistArchive(id, archivedAt, undefined, {
+      onlyIfActive: true,
+    });
   }
 
   private async persistArchive(
@@ -293,11 +323,6 @@ class FileBackedRegistry<TRecord extends RegistryRecord> {
     options?: RegistryArchiveOptions,
   ): Promise<TRecord | null> {
     await this.load();
-    const existing = this.cache.get(id);
-    if (!existing) {
-      return null;
-    }
-    await options?.recheck?.();
     return this.enqueueOperation(async () => {
       const current = this.cache.get(id);
       if (!current) {
@@ -332,16 +357,13 @@ class FileBackedRegistry<TRecord extends RegistryRecord> {
     this.loaded = true;
   }
 
-  private async persist(recheck?: () => void | Promise<void>): Promise<void> {
-    const records = Array.from(this.cache.values());
-    await this.persistRecords(records, recheck);
-  }
-
   private async persistRecords(
     records: readonly TRecord[],
     recheck?: () => void | Promise<void>,
   ): Promise<void> {
-    await writeJsonFileAtomic(this.filePath, records, { beforeCommit: recheck });
+    await writeJsonFileAtomic(this.filePath, records, {
+      beforeCommit: recheck,
+    });
   }
 
   private async enqueueOperation<TResult>(operation: () => Promise<TResult>): Promise<TResult> {
@@ -351,10 +373,6 @@ class FileBackedRegistry<TRecord extends RegistryRecord> {
       () => undefined,
     );
     return nextOperation;
-  }
-
-  private async enqueuePersist(recheck?: () => void | Promise<void>): Promise<void> {
-    await this.enqueueOperation(() => this.persist(recheck));
   }
 }
 
@@ -371,7 +389,6 @@ export class FileBackedProjectRegistry
       project: PersistedProjectRecord | null;
     }) => void | Promise<void>
   >();
-
   constructor(filePath: string, logger: Logger, options?: { projectIdFactory?: () => string }) {
     super({
       filePath,

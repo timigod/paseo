@@ -718,6 +718,29 @@ test("passes password as HTTP bearer header and WebSocket subprotocol", async ()
   });
 });
 
+test("passes an explicit bearer capability as HTTP header and WebSocket subprotocol", async () => {
+  const mock = createMockTransport();
+  const transportFactory = vi.fn(() => mock.transport);
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "explicit-capability-test",
+    authHeader: "Bearer identity-bound-token",
+    transportFactory,
+    reconnect: { enabled: false },
+  });
+  clients.push(client);
+
+  const connecting = client.connect();
+  mock.triggerOpen();
+  await connecting;
+
+  expect(transportFactory).toHaveBeenCalledWith({
+    url: "ws://test",
+    headers: { Authorization: "Bearer identity-bound-token" },
+    protocols: ["paseo.bearer.identity-bound-token"],
+  });
+});
+
 test("advertises client capabilities in hello", async () => {
   const logger = createMockLogger();
   const mock = createMockTransport();

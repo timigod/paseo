@@ -195,7 +195,6 @@ import { isHostnameAllowed, type HostnamesConfig } from "./hostnames.js";
 import {
   createRequireBearerMiddleware,
   extractHttpBearerToken,
-  isAgentMcpRequestAuthorized,
   isBearerTokenValidAsync,
   type DaemonAuthConfig,
 } from "./auth.js";
@@ -213,11 +212,18 @@ import { ensureUnarchivedAgentLoaded } from "./agent/agent-loading.js";
 import {
   createAgentDestructiveCaller,
   createCoordinatorDestructiveCaller,
-  createUncertainDestructiveCaller,
   revokeDestructiveCaller,
   type DestructiveActionRecheck,
   type DestructiveCallerContext,
 } from "./agent/destructive-action-authority.js";
+import {
+  AgentIngressCapabilityAuthority,
+  type IngressPrincipal,
+} from "./agent/ingress-capability.js";
+import {
+  removeCoordinatorCapability,
+  writeCoordinatorCapability,
+} from "./coordinator-capability-file.js";
 import { CreateAgentLifecycleDispatch } from "./agent/create-agent-lifecycle-dispatch.js";
 import {
   HubRelationshipController,
@@ -465,6 +471,8 @@ export interface PaseoDaemon {
   start(): Promise<void>;
   stop(options?: PaseoDaemonStopOptions): Promise<void>;
   getListenTarget(): ListenTarget | null;
+  /** Trusted in-process clients use this instead of relying on passwordless omission. */
+  getCoordinatorAuthToken(): string;
 }
 
 export interface PaseoDaemonStopOptions {
@@ -570,45 +578,32 @@ function firstQueryString(value: unknown): string | undefined {
 
 async function resolveAgentMcpCallerContext(
   req: express.Request,
-  daemonPassword: string | undefined,
-): Promise<AgentMcpCallerContext> {
+  principal: IngressPrincipal,
+): Promise<AgentMcpCallerContext | null> {
   const callerAgentId = firstQueryString(req.query.callerAgentId);
   const callerAgentIncarnation = firstQueryString(req.query.callerAgentIncarnation);
   const hasCallerClaim = callerAgentId !== undefined || callerAgentIncarnation !== undefined;
 
-  if (callerAgentId && callerAgentIncarnation) {
+  if (principal.kind === "agent") {
+    const identityMatchesClaim =
+      (!hasCallerClaim ||
+        (callerAgentId === principal.identity.agentId &&
+          callerAgentIncarnation === principal.identity.incarnation)) &&
+      callerAgentId !== "" &&
+      callerAgentIncarnation !== "";
+    if (!identityMatchesClaim) {
+      return null;
+    }
     return {
-      callerAgentId,
-      callerAgentIncarnation,
-      destructiveCaller: createAgentDestructiveCaller({
-        agentId: callerAgentId,
-        incarnation: callerAgentIncarnation,
-      }),
+      callerAgentId: principal.identity.agentId,
+      callerAgentIncarnation: principal.identity.incarnation,
+      destructiveCaller: createAgentDestructiveCaller(principal.identity),
     };
   }
   if (hasCallerClaim) {
-    return {
-      callerAgentId,
-      callerAgentIncarnation,
-      destructiveCaller: createUncertainDestructiveCaller("MCP caller identity was incomplete"),
-    };
+    return null;
   }
-  if (daemonPassword === undefined) {
-    return { destructiveCaller: createCoordinatorDestructiveCaller() };
-  }
-  if (
-    await isBearerTokenValidAsync({
-      password: daemonPassword,
-      token: extractHttpBearerToken(req.header("authorization")),
-    })
-  ) {
-    return { destructiveCaller: createCoordinatorDestructiveCaller() };
-  }
-  return {
-    destructiveCaller: createUncertainDestructiveCaller(
-      "MCP caller had no authenticated coordinator authority",
-    ),
-  };
+  return { destructiveCaller: createCoordinatorDestructiveCaller() };
 }
 
 function createBootstrapManagedProcessRegistry(
@@ -829,14 +824,12 @@ export async function createPaseoDaemon(
     ttlMs: downloadTokenTtlMs,
   });
 
-  // Capability token authenticating the daemon's own agents to the loopback
-  // Agent MCP endpoint (/mcp/agents). Random per daemon run, injected only into
-  // local agent configs and the daemon's own MCP client — never sent to remote
-  // clients — so it cannot be replayed off-box. This lets the injected MCP
-  // authenticate even when the daemon password is set via the app (hash only,
-  // no plaintext available). Mirrors the /api/files/download capability-token
-  // pattern.
-  const agentMcpAuthToken = randomUUID();
+  // Coordinator and managed-agent ingress capabilities are deliberately
+  // distinct. The coordinator token is never injected into agent runtimes;
+  // each agent receives an HMAC-bound token for only its own incarnation.
+  const coordinatorAuthToken = randomUUID();
+  const agentIngressAuthority = new AgentIngressCapabilityAuthority(coordinatorAuthToken);
+  await writeCoordinatorCapability(config.paseoHome, coordinatorAuthToken);
 
   const listenTarget = parseListenString(config.listen);
 
@@ -1089,7 +1082,7 @@ export async function createPaseoDaemon(
     onWorkspaceStateMayHaveChanged: ({ cwd }) => {
       workspaceGitService.onWorkspaceStateMayHaveChanged(cwd);
     },
-    mcpAuthToken: agentMcpAuthToken,
+    issueAgentAuthToken: (identity) => agentIngressAuthority.issueAgentToken(identity),
     logger,
   });
 
@@ -1254,6 +1247,7 @@ export async function createPaseoDaemon(
     logger,
     findWorkspaceIdForCwd: findWorkspaceIdForCwdExternal,
     listActiveWorkspaces: listActiveWorkspacesExternal,
+    getWorkspaceMembershipVersion: () => workspaceRegistry.getMembershipVersion(),
     archiveWorkspaceRecord: archiveWorkspaceRecordExternal,
     markWorkspaceArchiving: markWorkspaceArchivingExternal,
     clearWorkspaceArchiving: clearWorkspaceArchivingExternal,
@@ -1360,6 +1354,8 @@ export async function createPaseoDaemon(
           agentStorage,
           findWorkspaceIdForCwd: findWorkspaceIdForCwdExternal,
           listActiveWorkspaces: listActiveWorkspacesExternal,
+          getWorkspaceMembershipVersion: () => workspaceRegistry.getMembershipVersion(),
+          getTerminalMembershipVersion: () => terminalManager.getMembershipVersion?.() ?? 0,
           archiveWorkspaceRecord: archiveWorkspaceRecordExternal,
           emitWorkspaceUpdatesForWorkspaceIds: emitWorkspaceUpdatesExternal,
           markWorkspaceArchiving: markWorkspaceArchivingExternal,
@@ -1444,6 +1440,8 @@ export async function createPaseoDaemon(
     drainWorkspaceLifecycleOperations: () => defaultWorkspaceLifecycleCoordinator.drain(),
     findWorkspaceIdForCwd: findWorkspaceIdForCwdExternal,
     listActiveWorkspaces: listActiveWorkspacesExternal,
+    getWorkspaceMembershipVersion: () => workspaceRegistry.getMembershipVersion(),
+    getTerminalMembershipVersion: () => terminalManager.getMembershipVersion?.() ?? 0,
     archiveWorkspaceRecord: archiveWorkspaceRecordExternal,
     workspaceRegistry,
     emit: emitExternalSessionMessage,
@@ -1543,6 +1541,8 @@ export async function createPaseoDaemon(
         agentStorage,
         findWorkspaceIdForCwd: findWorkspaceIdForCwdExternal,
         listActiveWorkspaces: listActiveWorkspacesExternal,
+        getWorkspaceMembershipVersion: () => workspaceRegistry.getMembershipVersion(),
+        getTerminalMembershipVersion: () => terminalManager.getMembershipVersion?.() ?? 0,
         archiveWorkspaceRecord: archiveWorkspaceRecordExternal,
         emitWorkspaceUpdatesForWorkspaceIds: emitWorkspaceUpdatesExternal,
         markWorkspaceArchiving: markWorkspaceArchivingExternal,
@@ -1709,16 +1709,28 @@ export async function createPaseoDaemon(
       req: express.Request,
       res: express.Response,
     ): Promise<void> => {
-      // This route is exempt from the global daemon-password middleware, so it
-      // authenticates here using the injected capability token (or a valid
-      // daemon password). Without this, a password-protected daemon would be
-      // wide open on its agent control plane.
+      // This route is exempt from the global daemon-password middleware. It
+      // therefore always requires either a server-issued identity capability
+      // or an explicitly authenticated daemon-password coordinator.
+      const bearerToken = extractHttpBearerToken(req.header("authorization"));
+      let principal = agentIngressAuthority.resolve(bearerToken);
       if (
-        !(await isAgentMcpRequestAuthorized({
-          password: config.auth?.password,
-          capabilityToken: agentMcpAuthToken,
-          authorizationHeader: req.header("authorization"),
+        !principal &&
+        config.auth?.password &&
+        (await isBearerTokenValidAsync({
+          password: config.auth.password,
+          token: bearerToken,
         }))
+      ) {
+        principal = { kind: "coordinator" };
+      }
+      if (
+        !principal ||
+        (principal.kind === "agent" &&
+          !agentManager.isCurrentAgentIncarnation(
+            principal.identity.agentId,
+            principal.identity.incarnation,
+          ))
       ) {
         res.status(401).json({ error: "Unauthorized" });
         return;
@@ -1750,7 +1762,11 @@ export async function createPaseoDaemon(
           });
           return;
         }
-        const callerContext = await resolveAgentMcpCallerContext(req, config.auth?.password);
+        const callerContext = await resolveAgentMcpCallerContext(req, principal);
+        if (!callerContext) {
+          res.status(401).json({ error: "Unauthorized" });
+          return;
+        }
         let mcpSession: Awaited<ReturnType<typeof createAgentMcpSession>> | null = null;
         let requestClosed = false;
         let callerRevoked = false;
@@ -1957,6 +1973,7 @@ export async function createPaseoDaemon(
               serviceProxyPublicBaseUrl,
               browserToolsBroker,
               hubRelationships,
+              agentIngressAuthority,
             );
             await hubRelationships.start();
 
@@ -2106,6 +2123,9 @@ export async function createPaseoDaemon(
     if (errors.length > 0) {
       throw new AggregateError(errors, "One or more daemon shutdown steps failed");
     }
+    await removeCoordinatorCapability(config.paseoHome, coordinatorAuthToken).catch(
+      () => undefined,
+    );
   };
 
   return {
@@ -2119,6 +2139,7 @@ export async function createPaseoDaemon(
     start,
     stop,
     getListenTarget: () => boundListenTarget,
+    getCoordinatorAuthToken: () => coordinatorAuthToken,
   };
 }
 

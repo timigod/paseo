@@ -33,7 +33,10 @@ export function asSessionLogger(stub: {
 export function asAgentManager(stub: {
   [K in keyof SessionOptions["agentManager"]]?: unknown;
 }): SessionOptions["agentManager"] {
-  return createStub<SessionOptions["agentManager"]>(stub);
+  return createStub<SessionOptions["agentManager"]>({
+    getMembershipVersion: () => 0,
+    ...stub,
+  });
 }
 
 export function asAgentStorage(stub: {
@@ -93,6 +96,7 @@ export function asTerminalManager(stub: {
   [K in keyof NonNullable<SessionOptions["terminalManager"]>]?: unknown;
 }): NonNullable<SessionOptions["terminalManager"]> {
   return createStub<NonNullable<SessionOptions["terminalManager"]>>({
+    getMembershipVersion: () => 0,
     subscribeTerminalWorkspaceContributionChanged: () => () => {},
     ...stub,
   });

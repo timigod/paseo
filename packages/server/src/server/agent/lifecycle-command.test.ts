@@ -60,6 +60,7 @@ class FakeLifecycleAgentManager implements LifecycleAgentManager {
   readonly incarnations = new Map<string, string>();
   beforeArchiveCommit: (() => Promise<void>) | null = null;
   beforeCloseCommit: (() => Promise<void>) | null = null;
+  membershipVersion = 0;
 
   constructor(private readonly storage: FakeLifecycleAgentStorage) {}
 
@@ -69,6 +70,10 @@ class FakeLifecycleAgentManager implements LifecycleAgentManager {
 
   listAgents(): LifecycleAgentSnapshot[] {
     return Array.from(this.liveAgents.values());
+  }
+
+  getMembershipVersion(): number {
+    return this.membershipVersion;
   }
 
   isCurrentAgentIncarnation(agentId: string, incarnation: string): boolean {
@@ -384,6 +389,39 @@ describe("agent lifecycle commands", () => {
     expect(manager.cancelledAgentIds).toEqual(["agent-1"]);
     expect(manager.clearedAttentionAgentIds).toEqual(["agent-1"]);
     expect(manager.archivedAgentIds).toEqual(["agent-1"]);
+  });
+
+  test("aborts a frozen cascade when a new child attaches during cancellation", async () => {
+    const storage = new FakeLifecycleAgentStorage();
+    const manager = new FakeLifecycleAgentManager(storage);
+    manager.liveAgents.set("parent", managedAgent("parent", "running"));
+    manager.inFlightAgentIds.add("parent");
+    storage.records.set("parent", storedAgent("parent"));
+    const originalCancel = manager.cancelAgentRun.bind(manager);
+    vi.spyOn(manager, "cancelAgentRun").mockImplementation(async (agentId) => {
+      const result = await originalCancel(agentId);
+      const child = {
+        ...managedAgent("new-child", "idle"),
+        labels: { [PARENT_AGENT_ID_LABEL]: "parent" },
+      };
+      manager.liveAgents.set(child.id, child);
+      storage.records.set(child.id, {
+        ...storedAgent(child.id),
+        labels: child.labels,
+      });
+      manager.membershipVersion += 1;
+      return result;
+    });
+
+    await expect(
+      archiveAgentCommand({ agentManager: manager, agentStorage: storage, logger }, "parent", {
+        caller: createCoordinatorDestructiveCaller(),
+      }),
+    ).rejects.toThrow("Destructive target membership changed during execution (agents)");
+
+    expect(manager.archivedAgentIds).toEqual([]);
+    expect(manager.liveAgents.has("parent")).toBe(true);
+    expect(manager.liveAgents.has("new-child")).toBe(true);
   });
 
   test("blocks archive and kill aliases before mutating the caller agent", async () => {

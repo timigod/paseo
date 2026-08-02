@@ -51,6 +51,17 @@ const DEFAULT_HOST = "localhost:6767";
 const DEFAULT_TIMEOUT = 15000;
 const WEBSOCKET_CLOSE_TIMEOUT_MS = 1000;
 const PID_FILENAME = "paseo.pid";
+const COORDINATOR_CAPABILITY_FILENAME = "coordinator-auth-token";
+
+function readCoordinatorCapability(paseoHome: string): string | null {
+  try {
+    return (
+      readFileSync(path.join(paseoHome, COORDINATOR_CAPABILITY_FILENAME), "utf8").trim() || null
+    );
+  } catch {
+    return null;
+  }
+}
 
 type CliDaemonClientConfig = Omit<DaemonClientConfig, "clientType" | "appVersion" | "capabilities">;
 
@@ -301,7 +312,11 @@ export function resolveDaemonPassword(host: string): string | undefined {
 function createNodeWebSocketFactory() {
   return (
     url: string,
-    options?: { headers?: Record<string, string>; protocols?: string[]; socketPath?: string },
+    options?: {
+      headers?: Record<string, string>;
+      protocols?: string[];
+      socketPath?: string;
+    },
   ): WebSocketLike => {
     const socket = new WebSocket(url, options?.protocols, {
       headers: options?.headers,
@@ -356,13 +371,18 @@ async function tryConnectHost(
   clientId: string,
   timeout: number,
   nodeWebSocketFactory: ReturnType<typeof createNodeWebSocketFactory>,
+  callerAgent: ReturnType<typeof resolveCliCallerIdentity>,
+  agentAuthToken: string | null,
+  coordinatorAuthToken: string | null,
 ): Promise<{ client: DaemonClient } | { error: unknown }> {
   const target = resolveDaemonTarget(host);
+  const ingressToken = agentAuthToken ?? coordinatorAuthToken;
   const client = createCliDaemonClient({
     url: target.url,
     clientId,
-    callerAgent: resolveCliCallerIdentity(),
-    password,
+    callerAgent,
+    password: agentAuthToken ? undefined : password,
+    ...(ingressToken ? { authHeader: `Bearer ${ingressToken}` } : {}),
     connectTimeoutMs: timeout,
     webSocketFactory: (
       url: string,
@@ -436,6 +456,11 @@ export async function connectToDaemon(options?: ConnectOptions): Promise<DaemonC
   const timeout = options?.timeout ?? DEFAULT_TIMEOUT;
   const clientId = await getOrCreateCliClientId();
   const nodeWebSocketFactory = createNodeWebSocketFactory();
+  const callerAgent = resolveCliCallerIdentity();
+  const agentAuthToken = process.env.PASEO_AGENT_AUTH_TOKEN?.trim() || null;
+  const coordinatorAuthToken = callerAgent
+    ? null
+    : readCoordinatorCapability(resolvePaseoHome(process.env));
 
   const explicitHost = options?.host ?? process.env.PASEO_HOST;
   const offer = parseHostOfferOrNull(explicitHost);
@@ -452,7 +477,16 @@ export async function connectToDaemon(options?: ConnectOptions): Promise<DaemonC
     }
     const host = hosts[index];
     const password = resolveDaemonPassword(host);
-    const result = await tryConnectHost(host, password, clientId, timeout, nodeWebSocketFactory);
+    const result = await tryConnectHost(
+      host,
+      password,
+      clientId,
+      timeout,
+      nodeWebSocketFactory,
+      callerAgent,
+      agentAuthToken,
+      coordinatorAuthToken,
+    );
     if ("client" in result) {
       return result.client;
     }

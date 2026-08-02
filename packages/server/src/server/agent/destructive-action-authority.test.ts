@@ -118,7 +118,7 @@ describe("destructive action authority", () => {
     }
   });
 
-  test("fails closed for missing legacy identity only when the target is live", () => {
+  test("fails closed for missing identity for both live and stored-only targets", () => {
     const authority = liveAuthority();
     const caller = createUncertainDestructiveCaller("legacy caller omitted live identity");
 
@@ -137,7 +137,7 @@ describe("destructive action authority", () => {
         targetWorkspaceIds: [],
         hasLiveTarget: false,
       }),
-    ).not.toThrow();
+    ).toThrowError(DestructiveActionAuthorizationError);
   });
 
   test("accepts only coordinator authority minted in process", () => {

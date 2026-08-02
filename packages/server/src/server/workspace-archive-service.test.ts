@@ -184,6 +184,9 @@ interface ArchiveDepsInput {
   storedAgents?: StoredAgentRecord[];
   incarnations?: Record<string, string>;
   checkoutRootForCwd?: (cwd: string) => string | null;
+  getAgentMembershipVersion?: () => number;
+  getWorkspaceMembershipVersion?: () => number;
+  getTerminalMembershipVersion?: () => number;
 }
 
 interface ArchiveTestDependencies extends ArchiveDependencies {
@@ -228,6 +231,7 @@ function createArchiveDeps(input: ArchiveDepsInput): ArchiveTestDependencies {
       }),
     } as Pick<WorkspaceGitService, "getSnapshot" | "getCheckout">,
     agentManager: {
+      getMembershipVersion: input.getAgentMembershipVersion,
       listAgents: () => (input.liveAgents ?? []) as ManagedAgent[],
       getAgent: (agentId: string) =>
         ((input.liveAgents ?? []).find((agent) => agent.id === agentId) as
@@ -255,6 +259,8 @@ function createArchiveDeps(input: ArchiveDepsInput): ArchiveTestDependencies {
     findWorkspaceIdForCwd: input.findWorkspaceIdForCwd ?? vi.fn(async () => null),
     listActiveWorkspaces: async () =>
       active.filter((workspace) => !archivedWorkspaceIds.has(workspace.workspaceId)),
+    getWorkspaceMembershipVersion: input.getWorkspaceMembershipVersion,
+    getTerminalMembershipVersion: input.getTerminalMembershipVersion,
     archiveWorkspaceRecord: async (workspaceId: string, recheck?: () => void | Promise<void>) => {
       await recheck?.();
       archivedWorkspaceIds.add(workspaceId);
@@ -646,6 +652,52 @@ describe("archiveByScope", () => {
       callerWorkspaceId,
     ]);
   });
+
+  test.each(["agent", "terminal"] as const)(
+    "workspace archive aborts when a new %s joins after the membership snapshot",
+    async (membershipKind) => {
+      const { tempDir } = createGitRepo();
+      const workspaceId = `ws-new-${membershipKind}-race`;
+      const liveAgents: NonNullable<ArchiveDepsInput["liveAgents"]> = [];
+      let agentMembershipVersion = 0;
+      let terminalMembershipVersion = 0;
+      const deps = createArchiveDeps({
+        paseoHome: path.join(tempDir, ".paseo"),
+        activeWorkspaces: [{ workspaceId, cwd: tempDir, kind: "local_checkout" }],
+        liveAgents,
+        getAgentMembershipVersion: () => agentMembershipVersion,
+        getWorkspaceMembershipVersion: () => 0,
+        getTerminalMembershipVersion: () => terminalMembershipVersion,
+      });
+      deps.archiveWorkspaceRecord = vi.fn(deps.archiveWorkspaceRecord);
+      deps.killTerminalsForWorkspace = vi.fn(deps.killTerminalsForWorkspace);
+      deps.markWorkspaceArchiving = vi.fn(() => {
+        if (membershipKind === "agent") {
+          liveAgents.push({ id: "new-agent", workspaceId, cwd: tempDir });
+          agentMembershipVersion += 1;
+        } else {
+          terminalMembershipVersion += 1;
+        }
+      });
+
+      await expect(
+        archiveByScope(deps, {
+          scope: { kind: "workspace", workspaceId },
+          requestId: `req-new-${membershipKind}-race`,
+          caller: createCoordinatorDestructiveCaller(),
+        }),
+      ).rejects.toThrow(
+        `Destructive target membership changed during execution (${membershipKind}s)`,
+      );
+
+      expect(deps.archiveWorkspaceRecord).not.toHaveBeenCalled();
+      expect(deps.killTerminalsForWorkspace).not.toHaveBeenCalled();
+      expect(deps.archivedAgentIds).toEqual([]);
+      expect(deps.activeWorkspaces.map((workspace) => workspace.workspaceId)).toContain(
+        workspaceId,
+      );
+    },
+  );
 
   test("blocks a cross-workspace child when the target workspace cascades through its parent", async () => {
     const { tempDir } = createGitRepo();
@@ -2553,6 +2605,46 @@ describe("archiveByScope", () => {
 });
 
 describe("killTerminalsForWorkspace", () => {
+  test("aborts when a new workspace terminal registers during enumeration", async () => {
+    let releaseEnumeration = () => {};
+    let markEnumerationStarted = () => {};
+    let membershipVersion = 0;
+    const terminals = [{ id: "terminal-1", workspaceId: "workspace-1" }];
+    const enumerationStarted = new Promise<void>((resolve) => {
+      markEnumerationStarted = resolve;
+    });
+    const killTerminalAndWait = vi.fn(async () => {});
+    const detachTerminalStream = vi.fn();
+    const terminalManager = {
+      getMembershipVersion: () => membershipVersion,
+      listDirectories: () => ["/repo"],
+      getTerminals: vi.fn(async () => {
+        markEnumerationStarted();
+        await new Promise<void>((resolve) => {
+          releaseEnumeration = resolve;
+        });
+        return terminals;
+      }),
+      killTerminalAndWait,
+    } as unknown as TerminalManager;
+
+    const kill = killTerminalsForWorkspace(
+      { terminalManager, sessionLogger: createLogger(), detachTerminalStream },
+      "workspace-1",
+      vi.fn(async () => {}),
+    );
+    await enumerationStarted;
+    terminals.push({ id: "terminal-2", workspaceId: "workspace-1" });
+    membershipVersion += 1;
+    releaseEnumeration();
+
+    await expect(kill).rejects.toThrow(
+      "Destructive target membership changed during execution (terminals)",
+    );
+    expect(killTerminalAndWait).not.toHaveBeenCalled();
+    expect(detachTerminalStream).not.toHaveBeenCalled();
+  });
+
   test("rechecks a caller after terminal enumeration and before the kill batch", async () => {
     const caller = createCoordinatorDestructiveCaller();
     let releaseEnumeration = () => {};

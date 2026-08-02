@@ -6,6 +6,12 @@ import type { Logger } from "pino";
 
 import type { AgentManager } from "./agent/agent-manager.js";
 import type { AgentArchiveCascadePlan } from "./agent/agent-archive-cascade.js";
+import {
+  assertDestructiveMembershipFence,
+  captureDestructiveMembershipFence,
+  DestructiveMembershipChangedError,
+  type DestructiveMembershipVersionSource,
+} from "./agent/destructive-membership-fence.js";
 import type { AgentStorage, StoredAgentRecord } from "./agent/agent-storage.js";
 import { resolveAgentArchiveCascadeTarget } from "./agent/lifecycle-command.js";
 import type { WorkspaceGitService } from "./workspace-git-service.js";
@@ -61,7 +67,7 @@ export interface ArchiveDependencies {
   github: ForgeService;
   workspaceGitService: Pick<WorkspaceGitService, "getCheckout" | "getSnapshot">;
   agentManager: Pick<AgentManager, "getAgent" | "listAgents" | "archiveAgent" | "archiveSnapshot"> &
-    Partial<Pick<AgentManager, "isCurrentAgentIncarnation">>;
+    Partial<Pick<AgentManager, "isCurrentAgentIncarnation" | "getMembershipVersion">>;
   agentStorage: Pick<AgentStorage, "list">;
   // Resolves the worktree at a path to its workspaceId for archive-by-path. The
   // path uniquely identifies a worktree workspace; this is a directory lookup for
@@ -72,6 +78,8 @@ export interface ArchiveDependencies {
   // break a same-cwd tie in favor of the worktree-kind record when archiving by
   // path (no explicit workspaceId).
   listActiveWorkspaces: () => Promise<ActiveWorkspaceRef[]>;
+  getWorkspaceMembershipVersion?: () => number;
+  getTerminalMembershipVersion?: () => number;
   archiveWorkspaceRecord: (workspaceId: string, recheck: DestructiveActionRecheck) => Promise<void>;
   emitWorkspaceUpdatesForWorkspaceIds: (workspaceIds: Iterable<string>) => Promise<void>;
   markWorkspaceArchiving: (workspaceIds: Iterable<string>, archivingAt: string) => void;
@@ -404,6 +412,8 @@ async function archiveResolvedTarget(
   request: ArchiveByScopeRequest,
   target: ArchiveTarget,
 ): Promise<ArchiveResult> {
+  const membershipSources = resolveArchiveMembershipSources(dependencies);
+  const membershipFence = captureDestructiveMembershipFence(membershipSources);
   const targetWorkspaceIds = target.workspaceIds;
   const resolveCallerAuthorization = () =>
     assertCallerCanArchive(
@@ -414,10 +424,13 @@ async function archiveResolvedTarget(
       request.signal,
     );
   const recheckCaller: DestructiveActionRecheck = async () => {
+    assertDestructiveMembershipFence(membershipFence, membershipSources);
     await resolveCallerAuthorization();
+    assertDestructiveMembershipFence(membershipFence, membershipSources);
   };
 
   await resolveCallerAuthorization();
+  assertDestructiveMembershipFence(membershipFence, membershipSources);
 
   if (targetWorkspaceIds.length > 0) {
     dependencies.markWorkspaceArchiving(targetWorkspaceIds, new Date().toISOString());
@@ -493,6 +506,31 @@ async function archiveResolvedTarget(
       await dependencies.emitWorkspaceUpdatesForWorkspaceIds(targetWorkspaceIds);
     }
   }
+}
+
+function resolveArchiveMembershipSources(
+  dependencies: ArchiveDependencies,
+): DestructiveMembershipVersionSource[] {
+  const sources: DestructiveMembershipVersionSource[] = [];
+  if (dependencies.agentManager.getMembershipVersion) {
+    sources.push({
+      name: "agents",
+      getVersion: () => dependencies.agentManager.getMembershipVersion?.() ?? 0,
+    });
+  }
+  if (dependencies.getWorkspaceMembershipVersion) {
+    sources.push({
+      name: "workspaces",
+      getVersion: dependencies.getWorkspaceMembershipVersion,
+    });
+  }
+  if (dependencies.getTerminalMembershipVersion) {
+    sources.push({
+      name: "terminals",
+      getVersion: dependencies.getTerminalMembershipVersion,
+    });
+  }
+  return sources;
 }
 
 async function assertCallerCanArchive(
@@ -800,6 +838,9 @@ async function archiveTargetRecords(
         archivedAgents.add(agentId);
       }
     } else {
+      if (result.reason instanceof DestructiveMembershipChangedError) {
+        throw result.reason;
+      }
       dependencies.sessionLogger?.warn(
         { err: result.reason, requestId },
         "archiveByScope workspace teardown failed",
@@ -1446,6 +1487,13 @@ export async function archiveWorkspaceContents(
   const authorityFailure = failures.find(
     (failure): failure is WorkspaceArchiveError => failure instanceof WorkspaceArchiveError,
   );
+  const membershipFailure = failures.find(
+    (failure): failure is DestructiveMembershipChangedError =>
+      failure instanceof DestructiveMembershipChangedError,
+  );
+  if (membershipFailure) {
+    throw membershipFailure;
+  }
   if (authorityFailure) {
     throw authorityFailure;
   }
@@ -1487,6 +1535,15 @@ export async function killTerminalsForWorkspace(
   if (!terminalManager) {
     return;
   }
+  const membershipVersion = terminalManager.getMembershipVersion?.();
+  const assertTerminalMembershipUnchanged = () => {
+    if (
+      membershipVersion !== undefined &&
+      terminalManager.getMembershipVersion?.() !== membershipVersion
+    ) {
+      throw new DestructiveMembershipChangedError("terminals");
+    }
+  };
 
   const listWorkspaceTerminals = async () =>
     (
@@ -1507,22 +1564,32 @@ export async function killTerminalsForWorkspace(
       }
     }
   }
+  assertTerminalMembershipUnchanged();
 
   if (terminalIds.length === 0) {
     return;
   }
 
   await recheck();
-  await Promise.allSettled(
+  assertTerminalMembershipUnchanged();
+  const results = await Promise.allSettled(
     terminalIds.map(async (terminalId) => {
       await recheck();
-      dependencies.detachTerminalStream?.(terminalId, { emitExit: true });
+      assertTerminalMembershipUnchanged();
       await terminalManager.killTerminalAndWait(terminalId, {
         gracefulTimeoutMs: 2000,
         forceTimeoutMs: 1500,
       });
+      dependencies.detachTerminalStream?.(terminalId, { emitExit: true });
     }),
   );
+  const membershipFailure = results.find(
+    (result): result is PromiseRejectedResult =>
+      result.status === "rejected" && result.reason instanceof DestructiveMembershipChangedError,
+  );
+  if (membershipFailure) {
+    throw membershipFailure.reason;
+  }
   if ((await listWorkspaceTerminals()).length > 0) {
     throw new Error(`Workspace terminals remain after archive: ${workspaceId}`);
   }

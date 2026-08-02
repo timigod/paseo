@@ -120,7 +120,10 @@ export interface PaseoToolHostDependencies {
   listActiveWorkspaces?: ArchiveDependencies["listActiveWorkspaces"];
   archiveWorkspaceRecord?: ArchiveDependencies["archiveWorkspaceRecord"];
   emitWorkspaceUpdatesForWorkspaceIds?: ArchiveDependencies["emitWorkspaceUpdatesForWorkspaceIds"];
-  workspaceRegistry?: Pick<WorkspaceRegistry, "get" | "list" | "update" | "upsert">;
+  workspaceRegistry?: Pick<
+    WorkspaceRegistry,
+    "get" | "list" | "update" | "upsert" | "getMembershipVersion"
+  >;
   projectRegistry?: Pick<ProjectRegistry, "get" | "list">;
   createDirectoryWorkspace?: (
     cwd: string,
@@ -3299,6 +3302,12 @@ function archiveWorktreeDependencies(
     agentStorage: context.agentStorage,
     findWorkspaceIdForCwd: options.findWorkspaceIdForCwd,
     listActiveWorkspaces: options.listActiveWorkspaces,
+    getWorkspaceMembershipVersion: options.workspaceRegistry?.getMembershipVersion
+      ? () => options.workspaceRegistry?.getMembershipVersion?.() ?? 0
+      : undefined,
+    getTerminalMembershipVersion: context.terminalManager?.getMembershipVersion
+      ? () => context.terminalManager?.getMembershipVersion?.() ?? 0
+      : undefined,
     archiveWorkspaceRecord: options.archiveWorkspaceRecord,
     workspaceRegistry: options.workspaceRegistry,
     emitWorkspaceUpdatesForWorkspaceIds: options.emitWorkspaceUpdatesForWorkspaceIds,

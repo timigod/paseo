@@ -112,6 +112,11 @@ import {
   type DestructiveCallerContext,
 } from "./agent/destructive-action-authority.js";
 import {
+  assertDestructiveMembershipFence,
+  captureDestructiveMembershipFence,
+  type DestructiveMembershipVersionSource,
+} from "./agent/destructive-membership-fence.js";
+import {
   buildStoredAgentPayload,
   resolveStoredAgentPayloadUpdatedAt,
   toAgentPayload,
@@ -2957,6 +2962,29 @@ export class Session {
     this.sessionLogger.info({ projectId, requestId }, "session: project.remove.request");
 
     try {
+      const membershipSources: DestructiveMembershipVersionSource[] = [
+        ...(typeof this.agentManager.getMembershipVersion === "function"
+          ? [
+              {
+                name: "agents",
+                getVersion: () => this.agentManager.getMembershipVersion(),
+              },
+            ]
+          : []),
+        ...(typeof this.workspaceRegistry.getMembershipVersion === "function"
+          ? [
+              {
+                name: "workspaces",
+                getVersion: () => this.workspaceRegistry.getMembershipVersion?.() ?? 0,
+              },
+            ]
+          : []),
+        {
+          name: "terminals",
+          getVersion: () => this.terminalController.getMembershipVersion(),
+        },
+      ];
+      const membershipFence = captureDestructiveMembershipFence(membershipSources);
       const authorizeRemoval = async () => {
         const project = await this.projectRegistry.get(projectId);
         const resolvedProjectId = project?.projectId ?? projectId;
@@ -3008,8 +3036,11 @@ export class Session {
         return { project, resolvedProjectId, projectWorkspaces };
       };
       const authorizedTarget = await authorizeRemoval();
+      assertDestructiveMembershipFence(membershipFence, membershipSources);
       const recheck: DestructiveActionRecheck = async () => {
+        assertDestructiveMembershipFence(membershipFence, membershipSources);
         await authorizeRemoval();
+        assertDestructiveMembershipFence(membershipFence, membershipSources);
       };
       const { resolvedProjectId, projectWorkspaces } = authorizedTarget;
       const workspaceIdsToArchive = projectWorkspaces
@@ -4486,6 +4517,8 @@ export class Session {
         agentStorage: this.agentStorage,
         findWorkspaceIdForCwd: (cwd) => this.findWorkspaceIdForCwd(cwd),
         listActiveWorkspaces: () => this.listActiveWorkspaceRefs(),
+        getWorkspaceMembershipVersion: () => this.workspaceRegistry.getMembershipVersion?.() ?? 0,
+        getTerminalMembershipVersion: () => this.terminalController.getMembershipVersion(),
         archiveWorkspaceRecord: (workspaceId, recheck) =>
           this.archiveWorkspaceRecord(workspaceId, undefined, recheck),
         workspaceRegistry: this.workspaceRegistry,
@@ -6522,6 +6555,8 @@ export class Session {
           agentStorage: this.agentStorage,
           findWorkspaceIdForCwd: (cwd) => this.findWorkspaceIdForCwd(cwd),
           listActiveWorkspaces: () => this.listActiveWorkspaceRefs(),
+          getWorkspaceMembershipVersion: () => this.workspaceRegistry.getMembershipVersion?.() ?? 0,
+          getTerminalMembershipVersion: () => this.terminalController.getMembershipVersion(),
           archiveWorkspaceRecord: (workspaceId, recheck) =>
             this.archiveWorkspaceRecord(workspaceId, undefined, recheck),
           emitWorkspaceUpdatesForWorkspaceIds: (workspaceIds) =>

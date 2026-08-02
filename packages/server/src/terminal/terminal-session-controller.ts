@@ -194,6 +194,10 @@ export class TerminalSessionController {
     };
   }
 
+  getMembershipVersion(): number {
+    return this.terminalManager?.getMembershipVersion?.() ?? 0;
+  }
+
   dispatch(
     msg: SessionInboundMessage,
     destructiveCaller?: DestructiveCallerContext,

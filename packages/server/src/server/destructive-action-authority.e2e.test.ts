@@ -28,6 +28,7 @@ function createCwd(): string {
 async function createManagedAgent(
   daemon: Awaited<ReturnType<typeof createTestPaseoDaemon>>,
   cwd: string,
+  workspaceId?: string,
 ) {
   return daemon.daemon.agentManager.createAgent(
     {
@@ -37,16 +38,17 @@ async function createManagedAgent(
       cwd,
     },
     undefined,
-    { workspaceId: undefined },
+    { workspaceId },
   );
 }
 
 describe("destructive authority over real WebSocket execution paths", () => {
-  test("grants default passwordless app and CLI connections coordinator authority", async () => {
+  test("passwordless ingress denies anonymous destruction and preserves explicit coordinator authority", async () => {
     const daemon = await createTestPaseoDaemon();
     const cwd = createCwd();
     const cliTarget = await createManagedAgent(daemon, cwd);
     const appTarget = await createManagedAgent(daemon, cwd);
+    const coordinatorTarget = await createManagedAgent(daemon, cwd);
     const cli = new DaemonClient({
       url: `ws://127.0.0.1:${daemon.port}/ws`,
       clientId: "default-passwordless-cli",
@@ -59,15 +61,96 @@ describe("destructive authority over real WebSocket execution paths", () => {
       clientType: "browser",
       reconnect: { enabled: false },
     });
+    const coordinator = new DaemonClient({
+      url: `ws://127.0.0.1:${daemon.port}/ws`,
+      clientId: "explicit-passwordless-coordinator",
+      clientType: "cli",
+      authHeader: `Bearer ${daemon.daemon.getCoordinatorAuthToken()}`,
+      reconnect: { enabled: false },
+    });
 
     try {
-      await Promise.all([cli.connect(), app.connect()]);
-      await expect(cli.archiveAgent(cliTarget.id)).resolves.toHaveProperty("archivedAt");
-      await expect(app.deleteAgent(appTarget.id)).resolves.toBeUndefined();
-      expect(daemon.daemon.agentManager.getAgent(cliTarget.id)).toBeNull();
-      expect(daemon.daemon.agentManager.getAgent(appTarget.id)).toBeNull();
+      await Promise.all([cli.connect(), app.connect(), coordinator.connect()]);
+      await expect(cli.archiveAgent(cliTarget.id)).rejects.toThrow("INVALID_CALLER_IDENTITY");
+      await expect(app.deleteAgent(appTarget.id)).rejects.toThrow("INVALID_CALLER_IDENTITY");
+      expect(daemon.daemon.agentManager.getAgent(cliTarget.id)).not.toBeNull();
+      expect(daemon.daemon.agentManager.getAgent(appTarget.id)).not.toBeNull();
+
+      await expect(coordinator.archiveAgent(coordinatorTarget.id)).resolves.toHaveProperty(
+        "archivedAt",
+      );
+      expect(daemon.daemon.agentManager.getAgent(coordinatorTarget.id)).toBeNull();
     } finally {
-      await Promise.all([cli.close(), app.close()]);
+      await Promise.all([cli.close(), app.close(), coordinator.close()]);
+      await daemon.close();
+    }
+  });
+
+  test("passwordless managed capabilities bind omitted claims and reject spoofed claims", async () => {
+    const daemon = await createTestPaseoDaemon();
+    const cwd = createCwd();
+    const coordinator = new DaemonClient({
+      url: `ws://127.0.0.1:${daemon.port}/ws`,
+      clientId: "managed-capability-setup",
+      authHeader: `Bearer ${daemon.daemon.getCoordinatorAuthToken()}`,
+      reconnect: { enabled: false },
+    });
+    await coordinator.connect();
+    const created = await coordinator.createWorkspace({
+      source: { kind: "directory", path: cwd },
+      title: "Managed capability workspace",
+    });
+    const workspaceId = created.workspace?.id;
+    const projectId = created.workspace?.projectId;
+    if (!workspaceId || !projectId) throw new Error(created.error ?? "Expected project workspace");
+
+    const managed = await createManagedAgent(daemon, cwd, workspaceId);
+    const other = await createManagedAgent(daemon, cwd);
+    const managedToken = daemon.daemon.agentManager.getAgentIngressAuthToken(managed.id);
+    const otherIdentity = daemon.daemon.agentManager.getAgentCallerIdentity(other.id);
+    if (!managedToken || !otherIdentity) throw new Error("Expected managed ingress identities");
+    const omitted = new DaemonClient({
+      url: `ws://127.0.0.1:${daemon.port}/ws`,
+      clientId: "managed-capability-omitted-claim",
+      authHeader: `Bearer ${managedToken}`,
+      reconnect: { enabled: false },
+    });
+    const spoofed = new DaemonClient({
+      url: `ws://127.0.0.1:${daemon.port}/ws`,
+      clientId: "managed-capability-spoofed-claim",
+      authHeader: `Bearer ${managedToken}`,
+      callerAgent: otherIdentity,
+      reconnect: { enabled: false },
+    });
+
+    try {
+      await Promise.all([omitted.connect(), spoofed.connect()]);
+      await expect(omitted.archiveAgent(managed.id)).rejects.toThrow("SELF_ARCHIVE_BLOCKED");
+      await expect(omitted.deleteAgent(managed.id)).rejects.toThrow(
+        "managed agent cannot target itself",
+      );
+      await expect(omitted.archiveWorkspace(workspaceId)).resolves.toMatchObject({
+        archivedAt: null,
+        errorCode: "SELF_ARCHIVE_BLOCKED",
+      });
+      await expect(omitted.removeProject(projectId)).rejects.toThrow(
+        "managed agent cannot target itself",
+      );
+
+      await expect(spoofed.archiveAgent(managed.id)).rejects.toThrow("INVALID_CALLER_IDENTITY");
+      await expect(spoofed.deleteAgent(managed.id)).rejects.toThrow("INVALID_CALLER_IDENTITY");
+      await expect(spoofed.archiveWorkspace(workspaceId)).resolves.toMatchObject({
+        archivedAt: null,
+        errorCode: "INVALID_CALLER_IDENTITY",
+      });
+      await expect(spoofed.removeProject(projectId)).rejects.toThrow(
+        "Destructive action caller identity",
+      );
+      expect(daemon.daemon.agentManager.getAgent(managed.id)).not.toBeNull();
+      const workspaces = await coordinator.fetchWorkspaces();
+      expect(workspaces.entries.map((workspace) => workspace.id)).toContain(workspaceId);
+    } finally {
+      await Promise.all([omitted.close(), spoofed.close(), coordinator.close()]);
       await daemon.close();
     }
   });
@@ -98,7 +181,7 @@ describe("destructive authority over real WebSocket execution paths", () => {
     const agentCaller = new DaemonClient({
       url: `ws://127.0.0.1:${daemon.port}/ws`,
       clientId: "agent-physical-connection",
-      password: "shared-secret",
+      authHeader: `Bearer ${daemon.daemon.agentManager.getAgentIngressAuthToken(agentA.id)}`,
       callerAgent: identity,
       reconnect: { enabled: false },
     });
@@ -250,6 +333,7 @@ describe("destructive authority over real WebSocket execution paths", () => {
     const client = new DaemonClient({
       url: `ws://127.0.0.1:${daemon.port}/ws`,
       clientId: "disconnect-deferred-workspace-lookup",
+      authHeader: `Bearer ${daemon.daemon.getCoordinatorAuthToken()}`,
       reconnect: { enabled: false },
     });
     const observer = new DaemonClient({
@@ -336,6 +420,7 @@ describe("destructive authority over real WebSocket execution paths", () => {
     const client = new DaemonClient({
       url: `ws://127.0.0.1:${daemon.port}/ws`,
       clientId: "disconnect-after-delete-authorization",
+      authHeader: `Bearer ${daemon.daemon.getCoordinatorAuthToken()}`,
       reconnect: { enabled: false },
     });
 
@@ -406,6 +491,7 @@ describe("destructive authority over real WebSocket execution paths", () => {
     const client = new DaemonClient({
       url: `ws://127.0.0.1:${daemon.port}/ws`,
       clientId: "disconnect-before-permanent-delete",
+      authHeader: `Bearer ${daemon.daemon.getCoordinatorAuthToken()}`,
       reconnect: { enabled: false },
     });
 

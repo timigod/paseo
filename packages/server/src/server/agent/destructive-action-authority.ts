@@ -140,9 +140,6 @@ export function assertDestructiveActionAuthorized(
   }
 
   if (caller.kind === "uncertain") {
-    if (!target.hasLiveTarget) {
-      return;
-    }
     throw invalidCaller();
   }
 

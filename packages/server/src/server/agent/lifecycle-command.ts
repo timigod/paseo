@@ -18,6 +18,11 @@ import {
   buildAgentArchiveCascadePlan,
   type AgentArchiveCascadePlan,
 } from "./agent-archive-cascade.js";
+import {
+  assertDestructiveMembershipFence,
+  captureDestructiveMembershipFence,
+  type DestructiveMembershipVersionSource,
+} from "./destructive-membership-fence.js";
 
 export type LifecycleAgentSnapshot = Pick<
   ManagedAgent,
@@ -25,6 +30,7 @@ export type LifecycleAgentSnapshot = Pick<
 >;
 
 export interface LifecycleAgentManager {
+  getMembershipVersion?(): number;
   getAgent(agentId: string): LifecycleAgentSnapshot | null;
   listAgents(): LifecycleAgentSnapshot[];
   isCurrentAgentIncarnation?(agentId: string, incarnation: string): boolean;
@@ -263,6 +269,16 @@ export async function archiveAgentCommand(
 ): Promise<ArchiveAgentResult> {
   const liveAgent = dependencies.agentManager.getAgent(agentId);
   const caller = requireDestructiveCaller(options?.caller);
+  const membershipSources: DestructiveMembershipVersionSource[] = dependencies.agentManager
+    .getMembershipVersion
+    ? [
+        {
+          name: "agents",
+          getVersion: () => dependencies.agentManager.getMembershipVersion?.() ?? 0,
+        },
+      ]
+    : [];
+  const membershipFence = captureDestructiveMembershipFence(membershipSources);
   const cascadePlan = await assertAgentArchiveBatchAuthorized(
     dependencies,
     caller,
@@ -270,7 +286,9 @@ export async function archiveAgentCommand(
     options.action ?? "agent.archive",
     { signal: options.signal },
   );
+  assertDestructiveMembershipFence(membershipFence, membershipSources);
   const authorize: DestructiveActionRecheck = async () => {
+    assertDestructiveMembershipFence(membershipFence, membershipSources);
     await assertAgentArchiveBatchAuthorized(
       dependencies,
       caller,
@@ -278,6 +296,7 @@ export async function archiveAgentCommand(
       options.action ?? "agent.archive",
       { signal: options.signal },
     );
+    assertDestructiveMembershipFence(membershipFence, membershipSources);
   };
   let record: StoredAgentRecord | null;
   if (liveAgent) {

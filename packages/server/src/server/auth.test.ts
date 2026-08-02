@@ -74,14 +74,14 @@ describe("daemon bearer validator", () => {
 describe("agent MCP request authorizer", () => {
   const CAPABILITY_TOKEN = "cap-token-abc123";
 
-  test("allows any request when no daemon password is configured", async () => {
+  test("rejects missing ingress capability when no daemon password is configured", async () => {
     expect(
       await isAgentMcpRequestAuthorized({
         password: undefined,
         capabilityToken: CAPABILITY_TOKEN,
         authorizationHeader: undefined,
       }),
-    ).toBe(true);
+    ).toBe(false);
   });
 
   test("accepts the injected capability token", async () => {

@@ -68,6 +68,7 @@ import {
 import { createGitHubService } from "../services/github-service.js";
 import type { ForgeService } from "../services/forge-service.js";
 import {
+  extractHttpBearerToken,
   extractWsBearerProtocol,
   extractWsBearerToken,
   isBearerTokenValid,
@@ -91,6 +92,10 @@ import {
   revokeDestructiveCaller,
   type DestructiveCallerContext,
 } from "./agent/destructive-action-authority.js";
+import type {
+  AgentIngressCapabilityAuthority,
+  IngressPrincipal,
+} from "./agent/ingress-capability.js";
 import { CLIENT_CAPS } from "@getpaseo/protocol/client-capabilities";
 import type { BrowserAutomationExecuteResponse } from "@getpaseo/protocol/browser-automation/rpc-schemas";
 import {
@@ -128,7 +133,7 @@ interface WebSocketConnectionIdentity {
   transport: "direct" | "relay";
   peer: "loopback" | "local_ipc" | "external";
   browserOrigin: boolean;
-  coordinatorAuthorized: boolean;
+  ingressPrincipal: IngressPrincipal | null;
   host?: string;
   origin?: string;
   userAgent?: string;
@@ -624,6 +629,7 @@ export class VoiceAssistantWebSocketServer {
   private unsubscribeTerminalActivity: (() => void) | null = null;
   private readonly browserToolsBroker: BrowserToolsBroker | null;
   private readonly hubRelationships: HubRelationshipManagement | null;
+  private readonly agentIngressAuthority: AgentIngressCapabilityAuthority | null;
   private readonly browserToolsRegistrations = new Map<string, BrowserToolsRegistration>();
   private acceptingConnections = true;
 
@@ -672,6 +678,7 @@ export class VoiceAssistantWebSocketServer {
     serviceProxyPublicBaseUrl?: string | null,
     browserToolsBroker?: BrowserToolsBroker | null,
     hubRelationships?: HubRelationshipManagement | null,
+    agentIngressAuthority?: AgentIngressCapabilityAuthority | null,
   ) {
     this.logger = logger.child({ module: "websocket-server" });
     this.serverId = serverId;
@@ -682,6 +689,7 @@ export class VoiceAssistantWebSocketServer {
     this.daemonRuntimeConfig = daemonRuntimeConfig;
     this.browserToolsBroker = browserToolsBroker ?? null;
     this.hubRelationships = hubRelationships ?? null;
+    this.agentIngressAuthority = agentIngressAuthority ?? null;
     this.agentManager = agentManager;
     this.agentStorage = agentStorage;
     this.createAgentLifecycleDispatch = createAgentLifecycleDispatch;
@@ -919,26 +927,25 @@ export class VoiceAssistantWebSocketServer {
     request: IncomingMessage,
     password: string | undefined,
   ): Promise<void> {
-    if (password !== undefined) {
+    const protocol = extractWsBearerProtocol(request.headers["sec-websocket-protocol"]);
+    const token =
+      extractWsBearerToken(protocol) ?? extractHttpBearerToken(request.headers.authorization);
+    let principal = this.agentIngressAuthority?.resolve(token) ?? null;
+    if (!principal && password !== undefined && isBearerTokenValid({ password, token })) {
+      principal = { kind: "coordinator" };
+    }
+    if (password !== undefined && !principal) {
       const requestMetadata = extractSocketRequestMetadata(request);
-      const protocol = extractWsBearerProtocol(request.headers["sec-websocket-protocol"]);
-      const token = extractWsBearerToken(protocol);
-      const isAuthorized = isBearerTokenValid({ password, token });
-      if (!isAuthorized) {
-        const reason = token === null ? "Password required" : "Incorrect password";
-        this.logger.warn(
-          { ...requestMetadata, hasToken: token !== null },
-          "Rejected WebSocket connection with invalid daemon password",
-        );
-        ws.close(WS_CLOSE_DAEMON_AUTH_FAILED, reason);
-        return;
-      }
+      const reason = token === null ? "Password required" : "Incorrect password";
+      this.logger.warn(
+        { ...requestMetadata, hasToken: token !== null },
+        "Rejected WebSocket connection with invalid daemon password or ingress capability",
+      );
+      ws.close(WS_CLOSE_DAEMON_AUTH_FAILED, reason);
+      return;
     }
 
-    // Reaching this point means the connection was accepted by the daemon's
-    // configured transport policy: password-validated when configured, or the
-    // explicit passwordless policy otherwise.
-    await this.attachSocket(ws, request, undefined, true);
+    await this.attachSocket(ws, request, undefined, principal);
   }
 
   public broadcast(message: WSOutboundMessage): void {
@@ -984,7 +991,12 @@ export class VoiceAssistantWebSocketServer {
     if (metadata?.transport === "relay") {
       this.incrementRuntimeCounter("relayExternalSocketAttached");
     }
-    await this.attachSocket(ws, undefined, metadata, metadata?.transport === "relay");
+    await this.attachSocket(
+      ws,
+      undefined,
+      metadata,
+      metadata?.transport === "relay" ? { kind: "coordinator" } : null,
+    );
   }
 
   public async attachHubSocket(
@@ -1256,7 +1268,7 @@ export class VoiceAssistantWebSocketServer {
     ws: WebSocketLike,
     request?: unknown,
     metadata?: ExternalSocketMetadata,
-    coordinatorAuthorized = false,
+    ingressPrincipal: IngressPrincipal | null = null,
   ): Promise<void> {
     if (!this.acceptingConnections) {
       try {
@@ -1268,11 +1280,7 @@ export class VoiceAssistantWebSocketServer {
     }
 
     const requestMetadata = extractSocketRequestMetadata(request);
-    const identity = createWebSocketConnectionIdentity(
-      requestMetadata,
-      metadata,
-      coordinatorAuthorized,
-    );
+    const identity = createWebSocketConnectionIdentity(requestMetadata, metadata, ingressPrincipal);
     this.socketIdentities.set(ws, identity);
     const connectionLogger = this.logger.child(toConnectionLogFields(identity));
 
@@ -2616,14 +2624,14 @@ interface SocketRequestMetadata {
 function createWebSocketConnectionIdentity(
   requestMetadata: SocketRequestMetadata,
   metadata: ExternalSocketMetadata | undefined,
-  coordinatorAuthorized: boolean,
+  ingressPrincipal: IngressPrincipal | null,
 ): WebSocketConnectionIdentity {
   return {
     connectionId: `conn_${randomUUID().replaceAll("-", "")}`,
     transport: metadata?.transport === "relay" ? "relay" : "direct",
     peer: resolveConnectionPeer(requestMetadata, metadata),
     browserOrigin: requestMetadata.origin !== undefined,
-    coordinatorAuthorized,
+    ingressPrincipal,
     ...(requestMetadata.host ? { host: requestMetadata.host } : {}),
     ...(requestMetadata.origin ? { origin: requestMetadata.origin } : {}),
     ...(requestMetadata.userAgent ? { userAgent: requestMetadata.userAgent } : {}),
@@ -2636,21 +2644,26 @@ function resolveHelloDestructiveCaller(
   message: WSHelloMessage,
   identity: WebSocketConnectionIdentity,
 ): DestructiveCallerContext {
-  if (message.callerAgent) {
-    return message.callerAgent.agentId && message.callerAgent.incarnation
-      ? createAgentDestructiveCaller({
-          agentId: message.callerAgent.agentId,
-          incarnation: message.callerAgent.incarnation,
-        })
-      : createUncertainDestructiveCaller("Agent caller identity was incomplete");
+  const principal = identity.ingressPrincipal;
+  if (principal?.kind === "agent") {
+    if (
+      message.callerAgent &&
+      (message.callerAgent.agentId !== principal.identity.agentId ||
+        message.callerAgent.incarnation !== principal.identity.incarnation)
+    ) {
+      return createUncertainDestructiveCaller(
+        "Hello caller claim did not match its authenticated agent capability",
+      );
+    }
+    return createAgentDestructiveCaller(principal.identity);
   }
 
-  if (identity.coordinatorAuthorized) {
+  if (principal?.kind === "coordinator") {
     return createCoordinatorDestructiveCaller();
   }
 
   return createUncertainDestructiveCaller(
-    `${message.clientType} connection omitted current agent identity and coordinator authentication`,
+    `${message.clientType} connection has no authenticated agent or coordinator capability`,
   );
 }
 

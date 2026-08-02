@@ -24,7 +24,10 @@ import type { TerminalManager } from "../terminal/terminal-manager.js";
 import { createTerminalManager } from "../terminal/terminal-manager.js";
 import { AgentManager, ManagedWorktreeWriterConflictError } from "./agent/agent-manager.js";
 import { AgentStorage, type StoredAgentRecord } from "./agent/agent-storage.js";
-import { createAgentDestructiveCaller } from "./agent/destructive-action-authority.js";
+import {
+  createAgentDestructiveCaller,
+  createCoordinatorDestructiveCaller,
+} from "./agent/destructive-action-authority.js";
 import type {
   AgentClient,
   AgentCreateSessionOptions,
@@ -136,6 +139,7 @@ interface SessionTestAccess {
     setTitle(agentId: string, title: string): Promise<unknown>;
   };
   workspaceRegistry: {
+    getMembershipVersion?(): number;
     list(...args: unknown[]): Promise<unknown[]>;
     archive(workspaceId: string, archivedAt: string): Promise<void>;
     get(workspaceId: string): Promise<unknown>;
@@ -154,7 +158,7 @@ interface SessionTestAccess {
     removedWorkspaceId?: string | null;
     [key: string]: unknown;
   }>;
-  handleArchiveAgentRequest(agentId: string, requestId: string): Promise<unknown>;
+  handleArchiveAgentRequest(agentId: string, requestId: string, source?: object): Promise<unknown>;
   handleMessage(message: unknown, source?: object): Promise<unknown>;
   handleCreatePaseoWorktreeRequest(params: unknown): Promise<unknown>;
   listAgentPayloads(...args: unknown[]): Promise<unknown[]>;
@@ -1594,6 +1598,7 @@ test("archive emits an authoritative agent_update upsert for subscribed clients"
     new Session({
       clientId: "test-client",
       scopes: ["*"],
+      resolveDestructiveCaller: () => createCoordinatorDestructiveCaller(),
       onMessage: (message) => emitted.push(message),
       logger: asSessionLogger(logger),
       downloadTokenStore: asDownloadTokenStore(),
@@ -1699,7 +1704,7 @@ test("archive emits an authoritative agent_update upsert for subscribed clients"
 
   activateAgentUpdatesSubscription(session, "sub-agents", { includeArchived: true });
 
-  await session.handleArchiveAgentRequest("agent-1", "req-archive");
+  await session.handleArchiveAgentRequest("agent-1", "req-archive", {});
 
   const update = emitted.find((message) => message.type === "agent_update");
   expect(update?.payload).toMatchObject({
@@ -1962,6 +1967,7 @@ test("close_items_request archives agents and kills terminals in one batch", asy
     new Session({
       clientId: "test-client",
       scopes: ["*"],
+      resolveDestructiveCaller: () => createCoordinatorDestructiveCaller(),
       onMessage: (message) => emitted.push(message),
       logger: asSessionLogger(sessionLogger),
       downloadTokenStore: asDownloadTokenStore(),
@@ -2140,6 +2146,7 @@ test("close_items_request archives stored agents that are not currently loaded",
     new Session({
       clientId: "test-client",
       scopes: ["*"],
+      resolveDestructiveCaller: () => createCoordinatorDestructiveCaller(),
       onMessage: (message) => emitted.push(message),
       logger: asSessionLogger(sessionLogger),
       downloadTokenStore: asDownloadTokenStore(),
@@ -2257,12 +2264,15 @@ test("close_items_request archives stored agents that are not currently loaded",
 
   activateAgentUpdatesSubscription(session, "sub-agents", { includeArchived: true });
 
-  await session.handleMessage({
-    type: "close_items_request",
-    agentIds: ["agent-live", storedAgentId],
-    terminalIds: [],
-    requestId: "req-close-stored",
-  });
+  await session.handleMessage(
+    {
+      type: "close_items_request",
+      agentIds: ["agent-live", storedAgentId],
+      terminalIds: [],
+      requestId: "req-close-stored",
+    },
+    {},
+  );
 
   expect(storedRecord.archivedAt).toEqual(expect.any(String));
   expect(emitted.find((message) => message.type === "close_items_response")?.payload).toEqual({
@@ -3810,6 +3820,76 @@ test("project.remove.request archives active workspaces and removes the project 
     kind: "remove",
     id: workspace.workspaceId,
     removedProjectId: project.projectId,
+  });
+});
+
+test("project.remove.request aborts when a new workspace joins the frozen project batch", async () => {
+  const emitted: SessionOutboundMessage[] = [];
+  const session = createSessionForWorkspaceTests({
+    onMessage: (message) => emitted.push(message),
+  });
+  const project = createPersistedProjectRecord({
+    projectId: "proj-remove-membership-race",
+    rootPath: REPO_CWD,
+    kind: "git",
+    displayName: "repo",
+    createdAt: "2026-03-01T12:00:00.000Z",
+    updatedAt: "2026-03-01T12:00:00.000Z",
+  });
+  const initialWorkspace = createPersistedWorkspaceRecord({
+    workspaceId: "ws-project-remove-initial",
+    projectId: project.projectId,
+    cwd: REPO_CWD,
+    kind: "local_checkout",
+    displayName: "main",
+    createdAt: "2026-03-01T12:00:00.000Z",
+    updatedAt: "2026-03-01T12:00:00.000Z",
+  });
+  const addedWorkspace = createPersistedWorkspaceRecord({
+    workspaceId: "ws-project-remove-added",
+    projectId: project.projectId,
+    cwd: path.join(REPO_CWD, "added"),
+    kind: "local_checkout",
+    displayName: "added",
+    createdAt: "2026-03-01T12:00:01.000Z",
+    updatedAt: "2026-03-01T12:00:01.000Z",
+  });
+  const workspaces = new Map([[initialWorkspace.workspaceId, initialWorkspace]]);
+  let workspaceMembershipVersion = 0;
+  const archiveWorkspace = vi.fn();
+  const removeProject = vi.fn();
+
+  session.projectRegistry.get = async () => project;
+  session.projectRegistry.list = async () => [project];
+  session.projectRegistry.remove = removeProject;
+  session.workspaceRegistry.getMembershipVersion = () => workspaceMembershipVersion;
+  session.workspaceRegistry.get = async (workspaceId: string) =>
+    workspaces.get(workspaceId) ?? null;
+  session.workspaceRegistry.list = async () => Array.from(workspaces.values());
+  session.workspaceRegistry.archive = archiveWorkspace;
+  session.agentStorage.list = async () => [];
+  session.markWorkspaceArchiving = () => {
+    workspaces.set(addedWorkspace.workspaceId, addedWorkspace);
+    workspaceMembershipVersion += 1;
+  };
+
+  await session.handleMessage(
+    {
+      type: "project.remove.request",
+      projectId: project.projectId,
+      requestId: "req-remove-project-membership-race",
+    },
+    {},
+  );
+
+  expect(archiveWorkspace).not.toHaveBeenCalled();
+  expect(removeProject).not.toHaveBeenCalled();
+  expect(workspaces.get(initialWorkspace.workspaceId)?.archivedAt).toBeNull();
+  expect(workspaces.has(addedWorkspace.workspaceId)).toBe(true);
+  expect(findByType(emitted, "project.remove.response")?.payload).toMatchObject({
+    accepted: false,
+    removedWorkspaceIds: [],
+    error: expect.stringContaining("membership changed"),
   });
 });
 

@@ -577,7 +577,7 @@ describe("workspace registries", () => {
       {
         recheck: async () => {
           recheckCount += 1;
-          if (recheckCount === 4) {
+          if (recheckCount === 3) {
             markTemporaryWriteReached();
             await temporaryWriteReleased;
             throw new Error("workspace archive revoked after temporary write");
@@ -593,9 +593,7 @@ describe("workspace registries", () => {
       title: "Concurrent update",
       updatedAt: "2026-03-04T00:00:00.000Z",
     }));
-    await expect
-      .poll(async () => (await workspaceRegistry.get("workspace-concurrent-guard"))?.title)
-      .toBe("Concurrent update");
+    expect((await workspaceRegistry.get("workspace-concurrent-guard"))?.title).toBeNull();
     releaseTemporaryWrite();
 
     await expect(archive).rejects.toThrow("workspace archive revoked after temporary write");
@@ -615,6 +613,117 @@ describe("workspace registries", () => {
       title: "Concurrent update",
       archivedAt: null,
     });
+  });
+
+  test("serializes a successful guarded archive before a concurrent update", async () => {
+    const workspaceId = "workspace-successful-archive-update";
+    await workspaceRegistry.upsert(
+      createPersistedWorkspaceRecord({
+        workspaceId,
+        projectId: "project-one",
+        cwd: "/tmp/repo",
+        kind: "local_checkout",
+        displayName: "main",
+        createdAt: "2026-03-01T00:00:00.000Z",
+        updatedAt: "2026-03-01T00:00:00.000Z",
+      }),
+    );
+    let recheckCount = 0;
+    let markBeforeRenameReached = () => {};
+    let releaseBeforeRename = () => {};
+    const beforeRenameReached = new Promise<void>((resolve) => {
+      markBeforeRenameReached = resolve;
+    });
+    const beforeRenameReleased = new Promise<void>((resolve) => {
+      releaseBeforeRename = resolve;
+    });
+    const archive = workspaceRegistry.archive(workspaceId, "2026-03-03T00:00:00.000Z", {
+      recheck: async () => {
+        recheckCount += 1;
+        if (recheckCount === 3) {
+          markBeforeRenameReached();
+          await beforeRenameReleased;
+        }
+      },
+    });
+
+    await beforeRenameReached;
+    const update = workspaceRegistry.update(workspaceId, (record) => ({
+      ...record,
+      title: "Concurrent",
+      updatedAt: "2026-03-04T00:00:00.000Z",
+    }));
+    expect((await workspaceRegistry.get(workspaceId))?.title).toBeNull();
+    releaseBeforeRename();
+
+    await expect(archive).resolves.toBeUndefined();
+    await expect(update).resolves.toMatchObject({
+      title: "Concurrent",
+      archivedAt: "2026-03-03T00:00:00.000Z",
+    });
+    expect(await workspaceRegistry.get(workspaceId)).toMatchObject({
+      title: "Concurrent",
+      archivedAt: "2026-03-03T00:00:00.000Z",
+    });
+    const reloaded = new FileBackedWorkspaceRegistry(
+      path.join(tmpDir, "projects", "workspaces.json"),
+      logger,
+    );
+    expect(await reloaded.get(workspaceId)).toMatchObject({
+      title: "Concurrent",
+      archivedAt: "2026-03-03T00:00:00.000Z",
+    });
+  });
+
+  test("serializes a successful guarded removal before a queued replacement", async () => {
+    const workspaceId = "workspace-successful-remove-upsert";
+    const original = createPersistedWorkspaceRecord({
+      workspaceId,
+      projectId: "project-one",
+      cwd: "/tmp/repo",
+      kind: "local_checkout",
+      displayName: "main",
+      createdAt: "2026-03-01T00:00:00.000Z",
+      updatedAt: "2026-03-01T00:00:00.000Z",
+    });
+    await workspaceRegistry.upsert(original);
+    let recheckCount = 0;
+    let markBeforeRenameReached = () => {};
+    let releaseBeforeRename = () => {};
+    const beforeRenameReached = new Promise<void>((resolve) => {
+      markBeforeRenameReached = resolve;
+    });
+    const beforeRenameReleased = new Promise<void>((resolve) => {
+      releaseBeforeRename = resolve;
+    });
+    const removal = workspaceRegistry.remove(workspaceId, {
+      recheck: async () => {
+        recheckCount += 1;
+        if (recheckCount === 3) {
+          markBeforeRenameReached();
+          await beforeRenameReleased;
+        }
+      },
+    });
+
+    await beforeRenameReached;
+    const replacement = {
+      ...original,
+      title: "Replacement",
+      updatedAt: "2026-03-04T00:00:00.000Z",
+    };
+    const upsert = workspaceRegistry.upsert(replacement);
+    expect(await workspaceRegistry.get(workspaceId)).toEqual(original);
+    releaseBeforeRename();
+
+    await expect(removal).resolves.toBeUndefined();
+    await expect(upsert).resolves.toBeUndefined();
+    expect(await workspaceRegistry.get(workspaceId)).toEqual(replacement);
+    const reloaded = new FileBackedWorkspaceRegistry(
+      path.join(tmpDir, "projects", "workspaces.json"),
+      logger,
+    );
+    expect(await reloaded.get(workspaceId)).toEqual(replacement);
   });
 
   test("composes concurrent workspace field updates without losing either change", async () => {

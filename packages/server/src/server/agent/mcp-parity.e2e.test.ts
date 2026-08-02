@@ -321,7 +321,7 @@ beforeAll(async () => {
       agentId: parentAgentId,
       incarnation: parentCallerIdentity.incarnation,
     }),
-    daemonHandle.daemon.agentManager.getMcpAuthToken()!,
+    daemonHandle.daemon.agentManager.getAgentIngressAuthToken(parentAgentId)!,
   );
 
   execSync("git init -b main", { cwd: worktreeRepoCwd, stdio: "pipe" });
@@ -406,7 +406,9 @@ describe("Suite A: Core Fixes", () => {
           type: "http",
           url: expectedUrl,
           headers: {
-            Authorization: `Bearer ${daemonHandle.daemon.agentManager.getMcpAuthToken()!}`,
+            Authorization: `Bearer ${daemonHandle.daemon.agentManager.getAgentIngressAuthToken(
+              agentId,
+            )!}`,
           },
         },
       });
@@ -522,7 +524,11 @@ describe("Suite A: Core Fixes", () => {
     try {
       agentId = await createTopLevelAgent();
       const archivedAgentId = agentId;
-      await callToolStructured(topLevelClient, "archive_agent", { agentId });
+      const archiveResult = await topLevelClient.callTool({
+        name: "archive_agent",
+        args: { agentId },
+      });
+      expect(archiveResult.isError, JSON.stringify(archiveResult.content)).not.toBe(true);
       agentId = null;
 
       const agents = daemonHandle.daemon.agentManager.listAgents();
@@ -537,20 +543,19 @@ describe("Suite A: Core Fixes", () => {
     let crossTargetId: string | null = null;
     let staleTargetId: string | null = null;
     let scopedClient: McpClient | null = null;
-    let partialClaimClient: McpClient | null = null;
     try {
-      callerAgentId = await createTopLevelAgent({ title: "Restricted MCP caller" });
-      crossTargetId = await createTopLevelAgent({ title: "Cross-agent target" });
-      staleTargetId = await createTopLevelAgent({ title: "Stale replay target" });
-      const identity = getCallerAgentIdentity(callerAgentId);
+      callerAgentId = await createTopLevelAgent({
+        title: "Restricted MCP caller",
+      });
+      crossTargetId = await createTopLevelAgent({
+        title: "Cross-agent target",
+      });
+      staleTargetId = await createTopLevelAgent({
+        title: "Stale replay target",
+      });
       scopedClient = await createMcpClient(
-        buildExpectedAgentMcpUrl({
-          host: "127.0.0.1",
-          port: daemonHandle.port,
-          agentId: callerAgentId,
-          incarnation: identity.incarnation,
-        }),
-        daemonHandle.daemon.agentManager.getMcpAuthToken()!,
+        `http://127.0.0.1:${daemonHandle.port}/mcp/agents`,
+        daemonHandle.daemon.agentManager.getAgentIngressAuthToken(callerAgentId)!,
       );
 
       await expectToolError(
@@ -567,31 +572,41 @@ describe("Suite A: Core Fixes", () => {
       );
       expect(daemonHandle.daemon.agentManager.getAgent(callerAgentId)).not.toBeNull();
 
-      await callToolStructured(scopedClient, "archive_agent", { agentId: crossTargetId });
+      await callToolStructured(scopedClient, "archive_agent", {
+        agentId: crossTargetId,
+      });
       expect(daemonHandle.daemon.agentManager.getAgent(crossTargetId)).toBeNull();
       crossTargetId = null;
 
-      partialClaimClient = await createMcpClient(
-        `http://127.0.0.1:${daemonHandle.port}/mcp/agents?callerAgentId=${callerAgentId}`,
-        "mcp-parity-password",
-      );
-      await expectToolError(
-        partialClaimClient,
-        "archive_agent",
-        { agentId: staleTargetId },
-        /missing, stale, or does not match/,
-      );
+      await expect(
+        createMcpClient(
+          `http://127.0.0.1:${daemonHandle.port}/mcp/agents?callerAgentId=${callerAgentId}`,
+          daemonHandle.daemon.agentManager.getAgentIngressAuthToken(callerAgentId)!,
+        ),
+      ).rejects.toThrow(/Unauthorized/);
+
+      const staleTargetIdentity = getCallerAgentIdentity(staleTargetId);
+      await expect(
+        createMcpClient(
+          buildExpectedAgentMcpUrl({
+            host: "127.0.0.1",
+            port: daemonHandle.port,
+            agentId: staleTargetId,
+            incarnation: staleTargetIdentity.incarnation,
+          }),
+          daemonHandle.daemon.agentManager.getAgentIngressAuthToken(callerAgentId)!,
+        ),
+      ).rejects.toThrow(/Unauthorized/);
 
       await daemonHandle.daemon.agentManager.reloadAgentSession(callerAgentId);
-      await expectToolError(
-        scopedClient,
-        "archive_agent",
-        { agentId: staleTargetId },
-        /missing, stale, or does not match/,
-      );
+      await expect(
+        scopedClient.callTool({
+          name: "archive_agent",
+          args: { agentId: staleTargetId },
+        }),
+      ).rejects.toThrow(/Unauthorized/);
       expect(daemonHandle.daemon.agentManager.getAgent(staleTargetId)).not.toBeNull();
     } finally {
-      await partialClaimClient?.close();
       await scopedClient?.close();
       await archiveAgentIfPresent(callerAgentId);
       await archiveAgentIfPresent(crossTargetId);
@@ -1016,7 +1031,7 @@ describe("Suite E: Workspace Tools", () => {
           agentId: worktreeAgentId,
           incarnation: callerAgentIdentity.incarnation,
         }),
-        daemonHandle.daemon.agentManager.getMcpAuthToken()!,
+        daemonHandle.daemon.agentManager.getAgentIngressAuthToken(worktreeAgentId)!,
       );
 
       await expectToolError(

@@ -50,6 +50,7 @@ export type TerminalWorkspaceContributionChangedListener = (
 ) => void;
 
 export interface TerminalManager {
+  getMembershipVersion?(): number;
   getTerminals(cwd: string, options?: { workspaceId?: string }): Promise<TerminalSession[]>;
   createTerminal(options: {
     id?: string;
@@ -115,6 +116,7 @@ export function createTerminalManager(
   const terminalWorkspaceContributionChangedListeners =
     new Set<TerminalWorkspaceContributionChangedListener>();
   const defaultEnvByRootCwd = new Map<string, Record<string, string>>();
+  let membershipVersion = 0;
 
   function removeSessionById(id: string, options: { kill: boolean }): void {
     const session = terminalsById.get(id);
@@ -188,6 +190,7 @@ export function createTerminalManager(
 
   function registerSession(session: TerminalSession): TerminalSession {
     terminalsById.set(session.id, session);
+    membershipVersion += 1;
     const unsubscribeExit = session.onExit(() => {
       removeSessionById(session.id, { kill: false });
     });
@@ -283,6 +286,10 @@ export function createTerminalManager(
   }
 
   return {
+    getMembershipVersion(): number {
+      return membershipVersion;
+    },
+
     async getTerminals(
       cwd: string,
       options?: { workspaceId?: string },

@@ -190,6 +190,15 @@ function normalizePassword(value: string | undefined): string | null {
   return value.length > 0 ? value : null;
 }
 
+function resolveBearerProtocols(
+  password: string | null,
+  authorizationHeader: string | undefined,
+): string[] | undefined {
+  const explicitBearer = authorizationHeader?.match(/^Bearer\s+(\S+)$/)?.[1];
+  const token = password ?? explicitBearer;
+  return token ? [`paseo.bearer.${token}`] : undefined;
+}
+
 function extractCorrelatedResponseIdentity(input: unknown): CorrelatedResponseIdentity | null {
   if (!input || typeof input !== "object") {
     return null;
@@ -1230,7 +1239,7 @@ export class DaemonClient {
     } else if (this.config.authHeader) {
       headers.Authorization = this.config.authHeader;
     }
-    const protocols = password ? [`paseo.bearer.${password}`] : undefined;
+    const protocols = resolveBearerProtocols(password, this.config.authHeader);
 
     try {
       // Reconnect can overlap with browser close/error delivery ordering.

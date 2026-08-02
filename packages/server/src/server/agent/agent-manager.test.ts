@@ -2755,7 +2755,7 @@ test("createAgent passes native Paseo tools through launch context without inter
   });
 });
 
-test("createAgent injects the MCP auth token as a bearer header into the launch config", async () => {
+test("createAgent injects an identity-bound MCP auth token into the launch config", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-test-"));
   const storagePath = join(workdir, "agents");
   const storage = new AgentStorage(storagePath, logger);
@@ -2777,7 +2777,7 @@ test("createAgent injects the MCP auth token as a bearer header into the launch 
     registry: storage,
     logger,
     mcpBaseUrl: "http://127.0.0.1:6767/mcp/agents",
-    mcpAuthToken: "cap-token",
+    issueAgentAuthToken: ({ agentId, incarnation }) => `agent-token:${agentId}:${incarnation}`,
     idFactory: () => "00000000-0000-4000-8000-000000000104",
   });
 
@@ -2790,13 +2790,19 @@ test("createAgent injects the MCP auth token as a bearer header into the launch 
     { workspaceId: undefined },
   );
 
-  expect(manager.getMcpAuthToken()).toBe("cap-token");
   const callerIdentity = manager.getAgentCallerIdentity(snapshot.id);
   expect(client.lastConfig?.mcpServers?.paseo).toEqual({
     type: "http",
-    url: `http://127.0.0.1:6767/mcp/agents?callerAgentId=${snapshot.id}&callerAgentIncarnation=${callerIdentity!.incarnation}`,
-    headers: { Authorization: "Bearer cap-token" },
+    url: `http://127.0.0.1:6767/mcp/agents?callerAgentId=${
+      snapshot.id
+    }&callerAgentIncarnation=${callerIdentity!.incarnation}`,
+    headers: {
+      Authorization: `Bearer agent-token:${snapshot.id}:${callerIdentity!.incarnation}`,
+    },
   });
+  expect(manager.getAgentIngressAuthToken(snapshot.id)).toBe(
+    `agent-token:${snapshot.id}:${callerIdentity!.incarnation}`,
+  );
 
   rmSync(workdir, { recursive: true, force: true });
 });
@@ -5574,7 +5580,11 @@ test("replaceAgentRun stays running when a stale old terminal arrives before the
   await secondStartEntered.promise;
 
   const replaceGapSnapshot = manager.getAgent(snapshot.id) as
-    | { pendingReplacement: boolean; activeForegroundTurnId: string | null; lifecycle: string }
+    | {
+        pendingReplacement: boolean;
+        activeForegroundTurnId: string | null;
+        lifecycle: string;
+      }
     | undefined;
   expect(replaceGapSnapshot?.pendingReplacement).toBe(true);
   expect(replaceGapSnapshot?.activeForegroundTurnId).toBeNull();
@@ -6464,6 +6474,31 @@ test("subscribe hides provider subagents of internal parents from global subscri
   expect(() => manager.fetchProviderSubagentTimeline(internalAgentId, "hidden-child")).toThrow(
     `Unknown agent '${internalAgentId}'`,
   );
+});
+
+test("membership version advances for user agents but ignores internal helper sessions", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-membership-version-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const agentIds = ["00000000-0000-4000-8000-000000000201", "00000000-0000-4000-8000-000000000202"];
+  const manager = new AgentManager({
+    clients: { codex: new TestAgentClient() },
+    registry: storage,
+    logger,
+    idFactory: () => agentIds.shift()!,
+  });
+  const initialVersion = manager.getMembershipVersion();
+
+  await manager.createAgent(
+    { provider: "codex", cwd: workdir, title: "Internal Helper", internal: true },
+    undefined,
+    { workspaceId: undefined },
+  );
+  expect(manager.getMembershipVersion()).toBe(initialVersion);
+
+  await manager.createAgent({ provider: "codex", cwd: workdir, title: "User Agent" }, undefined, {
+    workspaceId: undefined,
+  });
+  expect(manager.getMembershipVersion()).toBe(initialVersion + 1);
 });
 
 test("subscribe emits state events for internal agents when subscribed by agentId", async () => {
