@@ -1,8 +1,142 @@
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import {
+  accessSync,
+  chmodSync,
+  constants,
+  existsSync,
+  mkdtempSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { delimiter, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+
+type GitFailureMode = "diagnostic" | "abort" | "restore" | "restore-noop";
+
+function resolveRealGitPath(): string {
+  for (const directory of (process.env.PATH ?? "").split(delimiter)) {
+    const candidate = join(directory, "git");
+    if (!existsSync(candidate)) continue;
+    try {
+      accessSync(candidate, constants.X_OK);
+      return candidate;
+    } catch {
+      // Keep looking for an executable Git binary.
+    }
+  }
+  throw new Error("Unable to find Git for checkout pressure tests");
+}
+
+const realGitPath = resolveRealGitPath();
+
+function createMergeRepository(conflicting: boolean): string {
+  const repoDir = mkdtempSync(join(tmpdir(), "checkout-merge-pressure-"));
+  execFileSync(realGitPath, ["init", "-b", "main"], { cwd: repoDir });
+  execFileSync(realGitPath, ["config", "user.email", "test@example.com"], { cwd: repoDir });
+  execFileSync(realGitPath, ["config", "user.name", "Test"], { cwd: repoDir });
+  writeFileSync(join(repoDir, "base.txt"), "base\n");
+  if (conflicting) {
+    writeFileSync(join(repoDir, "conflict.txt"), "base\n");
+  }
+  execFileSync(realGitPath, ["add", "."], { cwd: repoDir });
+  execFileSync(realGitPath, ["commit", "-m", "base"], { cwd: repoDir });
+  execFileSync(realGitPath, ["checkout", "-b", "feature"], { cwd: repoDir });
+  if (conflicting) {
+    writeFileSync(join(repoDir, "conflict.txt"), "feature\n");
+    execFileSync(realGitPath, ["commit", "-am", "feature"], { cwd: repoDir });
+    execFileSync(realGitPath, ["checkout", "main"], { cwd: repoDir });
+    writeFileSync(join(repoDir, "conflict.txt"), "main\n");
+    execFileSync(realGitPath, ["commit", "-am", "main"], { cwd: repoDir });
+  } else {
+    writeFileSync(join(repoDir, "feature.txt"), "feature\n");
+    execFileSync(realGitPath, ["add", "feature.txt"], { cwd: repoDir });
+    execFileSync(realGitPath, ["commit", "-m", "feature"], { cwd: repoDir });
+  }
+  execFileSync(realGitPath, ["checkout", "feature"], { cwd: repoDir });
+  return repoDir;
+}
+
+function installGitFailureWrapper(mode: GitFailureMode): string {
+  const binDir = mkdtempSync(join(tmpdir(), "checkout-git-wrapper-"));
+  const wrapperPath = join(binDir, "git");
+  const quotedGitPath = realGitPath.replaceAll("'", "'\\''");
+  writeFileSync(
+    wrapperPath,
+    `#!/bin/sh
+if [ "$PASEO_TEST_GIT_FAILURE" = "diagnostic" ] && [ "$3" = "diff" ] && [ "$4" = "--name-only" ]; then
+  echo "diagnostic blocked" >&2
+  exit 73
+fi
+if [ "$PASEO_TEST_GIT_FAILURE" = "abort" ] && [ "$3" = "merge" ] && [ "$4" = "--abort" ]; then
+  echo "abort blocked" >&2
+  exit 74
+fi
+if [ "$PASEO_TEST_GIT_FAILURE" = "restore" ] && [ "$3" = "checkout" ] && [ "$4" = "feature" ]; then
+  echo "restore blocked" >&2
+  exit 75
+fi
+if [ "$PASEO_TEST_GIT_FAILURE" = "restore-noop" ] && [ "$3" = "checkout" ] && [ "$4" = "feature" ]; then
+  exit 0
+fi
+exec '${quotedGitPath}' "$@"
+`,
+  );
+  chmodSync(wrapperPath, 0o755);
+  process.env.PASEO_TEST_GIT_FAILURE = mode;
+  process.env.PATH = `${binDir}${delimiter}${process.env.PATH ?? ""}`;
+  return binDir;
+}
+
+function readBranch(repoDir: string): string {
+  return execFileSync(realGitPath, ["rev-parse", "--abbrev-ref", "HEAD"], { cwd: repoDir })
+    .toString()
+    .trim();
+}
+
+function readStatus(repoDir: string): string {
+  return execFileSync(realGitPath, ["status", "--porcelain"], { cwd: repoDir }).toString().trim();
+}
+
+async function captureFailure(operation: Promise<unknown>): Promise<unknown> {
+  try {
+    await operation;
+    return null;
+  } catch (error) {
+    return error;
+  }
+}
+
+async function withBoundedMergeRepository(
+  options: { conflicting: boolean; failureMode: GitFailureMode },
+  run: (repoDir: string) => Promise<void>,
+): Promise<void> {
+  const previousConcurrency = process.env.PASEO_GIT_CONCURRENCY;
+  const previousMaxPending = process.env.PASEO_GIT_MAX_PENDING;
+  const previousFailureMode = process.env.PASEO_TEST_GIT_FAILURE;
+  const previousPath = process.env.PATH;
+  const repoDir = createMergeRepository(options.conflicting);
+  let wrapperDir: string | null = null;
+  try {
+    process.env.PASEO_GIT_CONCURRENCY = "1";
+    process.env.PASEO_GIT_MAX_PENDING = "1";
+    wrapperDir = installGitFailureWrapper(options.failureMode);
+    vi.resetModules();
+    await run(repoDir);
+  } finally {
+    if (previousConcurrency === undefined) delete process.env.PASEO_GIT_CONCURRENCY;
+    else process.env.PASEO_GIT_CONCURRENCY = previousConcurrency;
+    if (previousMaxPending === undefined) delete process.env.PASEO_GIT_MAX_PENDING;
+    else process.env.PASEO_GIT_MAX_PENDING = previousMaxPending;
+    if (previousFailureMode === undefined) delete process.env.PASEO_TEST_GIT_FAILURE;
+    else process.env.PASEO_TEST_GIT_FAILURE = previousFailureMode;
+    if (previousPath === undefined) delete process.env.PATH;
+    else process.env.PATH = previousPath;
+    if (wrapperDir) rmSync(wrapperDir, { recursive: true, force: true });
+    rmSync(repoDir, { recursive: true, force: true });
+    vi.resetModules();
+  }
+}
 
 describe("checkout Git pressure propagation", () => {
   afterEach(() => {
@@ -133,6 +267,70 @@ describe("checkout Git pressure propagation", () => {
     );
   });
 
+  it("attempts abort and restoration when conflict diagnostics receive backpressure", async () => {
+    vi.resetModules();
+    const actual =
+      await vi.importActual<typeof import("./run-git-command.js")>("./run-git-command.js");
+    const pressure = new actual.GitCommandBackpressureError(1, 1, 1, 1);
+    const cwd = process.cwd();
+    const runGitCommand = vi.fn(async (args: string[]) => {
+      if (args[0] === "merge" && args[1] === "feature") {
+        throw new Error("CONFLICT: Automatic merge failed");
+      }
+      if (args[0] === "diff") {
+        throw pressure;
+      }
+      if (args[0] === "rev-parse" && args[1] === "--abbrev-ref") {
+        return { stdout: "feature\n" };
+      }
+      if (args[0] === "rev-parse" && args[1] === "--show-toplevel") {
+        return { stdout: `${cwd}\n` };
+      }
+      if (args[0] === "worktree") {
+        return { stdout: `worktree ${cwd}\nHEAD abc\nbranch refs/heads/feature\n` };
+      }
+      if (args[0] === "status") {
+        return { stdout: "UU conflict.txt\n" };
+      }
+      return { stdout: "" };
+    });
+    vi.doMock("./run-git-command.js", async (importOriginal) => ({
+      ...(await importOriginal<typeof import("./run-git-command.js")>()),
+      runGitCommand,
+    }));
+    const { mergeToBase, MergeConflictError } = await import("./checkout-git.js");
+    const facts = {
+      isGit: true as const,
+      worktreeRoot: cwd,
+      currentBranch: "feature",
+      remoteUrl: "https://github.com/acme/repo.git",
+      absoluteGitDir: `${cwd}/.git`,
+      gitCommonDir: `${cwd}/.git`,
+      paseoWorktree: { isPaseoOwnedWorktree: false as const },
+      storedBaseRef: null,
+      resolvedBaseRef: "main",
+      mainRepoRoot: cwd,
+      comparisonBaseRef: "main",
+      branchRemoteName: "origin",
+      branchMergeRef: "refs/heads/feature",
+      pullRequestLookupTarget: { headRef: "feature" },
+    };
+
+    const failure = await mergeToBase(cwd, {}, { facts }).catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(MergeConflictError);
+    if (!(failure instanceof MergeConflictError)) throw failure;
+    expect(failure.relatedErrors).toContain(pressure);
+    expect(runGitCommand).toHaveBeenCalledWith(
+      ["merge", "--abort"],
+      expect.objectContaining({ cwd }),
+    );
+    expect(runGitCommand).toHaveBeenCalledWith(
+      ["checkout", "feature"],
+      expect.objectContaining({ cwd }),
+    );
+  });
+
   it.each(["symbolic-ref", "show-ref"])(
     "preserves typed backpressure from default branch %s fallback",
     async (target) => {
@@ -210,5 +408,70 @@ describe("checkout Git pressure propagation", () => {
       }
       rmSync(repoDir, { recursive: true, force: true });
     }
+  });
+
+  it("aborts and restores after a bounded conflict diagnostic fails", async () => {
+    await withBoundedMergeRepository(
+      { conflicting: true, failureMode: "diagnostic" },
+      async (repoDir) => {
+        const { mergeToBase, MergeConflictError } = await import("./checkout-git.js");
+
+        const failure = await captureFailure(mergeToBase(repoDir, { baseRef: "main" }));
+
+        expect(failure).toBeInstanceOf(MergeConflictError);
+        if (!(failure instanceof MergeConflictError)) throw failure;
+        expect(failure.relatedErrors).toEqual([
+          expect.objectContaining({ message: expect.stringContaining("diagnostic blocked") }),
+        ]);
+        expect(readBranch(repoDir)).toBe("feature");
+        expect(readStatus(repoDir)).toBe("");
+      },
+    );
+  });
+
+  it("surfaces abort and restoration failures from a bounded conflicting merge", async () => {
+    await withBoundedMergeRepository(
+      { conflicting: true, failureMode: "abort" },
+      async (repoDir) => {
+        const { mergeToBase, MergeConflictError } = await import("./checkout-git.js");
+
+        const failure = await captureFailure(mergeToBase(repoDir, { baseRef: "main" }));
+
+        expect(failure).toBeInstanceOf(MergeConflictError);
+        if (!(failure instanceof MergeConflictError)) throw failure;
+        expect(failure.relatedErrors).toEqual([
+          expect.objectContaining({ message: expect.stringContaining("abort blocked") }),
+          expect.objectContaining({ message: expect.stringContaining("checkout feature") }),
+        ]);
+        expect(readBranch(repoDir)).toBe("main");
+        expect(readStatus(repoDir)).toContain("UU conflict.txt");
+      },
+    );
+  });
+
+  it("rejects a bounded successful merge when branch restoration fails", async () => {
+    await withBoundedMergeRepository(
+      { conflicting: false, failureMode: "restore" },
+      async (repoDir) => {
+        const { mergeToBase } = await import("./checkout-git.js");
+
+        await expect(mergeToBase(repoDir, { baseRef: "main" })).rejects.toThrow("restore blocked");
+        expect(readBranch(repoDir)).toBe("main");
+      },
+    );
+  });
+
+  it("rejects a bounded merge when restoration leaves the checkout on the base branch", async () => {
+    await withBoundedMergeRepository(
+      { conflicting: false, failureMode: "restore-noop" },
+      async (repoDir) => {
+        const { mergeToBase } = await import("./checkout-git.js");
+
+        await expect(mergeToBase(repoDir, { baseRef: "main" })).rejects.toThrow(
+          "expected feature, found main",
+        );
+        expect(readBranch(repoDir)).toBe("main");
+      },
+    );
   });
 });

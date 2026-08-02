@@ -1423,7 +1423,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     knownRepoRoot?: string,
     replaceTarget?: WorkingTreeWatchTarget,
   ): Promise<WorkingTreeWatchTarget> {
-    const { repoRoot, retryRepoRoot } = await this.resolveInitialWorkingTreeWatchRoot(
+    const { repoRoot, retryDiscovery } = await this.resolveInitialWorkingTreeWatchRoot(
       cwd,
       knownRepoRoot,
     );
@@ -1446,7 +1446,16 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
       const repoWatchPath = repoRoot ?? cwd;
       target.repoWatchPath = repoWatchPath;
       const watchPaths = new Set<string>([repoWatchPath]);
-      const gitDir = await this.deps.resolveAbsoluteGitDir(cwd);
+      let retryWatchDiscovery = retryDiscovery;
+      let gitDir: string | null = null;
+      try {
+        gitDir = await this.deps.resolveAbsoluteGitDir(cwd);
+      } catch (error) {
+        if (!(error instanceof GitCommandBackpressureError)) {
+          throw error;
+        }
+        retryWatchDiscovery = true;
+      }
       this.assertWorkingTreeWatchSetupOpen();
       if (gitDir) {
         watchPaths.add(gitDir);
@@ -1501,7 +1510,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
 
       this.assertWorkingTreeWatchSetupOpen();
       this.installWorkingTreeWatchTarget(cwd, target, replaceTarget);
-      if (retryRepoRoot) {
+      if (retryWatchDiscovery) {
         this.scheduleWorkingTreeWatchRootRetry(target);
       }
       return target;
@@ -1514,17 +1523,17 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
   private async resolveInitialWorkingTreeWatchRoot(
     cwd: string,
     knownRepoRoot?: string,
-  ): Promise<{ repoRoot: string | null; retryRepoRoot: boolean }> {
+  ): Promise<{ repoRoot: string | null; retryDiscovery: boolean }> {
     if (knownRepoRoot !== undefined) {
-      return { repoRoot: knownRepoRoot, retryRepoRoot: false };
+      return { repoRoot: knownRepoRoot, retryDiscovery: false };
     }
     try {
-      return { repoRoot: await this.resolveCheckoutWatchRoot(cwd), retryRepoRoot: false };
+      return { repoRoot: await this.resolveCheckoutWatchRoot(cwd), retryDiscovery: false };
     } catch (error) {
       if (!(error instanceof GitCommandBackpressureError)) {
         throw error;
       }
-      return { repoRoot: null, retryRepoRoot: true };
+      return { repoRoot: null, retryDiscovery: true };
     }
   }
 

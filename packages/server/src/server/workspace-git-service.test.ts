@@ -2580,6 +2580,37 @@ describe("WorkspaceGitServiceImpl", () => {
     service.dispose();
   });
 
+  test("retries pressured git-dir discovery and rearms the existing subscription", async () => {
+    const pressure = new GitCommandBackpressureError(8, 64, 8, 64);
+    const resolveAbsoluteGitDir = vi
+      .fn()
+      .mockRejectedValueOnce(pressure)
+      .mockResolvedValue(join(REPO_CWD, ".git"));
+    const watchedPaths: string[] = [];
+    const watch = vi.fn((watchPath: string) => {
+      watchedPaths.push(watchPath);
+      return createWatcher();
+    });
+    const listener = vi.fn();
+    const service = createService({ resolveAbsoluteGitDir, watch });
+
+    const subscription = await service.requestWorkingTreeWatch(REPO_CWD, listener);
+    expect(subscription.repoRoot).toBe(REPO_CWD);
+    expect(watchedPaths).toContain(REPO_CWD);
+    expect(watchedPaths).not.toContain(join(REPO_CWD, ".git"));
+
+    await vi.advanceTimersByTimeAsync(5_000);
+    await flushPromises();
+
+    expect(resolveAbsoluteGitDir).toHaveBeenCalledTimes(2);
+    expect(watchedPaths).toContain(join(REPO_CWD, ".git"));
+    expect(listener).toHaveBeenCalledWith(REPO_CWD);
+    expect(service.getMetrics().workingTreeWatchListenerCount).toBe(1);
+
+    subscription.unsubscribe();
+    service.dispose();
+  });
+
   test("working tree changes notify watch listeners immediately", async () => {
     const watchCallbacks: Array<() => void> = [];
     const watch = vi.fn(
