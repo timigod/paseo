@@ -1,7 +1,8 @@
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, test } from "vitest";
+import { isPlatform } from "../test-utils/platform.js";
 import type {
   ManagedProcessInspection,
   ManagedProcessTable,
@@ -20,9 +21,12 @@ afterEach(async () => {
 
 class FakeProcessTable implements ManagedProcessTable {
   readonly processes = new Map<number, ManagedProcessInspection>();
+  inspectOverride: ((inspection: ManagedProcessInspection) => ManagedProcessInspection) | null =
+    null;
 
   async inspect(pid: number): Promise<ManagedProcessInspection> {
-    return this.processes.get(pid) ?? { status: "not-found" };
+    const inspection = this.processes.get(pid) ?? { status: "not-found" };
+    return this.inspectOverride?.(inspection) ?? inspection;
   }
 
   async inspectProcessGroup(): Promise<{ status: "not-found" }> {
@@ -32,6 +36,7 @@ class FakeProcessTable implements ManagedProcessTable {
 
 async function createFixture(options?: {
   onSignal?: (processTable: FakeProcessTable, pid: number, signal: NodeJS.Signals) => void;
+  platform?: NodeJS.Platform;
 }) {
   const paseoHome = await mkdtemp(path.join(tmpdir(), "paseo-supervisor-worker-"));
   tempDirs.push(paseoHome);
@@ -46,7 +51,7 @@ async function createFixture(options?: {
       workerEntry,
       desktopManaged: false,
       processTable,
-      platform: "darwin",
+      platform: options?.platform ?? "darwin",
       gracefulTimeoutMs: 5,
       forceTimeoutMs: 5,
       pollIntervalMs: 1,
@@ -77,7 +82,7 @@ async function createFixture(options?: {
   });
   await claim.commit(workerPid);
 
-  return { paseoHome, workerPid, processTable, signals, createOwnership };
+  return { paseoHome, workerEntry, workerPid, processTable, signals, createOwnership };
 }
 
 describe("supervisor worker ownership", () => {
@@ -112,6 +117,59 @@ describe("supervisor worker ownership", () => {
     await expect(
       readFile(path.join(fixture.paseoHome, "supervisor-worker.json"), "utf8"),
     ).resolves.toContain('"pid": 4101');
+  });
+
+  test("re-verifies identity immediately before the first recovery signal", async () => {
+    const fixture = await createFixture();
+    let recoveryInspections = 0;
+    fixture.processTable.inspectOverride = (inspection) => {
+      recoveryInspections += 1;
+      if (recoveryInspections === 2 && inspection.status === "alive") {
+        return {
+          status: "alive",
+          snapshot: {
+            ...inspection.snapshot,
+            startedAt: "Sun Aug  2 12:00:00 2026",
+          },
+        };
+      }
+      return inspection;
+    };
+
+    await expect(fixture.createOwnership().recoverStaleWorker()).rejects.toThrow(
+      /Refusing to signal stale worker PID 4101.*possible PID reuse/s,
+    );
+    expect(fixture.signals).toEqual([]);
+  });
+
+  test("fails closed when the worker entry bytes change at the same path", async () => {
+    const fixture = await createFixture();
+    await writeFile(fixture.workerEntry, "// replaced fixture\n");
+
+    await expect(fixture.createOwnership().recoverStaleWorker()).rejects.toThrow(
+      /belongs to a different Paseo service or installation/,
+    );
+    expect(fixture.signals).toEqual([]);
+    await expect(
+      readFile(path.join(fixture.paseoHome, "supervisor-worker.json"), "utf8"),
+    ).resolves.toContain('"pid": 4101');
+  });
+
+  test.skipIf(isPlatform("win32"))("persists owner-only ownership state", async () => {
+    const fixture = await createFixture();
+    const state = await stat(path.join(fixture.paseoHome, "supervisor-worker.json"));
+
+    expect(state.mode & 0o777).toBe(0o600);
+  });
+
+  test("reports Windows recovery as forced termination", async () => {
+    const fixture = await createFixture({ platform: "win32" });
+
+    await expect(fixture.createOwnership().recoverStaleWorker()).resolves.toEqual({
+      status: "terminated-forcefully",
+      workerPid: fixture.workerPid,
+    });
+    expect(fixture.signals).toEqual(["SIGKILL"]);
   });
 
   test("does not signal a replacement that reuses the worker PID after termination", async () => {

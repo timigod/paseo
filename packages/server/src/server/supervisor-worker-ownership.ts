@@ -1,8 +1,8 @@
-import { randomUUID } from "node:crypto";
-import { promises as fs } from "node:fs";
+import { createHash, randomUUID } from "node:crypto";
+import { promises as fs, readFileSync } from "node:fs";
 import path from "node:path";
 import { z } from "zod";
-import { writeJsonFileAtomic } from "./atomic-file.js";
+import { removeFileDurable, writeJsonFileAtomic } from "./atomic-file.js";
 import {
   createSystemManagedProcessTable,
   type ManagedProcessSnapshot,
@@ -24,6 +24,7 @@ const WorkerOwnershipStateSchema = z.object({
   service: z.object({
     paseoHome: z.string().min(1),
     workerEntry: z.string().min(1),
+    workerEntrySha256: z.string().regex(/^[a-f0-9]{64}$/),
     desktopManaged: z.boolean(),
   }),
   supervisor: z.object({
@@ -89,10 +90,12 @@ export class SupervisorWorkerOwnership {
 
   constructor(options: SupervisorWorkerOwnershipOptions) {
     const paseoHome = path.resolve(options.paseoHome);
+    const workerEntry = path.resolve(options.workerEntry);
     this.statePath = path.join(paseoHome, WORKER_STATE_FILENAME);
     this.service = {
       paseoHome,
-      workerEntry: path.resolve(options.workerEntry),
+      workerEntry,
+      workerEntrySha256: hashFile(workerEntry),
       desktopManaged: options.desktopManaged,
     };
     this.processTable =
@@ -125,6 +128,7 @@ export class SupervisorWorkerOwnership {
         return state?.worker.pid ?? null;
       },
       commit: async (workerPid) => {
+        this.assertCurrentBuildIdentity();
         const snapshot = await this.captureWorker(workerPid, token);
         state = {
           version: 1,
@@ -141,7 +145,7 @@ export class SupervisorWorkerOwnership {
           },
           recordedAt: new Date().toISOString(),
         };
-        await writeJsonFileAtomic(this.statePath, state);
+        await writeJsonFileAtomic(this.statePath, state, { mode: 0o600, durable: true });
       },
       verify: async () => {
         if (!state) {
@@ -165,6 +169,7 @@ export class SupervisorWorkerOwnership {
       return { status: "none" };
     }
     this.assertServiceBoundary(state);
+    this.assertCurrentBuildIdentity();
 
     const initialInspection = await this.inspectOwnedWorker(state);
     if (initialInspection.status === "not-found") {
@@ -173,6 +178,19 @@ export class SupervisorWorkerOwnership {
     }
     if (initialInspection.status !== "owned") {
       throw this.createIdentityRefusal(state, initialInspection.message);
+    }
+
+    if (this.platform === "win32") {
+      await this.signalOwnedWorker(state, "SIGKILL");
+      const forceResult = await this.waitForOwnedWorkerExit(state, this.forceTimeoutMs);
+      if (forceResult !== "exited") {
+        throw new SupervisorWorkerOwnershipError(
+          `Owned stale Paseo worker PID ${state.worker.pid} did not exit after forced Windows termination. ` +
+            `State remains at ${this.statePath}; inspect that PID before retrying.`,
+        );
+      }
+      await this.removeStateIfUnchanged(state);
+      return { status: "terminated-forcefully", workerPid: state.worker.pid };
     }
 
     await this.signalOwnedWorker(state, "SIGTERM");
@@ -243,11 +261,22 @@ export class SupervisorWorkerOwnership {
     if (
       state.service.paseoHome !== this.service.paseoHome ||
       state.service.workerEntry !== this.service.workerEntry ||
+      state.service.workerEntrySha256 !== this.service.workerEntrySha256 ||
       state.service.desktopManaged !== this.service.desktopManaged
     ) {
       throw new SupervisorWorkerOwnershipError(
         `Refusing to signal stale worker PID ${state.worker.pid}: ${this.statePath} belongs to a different Paseo service or installation. ` +
           "Inspect the recorded process and remove the state file only after confirming it is no longer needed.",
+      );
+    }
+  }
+
+  private assertCurrentBuildIdentity(): void {
+    const currentHash = hashFile(this.service.workerEntry);
+    if (currentHash !== this.service.workerEntrySha256) {
+      throw new SupervisorWorkerOwnershipError(
+        `Paseo worker entry changed after supervisor startup at ${this.service.workerEntry}. ` +
+          "Refusing worker ownership operations across installation identities.",
       );
     }
   }
@@ -349,7 +378,7 @@ export class SupervisorWorkerOwnership {
         `Worker ownership state changed before cleanup at ${this.statePath}; refusing to remove it.`,
       );
     }
-    await fs.unlink(this.statePath);
+    await removeFileDurable(this.statePath);
   }
 
   private createInvalidStateError(): SupervisorWorkerOwnershipError {
@@ -368,6 +397,10 @@ export class SupervisorWorkerOwnership {
         `The PID may have been reused. State remains at ${this.statePath} for diagnosis.`,
     );
   }
+}
+
+function hashFile(filePath: string): string {
+  return createHash("sha256").update(readFileSync(filePath)).digest("hex");
 }
 
 function isErrnoException(error: unknown): error is NodeJS.ErrnoException {

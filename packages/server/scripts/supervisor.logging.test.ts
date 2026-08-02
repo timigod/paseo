@@ -10,27 +10,123 @@ import { resolveSupervisorLogFile } from "./supervisor-log-config.js";
 const repoRoot = path.resolve(fileURLToPath(new URL("../../..", import.meta.url)));
 const supervisorPath = fileURLToPath(new URL("./supervisor.ts", import.meta.url));
 
-async function runSupervisorFixture(options: {
-  workerSource: string;
+interface SupervisorFixtureOptions {
+  workerSource: string | ((tempDir: string) => string);
   restartOnCrash?: boolean;
   ownershipCommitFailure?: boolean;
-}): Promise<{
+  ownershipMode?: "delayed-first-commit" | "verify-escalation";
+  workerStopTimeoutMs?: number;
+  platform?: NodeJS.Platform;
+}
+
+function createWorkerOwnershipSource(options: SupervisorFixtureOptions): string {
+  if (options.ownershipCommitFailure) {
+    return `{
+      createClaim(env) {
+        let workerPid = null;
+        return {
+          env,
+          get workerPid() { return workerPid; },
+          async commit(pid) {
+            workerPid = pid;
+            throw new Error("fixture ownership commit failed");
+          },
+          async verify() {
+            recordOwnershipEvent("verify-commit-failure");
+            return true;
+          },
+          async clear() {},
+        };
+      },
+    }`;
+  }
+  if (options.ownershipMode === "delayed-first-commit") {
+    return `{
+      createClaim(env) {
+        ownershipGeneration += 1;
+        const generation = ownershipGeneration;
+        let workerPid = null;
+        let cleared = false;
+        return {
+          env,
+          get workerPid() { return workerPid; },
+          async commit(pid) {
+            workerPid = pid;
+            if (generation === 1) {
+              const deadline = Date.now() + 100;
+              while (Date.now() < deadline) {
+                try {
+                  if (readFileSync(ownershipEventsPath, "utf8").includes("clear-1")) {
+                    break;
+                  }
+                } catch {}
+                await new Promise((resolve) => setTimeout(resolve, 5));
+              }
+            }
+            recordOwnershipEvent("commit-" + generation);
+          },
+          async verify() { return true; },
+          async clear() {
+            if (!cleared) {
+              cleared = true;
+              recordOwnershipEvent("clear-" + generation);
+            }
+          },
+        };
+      },
+    }`;
+  }
+  if (options.ownershipMode === "verify-escalation") {
+    return `{
+      createClaim(env) {
+        let workerPid = null;
+        return {
+          env,
+          get workerPid() { return workerPid; },
+          async commit(pid) { workerPid = pid; },
+          async verify() {
+            ownershipVerifyCount += 1;
+            recordOwnershipEvent("verify-" + ownershipVerifyCount);
+            return ownershipVerifyCount === 1;
+          },
+          async clear() {},
+        };
+      },
+    }`;
+  }
+  return "undefined";
+}
+
+async function runSupervisorFixture(options: SupervisorFixtureOptions): Promise<{
   code: number | null;
   signal: NodeJS.Signals | null;
   log: string;
   stdout: string;
   stderr: string;
+  ownershipEvents: string[];
 }> {
   const tempDir = await mkdtemp(path.join(tmpdir(), "paseo-supervisor-log-"));
   const logPath = path.join(tempDir, "daemon.log");
   const workerPath = path.join(tempDir, "worker.mjs");
   const runnerPath = path.join(tempDir, "runner.mjs");
+  const ownershipEventsPath = path.join(tempDir, "ownership-events.log");
+  const workerSource =
+    typeof options.workerSource === "function"
+      ? options.workerSource(tempDir)
+      : options.workerSource;
+  const workerOwnershipSource = createWorkerOwnershipSource(options);
 
-  await writeFile(workerPath, options.workerSource);
+  await writeFile(workerPath, workerSource);
   await writeFile(
     runnerPath,
     `
       import { runSupervisor } from ${JSON.stringify(pathToFileURL(supervisorPath).href)};
+      import { appendFileSync, readFileSync } from "node:fs";
+
+      let ownershipGeneration = 0;
+      let ownershipVerifyCount = 0;
+      const ownershipEventsPath = ${JSON.stringify(ownershipEventsPath)};
+      const recordOwnershipEvent = (event) => appendFileSync(ownershipEventsPath, event + "\\n");
 
       runSupervisor({
         name: "TestSupervisor",
@@ -40,21 +136,9 @@ async function runSupervisorFixture(options: {
         workerEnv: process.env,
         workerExecArgv: [],
         restartOnCrash: ${JSON.stringify(options.restartOnCrash ?? false)},
-        workerOwnership: ${
-          options.ownershipCommitFailure
-            ? `{
-                createClaim(env) {
-                  return {
-                    env,
-                    workerPid: null,
-                    async commit() { throw new Error("fixture ownership commit failed"); },
-                    async verify() { return false; },
-                    async clear() {},
-                  };
-                },
-              }`
-            : "undefined"
-        },
+        workerOwnership: ${workerOwnershipSource},
+        workerStopTimeoutMs: ${JSON.stringify(options.workerStopTimeoutMs)},
+        platform: ${JSON.stringify(options.platform)},
         logFile: {
           path: ${JSON.stringify(logPath)},
           rotate: { maxSize: "1m", maxFiles: 2 },
@@ -100,7 +184,10 @@ async function runSupervisorFixture(options: {
   });
 
   const log = await readFile(logPath, "utf8");
-  return { code, signal, log, stdout, stderr };
+  const ownershipEvents = await readFile(ownershipEventsPath, "utf8")
+    .then((content) => content.trim().split("\n").filter(Boolean))
+    .catch(() => []);
+  return { code, signal, log, stdout, stderr, ownershipEvents };
 }
 
 describe("supervisor durable logging", () => {
@@ -197,6 +284,60 @@ describe("supervisor durable logging", () => {
       "Worker ownership commit failed: fixture ownership commit failed",
     );
     expect(result.stderr).not.toContain("Restarting worker");
+    expect(result.ownershipEvents).toEqual(["verify-commit-failure"]);
+  });
+
+  test("finishes one generation's ownership lifecycle before restarting", async () => {
+    const result = await runSupervisorFixture({
+      workerSource: (tempDir) => {
+        const firstRunMarker = path.join(tempDir, "first-run-complete");
+        return `
+          import { existsSync, writeFileSync } from "node:fs";
+          const marker = ${JSON.stringify(firstRunMarker)};
+          if (!existsSync(marker)) {
+            writeFileSync(marker, "done");
+            process.exit(1);
+          }
+          process.exit(0);
+        `;
+      },
+      restartOnCrash: true,
+      ownershipMode: "delayed-first-commit",
+    });
+
+    expect(result.code).toBe(0);
+    expect(result.ownershipEvents).toEqual(["commit-1", "clear-1", "commit-2", "clear-2"]);
+  });
+
+  test("re-verifies ownership before initial and escalation signals", async () => {
+    const result = await runSupervisorFixture({
+      workerSource: `
+        process.on("SIGTERM", () => {});
+        process.send?.({ type: "paseo:shutdown", reason: "verify_each_signal" });
+        setTimeout(() => process.exit(0), 200);
+      `,
+      ownershipMode: "verify-escalation",
+      workerStopTimeoutMs: 20,
+    });
+
+    expect(result.code).toBe(1);
+    expect(result.ownershipEvents).toEqual(["verify-1", "verify-2"]);
+    expect(result.stderr).toContain("Refusing SIGKILL");
+  });
+
+  test("uses and reports forced worker termination on Windows", async () => {
+    const result = await runSupervisorFixture({
+      workerSource: `
+        process.send?.({ type: "paseo:shutdown", reason: "windows_shutdown" });
+        setInterval(() => {}, 1000);
+      `,
+      platform: "win32",
+    });
+
+    expect(result.code).toBe(0);
+    expect(result.log).toContain('"signal":"SIGKILL"');
+    expect(result.log).toContain('"termination":"forceful"');
+    expect(result.stderr).toContain("Forcing worker termination on Windows");
   });
 
   test("logs the worker shutdown reason before signaling the worker", async () => {

@@ -61,6 +61,8 @@ interface SupervisorOptions {
     message: string;
     fields: Record<string, unknown>;
   };
+  platform?: NodeJS.Platform;
+  workerStopTimeoutMs?: number;
 }
 
 export interface SupervisorController {
@@ -140,9 +142,12 @@ export function runSupervisor(options: SupervisorOptions): SupervisorController 
   const workerEnv = options.workerEnv ?? process.env;
   const workerExecArgv = options.workerExecArgv ?? ["--import", "tsx"];
   const resolveWorkerSpawnSpec = options.resolveWorkerSpawnSpec;
+  const platform = options.platform ?? process.platform;
+  const workerStopTimeoutMs = options.workerStopTimeoutMs ?? 12_000;
 
   let child: ChildProcess | null = null;
   let childOwnership: SupervisorWorkerClaim | null = null;
+  let childOwnershipSettled = Promise.resolve(true);
   let workerStopTimer: NodeJS.Timeout | null = null;
   let restarting = false;
   let shuttingDown = false;
@@ -205,6 +210,34 @@ export function runSupervisor(options: SupervisorOptions): SupervisorController 
     }
   };
 
+  const signalVerifiedWorker = async (
+    currentChild: ChildProcess,
+    ownership: SupervisorWorkerClaim | null,
+    signal: NodeJS.Signals,
+    reason: string,
+  ): Promise<"sent" | "gone" | "refused"> => {
+    if (child !== currentChild || currentChild.exitCode !== null || currentChild.signalCode) {
+      return "gone";
+    }
+    if (ownership && !(await ownership.verify())) {
+      log(
+        `Worker PID ${currentChild.pid ?? "unknown"} ownership identity no longer matches. Refusing ${signal}; inspect the worker PID manually.`,
+      );
+      return "refused";
+    }
+    if (child !== currentChild || currentChild.exitCode !== null || currentChild.signalCode) {
+      return "gone";
+    }
+    writeLifecycleLog("Supervisor sending signal to worker", {
+      reason,
+      signal,
+      termination: platform !== "win32" && signal === "SIGTERM" ? "graceful" : "forceful",
+      supervisorPid: process.pid,
+      workerPid: currentChild.pid ?? null,
+    });
+    return currentChild.kill(signal) ? "sent" : "gone";
+  };
+
   const scheduleWorkerEscalation = (
     currentChild: ChildProcess,
     ownership: SupervisorWorkerClaim | null,
@@ -213,26 +246,21 @@ export function runSupervisor(options: SupervisorOptions): SupervisorController 
     clearWorkerStopTimer();
     workerStopTimer = setTimeout(() => {
       void (async () => {
-        if (child !== currentChild || currentChild.exitCode !== null || currentChild.signalCode) {
-          return;
-        }
-        if (ownership && !(await ownership.verify())) {
-          log(
-            `Worker PID ${currentChild.pid ?? "unknown"} did not stop, but its ownership identity no longer matches. Refusing SIGKILL; inspect ${currentChild.pid ?? "the worker PID"} manually.`,
-          );
-          return;
-        }
         writeLifecycleLog("Worker graceful stop timed out; escalating", {
           reason,
           signal: "SIGKILL",
           workerPid: currentChild.pid ?? null,
         });
         log(`${reason}. Worker did not stop gracefully; sending SIGKILL...`);
-        currentChild.kill("SIGKILL");
+        const result = await signalVerifiedWorker(currentChild, ownership, "SIGKILL", reason);
+        if (result === "refused") {
+          exitSupervisor(1);
+        }
       })().catch((error) => {
         log(`Worker escalation failed: ${error instanceof Error ? error.message : String(error)}`);
+        exitSupervisor(1);
       });
-    }, 12_000);
+    }, workerStopTimeoutMs);
     workerStopTimer.unref();
   };
 
@@ -266,6 +294,8 @@ export function runSupervisor(options: SupervisorOptions): SupervisorController 
 
     const currentChild = child;
     childOwnership = ownership;
+    let ownershipSettled = Promise.resolve(true);
+    childOwnershipSettled = ownershipSettled;
     workerStartupFailure = null;
     if (ownership) {
       const workerPid = currentChild.pid;
@@ -275,23 +305,37 @@ export function runSupervisor(options: SupervisorOptions): SupervisorController 
         exitSupervisor(1);
         return;
       }
-      void ownership
+      ownershipSettled = ownership
         .commit(workerPid)
-        .then(() => {
+        .then(async () => {
           if (child !== currentChild || !currentChild.connected) {
-            return ownership.clear();
+            await ownership.clear();
+            return true;
           }
           writeLifecycleLog("Worker ownership committed", { workerPid });
           currentChild.send({ type: SUPERVISOR_OWNERSHIP_COMMITTED_MESSAGE });
-          return undefined;
+          return true;
         })
-        .catch((error) => {
+        .catch(async (error) => {
           log(
             `Worker ownership commit failed: ${error instanceof Error ? error.message : String(error)}`,
           );
-          currentChild.kill("SIGKILL");
+          try {
+            await signalVerifiedWorker(
+              currentChild,
+              ownership,
+              "SIGKILL",
+              "worker_ownership_commit_failed",
+            );
+          } catch (verificationError) {
+            log(
+              `Worker ownership verification failed during commit cleanup: ${verificationError instanceof Error ? verificationError.message : String(verificationError)}`,
+            );
+          }
           exitSupervisor(1);
+          return false;
         });
+      childOwnershipSettled = ownershipSettled;
     }
     const heartbeat = setInterval(() => {
       const message: SupervisorHeartbeatMessage = { type: "paseo:supervisor-heartbeat" };
@@ -366,6 +410,7 @@ export function runSupervisor(options: SupervisorOptions): SupervisorController 
         clearWorkerStopTimer();
         const exitDescriptor = describeExit(code, signal);
         writeLifecycleLog("Worker exited", { code, signal, exit: exitDescriptor });
+        await ownershipSettled;
         if (ownership) {
           await ownership.clear();
         }
@@ -418,14 +463,28 @@ export function runSupervisor(options: SupervisorOptions): SupervisorController 
     if (!child) {
       return;
     }
-    writeLifecycleLog("Supervisor sending signal to worker", {
-      reason,
-      signal,
-      supervisorPid: process.pid,
-      workerPid: child.pid ?? null,
-    });
-    child.kill(signal);
-    scheduleWorkerEscalation(child, childOwnership, reason);
+    const currentChild = child;
+    const ownership = childOwnership;
+    const ownershipSettled = childOwnershipSettled;
+    void ownershipSettled
+      .then(async (committed) => {
+        if (!committed) {
+          return undefined;
+        }
+        const result = await signalVerifiedWorker(currentChild, ownership, signal, reason);
+        if (result === "refused") {
+          exitSupervisor(1);
+          return undefined;
+        }
+        if (result === "sent" && signal !== "SIGKILL") {
+          scheduleWorkerEscalation(currentChild, ownership, reason);
+        }
+        return undefined;
+      })
+      .catch((error) => {
+        log(`Worker signal failed: ${error instanceof Error ? error.message : String(error)}`);
+        exitSupervisor(1);
+      });
   };
 
   const requestRestart = (reason: string) => {
@@ -434,8 +493,13 @@ export function runSupervisor(options: SupervisorOptions): SupervisorController 
     }
     restarting = true;
     writeLifecycleLog("Restart requested", { reason });
-    log(`${reason}. Stopping worker for restart...`);
-    signalWorker("SIGTERM", reason);
+    if (platform === "win32") {
+      log(`${reason}. Forcing worker termination for restart on Windows...`);
+      signalWorker("SIGKILL", reason);
+    } else {
+      log(`${reason}. Stopping worker for restart...`);
+      signalWorker("SIGTERM", reason);
+    }
   };
 
   const requestShutdown = (reason: string) => {
@@ -445,12 +509,16 @@ export function runSupervisor(options: SupervisorOptions): SupervisorController 
     shuttingDown = true;
     restarting = false;
     writeLifecycleLog("Supervisor shutdown requested", { reason });
-    log(`${reason}. Stopping worker...`);
+    log(
+      platform === "win32"
+        ? `${reason}. Forcing worker termination on Windows...`
+        : `${reason}. Stopping worker...`,
+    );
     if (!child) {
       exitSupervisor(0);
       return;
     }
-    signalWorker("SIGTERM", reason);
+    signalWorker(platform === "win32" ? "SIGKILL" : "SIGTERM", reason);
   };
 
   const forwardSignal = (signal: NodeJS.Signals) => {

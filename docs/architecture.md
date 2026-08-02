@@ -83,19 +83,23 @@ not retain non-Git directories.
 
 The daemon supervisor records its current worker in
 `$PASEO_HOME/supervisor-worker.json` before allowing that worker to listen. The atomic record binds
-the worker PID to the Paseo home, resolved worker entrypoint, desktop-management mode, OS process
-start time, command line, a random worker token, and a random supervisor incarnation. A replacement
-supervisor acquires the normal PID lock first, then uses this record to recover an orphan from a
-previous supervisor incarnation.
+the worker PID to the Paseo home, resolved worker entrypoint and its SHA-256, desktop-management
+mode, OS process start time, command line, a random worker token, and a random supervisor
+incarnation. The owner-only record is atomically replaced, the file is synchronized, and the
+containing directory is also synchronized where Node supports directory handles before the worker
+may listen. A replacement supervisor acquires the normal PID lock first, then uses this record to
+recover an orphan from a previous supervisor incarnation.
 
-Recovery is fail-closed. The replacement sends `SIGTERM` only after the service boundary, process
+Recovery is fail-closed. A same-path entrypoint replacement is a different installation identity.
+On POSIX, the replacement sends `SIGTERM` only after the service boundary, process
 start time, and worker identity match. If the worker does not stop within the grace period, it checks
 the identity again before sending `SIGKILL`. Invalid state, failed inspection, or unavailable
 identity before a signal leaves the process untouched and preserves the state file for diagnosis.
 If the PID changes identity after a signal, recovery treats the owned worker as gone without
 signaling the replacement process. An unrelated process that happens to own the daemon port is never
 treated as an orphan; the worker reports `EADDRINUSE` and the supervisor exits with an actionable
-error instead of crash-looping.
+error instead of crash-looping. Windows has no graceful POSIX signal equivalent through Node, so
+recovery explicitly uses and reports forced termination there.
 
 On macOS and Linux, external process inspection reads the random token from the worker environment.
 The supervised worker therefore retains its original process title because Node's `process.title`
