@@ -90,11 +90,16 @@ export function resolveFleetWorktreeBase(
   options: { newWorkspace?: string; worktree?: string; worktreeMode?: string; base?: string },
   cwd: string,
   readHead: (cwd: string) => string = readGitHead,
+  callerCanReadCwd = true,
 ): string | undefined {
   const newWorkspace = options.newWorkspace ?? (options.worktree ? "worktree" : undefined);
   const branchOff =
     newWorkspace === "worktree" && (options.worktreeMode ?? "branch-off") === "branch-off";
   if (!branchOff || options.base) return options.base;
+  // A fleet caller must not inspect a target host's absolute path on the
+  // caller machine. With no explicit base, the owning daemon resolves its
+  // own checkout default just as the local workspace flow does.
+  if (!callerCanReadCwd) return undefined;
   try {
     const base = readHead(cwd).trim();
     if (!/^[0-9a-f]{40}$/u.test(base)) throw new Error("not a full commit id");

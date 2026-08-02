@@ -872,3 +872,27 @@ describe("runGitCommand", () => {
     ]);
   });
 });
+
+describe("resolveGitExecutable", () => {
+  it("uses a known absolute POSIX Git when daemon PATH lookup is unavailable", async () => {
+    const { resolveGitExecutable } = await loadRunGitCommand(1);
+    expect(
+      resolveGitExecutable({
+        env: { PATH: "" },
+        platform: "darwin",
+        exists: (candidate) => candidate === "/usr/bin/git",
+      }),
+    ).toBe("/usr/bin/git");
+  });
+
+  it("honors an explicitly configured Git executable", async () => {
+    const { resolveGitExecutable } = await loadRunGitCommand(1);
+    expect(
+      resolveGitExecutable({
+        env: { PASEO_GIT_EXECUTABLE: "/custom/git" },
+        platform: "darwin",
+        exists: () => false,
+      }),
+    ).toBe("/custom/git");
+  });
+});

@@ -13,6 +13,7 @@ const DEFAULT_STDERR_LIMIT = 2048;
 const DEFAULT_MAX_PENDING = 64;
 const MAX_GIT_CONCURRENCY = 32;
 const MAX_GIT_PENDING = 1_024;
+const POSIX_GIT_CANDIDATES = ["/usr/bin/git", "/opt/homebrew/bin/git", "/usr/local/bin/git"];
 
 const gitConcurrency = parseIntegerEnv("PASEO_GIT_CONCURRENCY", 8, 1, MAX_GIT_CONCURRENCY);
 const gitMaxPending = parseIntegerEnv(
@@ -26,6 +27,23 @@ const gitRuntimeMetrics = new GitCommandRuntimeMetricsWindow(
   Date.now,
   gitMaxPending,
 );
+
+export function resolveGitExecutable(options?: {
+  env?: NodeJS.ProcessEnv;
+  platform?: NodeJS.Platform;
+  exists?: typeof existsSync;
+}): string {
+  const env = options?.env ?? process.env;
+  const configured = env.PASEO_GIT_EXECUTABLE?.trim();
+  if (configured) return configured;
+
+  if ((options?.platform ?? process.platform) !== "win32") {
+    const exists = options?.exists ?? existsSync;
+    const absolute = POSIX_GIT_CANDIDATES.find((candidate) => exists(candidate));
+    if (absolute) return absolute;
+  }
+  return "git";
+}
 
 export interface GitCommandOptions {
   cwd: string;
@@ -430,7 +448,7 @@ export function runGitCommand(
       try {
         // `core.quotepath=false` makes git emit raw UTF-8 paths instead of
         // octal-escaping non-ASCII bytes (e.g. `测试文件.txt` vs `"\346\265\213..."`).
-        child = spawnProcess("git", ["-c", "core.quotepath=false", ...args], {
+        child = spawnProcess(resolveGitExecutable(), ["-c", "core.quotepath=false", ...args], {
           cwd: options.cwd,
           envOverlay,
           shell: false,

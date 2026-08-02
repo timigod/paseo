@@ -1,10 +1,59 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  normalizeRunErrorWithWorkspaceReceipt,
   resolveExistingRunWorkspace,
   resolveRunCallerAgentId,
   runRunCommand,
   type AgentRunOptions,
 } from "./run";
+
+describe("failed run workspace receipt", () => {
+  it("returns the exact preserved workspace and reuse instruction", () => {
+    const intent = {
+      create: {
+        type: "create_agent_request" as const,
+        config: { provider: "opencode" as const, cwd: "/srv/worktrees/task" },
+        workspaceId: "wks_preserved",
+        initialPrompt: "implement",
+        labels: {},
+      },
+      prompt: "implement",
+      waitTimeoutMs: 0,
+      background: true,
+    };
+
+    expect(
+      normalizeRunErrorWithWorkspaceReceipt(new Error("provider failed"), intent, {
+        background: true,
+      }),
+    ).toMatchObject({
+      code: "AGENT_CREATE_FAILED_WORKSPACE_PRESERVED",
+      details: expect.stringContaining("--workspace wks_preserved"),
+    });
+  });
+
+  it("does not claim an explicitly selected workspace was newly created", () => {
+    const intent = {
+      create: {
+        type: "create_agent_request" as const,
+        config: { provider: "opencode" as const, cwd: "/srv/worktrees/task" },
+        workspaceId: "wks_existing",
+        initialPrompt: "implement",
+        labels: {},
+      },
+      prompt: "implement",
+      waitTimeoutMs: 0,
+      background: true,
+    };
+
+    expect(
+      normalizeRunErrorWithWorkspaceReceipt(new Error("provider failed"), intent, {
+        background: true,
+        workspace: "wks_existing",
+      }),
+    ).toMatchObject({ code: "AGENT_CREATE_FAILED" });
+  });
+});
 
 describe("managed agent caller context", () => {
   it("propagates a trimmed PASEO_AGENT_ID", () => {

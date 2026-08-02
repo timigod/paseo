@@ -45,6 +45,7 @@ import {
   resolveFleetWorktreeBase,
 } from "./run.js";
 import { claimFleetAffinity, loadFleetAffinity } from "./affinity.js";
+import { ensureFleetTargetProject } from "./project-preparation.js";
 
 interface FleetRunOptions extends AgentRunOptions {
   host?: string;
@@ -147,47 +148,25 @@ export async function runFleetRunCommand(
   const callerId = idempotencyKey ? await getOrCreateCliClientId() : null;
   const existingAffinity =
     idempotencyKey && callerId ? await loadFleetAffinity({ callerId, idempotencyKey }) : null;
-  if (
-    existingAffinity &&
-    options.host &&
-    !matchesFleetAffinitySelector(options.host, existingAffinity.host, loadFleetConfig().hosts)
-  ) {
-    throw {
-      code: "FLEET_KEY_HOST_CONFLICT",
-      message: `Idempotency key is owned by ${existingAffinity.host.id}, not pinned host ${options.host}`,
-    } satisfies CommandError;
-  }
-  if (existingAffinity && idempotencyKey) {
-    const currentHost = findFleetHostById(existingAffinity.host.id, loadFleetConfig().hosts);
-    if (!currentHost) {
-      throw {
-        code: "FLEET_AFFINITY_HOST_MISSING",
-        message: `Idempotency key is owned by fleet host ${existingAffinity.host.id}, which is no longer configured`,
-      } satisfies CommandError;
-    }
-    const result = await runAgentRunIntent({
-      intent: existingAffinity.intent,
-      host: currentHost.endpoint,
-      expectedDaemonId: existingAffinity.daemonId,
-      idempotencyKey,
-    });
-    return buildFleetRunResult(result, {
-      hostId: currentHost.id,
-      reason: "idempotency_key",
-      intent: existingAffinity.intent,
-    });
-  }
+  const existingAffinityResult = await tryRunExistingFleetAffinity({
+    affinity: existingAffinity,
+    idempotencyKey,
+    pinnedSelector: options.host,
+  });
+  if (existingAffinityResult) return existingAffinityResult;
 
   const pinnedHost = requireFleetHost(options.host, config.hosts);
   const prompt = await resolveFleetRunPrompt(positionalPrompt, options);
   const workspaceId = options.workspace ?? process.env.PASEO_WORKSPACE_ID;
   const cwd = options.cwd ?? process.cwd();
-  const plan = await resolveNewFleetRunPlan({
+  const sourceHost = findFleetHostForCwd(cwd, config.hosts);
+  const localHost = findFleetHostForHostname(os.hostname(), config.hosts);
+  const plan = await resolvePreparedNewFleetRunPlan({
     config,
     workspaceId,
     cwd,
-    sourceHost: findFleetHostForCwd(cwd, config.hosts),
-    localHost: findFleetHostForHostname(os.hostname(), config.hosts),
+    sourceHost,
+    localHost,
     pinnedHost,
     idempotencyKey,
   });
@@ -200,41 +179,23 @@ export async function runFleetRunCommand(
     provider: model.provider,
     model: model.model,
     thinking,
-    base: resolveFleetWorktreeBase(options, cwd),
+    base: resolveFleetWorktreeBase(
+      options,
+      cwd,
+      undefined,
+      localHost !== null && plan.host.id === localHost.id,
+    ),
   };
 
-  if (idempotencyKey && callerId) {
-    const prepared = await prepareAgentRunIntent(prompt, resolvedOptions);
-    const affinity = await claimFleetAffinity({
-      callerId,
-      idempotencyKey,
-      affinity: { host: plan.host, daemonId: prepared.daemonId, intent: prepared.intent },
-    });
-    if (pinnedHost && !matchesFleetHostId(affinity.host, pinnedHost.id)) {
-      throw {
-        code: "FLEET_KEY_HOST_CONFLICT",
-        message: `Idempotency key is owned by ${affinity.host.id}, not pinned host ${pinnedHost.id}`,
-      } satisfies CommandError;
-    }
-    const currentHost = findFleetHostById(affinity.host.id, loadFleetConfig().hosts);
-    if (!currentHost) {
-      throw {
-        code: "FLEET_AFFINITY_HOST_MISSING",
-        message: `Idempotency key is owned by fleet host ${affinity.host.id}, which is no longer configured`,
-      } satisfies CommandError;
-    }
-    const result = await runAgentRunIntent({
-      intent: affinity.intent,
-      host: currentHost.endpoint,
-      expectedDaemonId: affinity.daemonId,
-      idempotencyKey,
-    });
-    return buildFleetRunResult(result, {
-      hostId: currentHost.id,
-      reason: "idempotency_key",
-      intent: affinity.intent,
-    });
-  }
+  const claimedAffinityResult = await tryRunClaimedFleetAffinity({
+    callerId,
+    idempotencyKey,
+    prompt,
+    resolvedOptions,
+    selectedHost: plan.host,
+    pinnedHost,
+  });
+  if (claimedAffinityResult) return claimedAffinityResult;
 
   const result = await runRunCommand(prompt, resolvedOptions, command);
   return {
@@ -248,6 +209,87 @@ export async function runFleetRunCommand(
     },
     schema: fleetRunSchema,
   };
+}
+
+async function tryRunExistingFleetAffinity(input: {
+  affinity: Awaited<ReturnType<typeof loadFleetAffinity>>;
+  idempotencyKey: string | null;
+  pinnedSelector: string | undefined;
+}): Promise<SingleResult<FleetRunResult> | null> {
+  if (!input.affinity || !input.idempotencyKey) return null;
+  const hosts = loadFleetConfig().hosts;
+  if (
+    input.pinnedSelector &&
+    !matchesFleetAffinitySelector(input.pinnedSelector, input.affinity.host, hosts)
+  ) {
+    throw {
+      code: "FLEET_KEY_HOST_CONFLICT",
+      message: `Idempotency key is owned by ${input.affinity.host.id}, not pinned host ${input.pinnedSelector}`,
+    } satisfies CommandError;
+  }
+  const currentHost = findFleetHostById(input.affinity.host.id, hosts);
+  if (!currentHost) {
+    throw {
+      code: "FLEET_AFFINITY_HOST_MISSING",
+      message: `Idempotency key is owned by fleet host ${input.affinity.host.id}, which is no longer configured`,
+    } satisfies CommandError;
+  }
+  const result = await runAgentRunIntent({
+    intent: input.affinity.intent,
+    host: currentHost.endpoint,
+    expectedDaemonId: input.affinity.daemonId,
+    idempotencyKey: input.idempotencyKey,
+  });
+  return buildFleetRunResult(result, {
+    hostId: currentHost.id,
+    reason: "idempotency_key",
+    intent: input.affinity.intent,
+  });
+}
+
+async function tryRunClaimedFleetAffinity(input: {
+  callerId: string | null;
+  idempotencyKey: string | null;
+  prompt: string;
+  resolvedOptions: AgentRunOptions;
+  selectedHost: FleetHost;
+  pinnedHost: FleetHost | null;
+}): Promise<SingleResult<FleetRunResult> | null> {
+  if (!input.idempotencyKey || !input.callerId) return null;
+  const prepared = await prepareAgentRunIntent(input.prompt, input.resolvedOptions);
+  const affinity = await claimFleetAffinity({
+    callerId: input.callerId,
+    idempotencyKey: input.idempotencyKey,
+    affinity: {
+      host: input.selectedHost,
+      daemonId: prepared.daemonId,
+      intent: prepared.intent,
+    },
+  });
+  if (input.pinnedHost && !matchesFleetHostId(affinity.host, input.pinnedHost.id)) {
+    throw {
+      code: "FLEET_KEY_HOST_CONFLICT",
+      message: `Idempotency key is owned by ${affinity.host.id}, not pinned host ${input.pinnedHost.id}`,
+    } satisfies CommandError;
+  }
+  const currentHost = findFleetHostById(affinity.host.id, loadFleetConfig().hosts);
+  if (!currentHost) {
+    throw {
+      code: "FLEET_AFFINITY_HOST_MISSING",
+      message: `Idempotency key is owned by fleet host ${affinity.host.id}, which is no longer configured`,
+    } satisfies CommandError;
+  }
+  const result = await runAgentRunIntent({
+    intent: affinity.intent,
+    host: currentHost.endpoint,
+    expectedDaemonId: affinity.daemonId,
+    idempotencyKey: input.idempotencyKey,
+  });
+  return buildFleetRunResult(result, {
+    hostId: currentHost.id,
+    reason: "idempotency_key",
+    intent: affinity.intent,
+  });
 }
 
 function buildFleetRunResult(
@@ -295,6 +337,19 @@ async function resolveNewFleetRunPlan(input: {
         requiresLocalContext: Boolean(process.env.PASEO_AGENT_ID),
         idempotencyKey: input.idempotencyKey,
       });
+}
+
+async function resolvePreparedNewFleetRunPlan(input: Parameters<typeof resolveNewFleetRunPlan>[0]) {
+  const plan = await resolveNewFleetRunPlan(input);
+  if (input.workspaceId || !input.sourceHost || input.sourceHost.id === plan.host.id) {
+    return plan;
+  }
+  const prepared = await ensureFleetTargetProject({
+    sourceCwd: input.cwd,
+    sourceHost: input.sourceHost,
+    targetHost: plan.host,
+  });
+  return { ...plan, cwd: prepared.cwd };
 }
 
 export async function runFleetFinishCommand(

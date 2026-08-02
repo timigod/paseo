@@ -568,6 +568,7 @@ function createSessionForWorkspaceTests(
       newName: string,
     ) => Promise<{ previousBranch: string | null; currentBranch: string | null }>;
     generateWorkspaceName?: () => Promise<GeneratedWorkspaceName | null>;
+    providerSnapshotManager?: SessionOptions["providerSnapshotManager"];
   } = {},
 ): TestSession {
   const logger = {
@@ -636,7 +637,8 @@ function createSessionForWorkspaceTests(
     remove: async () => {},
   };
   const workspaceGitService = options.workspaceGitService ?? createNoopWorkspaceGitService();
-  const providerSnapshotManager = createProviderSnapshotManagerStub().manager;
+  const providerSnapshotManager =
+    options.providerSnapshotManager ?? createProviderSnapshotManagerStub().manager;
 
   const session = asTestSession(
     new Session({
@@ -9068,6 +9070,45 @@ test("failed local create_agent_request does not schedule workspace title genera
   } finally {
     vi.useRealTimers();
   }
+});
+
+test("create_agent_request rejects an invalid mode before creating its workspace", async () => {
+  const emitted: SessionOutboundMessage[] = [];
+  const { manager: providerSnapshotManager, resolveCreateConfig } =
+    createProviderSnapshotManagerStub();
+  resolveCreateConfig.mockRejectedValue(
+    new Error("Invalid mode 'default' for provider 'opencode'. Available modes: build, plan"),
+  );
+  const workspaceUpsert = vi.fn(async () => undefined);
+  const session = createSessionForWorkspaceTests({
+    onMessage: (message) => emitted.push(message),
+    providerSnapshotManager,
+    workspaceRegistry: {
+      initialize: async () => undefined,
+      existsOnDisk: async () => true,
+      list: async () => [],
+      get: async () => null,
+      upsert: workspaceUpsert,
+      archive: async () => undefined,
+      remove: async () => undefined,
+    },
+  });
+
+  await session.handleMessage({
+    type: "create_agent_request",
+    requestId: "req-invalid-mode-before-workspace",
+    config: { provider: "opencode", cwd: REPO_CWD, modeId: "default" },
+    workspaceSource: { kind: "directory", path: REPO_CWD },
+    initialPrompt: "implement",
+    attachments: [],
+  });
+
+  expect(findByType(emitted, "status")?.payload).toMatchObject({
+    status: "agent_create_failed",
+    requestId: "req-invalid-mode-before-workspace",
+    error: expect.stringContaining("Invalid mode 'default'"),
+  });
+  expect(workspaceUpsert).not.toHaveBeenCalled();
 });
 
 test("create_agent_request returns a sanitized managed-worktree writer conflict", async () => {

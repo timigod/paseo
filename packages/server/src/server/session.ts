@@ -3540,6 +3540,18 @@ export class Session {
     let createdAgentId: string | null = null;
     let pendingCreationAgentId: string | undefined;
     try {
+      // Validate provider/mode/features against the source checkout before a
+      // directory or worktree workspace is created. The resolved checkout is
+      // validated again by createAgentCommand, because a worktree can carry
+      // branch-specific provider configuration.
+      await this.providerSnapshotManager.resolveCreateConfig({
+        cwd: expandTilde(config.cwd),
+        provider: config.provider,
+        requestedMode: config.modeId,
+        featureValues: config.featureValues,
+        parent: null,
+        unattended: false,
+      });
       const placedRequest = await this.prepareAgentRequest(msg, requestContext);
       const trimmedPrompt = initialPrompt?.trim();
       const { provisionalTitle } = resolveCreateAgentTitles({

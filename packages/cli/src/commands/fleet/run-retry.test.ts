@@ -12,6 +12,7 @@ const mocks = vi.hoisted(() => ({
   resolveFleetRunPrompt: vi.fn(),
   resolveFleetProviderModelOptions: vi.fn(),
   resolveFleetWorktreeBase: vi.fn(),
+  ensureFleetTargetProject: vi.fn(),
 }));
 
 vi.mock("../../utils/client-id.js", () => ({
@@ -32,6 +33,9 @@ vi.mock("./run.js", () => ({
   resolveFleetRunPrompt: mocks.resolveFleetRunPrompt,
   resolveFleetProviderModelOptions: mocks.resolveFleetProviderModelOptions,
   resolveFleetWorktreeBase: mocks.resolveFleetWorktreeBase,
+}));
+vi.mock("./project-preparation.js", () => ({
+  ensureFleetTargetProject: mocks.ensureFleetTargetProject,
 }));
 
 import { claimFleetAffinity } from "./affinity.js";
@@ -116,6 +120,10 @@ function configureRunMocks() {
     effectiveModel: "gpt-original",
   });
   mocks.resolveFleetWorktreeBase.mockReturnValue("a".repeat(40));
+  mocks.ensureFleetTargetProject.mockImplementation(async ({ sourceCwd }) => ({
+    cwd: sourceCwd,
+    prepared: "existing",
+  }));
   const intent = {
     create: {
       type: "create_agent_request" as const,
@@ -186,6 +194,12 @@ describe("fleet run retry affinity", () => {
     expect(mocks.resolveFleetRunPrompt).toHaveBeenCalledOnce();
     expect(mocks.resolveFleetProviderModelOptions).toHaveBeenCalledOnce();
     expect(mocks.resolveFleetWorktreeBase).toHaveBeenCalledOnce();
+    expect(mocks.resolveFleetWorktreeBase).toHaveBeenCalledWith(
+      expect.objectContaining({ newWorkspace: "worktree", host: "builder-a.internal:6767" }),
+      runOptions.cwd,
+      undefined,
+      false,
+    );
     expect(mocks.prepareAgentRunIntent).toHaveBeenCalledOnce();
     const { idempotencyKey: _idempotencyKey, ...persistedCreate } = intent.create;
     expect(mocks.runAgentRunIntent).toHaveBeenLastCalledWith({

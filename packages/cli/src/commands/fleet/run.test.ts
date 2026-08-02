@@ -1,7 +1,7 @@
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   resolveFleetProviderModelOptions,
   resolveFleetRunPrompt,
@@ -101,5 +101,21 @@ describe("fleet worktree base", () => {
     expect(() =>
       resolveFleetWorktreeBase({ newWorkspace: "worktree" }, "/not-a-repo", readBadHead),
     ).toThrow(expect.objectContaining({ code: "FLEET_WORKTREE_BASE_UNRESOLVED" }));
+  });
+
+  it("lets the target daemon resolve the base for a remote-only cwd", () => {
+    const readHead = vi.fn(() => {
+      throw new Error("remote path does not exist on caller");
+    });
+
+    expect(
+      resolveFleetWorktreeBase(
+        { newWorkspace: "worktree" },
+        "/Users/remote/Code/paseo",
+        readHead,
+        false,
+      ),
+    ).toBeUndefined();
+    expect(readHead).not.toHaveBeenCalled();
   });
 });

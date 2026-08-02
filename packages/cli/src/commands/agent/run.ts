@@ -609,15 +609,41 @@ export async function runRunCommand(
   const inputs = resolveLocalRunInputs(prompt, options);
   const host = getDaemonHost({ host: options.host });
   const client = await connectToDaemonOrThrow(options.host, host);
+  let intent: AgentRunIntent | null = null;
 
   try {
-    const intent = await resolveAgentRunIntent(client, inputs, options);
+    intent = await resolveAgentRunIntent(client, inputs, options);
     return await executeAgentRunIntent(client, intent);
   } catch (err) {
-    throw normalizeRunError(err);
+    throw normalizeRunErrorWithWorkspaceReceipt(err, intent, options);
   } finally {
     await client.close().catch(() => {});
   }
+}
+
+export function normalizeRunErrorWithWorkspaceReceipt(
+  error: unknown,
+  intent: AgentRunIntent | null,
+  options: AgentRunOptions,
+): unknown {
+  const normalized = normalizeRunError(error);
+  const workspaceId = intent?.create.workspaceId;
+  const createdByThisRun =
+    workspaceId !== undefined &&
+    !options.idempotencyKey?.trim() &&
+    !options.workspace?.trim() &&
+    !process.env.PASEO_WORKSPACE_ID?.trim() &&
+    !resolveRunCallerAgentId();
+  if (!createdByThisRun || !workspaceId) return normalized;
+
+  const commandError = normalized as CommandError;
+  return {
+    ...commandError,
+    code: "AGENT_CREATE_FAILED_WORKSPACE_PRESERVED",
+    details:
+      `Workspace ${workspaceId} was created and preserved at ${intent.create.config.cwd}. ` +
+      `Retry this task with --workspace ${workspaceId}; do not create another workspace.`,
+  } satisfies CommandError;
 }
 
 interface LocalRunInputs {
