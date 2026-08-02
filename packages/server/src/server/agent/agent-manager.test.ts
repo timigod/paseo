@@ -7220,10 +7220,11 @@ test.each([
   { registrationKind: "create" as const, cleanupFails: false },
   { registrationKind: "resume" as const, cleanupFails: true },
 ])(
-  "$registrationKind rolls back an inserted registration after snapshot persistence fails",
+  "$registrationKind restores durable state when registration fails after its first snapshot",
   async ({ registrationKind, cleanupFails }) => {
     const workdir = mkdtempSync(join(tmpdir(), `agent-manager-${registrationKind}-rollback-`));
-    const storage = new AgentStorage(join(workdir, "agents"), logger);
+    const storagePath = join(workdir, "agents");
+    const storage = new AgentStorage(storagePath, logger);
     const membershipGate = new DestructiveMembershipGate();
     const persistenceFailure = new Error("injected registration persistence failure");
     const cleanupFailure = cleanupFails
@@ -7259,58 +7260,204 @@ test.each([
       logger,
     });
     const agentId = "00000000-0000-4000-8000-000000000143";
-    const originalApplySnapshot = storage.applySnapshot.bind(storage);
-    let failedAfterLiveInsertion = false;
-    vi.spyOn(storage, "applySnapshot").mockImplementation(async (agent, options) => {
-      if (agent.id === agentId && !failedAfterLiveInsertion) {
-        failedAfterLiveInsertion = true;
-        expect(manager.getAgent(agentId)).not.toBeNull();
-        throw persistenceFailure;
-      }
-      await originalApplySnapshot(agent, options);
-    });
-
-    const registration =
-      registrationKind === "create"
-        ? manager.createAgent(
-            { provider: "codex", cwd: workdir, title: "Failed registration" },
-            agentId,
-            { workspaceId: "workspace-registration-rollback" },
-          )
-        : manager.resumeAgentFromPersistence(
-            {
+    const priorRecord: StoredAgentRecord | null =
+      registrationKind === "resume"
+        ? {
+            id: agentId,
+            provider: "codex",
+            cwd: workdir,
+            workspaceId: "workspace-before-resume",
+            createdAt: "2026-07-01T10:00:00.000Z",
+            updatedAt: "2026-07-01T10:05:00.000Z",
+            lastActivityAt: "2026-07-01T10:05:00.000Z",
+            lastUserMessageAt: "2026-07-01T10:04:00.000Z",
+            title: "Exact prior record",
+            labels: { retained: "true" },
+            lastStatus: "closed",
+            lastModeId: "plan",
+            config: { modeId: "plan", model: "gpt-5.4-mini" },
+            persistence: {
               provider: "codex",
-              sessionId: "resume-registration-rollback",
-              metadata: { provider: "codex", cwd: workdir },
+              sessionId: "prior-resume-session",
+              metadata: { retained: true },
             },
-            { cwd: workdir, title: "Failed registration" },
-            agentId,
-            { workspaceId: "workspace-registration-rollback" },
-          );
-    const rejection = await registration.then(
-      () => null,
-      (error: unknown) => error,
-    );
+          }
+        : null;
+    if (priorRecord) await storage.upsert(priorRecord);
+    const capturedPrior = structuredClone(await storage.get(agentId));
 
-    expect(failedAfterLiveInsertion).toBe(true);
-    if (cleanupFailure) {
-      expect(rejection).toBeInstanceOf(AggregateError);
-      expect((rejection as AggregateError).errors).toEqual([persistenceFailure, cleanupFailure]);
-    } else {
-      expect(rejection).toBe(persistenceFailure);
+    const originalApplySnapshot = storage.applySnapshot.bind(storage);
+    let snapshotCalls = 0;
+    const applySnapshotSpy = vi
+      .spyOn(storage, "applySnapshot")
+      .mockImplementation(async (agent, options) => {
+        if (agent.id === agentId) {
+          snapshotCalls += 1;
+        }
+        if (agent.id === agentId && snapshotCalls === 2) {
+          expect(await storage.get(agentId)).not.toEqual(capturedPrior);
+          expect(manager.getAgent(agentId)).not.toBeNull();
+          throw persistenceFailure;
+        }
+        await originalApplySnapshot(agent, options);
+      });
+    const rollbackStarted = deferred<void>();
+    const rollbackAllowed = deferred<void>();
+    const originalRollbackRegistration = storage.rollbackRegistration.bind(storage);
+    const rollbackSpy = vi
+      .spyOn(storage, "rollbackRegistration")
+      .mockImplementation(async (rollbackAgentId, previousRecord) => {
+        rollbackStarted.resolve();
+        await rollbackAllowed.promise;
+        await originalRollbackRegistration(rollbackAgentId, previousRecord);
+      });
+
+    let registration: Promise<ManagedAgent> | null = null;
+    let destructiveLease: Awaited<
+      ReturnType<DestructiveMembershipGate["acquireDestructive"]>
+    > | null = null;
+    try {
+      registration =
+        registrationKind === "create"
+          ? manager.createAgent(
+              { provider: "codex", cwd: workdir, title: "Failed registration" },
+              agentId,
+              { workspaceId: "workspace-registration-rollback" },
+            )
+          : manager.resumeAgentFromPersistence(
+              {
+                provider: "codex",
+                sessionId: "resume-registration-rollback",
+                metadata: { provider: "codex", cwd: workdir },
+              },
+              { cwd: workdir, title: "Failed registration" },
+              agentId,
+              { workspaceId: "workspace-registration-rollback" },
+            );
+
+      await rollbackStarted.promise;
+      let destructiveLeaseAcquired = false;
+      const destructiveLeasePromise = membershipGate
+        .acquireDestructive({ agentIds: [agentId] })
+        .then((lease) => {
+          destructiveLeaseAcquired = true;
+          return lease;
+        });
+      await Promise.resolve();
+      expect(destructiveLeaseAcquired).toBe(false);
+
+      rollbackAllowed.resolve();
+      const rejection = await registration.then(
+        () => null,
+        (error: unknown) => error,
+      );
+      destructiveLease = await destructiveLeasePromise;
+
+      expect(snapshotCalls).toBe(2);
+      if (cleanupFailure) {
+        expect(rejection).toBeInstanceOf(AggregateError);
+        expect((rejection as AggregateError).errors).toEqual([persistenceFailure, cleanupFailure]);
+      } else {
+        expect(rejection).toBe(persistenceFailure);
+      }
+      expect(manager.getAgent(agentId)).toBeNull();
+      expect(manager.getAgentCallerIdentity(agentId)).toBeNull();
+      expect(manager.listAgents()).toEqual([]);
+      expect(await storage.get(agentId)).toEqual(capturedPrior);
+      expect(await storage.list()).toEqual(capturedPrior ? [capturedPrior] : []);
+      const reloadedStorage = new AgentStorage(storagePath, logger);
+      expect(await reloadedStorage.get(agentId)).toEqual(capturedPrior);
+      expect(await reloadedStorage.list()).toEqual(capturedPrior ? [capturedPrior] : []);
+      expect(sessions).toHaveLength(1);
+      expect(sessions[0]?.closeCalls).toBe(1);
+      expect(sessions[0]?.activeSubscriptions).toBe(0);
+
+      destructiveLease.release();
+      destructiveLease = null;
+
+      if (registrationKind === "create") {
+        await expect(
+          ensureAgentLoaded(agentId, {
+            agentManager: manager,
+            agentStorage: storage,
+            logger,
+          }),
+        ).rejects.toThrow(`Agent not found: ${agentId}`);
+
+        applySnapshotSpy.mockRestore();
+        rollbackSpy.mockRestore();
+        const retry = await manager.createAgent(
+          { provider: "codex", cwd: workdir, title: "Same-ID retry" },
+          agentId,
+          { workspaceId: "workspace-registration-retry" },
+        );
+        expect(retry.id).toBe(agentId);
+      }
+    } finally {
+      rollbackAllowed.resolve();
+      await registration?.catch(() => undefined);
+      destructiveLease?.release();
+      applySnapshotSpy.mockRestore();
+      rollbackSpy.mockRestore();
+      await manager.closeAgent(agentId).catch(() => undefined);
+      await storage.flush().catch(() => undefined);
+      rmSync(workdir, { recursive: true, force: true });
     }
-    expect(manager.getAgent(agentId)).toBeNull();
-    expect(manager.getAgentCallerIdentity(agentId)).toBeNull();
-    expect(manager.listAgents()).toEqual([]);
-    expect(await storage.get(agentId)).toBeNull();
-    expect(sessions).toHaveLength(1);
-    expect(sessions[0]?.closeCalls).toBe(1);
-    expect(sessions[0]?.activeSubscriptions).toBe(0);
-
-    const destructiveLease = await membershipGate.acquireDestructive({ agentIds: [agentId] });
-    destructiveLease.release();
   },
 );
+
+test("registration reports storage rollback failure with the original snapshot failure", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-registration-rollback-error-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const membershipGate = new DestructiveMembershipGate();
+  const persistenceFailure = new Error("injected second snapshot failure");
+  const rollbackFailure = new Error("injected storage rollback failure");
+  const session = new RegistrationCleanupSession({ provider: "codex", cwd: workdir });
+  const client = new (class extends TestAgentClient {
+    override async createSession(): Promise<AgentSession> {
+      return session;
+    }
+  })();
+  const manager = new AgentManager({
+    clients: { codex: client },
+    registry: storage,
+    membershipGate,
+    logger,
+  });
+  const agentId = "00000000-0000-4000-8000-000000000144";
+  const originalApplySnapshot = storage.applySnapshot.bind(storage);
+  let snapshotCalls = 0;
+  vi.spyOn(storage, "applySnapshot").mockImplementation(async (agent, options) => {
+    if (agent.id === agentId) snapshotCalls += 1;
+    if (agent.id === agentId && snapshotCalls === 2) {
+      throw persistenceFailure;
+    }
+    await originalApplySnapshot(agent, options);
+  });
+  vi.spyOn(storage, "rollbackRegistration").mockRejectedValue(rollbackFailure);
+
+  try {
+    const rejection = await manager
+      .createAgent({ provider: "codex", cwd: workdir }, agentId, {
+        workspaceId: "workspace-registration-rollback-error",
+      })
+      .then(
+        () => null,
+        (error: unknown) => error,
+      );
+
+    expect(rejection).toBeInstanceOf(AggregateError);
+    expect((rejection as AggregateError).errors).toEqual([persistenceFailure, rollbackFailure]);
+    expect(manager.getAgent(agentId)).toBeNull();
+    expect(session.closeCalls).toBe(1);
+    const destructiveLease = await membershipGate.acquireDestructive({ agentIds: [agentId] });
+    destructiveLease.release();
+  } finally {
+    vi.restoreAllMocks();
+    await storage.rollbackRegistration(agentId, null).catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
 
 test("fires onAgentArchived for stored-only snapshot archives", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-archived-hook-snapshot-"));

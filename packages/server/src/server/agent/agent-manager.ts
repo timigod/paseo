@@ -3403,16 +3403,23 @@ export class AgentManager {
     let managed: ActiveManagedAgent | null = null;
     let inserted = false;
     let timelineInitialized = false;
+    let previousStoredRecord: StoredAgentRecord | null = null;
+    let storageStateCaptured = false;
     try {
       this.assertAcceptingAgentRegistrations();
       resolvedAgentId = validateAgentId(agentId, "registerSession");
       if (this.agents.has(resolvedAgentId)) {
         throw new Error(`Agent with id ${resolvedAgentId} already exists`);
       }
-      const initialPersistedTitle = await this.resolveInitialPersistedTitle(
-        resolvedAgentId,
+      if (this.registry) {
+        const storedRecord = await this.registry.get(resolvedAgentId);
+        previousStoredRecord = storedRecord ? structuredClone(storedRecord) : null;
+        storageStateCaptured = true;
+      }
+      const initialPersistedTitle = this.resolveInitialPersistedTitle(
         config,
         options.initialTitle ?? null,
+        previousStoredRecord,
       );
 
       const now = new Date();
@@ -3483,6 +3490,8 @@ export class AgentManager {
         inserted,
         timelineInitialized,
         resolvedAgentId,
+        previousStoredRecord,
+        storageStateCaptured,
       });
       throw error;
     }
@@ -3495,6 +3504,8 @@ export class AgentManager {
     inserted: boolean;
     timelineInitialized: boolean;
     resolvedAgentId: string | null;
+    previousStoredRecord: StoredAgentRecord | null;
+    storageStateCaptured: boolean;
   }): Promise<void> {
     const cleanupErrors: unknown[] = [];
     let ownsSessionCleanup = !input.inserted;
@@ -3511,6 +3522,19 @@ export class AgentManager {
     if (ownsSessionCleanup && input.timelineInitialized && input.resolvedAgentId) {
       try {
         this.discardRetainedAgentState(input.resolvedAgentId);
+      } catch (error) {
+        cleanupErrors.push(error);
+      }
+    }
+
+    if (
+      ownsSessionCleanup &&
+      input.storageStateCaptured &&
+      input.resolvedAgentId &&
+      this.registry
+    ) {
+      try {
+        await this.registry.rollbackRegistration(input.resolvedAgentId, input.previousStoredRecord);
       } catch (error) {
         cleanupErrors.push(error);
       }
@@ -3834,12 +3858,11 @@ export class AgentManager {
     );
   }
 
-  private async resolveInitialPersistedTitle(
-    agentId: string,
+  private resolveInitialPersistedTitle(
     config: AgentSessionConfig,
     fallbackTitle: string | null,
-  ): Promise<string | null> {
-    const existing = await this.registry?.get(agentId);
+    existing: StoredAgentRecord | null,
+  ): string | null {
     if (existing) {
       return existing.title ?? null;
     }

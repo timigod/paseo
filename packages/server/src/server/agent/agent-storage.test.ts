@@ -5,7 +5,7 @@ import { mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { promises as fs } from "node:fs";
 
 import { createTestLogger } from "../../test-utils/test-logger.js";
-import { AgentStorage } from "./agent-storage.js";
+import { AgentStorage, type StoredAgentRecord } from "./agent-storage.js";
 import { buildConfigOverrides, buildSessionConfig } from "../persistence-hooks.js";
 import type { ManagedAgent } from "./agent-manager.js";
 import type {
@@ -579,6 +579,71 @@ describe("AgentStorage", () => {
     const record = await storage.get(agentId);
     expect(record?.title).toBe("Generated title");
   });
+
+  test.each([
+    { rollbackKind: "remove provisional" as const, restorePrior: false },
+    { rollbackKind: "restore prior" as const, restorePrior: true },
+  ])(
+    "registration rollback queues behind a pending write and can $rollbackKind without a tombstone",
+    async ({ restorePrior }) => {
+      const agentId = `agent-registration-${restorePrior ? "restore" : "remove"}`;
+      await storage.applySnapshot(
+        createManagedAgent({
+          id: agentId,
+          cwd: "/tmp/prior-project",
+          lifecycle: "closed",
+        }),
+        { title: "Prior record" },
+      );
+      const priorReload = new AgentStorage(storagePath, logger);
+      const capturedPrior = structuredClone(await priorReload.get(agentId));
+      expect(capturedPrior).not.toBeNull();
+      if (!restorePrior) {
+        await storage.rollbackRegistration(agentId, null);
+      }
+
+      let releaseWrite!: () => void;
+      const writeAllowed = new Promise<void>((resolve) => {
+        releaseWrite = resolve;
+      });
+      let signalWriteStarted!: () => void;
+      const writeStarted = new Promise<void>((resolve) => {
+        signalWriteStarted = resolve;
+      });
+      const provisionalRecord: StoredAgentRecord = {
+        ...capturedPrior!,
+        cwd: "/tmp/provisional-project",
+        title: "Provisional record",
+        lastStatus: "running",
+      };
+      const pendingWrite = storage.upsert(provisionalRecord, {
+        recheck: async () => {
+          signalWriteStarted();
+          await writeAllowed;
+        },
+      });
+      await writeStarted;
+
+      let rollbackSettled = false;
+      const rollback = storage
+        .rollbackRegistration(agentId, restorePrior ? capturedPrior : null)
+        .then(() => {
+          rollbackSettled = true;
+          return undefined;
+        });
+      await Promise.resolve();
+      expect(rollbackSettled).toBe(false);
+
+      releaseWrite();
+      await Promise.all([pendingWrite, rollback]);
+      expect(await storage.get(agentId)).toEqual(restorePrior ? capturedPrior : null);
+      const reloaded = new AgentStorage(storagePath, logger);
+      expect(await reloaded.get(agentId)).toEqual(restorePrior ? capturedPrior : null);
+
+      await storage.upsert({ ...provisionalRecord, title: "Same-ID retry" });
+      expect((await storage.get(agentId))?.title).toBe("Same-ID retry");
+    },
+  );
 
   test("list returns all agents including internal ones", async () => {
     // Create a normal agent

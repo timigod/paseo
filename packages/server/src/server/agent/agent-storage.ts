@@ -310,6 +310,33 @@ export class AgentStorage {
     return operation;
   }
 
+  async rollbackRegistration(
+    agentId: string,
+    previousRecord: StoredAgentRecord | null,
+  ): Promise<void> {
+    await this.load();
+    if (previousRecord && previousRecord.id !== agentId) {
+      throw new Error(
+        `Registration rollback record for ${previousRecord.id} cannot restore agent ${agentId}`,
+      );
+    }
+    const capturedRecord = previousRecord ? structuredClone(previousRecord) : null;
+
+    // Registration compensation is serialized with snapshot writes, but unlike
+    // public remove() it must not tombstone the ID: the caller may safely retry.
+    const previousWrite = this.pendingWrites.get(agentId) ?? Promise.resolve();
+    const next = previousWrite
+      .catch(() => undefined)
+      .then(() => this.restoreRegistrationRecord(agentId, capturedRecord));
+    const tracked = next.finally(() => {
+      if (this.pendingWrites.get(agentId) === tracked) {
+        this.pendingWrites.delete(agentId);
+      }
+    });
+    this.pendingWrites.set(agentId, tracked);
+    await tracked;
+  }
+
   private queueRecordWrite(
     record: StoredAgentRecord,
     recheck?: DestructiveActionRecheck,
@@ -373,6 +400,50 @@ export class AgentStorage {
     this.cache.set(agentId, record);
     this.indexOwner(record);
     this.pathById.set(agentId, nextPath);
+  }
+
+  private async restoreRegistrationRecord(
+    agentId: string,
+    previousRecord: StoredAgentRecord | null,
+  ): Promise<void> {
+    const indexedPaths = new Set(this.pathsById.get(agentId) ?? []);
+    const currentPath = this.pathById.get(agentId);
+    if (currentPath) indexedPaths.add(currentPath);
+
+    if (!previousRecord) {
+      await this.unlinkRecordPaths(agentId, indexedPaths);
+      this.cache.delete(agentId);
+      this.removeOwnerIndex(agentId);
+      this.pathById.delete(agentId);
+      this.pathsById.delete(agentId);
+      return;
+    }
+
+    const restoredPath = this.buildRecordPath(previousRecord);
+    await writeJsonFileAtomic(restoredPath, previousRecord);
+    indexedPaths.delete(restoredPath);
+    await this.unlinkRecordPaths(agentId, indexedPaths);
+
+    this.cache.set(agentId, previousRecord);
+    this.indexOwner(previousRecord);
+    this.pathById.set(agentId, restoredPath);
+    this.pathsById.set(agentId, new Set([restoredPath]));
+  }
+
+  private async unlinkRecordPaths(agentId: string, filePaths: Iterable<string>): Promise<void> {
+    await Promise.all(
+      Array.from(filePaths, async (filePath) => {
+        try {
+          await fs.unlink(filePath);
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+            throw new Error(`Failed to roll back agent record ${agentId} at ${filePath}`, {
+              cause: error,
+            });
+          }
+        }
+      }),
+    );
   }
 
   beginDelete(agentId: string): AgentDeleteFence {
