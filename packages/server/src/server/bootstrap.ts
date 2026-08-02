@@ -190,6 +190,7 @@ import {
   type ManagedProcessRegistry,
 } from "./managed-processes/managed-processes.js";
 import { terminateWithTreeKill } from "../utils/tree-kill.js";
+import { drainGitCommands } from "../utils/run-git-command.js";
 import { isHostnameAllowed, type HostnamesConfig } from "./hostnames.js";
 import {
   createRequireBearerMiddleware,
@@ -2052,6 +2053,9 @@ export async function createPaseoDaemon(
     await attempt("speech", () => speechService.stop());
     await attempt("relay", () => relayTransport?.stop());
     await attempt("WebSocket server", () => wsServer?.close());
+    // All daemon-owned Git producers are stopped above; now join every command
+    // already admitted to the shared executor before process shutdown continues.
+    await attempt("Git commands", () => drainGitCommands());
     await attempt("service proxy", () => serviceProxy.stopStandalone());
     // Force-drop remaining sockets so httpServer.close() resolves promptly.
     // We've already closed wsServer (which sent ws-layer close frames) and

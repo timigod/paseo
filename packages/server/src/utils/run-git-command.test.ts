@@ -16,6 +16,7 @@ interface FakeSpawnController {
   peakActiveCount: number;
   processes: FakeChildProcess[];
   queue: FakeSpawnBehavior[];
+  spawnedArgs: string[][];
   reset: () => void;
 }
 
@@ -25,6 +26,7 @@ const fakeSpawnController = vi.hoisted<FakeSpawnController>(() => ({
   peakActiveCount: 0,
   processes: [],
   queue: [],
+  spawnedArgs: [],
   reset() {
     for (const process of this.processes) {
       process.dispose();
@@ -35,6 +37,7 @@ const fakeSpawnController = vi.hoisted<FakeSpawnController>(() => ({
     this.peakActiveCount = 0;
     this.processes = [];
     this.queue = [];
+    this.spawnedArgs = [];
   },
 }));
 
@@ -161,8 +164,9 @@ vi.mock("node:child_process", async () => {
 
   return {
     ...actual,
-    spawn: vi.fn(() => {
+    spawn: vi.fn((_command: string, args: string[]) => {
       const behavior = fakeSpawnController.queue.shift() ?? {};
+      fakeSpawnController.spawnedArgs.push(args);
       const child = new FakeChildProcess(behavior);
       fakeSpawnController.processes.push(child);
       return child as unknown as ReturnType<typeof actual.spawn>;
@@ -174,9 +178,12 @@ function enqueueSpawnBehaviors(...behaviors: FakeSpawnBehavior[]): void {
   fakeSpawnController.queue.push(...behaviors);
 }
 
-async function loadRunGitCommand(concurrency: number) {
+async function loadRunGitCommand(concurrency: number, maxPending?: number) {
   vi.resetModules();
   vi.stubEnv("PASEO_GIT_CONCURRENCY", String(concurrency));
+  if (maxPending !== undefined) {
+    vi.stubEnv("PASEO_GIT_MAX_PENDING", String(maxPending));
+  }
   return import("./run-git-command.js");
 }
 
@@ -205,6 +212,83 @@ describe("runGitCommand", () => {
     );
 
     expect(fakeSpawnController.peakActiveCount).toBe(2);
+    expect(fakeSpawnController.activeCount).toBe(0);
+  });
+
+  it("bounds pending admission across more than 100 targets and recovers on retry", async () => {
+    const { GitCommandBackpressureError, runGitCommand, snapshotGitCommandRuntimeMetrics } =
+      await loadRunGitCommand(2, 3);
+    enqueueSpawnBehaviors(...Array.from({ length: 5 }, () => ({ delayMs: 25 })));
+
+    const attempts = Array.from({ length: 128 }, (_, index) =>
+      runGitCommand(["status", `target-${index}`], { cwd: process.cwd() }),
+    );
+    const outcomes = await Promise.allSettled(attempts);
+
+    expect(outcomes.filter((outcome) => outcome.status === "fulfilled")).toHaveLength(5);
+    const rejections = outcomes.filter(
+      (outcome): outcome is PromiseRejectedResult => outcome.status === "rejected",
+    );
+    expect(rejections).toHaveLength(123);
+    expect(
+      rejections.every(
+        ({ reason }) =>
+          reason instanceof GitCommandBackpressureError &&
+          reason.retryable === true &&
+          reason.maxPending === 3,
+      ),
+    ).toBe(true);
+    expect(snapshotGitCommandRuntimeMetrics()).toMatchObject({
+      maxPending: 3,
+      peakPending: 3,
+      submitted: 128,
+      admitted: 5,
+      rejected: 123,
+    });
+
+    enqueueSpawnBehaviors({ stdoutData: "recovered" });
+    await expect(runGitCommand(["status", "retry"], { cwd: process.cwd() })).resolves.toMatchObject(
+      { stdout: "recovered" },
+    );
+  });
+
+  it("keeps admitted commands in FIFO order while rejecting excess pressure", async () => {
+    const { GitCommandBackpressureError, runGitCommand } = await loadRunGitCommand(1, 3);
+    enqueueSpawnBehaviors(...Array.from({ length: 4 }, () => ({ delayMs: 10 })));
+
+    const accepted = ["first", "second", "third", "fourth"].map((label) =>
+      runGitCommand(["status", label], { cwd: process.cwd() }),
+    );
+    const rejected = runGitCommand(["status", "rejected"], { cwd: process.cwd() });
+
+    await expect(rejected).rejects.toBeInstanceOf(GitCommandBackpressureError);
+    await expect(Promise.all(accepted)).resolves.toHaveLength(4);
+    expect(fakeSpawnController.spawnedArgs.map((args) => args.at(-1))).toEqual([
+      "first",
+      "second",
+      "third",
+      "fourth",
+    ]);
+  });
+
+  it("drains active and pending admitted commands", async () => {
+    const { drainGitCommands, runGitCommand } = await loadRunGitCommand(1, 2);
+    enqueueSpawnBehaviors(...Array.from({ length: 3 }, () => ({ delayMs: 20 })));
+    const commands = ["first", "second", "third"].map((label) =>
+      runGitCommand(["status", label], { cwd: process.cwd() }),
+    );
+    let drained = false;
+
+    const drain = drainGitCommands().then(() => {
+      drained = true;
+      return undefined;
+    });
+    await Promise.resolve();
+    expect(drained).toBe(false);
+
+    await drain;
+    await expect(Promise.all(commands)).resolves.toHaveLength(3);
+    expect(drained).toBe(true);
     expect(fakeSpawnController.activeCount).toBe(0);
   });
 

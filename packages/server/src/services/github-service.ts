@@ -114,6 +114,7 @@ const GITHUB_ENV = {
 // (e.g. a stalled network call) fails the same way across every forge.
 const GITHUB_COMMAND_TIMEOUT_MS = 30_000;
 const REPO_HOST_NULL_TTL_MS = 60_000;
+const GITHUB_MISSING_CLI_TTL_MS = 30_000;
 const GIT_ORIGIN_URL_READ_TIMEOUT_MS = 5_000;
 const GITHUB_RATE_LIMIT_FALLBACK_COOLDOWN_MS = 60_000;
 // GitHub's primary rate limits reset hourly. Never let malformed upstream
@@ -716,6 +717,7 @@ export class GitHubEnterpriseHostProbeError extends Error {
 
 interface CreateGitHubServiceOptions {
   ttlMs?: number;
+  missingCliTtlMs?: number;
   runner?: GitHubCommandRunner;
   resolveGhPath?: () => Promise<string | null>;
   now?: () => number;
@@ -765,6 +767,7 @@ interface ResolvedPullRequestCandidate {
 
 export function createGitHubService(options: CreateGitHubServiceOptions = {}): GitHubService {
   const ttlMs = options.ttlMs ?? DEFAULT_GITHUB_CACHE_TTL_MS;
+  const missingCliTtlMs = options.missingCliTtlMs ?? GITHUB_MISSING_CLI_TTL_MS;
   const deps: GitHubServiceDependencies = {
     runner: options.runner ?? runGhCommand,
     resolveGhPath: options.resolveGhPath ?? resolveGhPath,
@@ -785,7 +788,39 @@ export function createGitHubService(options: CreateGitHubServiceOptions = {}): G
   const rateLimitCooldownByResource = new Map<string, number>();
   const rateLimitAdmissionByResource = new Map<string, Promise<void>>();
   const lastAuthenticatedByHost = new Set<string>();
+  let ghPathProbe: Promise<string | null> | null = null;
+  let ghAvailable = false;
+  let ghMissingUntil = 0;
   let api!: GitHubService;
+
+  async function assertGhAvailable(): Promise<void> {
+    if (ghAvailable) {
+      return;
+    }
+    if (deps.now() < ghMissingUntil) {
+      throw new GitHubCliMissingError();
+    }
+    if (!ghPathProbe) {
+      const pending = deps.resolveGhPath().finally(() => {
+        if (ghPathProbe === pending) {
+          ghPathProbe = null;
+        }
+      });
+      ghPathProbe = pending;
+    }
+    const ghPath = await ghPathProbe;
+    if (!ghPath) {
+      ghMissingUntil = deps.now() + missingCliTtlMs;
+      throw new GitHubCliMissingError();
+    }
+    ghAvailable = true;
+    ghMissingUntil = 0;
+  }
+
+  function rememberMissingGh(): void {
+    ghAvailable = false;
+    ghMissingUntil = deps.now() + missingCliTtlMs;
+  }
 
   async function cached<T>(params: {
     cwd: string;
@@ -866,10 +901,7 @@ export function createGitHubService(options: CreateGitHubServiceOptions = {}): G
   }
 
   async function run(args: string[], runOptions: GitHubCommandRunnerOptions): Promise<string> {
-    const ghPath = await deps.resolveGhPath();
-    if (!ghPath) {
-      throw new GitHubCliMissingError();
-    }
+    await assertGhAvailable();
     // Route every gh invocation to the workspace's host. `gh api`/`graphql`
     // otherwise default to github.com regardless of the resolved repository,
     // which silently queries the wrong server on GitHub Enterprise. GH_HOST is
@@ -890,6 +922,9 @@ export function createGitHubService(options: CreateGitHubServiceOptions = {}): G
           args: commandArgs,
           cwd: runOptions.cwd,
         });
+        if (normalized instanceof GitHubCliMissingError) {
+          rememberMissingGh();
+        }
         if (resource) {
           const cooldown = getGitHubRateLimitCooldown({
             error: normalized,

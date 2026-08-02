@@ -7,12 +7,15 @@ export interface GitCommandDurationStats {
 
 export interface GitCommandRuntimeMetricsSnapshot {
   concurrencyLimit: number;
+  maxPending: number;
   active: number;
   pending: number;
   peakActive: number;
   peakPending: number;
   oldestPendingMs: number;
   submitted: number;
+  admitted: number;
+  rejected: number;
   started: number;
   completed: number;
   failed: number;
@@ -35,6 +38,8 @@ export class GitCommandRuntimeMetricsWindow {
   private peakActive = 0;
   private peakPending = 0;
   private submittedCount = 0;
+  private admittedCount = 0;
+  private rejectedCount = 0;
   private startedCount = 0;
   private completedCount = 0;
   private failedCount = 0;
@@ -46,14 +51,22 @@ export class GitCommandRuntimeMetricsWindow {
   constructor(
     private readonly concurrencyLimit: number,
     private readonly clock: Clock = Date.now,
+    private readonly maxPending = Number.MAX_SAFE_INTEGER,
   ) {}
 
   submit(operation: string): GitCommandRuntimeMetric {
     const metric = { queuedAtMs: this.clock(), startedAtMs: null };
     this.pendingCommands.add(metric);
     this.submittedCount += 1;
+    this.admittedCount += 1;
     this.operationCounts.set(operation, (this.operationCounts.get(operation) ?? 0) + 1);
     return metric;
+  }
+
+  reject(operation: string): void {
+    this.submittedCount += 1;
+    this.rejectedCount += 1;
+    this.operationCounts.set(operation, (this.operationCounts.get(operation) ?? 0) + 1);
   }
 
   observeLimiter(active: number, pending: number): void {
@@ -99,6 +112,7 @@ export class GitCommandRuntimeMetricsWindow {
     );
     const snapshot: GitCommandRuntimeMetricsSnapshot = {
       concurrencyLimit: this.concurrencyLimit,
+      maxPending: this.maxPending,
       active: limiter.active,
       pending: limiter.pending,
       peakActive: this.peakActive,
@@ -108,6 +122,8 @@ export class GitCommandRuntimeMetricsWindow {
           ? Math.max(0, now - oldestPendingAtMs)
           : 0,
       submitted: this.submittedCount,
+      admitted: this.admittedCount,
+      rejected: this.rejectedCount,
       started: this.startedCount,
       completed: this.completedCount,
       failed: this.failedCount,
@@ -122,6 +138,8 @@ export class GitCommandRuntimeMetricsWindow {
     this.peakActive = limiter.active;
     this.peakPending = limiter.pending;
     this.submittedCount = 0;
+    this.admittedCount = 0;
+    this.rejectedCount = 0;
     this.startedCount = 0;
     this.completedCount = 0;
     this.failedCount = 0;

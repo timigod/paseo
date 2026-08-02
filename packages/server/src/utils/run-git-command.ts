@@ -11,10 +11,17 @@ import { spawnProcess } from "./spawn.js";
 const DEFAULT_TIMEOUT_MS = 30_000;
 const DEFAULT_MAX_OUTPUT_BYTES = 20 * 1024 * 1024; // 20MB
 const DEFAULT_STDERR_LIMIT = 2048;
+const DEFAULT_MAX_PENDING = 64;
 
-const gitConcurrency = parseInt(process.env.PASEO_GIT_CONCURRENCY ?? "8", 10) || 8;
+const gitConcurrency = parseIntegerEnv("PASEO_GIT_CONCURRENCY", 8, 1);
+const gitMaxPending = parseIntegerEnv("PASEO_GIT_MAX_PENDING", DEFAULT_MAX_PENDING, 0);
 const gitLimit = pLimit(gitConcurrency);
-const gitRuntimeMetrics = new GitCommandRuntimeMetricsWindow(gitConcurrency);
+const gitRuntimeMetrics = new GitCommandRuntimeMetricsWindow(
+  gitConcurrency,
+  Date.now,
+  gitMaxPending,
+);
+const admittedGitCommands = new Set<Promise<unknown>>();
 
 export interface GitCommandOptions {
   cwd: string;
@@ -50,6 +57,21 @@ export interface GitCommandMetricsSnapshot {
   total: number;
   failed: number;
   maxConcurrent: number;
+}
+
+export class GitCommandBackpressureError extends Error {
+  readonly kind = "git-command-backpressure";
+  readonly retryable = true;
+
+  constructor(
+    readonly active: number,
+    readonly pending: number,
+    readonly concurrencyLimit: number,
+    readonly maxPending: number,
+  ) {
+    super(`Git command queue is full (${pending}/${maxPending} pending)`);
+    this.name = "GitCommandBackpressureError";
+  }
 }
 
 interface GitCommandMetricsState {
@@ -92,6 +114,13 @@ export function snapshotGitCommandRuntimeMetrics(): GitCommandRuntimeMetricsSnap
     active: gitLimit.activeCount,
     pending: gitLimit.pendingCount,
   });
+}
+
+/** Wait for all commands admitted before and during the drain to leave the global executor. */
+export async function drainGitCommands(): Promise<void> {
+  while (admittedGitCommands.size > 0) {
+    await Promise.allSettled(admittedGitCommands);
+  }
 }
 
 function beginGitCommandMetric(): GitCommandMetricsState | null {
@@ -174,7 +203,21 @@ export function runGitCommand(
   args: string[],
   options: GitCommandOptions,
 ): Promise<GitCommandResult> {
-  const runtimeMetric = gitRuntimeMetrics.submit(getGitOperation(args));
+  const operation = getGitOperation(args);
+  if (gitLimit.activeCount >= gitConcurrency && gitLimit.pendingCount >= gitMaxPending) {
+    gitRuntimeMetrics.reject(operation);
+    gitRuntimeMetrics.observeLimiter(gitLimit.activeCount, gitLimit.pendingCount);
+    return Promise.reject(
+      new GitCommandBackpressureError(
+        gitLimit.activeCount,
+        gitLimit.pendingCount,
+        gitConcurrency,
+        gitMaxPending,
+      ),
+    );
+  }
+
+  const runtimeMetric = gitRuntimeMetrics.submit(operation);
   let started = false;
   const promise = gitLimit(() => {
     started = true;
@@ -400,6 +443,11 @@ export function runGitCommand(
       });
     });
   });
+  admittedGitCommands.add(promise);
+  void promise.then(
+    () => admittedGitCommands.delete(promise),
+    () => admittedGitCommands.delete(promise),
+  );
   gitRuntimeMetrics.observeLimiter(gitLimit.activeCount, gitLimit.pendingCount);
   return waitForGitCommand(promise, options.signal, args, () => started);
 }
@@ -410,4 +458,9 @@ function formatGitCommand(args: readonly string[]): string {
 
 function getGitOperation(args: string[]): string {
   return args[0] === "-c" ? (args[2] ?? "unknown") : (args[0] ?? "unknown");
+}
+
+function parseIntegerEnv(name: string, fallback: number, minimum: number): number {
+  const parsed = Number.parseInt(process.env[name] ?? "", 10);
+  return Number.isInteger(parsed) && parsed >= minimum ? parsed : fallback;
 }

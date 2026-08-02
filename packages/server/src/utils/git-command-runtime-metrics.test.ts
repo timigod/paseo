@@ -22,6 +22,8 @@ describe("GitCommandRuntimeMetricsWindow", () => {
 
     expect(metrics.snapshotAndReset()).toMatchObject({
       submitted: 1,
+      admitted: 1,
+      rejected: 0,
       started: 1,
       completed: 1,
       failed: 0,
@@ -48,6 +50,8 @@ describe("GitCommandRuntimeMetricsWindow", () => {
       peakPending: 1,
       oldestPendingMs: 25,
       submitted: 2,
+      admitted: 2,
+      rejected: 0,
       started: 1,
     });
 
@@ -64,11 +68,33 @@ describe("GitCommandRuntimeMetricsWindow", () => {
       peakActive: 1,
       peakPending: 1,
       submitted: 0,
+      admitted: 0,
+      rejected: 0,
       started: 1,
       completed: 2,
       failed: 1,
       timedOut: 1,
       queueWaitMs: { count: 1, p50Ms: 35, p95Ms: 35, maxMs: 35 },
+    });
+  });
+
+  test("separates rejected admission attempts from admitted commands", () => {
+    const { metrics } = createMetricsWindow(1);
+    const admitted = metrics.submit("status");
+    metrics.reject("rev-parse");
+    metrics.start(admitted);
+    metrics.finish(admitted, { success: true, timedOut: false });
+
+    expect(metrics.snapshotAndReset()).toMatchObject({
+      submitted: 2,
+      admitted: 1,
+      rejected: 1,
+      started: 1,
+      completed: 1,
+      operationsTop: [
+        ["rev-parse", 1],
+        ["status", 1],
+      ],
     });
   });
 });

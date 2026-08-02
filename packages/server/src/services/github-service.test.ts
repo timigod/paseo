@@ -3635,6 +3635,49 @@ describe("ForgeService", () => {
     expect(runner.calls).toHaveLength(0);
   });
 
+  it("shares missing gh capability across targets and recovers after the cooldown", async () => {
+    let now = 100;
+    const resolveGhPath = vi
+      .fn<() => Promise<string | null>>()
+      .mockResolvedValueOnce(null)
+      .mockResolvedValue("/usr/bin/gh");
+    const runner = createRunner([pullRequestJson("Recovered")]);
+    const service = createGitHubService({
+      missingCliTtlMs: 50,
+      runner: runner.runner,
+      resolveGhPath,
+      resolveRepoHost: async () => null,
+      now: () => now,
+    });
+
+    const outcomes = await Promise.allSettled(
+      Array.from({ length: 120 }, (_, index) =>
+        service.listPullRequests({ cwd: `/repo-${index}`, query: `target-${index}` }),
+      ),
+    );
+
+    expect(
+      outcomes.every(
+        (outcome) =>
+          outcome.status === "rejected" && outcome.reason instanceof GitHubCliMissingError,
+      ),
+    ).toBe(true);
+    expect(resolveGhPath).toHaveBeenCalledTimes(1);
+    expect(runner.calls).toHaveLength(0);
+
+    await expect(service.listPullRequests({ cwd: "/another-repo" })).rejects.toBeInstanceOf(
+      GitHubCliMissingError,
+    );
+    expect(resolveGhPath).toHaveBeenCalledTimes(1);
+
+    now += 51;
+    await expect(service.listPullRequests({ cwd: "/recovered-repo" })).resolves.toEqual([
+      expect.objectContaining({ title: "Recovered" }),
+    ]);
+    expect(resolveGhPath).toHaveBeenCalledTimes(2);
+    expect(runner.calls).toHaveLength(1);
+  });
+
   it("throws a typed auth error for authentication failures", async () => {
     const service = createGitHubService({
       runner: async () => {
