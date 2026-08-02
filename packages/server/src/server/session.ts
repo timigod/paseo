@@ -4339,6 +4339,9 @@ export class Session {
       aheadBehind: snapshot.git.aheadBehind,
       aheadOfOrigin: snapshot.git.aheadOfOrigin,
       behindOfOrigin: snapshot.git.behindOfOrigin,
+      ...(this.workspaceGitService.isSnapshotStale?.(snapshot.cwd) === true
+        ? { isStale: true }
+        : {}),
     };
   }
 
@@ -4349,6 +4352,9 @@ export class Session {
       featuresEnabled: snapshot.forge.featuresEnabled,
       pullRequest: snapshot.forge.pullRequest,
       error: snapshot.forge.error,
+      ...(this.workspaceGitService.isSnapshotStale?.(snapshot.cwd) === true
+        ? { isStale: true }
+        : {}),
     };
   }
 

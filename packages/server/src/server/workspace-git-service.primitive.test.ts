@@ -496,7 +496,9 @@ describe("WorkspaceGitServiceImpl primitive refresh entrypoint", () => {
 
     await flushPromises();
 
-    expect(getCheckoutStatus).toHaveBeenCalledTimes(1);
+    await vi.waitFor(() => {
+      expect(getCheckoutStatus).toHaveBeenCalledTimes(1);
+    });
     expect(service.peekSnapshot(REPO_CWD)).toBeNull();
 
     checkoutStatusDeferred.resolve(createCheckoutStatus(REPO_CWD));
@@ -780,7 +782,7 @@ describe("WorkspaceGitServiceImpl primitive refresh entrypoint", () => {
     service.dispose();
   });
 
-  test("ref-watch firing during an in-flight forced refresh does not produce an extra shell burst", async () => {
+  test("ref-watch firing during an in-flight forced refresh queues one later shell burst", async () => {
     const forcedRefresh = createDeferred<CheckoutStatusGit>();
     const getCheckoutStatus = vi
       .fn<() => Promise<CheckoutStatusGit>>()
@@ -798,7 +800,9 @@ describe("WorkspaceGitServiceImpl primitive refresh entrypoint", () => {
     forcedRefresh.resolve(createCheckoutStatus(REPO_CWD));
     await forcePromise;
 
-    expect(getCheckoutStatus).toHaveBeenCalledTimes(2);
+    await vi.waitFor(() => {
+      expect(getCheckoutStatus).toHaveBeenCalledTimes(3);
+    });
 
     service.dispose();
   });
