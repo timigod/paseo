@@ -248,6 +248,115 @@ describe("agent MCP end-to-end (offline)", () => {
     }
   }, 30_000);
 
+  test("default passwordless top-level MCP can archive, kill, and archive a workspace", async () => {
+    const paseoHome = await mkdtemp(path.join(os.tmpdir(), "paseo-home-"));
+    const staticDir = await mkdtemp(path.join(os.tmpdir(), "paseo-static-"));
+    const archiveAgentCwd = await mkdtemp(path.join(os.tmpdir(), "paseo-archive-agent-"));
+    const killAgentCwd = await mkdtemp(path.join(os.tmpdir(), "paseo-kill-agent-"));
+    const workspaceCwd = await mkdtemp(path.join(os.tmpdir(), "paseo-archive-workspace-"));
+    const port = await getAvailablePort();
+    const daemon = await createPaseoDaemon(
+      {
+        listen: `127.0.0.1:${port}`,
+        paseoHome,
+        corsAllowedOrigins: [],
+        hostnames: true,
+        mcpEnabled: true,
+        staticDir,
+        mcpDebug: false,
+        agentClients: createTestAgentClients(),
+        agentStoragePath: path.join(paseoHome, "agents"),
+      },
+      pino({ level: "silent" }),
+    );
+    await daemon.start();
+    const client = await createMcpClient(`http://127.0.0.1:${port}/mcp/agents`);
+    let agentScopedClient: McpClient | null = null;
+
+    const createAgent = async (cwd: string, title: string): Promise<string> => {
+      const result = await client.callTool({
+        name: "create_agent",
+        args: {
+          cwd,
+          title,
+          provider: "claude/claude-test-model",
+          mode: "bypassPermissions",
+          initialPrompt: "reply with done and stop",
+          background: true,
+        },
+      });
+      expect(result.isError).not.toBe(true);
+      const agentId = getStructuredContent(result)?.agentId;
+      if (typeof agentId !== "string") throw new Error("Expected create_agent agentId");
+      return agentId;
+    };
+
+    try {
+      const archiveAgentId = await createAgent(archiveAgentCwd, "Passwordless archive target");
+      const killAgentId = await createAgent(killAgentCwd, "Passwordless kill target");
+
+      const callerIdentity = daemon.agentManager.getAgentCallerIdentity(archiveAgentId);
+      if (!callerIdentity) throw new Error("Expected current passwordless MCP caller identity");
+      const agentScopedUrl = new URL(`http://127.0.0.1:${port}/mcp/agents`);
+      agentScopedUrl.searchParams.set("callerAgentId", callerIdentity.agentId);
+      agentScopedUrl.searchParams.set("callerAgentIncarnation", callerIdentity.incarnation);
+      agentScopedClient = await createMcpClient(agentScopedUrl.toString());
+      const selfArchiveResult = await agentScopedClient.callTool({
+        name: "archive_agent",
+        args: { agentId: archiveAgentId },
+      });
+      expect(selfArchiveResult.isError).toBe(true);
+      expect(daemon.agentManager.getAgent(archiveAgentId)).not.toBeNull();
+
+      const archiveAgentResult = await client.callTool({
+        name: "archive_agent",
+        args: { agentId: archiveAgentId },
+      });
+      expect(archiveAgentResult.isError).not.toBe(true);
+      expect(daemon.agentManager.getAgent(archiveAgentId)).toBeNull();
+
+      const killAgentResult = await client.callTool({
+        name: "kill_agent",
+        args: { agentId: killAgentId },
+      });
+      expect(killAgentResult.isError).not.toBe(true);
+      expect(daemon.agentManager.getAgent(killAgentId)).toBeNull();
+
+      const createWorkspaceResult = await client.callTool({
+        name: "create_workspace",
+        args: { isolation: "local", path: workspaceCwd },
+      });
+      expect(createWorkspaceResult.isError).not.toBe(true);
+      const workspaceId = getStructuredContent(createWorkspaceResult)?.workspaceId;
+      if (typeof workspaceId !== "string") {
+        throw new Error("Expected create_workspace workspaceId");
+      }
+
+      const archiveWorkspaceResult = await client.callTool({
+        name: "archive_workspace",
+        args: { workspaceId },
+      });
+      expect(archiveWorkspaceResult.isError).not.toBe(true);
+      const listResult = await client.callTool({ name: "list_workspaces", args: {} });
+      const workspaces = getStructuredContent(listResult)?.workspaces;
+      expect(Array.isArray(workspaces)).toBe(true);
+      expect(
+        (workspaces as Array<{ workspaceId?: string }>).some(
+          (workspace) => workspace.workspaceId === workspaceId,
+        ),
+      ).toBe(false);
+    } finally {
+      await agentScopedClient?.close();
+      await client.close();
+      await daemon.stop();
+      await Promise.all(
+        [paseoHome, staticDir, archiveAgentCwd, killAgentCwd, workspaceCwd].map((target) =>
+          rm(target, { recursive: true, force: true }),
+        ),
+      );
+    }
+  }, 30_000);
+
   test("password-protected daemon authorizes the agent MCP via the capability token", async () => {
     const paseoHome = await mkdtemp(path.join(os.tmpdir(), "paseo-home-"));
     const staticDir = await mkdtemp(path.join(os.tmpdir(), "paseo-static-"));

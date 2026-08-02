@@ -2,9 +2,12 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
-import { afterEach, describe, expect, test } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 
 import { DaemonClient, createTestPaseoDaemon } from "./test-utils/index.js";
+import { AgentManager } from "./agent/agent-manager.js";
+import { FileBackedWorkspaceRegistry } from "./workspace-registry.js";
+import { VoiceAssistantWebSocketServer } from "./websocket-server.js";
 
 const SHARED_SECRET_HASH = "$2b$12$GMhF7pN4QnMlHOQXOqjd1OitKWPSmAO3FwB0PHzKtcZR/sAMryz76";
 const cleanupPaths: string[] = [];
@@ -38,6 +41,36 @@ async function createManagedAgent(
 }
 
 describe("destructive authority over real WebSocket execution paths", () => {
+  test("grants default passwordless app and CLI connections coordinator authority", async () => {
+    const daemon = await createTestPaseoDaemon();
+    const cwd = createCwd();
+    const cliTarget = await createManagedAgent(daemon, cwd);
+    const appTarget = await createManagedAgent(daemon, cwd);
+    const cli = new DaemonClient({
+      url: `ws://127.0.0.1:${daemon.port}/ws`,
+      clientId: "default-passwordless-cli",
+      clientType: "cli",
+      reconnect: { enabled: false },
+    });
+    const app = new DaemonClient({
+      url: `ws://127.0.0.1:${daemon.port}/ws`,
+      clientId: "default-passwordless-app",
+      clientType: "browser",
+      reconnect: { enabled: false },
+    });
+
+    try {
+      await Promise.all([cli.connect(), app.connect()]);
+      await expect(cli.archiveAgent(cliTarget.id)).resolves.toHaveProperty("archivedAt");
+      await expect(app.deleteAgent(appTarget.id)).resolves.toBeUndefined();
+      expect(daemon.daemon.agentManager.getAgent(cliTarget.id)).toBeNull();
+      expect(daemon.daemon.agentManager.getAgent(appTarget.id)).toBeNull();
+    } finally {
+      await Promise.all([cli.close(), app.close()]);
+      await daemon.close();
+    }
+  });
+
   test("binds agent and coordinator authority to the physical connection", async () => {
     const daemon = await createTestPaseoDaemon({
       auth: { password: SHARED_SECRET_HASH },
@@ -100,33 +133,148 @@ describe("destructive authority over real WebSocket execution paths", () => {
     }
   });
 
-  test("fails closed for unauthenticated raw and partial legacy callers", async () => {
+  test("fails closed for partial and JSON-forged caller claims", async () => {
     const daemon = await createTestPaseoDaemon();
     const cwd = createCwd();
-    const target = await createManagedAgent(daemon, cwd);
-    const rawClient = new DaemonClient({
-      url: `ws://127.0.0.1:${daemon.port}/ws`,
-      clientId: "raw-legacy-connection",
-      clientType: "browser",
-      reconnect: { enabled: false },
-    });
+    const partialTarget = await createManagedAgent(daemon, cwd);
+    const forgedTarget = await createManagedAgent(daemon, cwd);
     const partialAgentClient = new DaemonClient({
       url: `ws://127.0.0.1:${daemon.port}/ws`,
       clientId: "partial-agent-connection",
-      callerAgent: { agentId: target.id },
+      clientType: "browser",
+      callerAgent: { agentId: partialTarget.id },
+      reconnect: { enabled: false },
+    });
+    const forgedCoordinatorClient = new DaemonClient({
+      url: `ws://127.0.0.1:${daemon.port}/ws`,
+      clientId: "json-forged-coordinator-connection",
+      callerAgent: { kind: "coordinator" } as unknown as {
+        agentId?: string;
+        incarnation?: string;
+      },
       reconnect: { enabled: false },
     });
 
     try {
-      await Promise.all([rawClient.connect(), partialAgentClient.connect()]);
-      await expect(rawClient.archiveAgent(target.id)).rejects.toThrow("INVALID_CALLER_IDENTITY");
-      await expect(partialAgentClient.deleteAgent(target.id)).rejects.toThrow(
+      await Promise.all([partialAgentClient.connect(), forgedCoordinatorClient.connect()]);
+      await expect(partialAgentClient.deleteAgent(partialTarget.id)).rejects.toThrow(
         "INVALID_CALLER_IDENTITY",
       );
-      expect(daemon.daemon.agentManager.getAgent(target.id)).not.toBeNull();
+      await expect(forgedCoordinatorClient.archiveAgent(forgedTarget.id)).rejects.toThrow(
+        "INVALID_CALLER_IDENTITY",
+      );
+      expect(daemon.daemon.agentManager.getAgent(partialTarget.id)).not.toBeNull();
+      expect(daemon.daemon.agentManager.getAgent(forgedTarget.id)).not.toBeNull();
     } finally {
-      await Promise.all([rawClient.close(), partialAgentClient.close()]);
+      await Promise.all([partialAgentClient.close(), forgedCoordinatorClient.close()]);
       await daemon.close();
     }
   });
+
+  test("disconnect during a deferred workspace lookup revokes authority before mutation", async () => {
+    const originalList = FileBackedWorkspaceRegistry.prototype.list;
+    const originalArchive = FileBackedWorkspaceRegistry.prototype.archive;
+    const originalListAgents = AgentManager.prototype.listAgents;
+    const webSocketServerPrototype = VoiceAssistantWebSocketServer.prototype as unknown as {
+      revokeSocketDestructiveCaller(socket: unknown): void;
+    };
+    const originalRevokeSocketDestructiveCaller =
+      webSocketServerPrototype.revokeSocketDestructiveCaller;
+    let deferNextWorkspaceList = false;
+    let releaseLookup = () => {};
+    let markLookupStarted = () => {};
+    let markAuthorizationReached = () => {};
+    let authorizationWaitArmed = false;
+    const lookupGate = new Promise<void>((resolve) => {
+      releaseLookup = resolve;
+    });
+    const lookupStarted = new Promise<void>((resolve) => {
+      markLookupStarted = resolve;
+    });
+    const authorizationReached = new Promise<void>((resolve) => {
+      markAuthorizationReached = resolve;
+    });
+    const listSpy = vi
+      .spyOn(FileBackedWorkspaceRegistry.prototype, "list")
+      .mockImplementation(async function () {
+        const stack = new Error().stack ?? "";
+        if (
+          deferNextWorkspaceList &&
+          (stack.includes("requireActiveWorkspaceForArchive") ||
+            stack.includes("handleArchiveWorkspaceRequest"))
+        ) {
+          deferNextWorkspaceList = false;
+          markLookupStarted();
+          await lookupGate;
+        }
+        return originalList.call(this);
+      });
+    const archiveSpy = vi
+      .spyOn(FileBackedWorkspaceRegistry.prototype, "archive")
+      .mockImplementation(function (workspaceId, archivedAt) {
+        return originalArchive.call(this, workspaceId, archivedAt);
+      });
+    const listAgentsSpy = vi
+      .spyOn(AgentManager.prototype, "listAgents")
+      .mockImplementation(function () {
+        const agents = originalListAgents.call(this);
+        if (authorizationWaitArmed) {
+          authorizationWaitArmed = false;
+          setImmediate(markAuthorizationReached);
+        }
+        return agents;
+      });
+    const revokeSocketSpy = vi
+      .spyOn(webSocketServerPrototype, "revokeSocketDestructiveCaller")
+      .mockImplementation(function (socket) {
+        return originalRevokeSocketDestructiveCaller.call(this, socket);
+      });
+    const daemon = await createTestPaseoDaemon();
+    const cwd = createCwd();
+    const client = new DaemonClient({
+      url: `ws://127.0.0.1:${daemon.port}/ws`,
+      clientId: "disconnect-deferred-workspace-lookup",
+      reconnect: { enabled: false },
+    });
+    const observer = new DaemonClient({
+      url: `ws://127.0.0.1:${daemon.port}/ws`,
+      clientId: "disconnect-deferred-workspace-observer",
+      reconnect: { enabled: false },
+    });
+
+    try {
+      await client.connect();
+      const created = await client.createWorkspace({
+        source: { kind: "directory", path: cwd },
+        title: "Deferred disconnect target",
+      });
+      const workspaceId = created.workspace?.id;
+      if (!workspaceId) throw new Error(created.error ?? "Expected created workspace");
+
+      archiveSpy.mockClear();
+      revokeSocketSpy.mockClear();
+      deferNextWorkspaceList = true;
+      const archiveResult = client.archiveWorkspace(workspaceId).catch((error) => error as Error);
+      await lookupStarted;
+      await client.close();
+      await expect.poll(() => revokeSocketSpy.mock.calls.length).toBeGreaterThan(0);
+      authorizationWaitArmed = true;
+      releaseLookup();
+      await authorizationReached;
+
+      expect(archiveSpy).not.toHaveBeenCalled();
+      await observer.connect();
+      const active = await observer.fetchWorkspaces();
+      expect(active.entries.map((workspace) => workspace.id)).toContain(workspaceId);
+      await expect(archiveResult).resolves.toBeInstanceOf(Error);
+    } finally {
+      releaseLookup();
+      await Promise.all([client.close(), observer.close()]);
+      await daemon.close();
+      revokeSocketSpy.mockRestore();
+      listAgentsSpy.mockRestore();
+      archiveSpy.mockRestore();
+      listSpy.mockRestore();
+    }
+  }, 30_000);
 });

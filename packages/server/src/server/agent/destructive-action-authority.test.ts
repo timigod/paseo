@@ -6,11 +6,14 @@ import {
   createCoordinatorDestructiveCaller,
   createUncertainDestructiveCaller,
   DestructiveActionAuthorizationError,
+  revokeDestructiveCaller,
 } from "./destructive-action-authority.js";
 
 interface FakeAgent {
   id: string;
   workspaceId?: string;
+  cwd?: string;
+  containmentPaths?: readonly string[];
 }
 
 class FakeLiveAgentAuthority {
@@ -152,5 +155,80 @@ describe("destructive action authority", () => {
     expect(() => assertDestructiveActionAuthorized(authority, forged, action)).toThrowError(
       DestructiveActionAuthorizationError,
     );
+  });
+
+  test("blocks a target containing the caller cwd or its canonical checkout root", () => {
+    const authority = liveAuthority();
+    authority.agents.set("agent-a", {
+      id: "agent-a",
+      cwd: "/managed/repo/packages/server",
+      containmentPaths: ["/managed/repo"],
+    });
+    const caller = createAgentDestructiveCaller({
+      agentId: "agent-a",
+      incarnation: "incarnation-a",
+    });
+
+    for (const targetPaths of [["/managed/repo"], ["/managed/repo/packages"]]) {
+      expect(() =>
+        assertDestructiveActionAuthorized(authority, caller, {
+          action: "workspace.archive",
+          targetAgentIds: [],
+          targetWorkspaceIds: ["legacy-workspace-without-agent-owner"],
+          targetPaths,
+          hasLiveTarget: true,
+        }),
+      ).toThrowError(DestructiveActionAuthorizationError);
+    }
+  });
+
+  test("allows an agent to target a different checkout", () => {
+    const authority = liveAuthority();
+    authority.agents.set("agent-a", {
+      id: "agent-a",
+      cwd: "/managed/repo-a/packages/server",
+      containmentPaths: ["/managed/repo-a"],
+    });
+    const caller = createAgentDestructiveCaller({
+      agentId: "agent-a",
+      incarnation: "incarnation-a",
+    });
+
+    expect(() =>
+      assertDestructiveActionAuthorized(authority, caller, {
+        action: "workspace.archive",
+        targetAgentIds: [],
+        targetWorkspaceIds: ["workspace-b"],
+        targetPaths: ["/managed/repo-b"],
+        hasLiveTarget: true,
+      }),
+    ).not.toThrow();
+  });
+
+  test("revokes a captured caller before a deferred destructive mutation resumes", async () => {
+    const authority = liveAuthority();
+    const caller = createCoordinatorDestructiveCaller();
+    let releaseLookup = () => {};
+    const lookup = new Promise<void>((resolve) => {
+      releaseLookup = resolve;
+    });
+    let mutated = false;
+
+    const operation = (async () => {
+      await lookup;
+      assertDestructiveActionAuthorized(authority, caller, {
+        action: "workspace.archive",
+        targetAgentIds: ["agent-b"],
+        targetWorkspaceIds: ["workspace-b"],
+        hasLiveTarget: true,
+      });
+      mutated = true;
+    })();
+
+    revokeDestructiveCaller(caller);
+    releaseLookup();
+
+    await expect(operation).rejects.toThrowError(DestructiveActionAuthorizationError);
+    expect(mutated).toBe(false);
   });
 });

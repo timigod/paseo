@@ -110,7 +110,7 @@ export interface PaseoToolHostDependencies {
   github?: ForgeService;
   workspaceGitService?: Pick<
     WorkspaceGitService,
-    "getSnapshot" | "listWorktrees" | "resolveRepoRoot"
+    "getCheckout" | "getSnapshot" | "listWorktrees" | "resolveRepoRoot"
   >;
   findWorkspaceIdForCwd?: ArchiveDependencies["findWorkspaceIdForCwd"];
   listActiveWorkspaces?: ArchiveDependencies["listActiveWorkspaces"];

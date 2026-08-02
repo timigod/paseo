@@ -85,15 +85,21 @@ imported, reloaded, or restored after daemon restart. Native tools retain the ca
 agent MCP URLs and provider-launched CLI connection hellos carry only the agent id and current
 incarnation. Those values identify the restricted caller but do not grant coordinator authority.
 The daemon rejects missing, incomplete, mismatched, or stale agent identity whenever the resolved
-target is live. Deprecated per-action caller fields remain parseable but are ignored.
+target is live. For restored or imported agents without `workspaceId`, the same fence compares the
+canonical caller cwd and Git worktree root with every target checkout, including symlink aliases and
+nested or sibling workspace paths. Deprecated per-action caller fields remain parseable but are
+ignored.
 
-External destructive authority is minted only inside the daemon after coordinator authentication
-(or an already authenticated relay/hub attachment). WebSocket authority is kept in a server-side map
-keyed by the physical connection, so a reconnect must establish it again; HTTP MCP authority is
-minted for the authenticated request and never returned to the caller. Neither form is serialized
-into provider environment variables, HTTP headers, or WebSocket messages. Unauthenticated CLI, MCP,
-browser, mobile, raw, and legacy connections therefore fail closed against live targets rather than
-being treated as coordinators.
+External destructive authority is minted only inside the daemon after a connection is accepted by
+the configured product policy: password validation when a daemon password exists, or the explicit
+passwordless policy otherwise (plus authenticated relay/hub attachments). WebSocket authority is
+kept in a server-side map keyed by the physical connection and revoked synchronously when that socket
+starts detaching, so a captured in-flight request cannot mutate after disconnect and a reconnect must
+establish authority again. Top-level HTTP MCP follows the same password/passwordless daemon policy;
+agent-scoped MCP claims remain restricted agents. Neither form is serialized into provider
+environment variables, HTTP headers, or WebSocket messages. Raw sockets outside the accepted product
+path, incomplete agent claims, and caller-supplied coordinator-shaped JSON fail closed against live
+targets.
 
 History navigation preserves the selected agent as an explicit recovery target. If both that agent
 and its workspace are archived, the workspace recovery action restores the workspace and unarchives

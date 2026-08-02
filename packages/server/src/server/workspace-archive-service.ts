@@ -54,7 +54,7 @@ export interface ArchiveDependencies {
   // Base directory that may hold worktrees across repositories.
   paseoWorktreesBaseRoot?: string;
   github: ForgeService;
-  workspaceGitService: Pick<WorkspaceGitService, "getSnapshot">;
+  workspaceGitService: Pick<WorkspaceGitService, "getCheckout" | "getSnapshot">;
   agentManager: Pick<AgentManager, "listAgents" | "archiveAgent" | "archiveSnapshot"> &
     Partial<Pick<AgentManager, "isCurrentAgentIncarnation">>;
   agentStorage: Pick<AgentStorage, "list">;
@@ -398,10 +398,10 @@ async function archiveResolvedTarget(
 ): Promise<ArchiveResult> {
   const targetWorkspaceIds = target.workspaceIds;
 
-  assertCallerCanArchive(
+  await assertCallerCanArchive(
     dependencies,
     request.caller,
-    targetWorkspaceIds,
+    target,
     request.scope.kind === "worktree" ? "worktree.archive" : "workspace.archive",
   );
 
@@ -468,20 +468,48 @@ async function archiveResolvedTarget(
   }
 }
 
-function assertCallerCanArchive(
-  dependencies: Pick<ArchiveDependencies, "agentManager">,
+async function assertCallerCanArchive(
+  dependencies: Pick<ArchiveDependencies, "agentManager" | "workspaceGitService">,
   caller: ArchiveCallerContext | undefined,
-  targetWorkspaceIds: string[],
+  target: ArchiveTarget,
   action: "workspace.archive" | "worktree.archive",
-): void {
+): Promise<void> {
   if (!caller) {
     return;
   }
   const liveAgents = dependencies.agentManager.listAgents();
+  const targetWorkspaceIds = target.workspaceIds;
+  const callerAgent =
+    caller.kind === "agent"
+      ? (liveAgents.find((agent) => agent.id === caller.identity.agentId) ?? null)
+      : null;
+  const callerContainmentPaths = callerAgent
+    ? await resolveGitCheckoutContainmentPaths(dependencies.workspaceGitService, [callerAgent.cwd])
+    : [];
+  const targetPaths = callerAgent
+    ? [
+        ...(target.backing ? [target.backing.path] : []),
+        ...target.teardownTargets.map((teardownTarget) => teardownTarget.cwd),
+        ...(await resolveGitCheckoutContainmentPaths(
+          dependencies.workspaceGitService,
+          target.teardownTargets.map((teardownTarget) => teardownTarget.cwd),
+        )),
+      ]
+    : [];
   try {
     assertDestructiveActionAuthorized(
       {
-        getAgent: (agentId) => liveAgents.find((agent) => agent.id === agentId) ?? null,
+        getAgent: (agentId) => {
+          const agent = liveAgents.find((candidate) => candidate.id === agentId);
+          return agent
+            ? {
+                id: agent.id,
+                workspaceId: agent.workspaceId,
+                cwd: agent.cwd,
+                containmentPaths: agent.id === callerAgent?.id ? callerContainmentPaths : [],
+              }
+            : null;
+        },
         isCurrentAgentIncarnation: (agentId, incarnation) =>
           dependencies.agentManager.isCurrentAgentIncarnation?.(agentId, incarnation) === true,
       },
@@ -492,6 +520,7 @@ function assertCallerCanArchive(
           .filter((agent) => agent.workspaceId && targetWorkspaceIds.includes(agent.workspaceId))
           .map((agent) => agent.id),
         targetWorkspaceIds,
+        targetPaths,
         hasLiveTarget: targetWorkspaceIds.length > 0,
       },
     );
@@ -501,6 +530,19 @@ function assertCallerCanArchive(
     }
     throw error;
   }
+}
+
+async function resolveGitCheckoutContainmentPaths(
+  workspaceGitService: Pick<WorkspaceGitService, "getCheckout">,
+  cwds: readonly string[],
+): Promise<string[]> {
+  const roots = await Promise.all(
+    Array.from(new Set(cwds)).map(async (cwd) => {
+      const checkout = await workspaceGitService.getCheckout(cwd);
+      return checkout.isGit ? checkout.worktreeRoot : null;
+    }),
+  );
+  return Array.from(new Set(roots.filter((root): root is string => typeof root === "string")));
 }
 
 async function resolveArchiveTarget(

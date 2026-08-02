@@ -109,9 +109,19 @@ import { z } from "zod";
 import { VoiceAssistantWebSocketServer } from "./websocket-server";
 import { parseServerInfoStatusPayload } from "./messages.js";
 import type { SpeechReadinessSnapshot } from "./speech/speech-runtime.js";
+import {
+  assertDestructiveActionAuthorized,
+  DestructiveActionAuthorizationError,
+  type DestructiveCallerContext,
+} from "./agent/destructive-action-authority.js";
 
 interface WebSocketServerInternals {
-  attachSocket(ws: unknown, req: unknown): Promise<void>;
+  attachSocket(
+    ws: unknown,
+    req: unknown,
+    metadata?: unknown,
+    authenticated?: boolean,
+  ): Promise<void>;
 }
 
 const TEST_DAEMON_VERSION = "1.2.3-test";
@@ -535,6 +545,75 @@ describe("relay external socket reconnect behavior", () => {
       [CLIENT_CAPS.reasoningMergeEnum]: true,
     });
 
+    await server.close();
+  });
+
+  test("does not grant coordinator authority to a raw socket attached outside product policy", async () => {
+    const server = createServer();
+    const socket = new MockSocket();
+
+    await attachDirectAndHello({ server, socket, clientId: "raw-test-only-socket" });
+    const resolveDestructiveCaller = sessionMock.instances[0].args.resolveDestructiveCaller as (
+      source: object,
+    ) => DestructiveCallerContext;
+    const caller = resolveDestructiveCaller(socket);
+
+    expect(() =>
+      assertDestructiveActionAuthorized(
+        {
+          getAgent: () => ({ id: "target-agent", workspaceId: "target-workspace" }),
+          isCurrentAgentIncarnation: () => true,
+        },
+        caller,
+        {
+          action: "agent.archive",
+          targetAgentIds: ["target-agent"],
+          targetWorkspaceIds: [],
+          hasLiveTarget: true,
+        },
+      ),
+    ).toThrowError(DestructiveActionAuthorizationError);
+
+    await server.close();
+  });
+
+  test("revokes a captured socket caller before a deferred workspace lookup can mutate", async () => {
+    const server = createServer();
+    const socket = new MockSocket();
+    await attachRelayAndHello({ server, socket, clientId: "disconnect-during-workspace-lookup" });
+    const resolveDestructiveCaller = sessionMock.instances[0].args.resolveDestructiveCaller as (
+      source: object,
+    ) => DestructiveCallerContext;
+    const caller = resolveDestructiveCaller(socket);
+    let releaseLookup = () => {};
+    const lookup = new Promise<void>((resolve) => {
+      releaseLookup = resolve;
+    });
+    let mutated = false;
+
+    const operation = (async () => {
+      await lookup;
+      assertDestructiveActionAuthorized(
+        {
+          getAgent: () => ({ id: "target-agent", workspaceId: "target-workspace" }),
+          isCurrentAgentIncarnation: () => true,
+        },
+        caller,
+        {
+          action: "workspace.archive",
+          targetAgentIds: ["target-agent"],
+          targetWorkspaceIds: ["target-workspace"],
+          hasLiveTarget: true,
+        },
+      );
+      mutated = true;
+    })();
+
+    socket.emit("close", 1006, "");
+    releaseLookup();
+
+    await expect(operation).rejects.toThrowError(DestructiveActionAuthorizationError);
+    expect(mutated).toBe(false);
     await server.close();
   });
 

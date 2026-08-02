@@ -2271,11 +2271,20 @@ describe("handlePaseoWorktreeArchiveRequest worktree scope", () => {
         paseoHome: path.join(tempDir, ".paseo"),
         github: createGitHubServiceStub(),
         workspaceGitService: {
+          getCheckout: vi.fn(async (cwd: string) => ({
+            cwd,
+            isGit: true as const,
+            currentBranch: "main",
+            remoteUrl: null,
+            worktreeRoot: repoDir,
+            isPaseoOwnedWorktree: false as const,
+            mainRepoRoot: null,
+          })),
           getSnapshot: vi.fn(async () => null),
           listWorktrees: vi.fn(async () => []),
         },
         agentManager: {
-          listAgents: () => [{ id: agentId, workspaceId } as ManagedAgent],
+          listAgents: () => [{ id: agentId, workspaceId, cwd: repoDir } as ManagedAgent],
           archiveAgent: vi.fn(async () => ({ archivedAt: new Date().toISOString() })),
           archiveSnapshot: vi.fn(async () => ({})),
           isCurrentAgentIncarnation: (candidateAgentId, incarnation) =>

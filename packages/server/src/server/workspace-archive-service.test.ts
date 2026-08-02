@@ -169,8 +169,9 @@ interface ArchiveDepsInput {
   activeWorkspaces: ActiveWorkspaceRef[];
   paseoWorktreesBaseRoot?: string;
   findWorkspaceIdForCwd?: (cwd: string) => Promise<string | null>;
-  liveAgents?: Array<{ id: string; workspaceId?: string }>;
+  liveAgents?: Array<{ id: string; workspaceId?: string; cwd?: string }>;
   incarnations?: Record<string, string>;
+  checkoutRootForCwd?: (cwd: string) => string | null;
 }
 
 interface ArchiveTestDependencies extends ArchiveDependencies {
@@ -191,7 +192,29 @@ function createArchiveDeps(input: ArchiveDepsInput): ArchiveTestDependencies {
     github: createGitHubServiceStub(),
     workspaceGitService: {
       getSnapshot: vi.fn(async () => null),
-    } as unknown as Pick<WorkspaceGitService, "getSnapshot">,
+      getCheckout: vi.fn(async (cwd: string) => {
+        const worktreeRoot = input.checkoutRootForCwd?.(cwd) ?? null;
+        return worktreeRoot
+          ? {
+              cwd,
+              isGit: true as const,
+              currentBranch: "test",
+              remoteUrl: null,
+              worktreeRoot,
+              isPaseoOwnedWorktree: false as const,
+              mainRepoRoot: null,
+            }
+          : {
+              cwd,
+              isGit: false as const,
+              currentBranch: null,
+              remoteUrl: null,
+              worktreeRoot: null,
+              isPaseoOwnedWorktree: false as const,
+              mainRepoRoot: null,
+            };
+      }),
+    } as Pick<WorkspaceGitService, "getSnapshot" | "getCheckout">,
     agentManager: {
       listAgents: () => (input.liveAgents ?? []) as ManagedAgent[],
       archiveAgent: vi.fn(async (agentId: string) => {
@@ -573,15 +596,19 @@ describe("archiveByScope", () => {
 
   test("allows a verified agent to archive a different workspace", async () => {
     const { tempDir } = createGitRepo();
+    const callerCwd = path.join(tempDir, "caller-checkout");
+    const targetCwd = path.join(tempDir, "target-checkout");
+    mkdirSync(callerCwd, { recursive: true });
+    mkdirSync(targetCwd, { recursive: true });
     const callerWorkspaceId = "ws-caller";
     const targetWorkspaceId = "ws-target";
     const deps = createArchiveDeps({
       paseoHome: path.join(tempDir, ".paseo"),
       activeWorkspaces: [
-        { workspaceId: callerWorkspaceId, cwd: tempDir, kind: "local_checkout" },
-        { workspaceId: targetWorkspaceId, cwd: tempDir, kind: "local_checkout" },
+        { workspaceId: callerWorkspaceId, cwd: callerCwd, kind: "local_checkout" },
+        { workspaceId: targetWorkspaceId, cwd: targetCwd, kind: "local_checkout" },
       ],
-      liveAgents: [{ id: "agent-caller", workspaceId: callerWorkspaceId }],
+      liveAgents: [{ id: "agent-caller", workspaceId: callerWorkspaceId, cwd: callerCwd }],
     });
 
     const result = await archiveByScope(deps, {
@@ -679,6 +706,74 @@ describe("archiveByScope", () => {
     ).rejects.toBeInstanceOf(WorkspaceArchiveError);
     expect(deps.markWorkspaceArchiving).not.toHaveBeenCalled();
     expect(existsSync(worktree.worktreePath)).toBe(true);
+  });
+
+  test("blocks a restored agent without workspaceId from archiving its cwd through a symlink", async () => {
+    const { tempDir, repoDir } = createGitRepo();
+    const paseoHome = path.join(tempDir, ".paseo");
+    const worktree = await createPaseoOwnedWorktree(repoDir, paseoHome, "legacy-cwd-self-archive");
+    const callerCwd = path.join(worktree.worktreePath, "packages", "server");
+    mkdirSync(callerCwd, { recursive: true });
+    const symlinkPath = path.join(tempDir, "legacy-worktree-alias");
+    symlinkSync(worktree.worktreePath, symlinkPath);
+    const workspaceId = "ws-legacy-cwd-self-archive";
+    const agentId = "agent-legacy-cwd";
+    const deps = createArchiveDeps({
+      paseoHome,
+      activeWorkspaces: [
+        {
+          workspaceId,
+          cwd: worktree.worktreePath,
+          kind: "worktree",
+          worktreeRoot: worktree.worktreePath,
+          isPaseoOwnedWorktree: true,
+        },
+      ],
+      liveAgents: [{ id: agentId, cwd: callerCwd }],
+      checkoutRootForCwd: () => worktree.worktreePath,
+    });
+
+    await expect(
+      archiveByScope(deps, {
+        scope: { kind: "worktree", targetPath: symlinkPath },
+        requestId: "req-legacy-cwd-self-archive",
+        caller: createAgentDestructiveCaller({
+          agentId,
+          incarnation: `incarnation-${agentId}`,
+        }),
+      }),
+    ).rejects.toMatchObject({ code: WORKSPACE_ARCHIVE_ERROR_CODES.selfArchiveBlocked });
+    expect(deps.markWorkspaceArchiving).not.toHaveBeenCalled();
+    expect(existsSync(worktree.worktreePath)).toBe(true);
+  });
+
+  test("blocks sibling workspace deletion when the caller shares its git checkout root", async () => {
+    const { tempDir } = createGitRepo();
+    const checkoutRoot = path.join(tempDir, "shared-checkout");
+    const callerCwd = path.join(checkoutRoot, "packages", "server");
+    const targetCwd = path.join(checkoutRoot, "packages", "client");
+    mkdirSync(callerCwd, { recursive: true });
+    mkdirSync(targetCwd, { recursive: true });
+    const workspaceId = "ws-sibling-checkout-target";
+    const agentId = "agent-sibling-checkout";
+    const deps = createArchiveDeps({
+      paseoHome: path.join(tempDir, ".paseo"),
+      activeWorkspaces: [{ workspaceId, cwd: targetCwd, kind: "local_checkout" }],
+      liveAgents: [{ id: agentId, cwd: callerCwd }],
+      checkoutRootForCwd: () => checkoutRoot,
+    });
+
+    await expect(
+      archiveByScope(deps, {
+        scope: { kind: "workspace", workspaceId },
+        requestId: "req-sibling-checkout-target",
+        caller: createAgentDestructiveCaller({
+          agentId,
+          incarnation: `incarnation-${agentId}`,
+        }),
+      }),
+    ).rejects.toMatchObject({ code: WORKSPACE_ARCHIVE_ERROR_CODES.selfArchiveBlocked });
+    expect(deps.markWorkspaceArchiving).not.toHaveBeenCalled();
   });
 
   test("workspace scope archives the record and removes the directory on last reference", async () => {

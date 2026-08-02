@@ -87,6 +87,7 @@ import {
   createAgentDestructiveCaller,
   createCoordinatorDestructiveCaller,
   createUncertainDestructiveCaller,
+  revokeDestructiveCaller,
   type DestructiveCallerContext,
 } from "./agent/destructive-action-authority.js";
 import { CLIENT_CAPS } from "@getpaseo/protocol/client-capabilities";
@@ -126,7 +127,7 @@ interface WebSocketConnectionIdentity {
   transport: "direct" | "relay";
   peer: "loopback" | "local_ipc" | "external";
   browserOrigin: boolean;
-  authenticated: boolean;
+  coordinatorAuthorized: boolean;
   host?: string;
   origin?: string;
   userAgent?: string;
@@ -909,7 +910,7 @@ export class VoiceAssistantWebSocketServer {
     request: IncomingMessage,
     password: string | undefined,
   ): Promise<void> {
-    if (password) {
+    if (password !== undefined) {
       const requestMetadata = extractSocketRequestMetadata(request);
       const protocol = extractWsBearerProtocol(request.headers["sec-websocket-protocol"]);
       const token = extractWsBearerToken(protocol);
@@ -925,7 +926,10 @@ export class VoiceAssistantWebSocketServer {
       }
     }
 
-    await this.attachSocket(ws, request, undefined, password !== undefined);
+    // Reaching this point means the connection was accepted by the daemon's
+    // configured transport policy: password-validated when configured, or the
+    // explicit passwordless policy otherwise.
+    await this.attachSocket(ws, request, undefined, true);
   }
 
   public broadcast(message: WSOutboundMessage): void {
@@ -1065,6 +1069,7 @@ export class VoiceAssistantWebSocketServer {
       cleanupPromises.push(Promise.resolve(connection.session.cleanup()));
       const sockets = connection.kind === "trusted" ? connection.sockets : [connection.socket];
       for (const ws of sockets) {
+        this.revokeSocketDestructiveCaller(ws);
         cleanupPromises.push(
           new Promise<void>((resolve) => {
             // WebSocket.CLOSED = 3
@@ -1195,6 +1200,7 @@ export class VoiceAssistantWebSocketServer {
 
   private closePhysicalSocket(params: ClosePhysicalSocketParams): void {
     const { ws, logMessage, logFields } = params;
+    this.revokeSocketDestructiveCaller(ws);
     this.applicationSocketLease.release(ws);
     if (ws.readyState !== 1) {
       return;
@@ -1241,7 +1247,7 @@ export class VoiceAssistantWebSocketServer {
     ws: WebSocketLike,
     request?: unknown,
     metadata?: ExternalSocketMetadata,
-    authenticated = false,
+    coordinatorAuthorized = false,
   ): Promise<void> {
     if (!this.acceptingConnections) {
       try {
@@ -1253,7 +1259,11 @@ export class VoiceAssistantWebSocketServer {
     }
 
     const requestMetadata = extractSocketRequestMetadata(request);
-    const identity = createWebSocketConnectionIdentity(requestMetadata, metadata, authenticated);
+    const identity = createWebSocketConnectionIdentity(
+      requestMetadata,
+      metadata,
+      coordinatorAuthorized,
+    );
     this.socketIdentities.set(ws, identity);
     const connectionLogger = this.logger.child(toConnectionLogFields(identity));
 
@@ -1741,6 +1751,7 @@ export class VoiceAssistantWebSocketServer {
       error?: Error;
     },
   ): Promise<void> {
+    this.revokeSocketDestructiveCaller(ws);
     this.applicationSocketLease.release(ws);
     const identity = this.socketIdentities.get(ws);
     const identityFields = identity ? toConnectionLogFields(identity) : {};
@@ -1844,6 +1855,7 @@ export class VoiceAssistantWebSocketServer {
     }
 
     for (const socket of connection.sockets) {
+      this.revokeSocketDestructiveCaller(socket);
       this.sessions.delete(socket);
       this.socketIdentities.delete(socket);
     }
@@ -1859,6 +1871,14 @@ export class VoiceAssistantWebSocketServer {
       logMessage,
     );
     await connection.session.cleanup();
+  }
+
+  private revokeSocketDestructiveCaller(ws: WebSocketLike): void {
+    const caller = this.destructiveCallers.get(ws);
+    if (caller) {
+      revokeDestructiveCaller(caller);
+      this.destructiveCallers.delete(ws);
+    }
   }
 
   private syncBrowserToolsClientRegistration(connection: TrustedSessionConnection): void {
@@ -2584,14 +2604,14 @@ interface SocketRequestMetadata {
 function createWebSocketConnectionIdentity(
   requestMetadata: SocketRequestMetadata,
   metadata: ExternalSocketMetadata | undefined,
-  authenticated: boolean,
+  coordinatorAuthorized: boolean,
 ): WebSocketConnectionIdentity {
   return {
     connectionId: `conn_${randomUUID().replaceAll("-", "")}`,
     transport: metadata?.transport === "relay" ? "relay" : "direct",
     peer: resolveConnectionPeer(requestMetadata, metadata),
     browserOrigin: requestMetadata.origin !== undefined,
-    authenticated,
+    coordinatorAuthorized,
     ...(requestMetadata.host ? { host: requestMetadata.host } : {}),
     ...(requestMetadata.origin ? { origin: requestMetadata.origin } : {}),
     ...(requestMetadata.userAgent ? { userAgent: requestMetadata.userAgent } : {}),
@@ -2613,7 +2633,7 @@ function resolveHelloDestructiveCaller(
       : createUncertainDestructiveCaller("Agent caller identity was incomplete");
   }
 
-  if (identity.authenticated || identity.transport === "relay") {
+  if (identity.coordinatorAuthorized) {
     return createCoordinatorDestructiveCaller();
   }
 

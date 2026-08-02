@@ -587,12 +587,14 @@ async function resolveAgentMcpCallerContext(
       destructiveCaller: createUncertainDestructiveCaller("MCP caller identity was incomplete"),
     };
   }
+  if (daemonPassword === undefined) {
+    return { destructiveCaller: createCoordinatorDestructiveCaller() };
+  }
   if (
-    daemonPassword &&
-    (await isBearerTokenValidAsync({
+    await isBearerTokenValidAsync({
       password: daemonPassword,
       token: extractHttpBearerToken(req.header("authorization")),
-    }))
+    })
   ) {
     return { destructiveCaller: createCoordinatorDestructiveCaller() };
   }
