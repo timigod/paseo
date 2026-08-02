@@ -23,6 +23,7 @@ interface PersistedAgentTimeline {
 
 export interface FileAgentTimelineStoreOptions {
   epochFactory?: () => string;
+  readFile?: (filePath: string) => Promise<string>;
   writeJson?: (filePath: string, value: unknown) => Promise<void>;
 }
 
@@ -80,6 +81,7 @@ export class FileAgentTimelineStore implements AgentTimelineStore {
   private readonly operationTails = new Map<string, Promise<void>>();
   private readonly logger: Logger;
   private readonly epochFactory: () => string;
+  private readonly readFile: (filePath: string) => Promise<string>;
   private readonly writeJson: (filePath: string, value: unknown) => Promise<void>;
 
   constructor(
@@ -89,6 +91,7 @@ export class FileAgentTimelineStore implements AgentTimelineStore {
   ) {
     this.logger = logger.child({ module: "agent", component: "file-agent-timeline-store" });
     this.epochFactory = options?.epochFactory ?? randomUUID;
+    this.readFile = options?.readFile ?? ((filePath) => fs.readFile(filePath, "utf8"));
     this.writeJson = options?.writeJson ?? writeJsonFileAtomic;
   }
 
@@ -195,11 +198,10 @@ export class FileAgentTimelineStore implements AgentTimelineStore {
   }
 
   private async readState(agentId: string): Promise<PersistedAgentTimeline> {
-    await (this.operationTails.get(agentId) ?? Promise.resolve());
-    return await this.loadState(agentId);
+    return await this.queueOperation(agentId, () => this.loadStateUnqueued(agentId));
   }
 
-  private async loadState(agentId: string): Promise<PersistedAgentTimeline> {
+  private async loadStateUnqueued(agentId: string): Promise<PersistedAgentTimeline> {
     const cached = this.states.get(agentId);
     if (cached) return cached;
     const existingLoad = this.loadPromises.get(agentId);
@@ -215,7 +217,7 @@ export class FileAgentTimelineStore implements AgentTimelineStore {
     const filePath = this.filePath(agentId);
     let state: PersistedAgentTimeline;
     try {
-      const raw = await fs.readFile(filePath, "utf8");
+      const raw = await this.readFile(filePath);
       state = parsePersistedTimeline(JSON.parse(raw));
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
@@ -238,7 +240,7 @@ export class FileAgentTimelineStore implements AgentTimelineStore {
       | Promise<{ next: PersistedAgentTimeline; result: T }>,
   ): Promise<T> {
     return await this.queueOperation(agentId, async () => {
-      const current = await this.loadState(agentId);
+      const current = await this.loadStateUnqueued(agentId);
       const { next, result } = await mutate(current);
       await this.writeJson(this.filePath(agentId), next);
       this.states.set(agentId, next);

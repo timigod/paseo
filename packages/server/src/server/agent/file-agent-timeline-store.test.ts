@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -11,6 +11,14 @@ import type { AgentTimelineRow } from "./agent-timeline-store-types.js";
 
 const logger = createTestLogger();
 const temporaryDirectories: string[] = [];
+
+function deferred(): { promise: Promise<void>; resolve: () => void } {
+  let resolve!: () => void;
+  const promise = new Promise<void>((promiseResolve) => {
+    resolve = promiseResolve;
+  });
+  return { promise, resolve };
+}
 
 async function createStoreDirectory(): Promise<string> {
   const directory = await mkdtemp(path.join(tmpdir(), "file-agent-timeline-store-"));
@@ -123,5 +131,53 @@ describe("FileAgentTimelineStore", () => {
       window: { minSeq: 1, maxSeq: 2, nextSeq: 3 },
       rows: replacementRows,
     });
+  });
+
+  it("does not let a cold read republish state retired by deletion and same-ID reuse", async () => {
+    const directory = await createStoreDirectory();
+    const agentId = "agent-with-gated-cold-read";
+    const oldRows: AgentTimelineRow[] = [
+      {
+        seq: 1,
+        timestamp: "2026-08-01T00:00:00.000Z",
+        item: { type: "assistant_message", text: "retired row" },
+      },
+    ];
+    const replacementRows: AgentTimelineRow[] = [
+      {
+        seq: 1,
+        timestamp: "2026-08-02T00:00:00.000Z",
+        item: { type: "assistant_message", text: "replacement row" },
+      },
+    ];
+    const seedStore = new FileAgentTimelineStore(directory, logger);
+    await seedStore.replaceCommitted(agentId, oldRows);
+
+    const readStarted = deferred();
+    const releaseRead = deferred();
+    let gateRead = true;
+    const store = new FileAgentTimelineStore(directory, logger, {
+      readFile: async (filePath) => {
+        const raw = await readFile(filePath, "utf8");
+        if (gateRead) {
+          gateRead = false;
+          readStarted.resolve();
+          await releaseRead.promise;
+        }
+        return raw;
+      },
+    });
+
+    const coldRead = store.getCommittedRows(agentId);
+    await readStarted.promise;
+    const deletion = store.deleteAgent(agentId);
+    const replacement = store.bulkInsert(agentId, replacementRows);
+    releaseRead.resolve();
+
+    await expect(coldRead).resolves.toEqual(oldRows);
+    await Promise.all([deletion, replacement]);
+    await expect(store.getCommittedRows(agentId)).resolves.toEqual(replacementRows);
+    const freshStore = new FileAgentTimelineStore(directory, logger);
+    await expect(freshStore.getCommittedRows(agentId)).resolves.toEqual(replacementRows);
   });
 });

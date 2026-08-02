@@ -10733,6 +10733,110 @@ test("respondToPermission emits refreshed state before permission_resolved", asy
   expect(resolvedIndex).toBeGreaterThan(refreshedStateIndex);
 });
 
+test("a retired permission response cannot mutate a recreated agent with the same ID", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-retired-permission-"));
+  const agentId = "00000000-0000-4000-8000-000000000224";
+  const responseStarted = deferred<void>();
+  const releaseResponse = deferred<void>();
+  let sessionGeneration = 0;
+
+  class RecordingPermissionStorage extends AgentStorage {
+    recording = false;
+    readonly appliedSessionIds: string[] = [];
+
+    override async applySnapshot(
+      agent: ManagedAgent,
+      options?: Parameters<AgentStorage["applySnapshot"]>[1],
+    ): Promise<void> {
+      if (this.recording) {
+        this.appliedSessionIds.push(agent.persistence?.sessionId ?? "missing");
+      }
+      await super.applySnapshot(agent, options);
+    }
+  }
+
+  class GatedPermissionSession extends TestAgentSession {
+    override async respondToPermission(): Promise<void> {
+      responseStarted.resolve();
+      await releaseResponse.promise;
+    }
+  }
+
+  class IncarnationPermissionClient extends TestAgentClient {
+    override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+      sessionGeneration += 1;
+      return sessionGeneration === 1
+        ? new GatedPermissionSession(config)
+        : new TestAgentSession(config);
+    }
+  }
+
+  const storage = new RecordingPermissionStorage(join(workdir, "agents"), logger);
+  const manager = new AgentManager({
+    clients: { codex: new IncarnationPermissionClient() },
+    registry: storage,
+    logger,
+    idFactory: () => agentId,
+  });
+
+  try {
+    const first = await manager.createAgent({ provider: "codex", cwd: workdir }, agentId, {
+      workspaceId: undefined,
+    });
+    const firstSessionId = first.persistence?.sessionId;
+    if (!firstSessionId) {
+      throw new Error("Expected first permission session persistence");
+    }
+    manager.getAgent(first.id)?.pendingPermissions.set("permission-1", {
+      id: "permission-1",
+      provider: "codex",
+      name: "write",
+      kind: "tool",
+      input: { path: "proof.txt" },
+    });
+
+    const response = manager.respondToPermission(first.id, "permission-1", {
+      behavior: "allow",
+    });
+    await responseStarted.promise;
+
+    await manager.closeAgent(first.id);
+    const second = await manager.createAgent({ provider: "codex", cwd: workdir }, agentId, {
+      workspaceId: undefined,
+    });
+    const secondSessionId = second.persistence?.sessionId;
+    if (!secondSessionId) {
+      throw new Error("Expected successor permission session persistence");
+    }
+    expect(secondSessionId).not.toBe(firstSessionId);
+    await manager.flush();
+    await storage.flush();
+
+    const emitted: AgentManagerEvent[] = [];
+    const unsubscribe = manager.subscribe((event) => emitted.push(event), {
+      agentId,
+      replayState: false,
+    });
+    storage.recording = true;
+    releaseResponse.resolve();
+    await response;
+    await manager.flush();
+    await storage.flush();
+    unsubscribe();
+
+    expect(storage.appliedSessionIds).toEqual([]);
+    expect(emitted).toEqual([]);
+    expect(manager.getAgent(agentId)?.persistence?.sessionId).toBe(secondSessionId);
+    await expect(storage.get(agentId)).resolves.toMatchObject({
+      persistence: { sessionId: secondSessionId },
+    });
+  } finally {
+    releaseResponse.resolve();
+    await manager.closeAgent(agentId).catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
 test("close during in-flight stream does not clear persistence sessionId", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-test-"));
   const storagePath = join(workdir, "agents");

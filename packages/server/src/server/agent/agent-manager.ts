@@ -3242,21 +3242,44 @@ export class AgentManager {
     response: AgentPermissionResponse,
   ): Promise<AgentPermissionResult | void> {
     const agent = this.requireAgent(agentId);
+    const incarnation = this.agentIncarnations.get(agentId);
+    if (!incarnation) {
+      throw new Error(`Agent ${agentId} has no live incarnation for permission response`);
+    }
+    const isCurrentIncarnation = () =>
+      this.agents.get(agentId) === agent && this.isCurrentAgentIncarnation(agentId, incarnation);
+    const assertCurrentIncarnation = () => {
+      if (!isCurrentIncarnation()) {
+        throw new AgentManagerShuttingDownError();
+      }
+    };
     agent.inFlightPermissionResponses.add(requestId);
 
     try {
       const result = await agent.session.respondToPermission(requestId, response);
+      if (!isCurrentIncarnation()) return result;
       agent.pendingPermissions.delete(requestId);
 
       try {
-        await this.refreshSessionState(agent);
+        await this.refreshSessionState(agent, {
+          emit: false,
+          isCurrent: isCurrentIncarnation,
+        });
       } catch {
         // Ignore refresh errors - state sync after permission approval is best effort.
       }
 
+      if (!isCurrentIncarnation()) return result;
       this.touchUpdatedAt(agent);
-      await this.persistSnapshot(agent);
-      this.emitState(agent);
+      if (!isCurrentIncarnation()) return result;
+      try {
+        await this.persistSnapshot(agent, { recheck: assertCurrentIncarnation });
+      } catch (error) {
+        if (!isCurrentIncarnation()) return result;
+        throw error;
+      }
+      if (!isCurrentIncarnation()) return result;
+      this.emitState(agent, { persist: false });
 
       const bufferedResolution = agent.bufferedPermissionResolutions.get(requestId);
       if (bufferedResolution) {
@@ -4434,18 +4457,23 @@ export class AgentManager {
 
   private async refreshSessionState(
     agent: ActiveManagedAgent,
-    options?: { emit?: boolean },
+    options?: { emit?: boolean; isCurrent?: () => boolean },
   ): Promise<void> {
     try {
       const modes = await agent.session.getAvailableModes();
+      if (options?.isCurrent && !options.isCurrent()) return;
       agent.availableModes = modes;
     } catch {
+      if (options?.isCurrent && !options.isCurrent()) return;
       agent.availableModes = [];
     }
 
     try {
-      agent.currentModeId = await agent.session.getCurrentMode();
+      const currentModeId = await agent.session.getCurrentMode();
+      if (options?.isCurrent && !options.isCurrent()) return;
+      agent.currentModeId = currentModeId;
     } catch {
+      if (options?.isCurrent && !options.isCurrent()) return;
       agent.currentModeId = null;
     }
 
@@ -4462,10 +4490,11 @@ export class AgentManager {
 
   private async refreshRuntimeInfo(
     agent: ActiveManagedAgent,
-    options?: { emit?: boolean },
+    options?: { emit?: boolean; isCurrent?: () => boolean },
   ): Promise<void> {
     try {
       const newInfo = await agent.session.getRuntimeInfo();
+      if (options?.isCurrent && !options.isCurrent()) return;
       const changed =
         newInfo.model !== agent.runtimeInfo?.model ||
         newInfo.thinkingOptionId !== agent.runtimeInfo?.thinkingOptionId ||
