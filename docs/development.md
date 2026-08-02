@@ -19,6 +19,27 @@ Root checkout dev is intentionally split across terminals:
 - `npm run dev:app` runs Expo on `http://localhost:8081` and connects to the dev daemon.
 - `npm run dev:desktop` runs its own Electron-flavored Expo server on the first free port from `8082` through `8089`. It never claims port `8081`.
 
+### Building the macOS desktop app without a signing identity
+
+Signed macOS builds remain the default. The build wrapper preserves Electron
+Builder's normal Developer ID, `CSC_LINK`, `CSC_NAME`, and identity-discovery
+paths without modifying hardened runtime or notarization settings.
+
+For a local artifact that is intentionally unsigned, opt in explicitly:
+
+```bash
+PASEO_DESKTOP_UNSIGNED_MAC=1 npm run build:desktop -- --mac --arm64
+```
+
+This mode disables signing identity auto-discovery, hardened runtime, and
+notarization so the ad-hoc bundle remains launchable. It fails closed when used
+with `CSC_LINK`, `CSC_NAME`, or a `mac.identity` build argument. Setting
+`CSC_IDENTITY_AUTO_DISCOVERY=false` by itself is not an unsigned-build request.
+Every macOS build checks both packaged CLI launchers; native-architecture and
+universal builds also execute the packaged Electron helper. A cross-architecture
+build records an explicit helper-execution skip because no translation mechanism
+is assumed.
+
 `npm run dev` is only a shorthand for `npm run dev:server`. Keep `127.0.0.1:6767` for the packaged app and production-style `~/.paseo` state.
 
 ### PASEO_HOME

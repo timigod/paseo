@@ -1,12 +1,14 @@
 const fs = require("fs");
 const path = require("path");
 
+const {
+  assertPackagedMacRuntime,
+  resolveElectronBuilderTargetArch,
+  shouldRunPackagedRuntimeGate,
+} = require("./packaged-runtime-gate.js");
 const { smokePackagedDesktopApp } = require("./smoke-packaged-desktop-app.js");
 
 const EXECUTABLE_NAME = "Paseo";
-
-// electron-builder arch enum → Node.js arch string
-const ARCH_MAP = { 0: "ia32", 1: "x64", 2: "armv7l", 3: "arm64", 4: "universal" };
 
 const RIPGREP_PLATFORM_DIR = {
   darwin: { arm64: "arm64-darwin", x64: "x64-darwin" },
@@ -111,9 +113,21 @@ function fmtMB(bytes) {
 
 exports.default = async function afterPack(context) {
   const platform = context.electronPlatformName;
-  const arch = ARCH_MAP[context.arch] || process.arch;
+  const arch = resolveElectronBuilderTargetArch(context.arch);
 
   pruneNativeModules(context.appOutDir, platform, arch);
+
+  if (
+    platform === "darwin" &&
+    shouldRunPackagedRuntimeGate({ env: process.env, phase: "afterPack" })
+  ) {
+    const appPath = path.join(context.appOutDir, `${EXECUTABLE_NAME}.app`);
+    const receipt = assertPackagedMacRuntime({ appPath, targetArch: arch });
+    if (process.env.PASEO_DESKTOP_SMOKE === "1" && receipt.helperExecution !== "skipped") {
+      await smokePackagedDesktopApp({ appPath });
+    }
+    return;
+  }
 
   if (platform === "linux" || platform === "win32") {
     if (arch !== process.arch) {
