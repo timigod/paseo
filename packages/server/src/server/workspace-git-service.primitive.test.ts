@@ -855,7 +855,7 @@ describe("WorkspaceGitServiceImpl primitive refresh entrypoint", () => {
     await vi.advanceTimersByTimeAsync(60_000);
     await flushPromises();
 
-    expect(getCheckoutStatus).toHaveBeenCalledTimes(2);
+    expect(getCheckoutStatus).toHaveBeenCalledTimes(3);
     expect(getPullRequestStatus).toHaveBeenCalledTimes(1);
     expect(getPullRequestStatus).toHaveBeenCalledWith(
       REPO_CWD,
@@ -978,6 +978,7 @@ describe("WorkspaceGitServiceImpl primitive refresh entrypoint", () => {
         stderr: "",
       })),
       resolveGhPath: async () => "/usr/bin/gh",
+      resolveRepoHost: async () => null,
       now: () => nowMs,
     });
     const getCurrentPullRequestStatus = github.getCurrentPullRequestStatus.bind(github);
@@ -1082,6 +1083,7 @@ describe("WorkspaceGitServiceImpl primitive refresh entrypoint", () => {
         stderr: "",
       })),
       resolveGhPath: async () => "/usr/bin/gh",
+      resolveRepoHost: async () => null,
       now: () => nowMs,
     });
     const getCurrentPullRequestStatus = github.getCurrentPullRequestStatus.bind(github);
@@ -1403,7 +1405,7 @@ describe("WorkspaceGitServiceImpl primitive refresh entrypoint", () => {
     await vi.advanceTimersByTimeAsync(60_000);
     await flushPromises();
 
-    expect(getCheckoutStatus).toHaveBeenCalledTimes(2);
+    expect(getCheckoutStatus).toHaveBeenCalledTimes(3);
 
     first.unsubscribe();
     second.unsubscribe();
@@ -1448,6 +1450,7 @@ describe("WorkspaceGitServiceImpl primitive refresh entrypoint", () => {
 
   test("direct getSnapshot returns current snapshot during a self-heal refresh", async () => {
     let nowMs = 0;
+    const backgroundFetch = createDeferred<void>();
     const selfHealRefresh = createDeferred<CheckoutStatusGit>();
     const getCheckoutStatus = vi
       .fn<() => Promise<CheckoutStatusGit>>()
@@ -1455,6 +1458,7 @@ describe("WorkspaceGitServiceImpl primitive refresh entrypoint", () => {
       .mockImplementationOnce(async () => selfHealRefresh.promise);
     const service = createService({
       getCheckoutStatus,
+      runGitFetch: vi.fn(async () => backgroundFetch.promise),
       now: () => new Date(nowMs),
     });
     const subscription = service.registerWorkspace({ cwd: REPO_CWD }, vi.fn());
@@ -1475,6 +1479,8 @@ describe("WorkspaceGitServiceImpl primitive refresh entrypoint", () => {
     expect(getCheckoutStatus).toHaveBeenCalledTimes(2);
 
     subscription.unsubscribe();
+    backgroundFetch.resolve();
+    await flushPromises();
     service.dispose();
   });
 });
