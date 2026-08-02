@@ -6,6 +6,7 @@ import { promisify } from "node:util";
 import type { Logger } from "pino";
 import { z } from "zod";
 import type { ProviderUsage, ProviderUsageBalance } from "../../../server/messages.js";
+import { createExternalProcessEnv } from "../../../server/paseo-env.js";
 import type { ProviderApiFetch, ProviderUsageFetcher } from "../provider.js";
 import {
   ApiNullableNumberSchema,
@@ -44,9 +45,25 @@ const CursorAuthStatusSchema = z.object({
 
 type CursorUsageResponse = z.infer<typeof CursorUsageResponseSchema>;
 
+interface QuotaHelperCommandOptions {
+  env: NodeJS.ProcessEnv;
+  timeout: number;
+}
+
+interface QuotaHelperCommandResult {
+  stdout: string;
+}
+
+type QuotaHelperCommandRunner = (
+  command: string,
+  args: string[],
+  options: QuotaHelperCommandOptions,
+) => Promise<QuotaHelperCommandResult>;
+
 interface CursorQuotaProviderOptions {
   logger: Logger;
   fetch?: ProviderApiFetch;
+  sqliteCommandRunner?: QuotaHelperCommandRunner;
 }
 
 function parseCursorBillingCycleTimestamp(
@@ -70,7 +87,17 @@ function centsToDollars(value: number | null): number | null {
   return value === null ? null : value / 100;
 }
 
-async function readCursorTokenFromSqlite(): Promise<string | null> {
+async function runQuotaHelperCommand(
+  command: string,
+  args: string[],
+  options: QuotaHelperCommandOptions,
+): Promise<QuotaHelperCommandResult> {
+  return execFileAsync(command, args, { ...options, encoding: "utf8" });
+}
+
+async function readCursorTokenFromSqlite(
+  runCommand: QuotaHelperCommandRunner,
+): Promise<string | null> {
   const dbPaths: string[] = [];
   if (process.env["APPDATA"]) {
     dbPaths.push(join(process.env["APPDATA"], "Cursor", "User", "globalStorage", "state.vscdb"));
@@ -91,10 +118,13 @@ async function readCursorTokenFromSqlite(): Promise<string | null> {
   for (const path of dbPaths) {
     if (!existsSync(path)) continue;
     try {
-      const { stdout } = await execFileAsync(
+      const { stdout } = await runCommand(
         "sqlite3",
         [path, "SELECT value FROM ItemTable WHERE key = 'cursorAuthStatus'"],
-        { timeout: CURSOR_SQLITE_TIMEOUT_MS },
+        {
+          timeout: CURSOR_SQLITE_TIMEOUT_MS,
+          env: createExternalProcessEnv(process.env),
+        },
       );
       if (stdout) {
         const parsed = CursorAuthStatusSchema.parse(JSON.parse(stdout.trim()));
@@ -113,17 +143,20 @@ export class CursorQuotaProvider implements ProviderUsageFetcher {
 
   private readonly logger: Logger;
   private readonly fetchApi: ProviderApiFetch;
+  private readonly readSqliteToken: () => Promise<string | null>;
 
   constructor(options: CursorQuotaProviderOptions) {
     this.logger = options.logger;
     this.fetchApi = options.fetch ?? fetch;
+    const sqliteCommandRunner = options.sqliteCommandRunner ?? runQuotaHelperCommand;
+    this.readSqliteToken = () => readCursorTokenFromSqlite(sqliteCommandRunner);
   }
 
   async fetchUsage(): Promise<ProviderUsage> {
     const token =
       process.env["CURSOR_ACCESS_TOKEN"] ||
       process.env["CURSOR_TOKEN"] ||
-      (await readCursorTokenFromSqlite());
+      (await this.readSqliteToken());
 
     if (!token) return unavailableUsage(this);
 

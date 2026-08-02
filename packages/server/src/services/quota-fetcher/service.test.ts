@@ -545,6 +545,37 @@ describe("real provider usage fetchers", () => {
     );
   });
 
+  it("scrubs supervisor identity from the Claude keychain helper environment", async () => {
+    process.env["HOME"] = homeDir;
+    process.env["PATH"] = "/quota-helper-bin";
+    process.env["PASEO_SUPERVISOR_INCARNATION"] = "supervisor-incarnation";
+    process.env["PASEO_SUPERVISOR_WORKER_TOKEN"] = "worker-token";
+    let helperEnv: NodeJS.ProcessEnv | null = null;
+    fetchApi = mockFetch(
+      new Map([
+        ["https://api.anthropic.com/api/oauth/usage", () => jsonResponse(makeClaudeResponse())],
+      ]),
+    );
+
+    const usage = await new ClaudeQuotaProvider({
+      logger: createLogger(),
+      claudeHome,
+      platform: "darwin",
+      keychainCommandRunner: async (_command, _args, options) => {
+        helperEnv = options.env;
+        return {
+          stdout: JSON.stringify({ claudeAiOauth: { accessToken: "keychain-token" } }),
+        };
+      },
+      fetch: fetchApi,
+    }).fetchUsage();
+
+    expect(usage.status).toBe("available");
+    expect(helperEnv).toMatchObject({ HOME: homeDir, PATH: "/quota-helper-bin" });
+    expect(helperEnv?.["PASEO_SUPERVISOR_INCARNATION"]).toBeUndefined();
+    expect(helperEnv?.["PASEO_SUPERVISOR_WORKER_TOKEN"]).toBeUndefined();
+  });
+
   it("fetches Codex windows and coerces string credit balances", async () => {
     writeCodexAuth(codexHome, "at_codex_valid");
     fetchApi = mockFetch(
@@ -691,6 +722,40 @@ describe("real provider usage fetchers", () => {
         }),
       ],
     });
+  });
+
+  it("scrubs supervisor identity from the Cursor sqlite helper environment", async () => {
+    const appData = join(homeDir, "app-data");
+    const cursorStorage = join(appData, "Cursor", "User", "globalStorage");
+    mkdirSync(cursorStorage, { recursive: true });
+    writeFileSync(join(cursorStorage, "state.vscdb"), "fixture");
+    process.env["APPDATA"] = appData;
+    process.env["PATH"] = "/quota-helper-bin";
+    process.env["PASEO_SUPERVISOR_INCARNATION"] = "supervisor-incarnation";
+    process.env["PASEO_SUPERVISOR_WORKER_TOKEN"] = "worker-token";
+    let helperEnv: NodeJS.ProcessEnv | null = null;
+    fetchApi = mockFetch(
+      new Map([
+        [
+          "https://api2.cursor.sh/aiserver.v1.DashboardService/GetCurrentPeriodUsage",
+          () => jsonResponse({ billingCycleStart: null, billingCycleEnd: null }),
+        ],
+      ]),
+    );
+
+    const usage = await new CursorQuotaProvider({
+      logger: createLogger(),
+      sqliteCommandRunner: async (_command, _args, options) => {
+        helperEnv = options.env;
+        return { stdout: JSON.stringify({ accessToken: "sqlite-token" }) };
+      },
+      fetch: fetchApi,
+    }).fetchUsage();
+
+    expect(usage.status).toBe("available");
+    expect(helperEnv).toMatchObject({ APPDATA: appData, PATH: "/quota-helper-bin" });
+    expect(helperEnv?.["PASEO_SUPERVISOR_INCARNATION"]).toBeUndefined();
+    expect(helperEnv?.["PASEO_SUPERVISOR_WORKER_TOKEN"]).toBeUndefined();
   });
 
   it("fetches Z.ai usage from ZAI_API_KEY", async () => {

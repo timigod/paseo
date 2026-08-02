@@ -10,6 +10,7 @@ import type {
   ProviderUsageDetail,
   ProviderUsageWindow,
 } from "../../../server/messages.js";
+import { createExternalProcessEnv } from "../../../server/paseo-env.js";
 import type { ProviderApiFetch, ProviderUsageFetcher } from "../provider.js";
 import {
   ApiNumberSchema,
@@ -88,10 +89,26 @@ interface ClaudeCredentialRecord {
   filePath: string | null;
 }
 
+interface QuotaHelperCommandOptions {
+  env: NodeJS.ProcessEnv;
+  timeout: number;
+}
+
+interface QuotaHelperCommandResult {
+  stdout: string;
+}
+
+type QuotaHelperCommandRunner = (
+  command: string,
+  args: string[],
+  options: QuotaHelperCommandOptions,
+) => Promise<QuotaHelperCommandResult>;
+
 interface ClaudeQuotaProviderOptions {
   logger: Logger;
   claudeHome?: string;
   claudeKeychainReader?: () => Promise<unknown | null>;
+  keychainCommandRunner?: QuotaHelperCommandRunner;
   platform?: typeof process.platform;
   fetch?: ProviderApiFetch;
 }
@@ -297,12 +314,25 @@ function scopedWindows(limits: ScopedLimit[]): ProviderUsageWindow[] {
   });
 }
 
-async function readClaudeKeychainCredentials(): Promise<unknown | null> {
+async function runQuotaHelperCommand(
+  command: string,
+  args: string[],
+  options: QuotaHelperCommandOptions,
+): Promise<QuotaHelperCommandResult> {
+  return execFileAsync(command, args, { ...options, encoding: "utf8" });
+}
+
+async function readClaudeKeychainCredentials(
+  runCommand: QuotaHelperCommandRunner,
+): Promise<unknown | null> {
   try {
-    const { stdout } = await execFileAsync(
+    const { stdout } = await runCommand(
       "security",
       ["find-generic-password", "-s", CLAUDE_KEYCHAIN_SERVICE, "-w"],
-      { timeout: CLAUDE_KEYCHAIN_TIMEOUT_MS },
+      {
+        timeout: CLAUDE_KEYCHAIN_TIMEOUT_MS,
+        env: createExternalProcessEnv(process.env),
+      },
     );
     const raw = stdout.trim();
     if (!raw) return null;
@@ -326,7 +356,9 @@ export class ClaudeQuotaProvider implements ProviderUsageFetcher {
     this.logger = options.logger.child({ module: "claude-quota-provider" });
     this.claudeHome =
       options.claudeHome || process.env["CLAUDE_HOME"] || join(homedir(), ".claude");
-    this.readKeychainCredentials = options.claudeKeychainReader ?? readClaudeKeychainCredentials;
+    const keychainCommandRunner = options.keychainCommandRunner ?? runQuotaHelperCommand;
+    this.readKeychainCredentials =
+      options.claudeKeychainReader ?? (() => readClaudeKeychainCredentials(keychainCommandRunner));
     this.platform = options.platform ?? process.platform;
     this.fetchApi = options.fetch ?? fetch;
   }
