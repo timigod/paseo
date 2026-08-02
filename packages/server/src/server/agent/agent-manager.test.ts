@@ -4326,6 +4326,112 @@ test("a broadcast admitted after publish handoff replays the snapshot without a 
   }
 });
 
+test("a broadcast admitted inside delayed buffered replay receives the complete snapshot without another provider read", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-history-buffered-broadcast-"));
+  const agentId = "00000000-0000-4000-8000-000000000196";
+  const historyStarted = deferred<void>();
+  const releaseHistory = deferred<void>();
+  const userPersistStarted = deferred<void>();
+  const releaseUserPersist = deferred<void>();
+  let historyReads = 0;
+  let session: TestAgentSession | null = null;
+
+  class DelayedUserStateStorage extends AgentStorage {
+    delayNextUserStatePersist = false;
+
+    override async applySnapshot(
+      ...args: Parameters<AgentStorage["applySnapshot"]>
+    ): Promise<void> {
+      const [agent] = args;
+      if (this.delayNextUserStatePersist && agent.lastUserMessageAt) {
+        this.delayNextUserStatePersist = false;
+        userPersistStarted.resolve();
+        await releaseUserPersist.promise;
+      }
+      await super.applySnapshot(...args);
+    }
+  }
+
+  class BufferedBroadcastSession extends TestAgentSession {
+    override async *streamHistory(): AsyncGenerator<AgentStreamEvent> {
+      historyReads += 1;
+      historyStarted.resolve();
+      await releaseHistory.promise;
+      yield {
+        type: "timeline",
+        provider: "codex",
+        item: { type: "assistant_message", text: "provider snapshot row" },
+      };
+    }
+  }
+  class BufferedBroadcastClient extends TestAgentClient {
+    override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+      session = new BufferedBroadcastSession(config);
+      return session;
+    }
+  }
+
+  const storage = new DelayedUserStateStorage(join(workdir, "agents"), logger);
+  const durableTimelineStore = new FileAgentTimelineStore(join(workdir, "timelines"), logger);
+  const manager = new AgentManager({
+    clients: { codex: new BufferedBroadcastClient() },
+    registry: storage,
+    durableTimelineStore,
+    logger,
+    idFactory: () => agentId,
+  });
+  const events: AgentManagerEvent[] = [];
+  manager.subscribe((event) => events.push(event), { agentId, replayState: false });
+
+  try {
+    await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+    storage.delayNextUserStatePersist = true;
+
+    const hydration = manager.hydrateTimelineFromProvider(agentId, {
+      force: true,
+      broadcast: true,
+    });
+    await historyStarted.promise;
+    session?.pushEvent({
+      type: "timeline",
+      provider: "codex",
+      item: { type: "user_message", text: "buffered live row" },
+    });
+    releaseHistory.resolve();
+    await userPersistStarted.promise;
+
+    const lateEventStart = events.length;
+    const lateBroadcast = manager.hydrateTimelineFromProvider(agentId, { broadcast: true });
+    releaseUserPersist.resolve();
+    await Promise.all([hydration, lateBroadcast]);
+
+    expect(historyReads).toBe(1);
+    const replayedItems = events
+      .slice(lateEventStart)
+      .filter(
+        (event): event is Extract<AgentManagerEvent, { type: "agent_stream" }> =>
+          event.type === "agent_stream" && event.event.type === "timeline",
+      )
+      .map((event) => event.event.item);
+    expect(replayedItems).toEqual([
+      { type: "assistant_message", text: "provider snapshot row" },
+      { type: "user_message", text: "buffered live row" },
+    ]);
+    expect(manager.getTimeline(agentId)).toEqual(replayedItems);
+    await expect(durableTimelineStore.getCommittedRows(agentId)).resolves.toMatchObject([
+      { seq: 1, item: replayedItems[0] },
+      { seq: 2, item: replayedItems[1] },
+    ]);
+  } finally {
+    releaseHistory.resolve();
+    releaseUserPersist.resolve();
+    await manager.closeAgent(agentId).catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
 test("provider history consumes ordered live timeline and child overlap exactly once", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-history-overlap-"));
   const agentId = "00000000-0000-4000-8000-000000000183";
@@ -4833,6 +4939,47 @@ test("reload cancels and joins old-incarnation history and ignores old session e
     expect(manager.getTimeline(agentId)).toEqual([]);
   } finally {
     releaseHistory.resolve();
+    await manager.closeAgent(agentId).catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("a live event without a durable timeline persists the promoted history state", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-live-history-primed-"));
+  const agentId = "00000000-0000-4000-8000-000000000197";
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  let session: TestAgentSession | null = null;
+  class LiveHistoryPrimedClient extends TestAgentClient {
+    override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+      session = new TestAgentSession(config);
+      return session;
+    }
+  }
+  const manager = new AgentManager({
+    clients: { codex: new LiveHistoryPrimedClient() },
+    registry: storage,
+    logger,
+    idFactory: () => agentId,
+  });
+
+  try {
+    await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+    session?.pushEvent({
+      type: "timeline",
+      provider: "codex",
+      item: { type: "user_message", text: "live state must persist as primed" },
+    });
+    await vi.waitFor(async () => {
+      expect(manager.getTimeline(agentId)).toHaveLength(1);
+      expect((await storage.get(agentId))?.lastUserMessageAt).toBeTruthy();
+    });
+    await manager.flush();
+
+    expect(manager.getAgent(agentId)?.historyPrimed).toBe(true);
+    expect((await storage.get(agentId))?.historyPrimed).toBe(true);
+  } finally {
     await manager.closeAgent(agentId).catch(() => undefined);
     rmSync(workdir, { recursive: true, force: true });
   }

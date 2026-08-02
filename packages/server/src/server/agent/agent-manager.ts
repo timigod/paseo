@@ -4422,9 +4422,6 @@ export class AgentManager {
         { seq: row.seq, epoch, timestamp: row.timestamp },
       );
     }
-    for (const subagent of this.providerSubagents.list(agent.id)) {
-      this.dispatch({ type: "provider_subagent", event: { type: "upsert", subagent } });
-    }
   }
 
   private async primeTimelineFromLegacyProviderHistory(
@@ -4722,15 +4719,7 @@ export class AgentManager {
           this.agentStreamCoalescer.flushFor(agentId);
         });
       }
-      const request = this.historyHydrationRequests.get(agentId);
-      const publishesLiveProjection =
-        operation.timelineItem !== undefined || operation.providerSubagentEvent !== undefined;
-      if (request && publishesLiveProjection) request.acceptingBroadcastDemand = true;
-      try {
-        await operation.run();
-      } finally {
-        if (request && publishesLiveProjection) request.acceptingBroadcastDemand = false;
-      }
+      await operation.run();
       if (operation.kind === "provider_subagent" && operation.providerSubagentEvent) {
         activeHydration.carriedProviderSubagentEvents.push(
           structuredClone(operation.providerSubagentEvent),
@@ -5489,8 +5478,8 @@ export class AgentManager {
     const agent = this.agents.get(agentId);
     if (!this.durableTimelineStore) {
       const row = this.timelineStore.append(agentId, item, options);
-      await afterCommit?.(row);
       if (agent && !this.activeHistoryHydrations.has(agentId)) agent.historyPrimed = true;
+      await afterCommit?.(row);
       return row;
     }
 
