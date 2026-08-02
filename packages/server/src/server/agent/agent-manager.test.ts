@@ -4432,9 +4432,23 @@ test("a broadcast admitted inside delayed buffered replay receives the complete 
   }
 });
 
-test("a successor hydration preserves material progress opened by replayed live events", async () => {
+test("a successor hydration preserves stalled progress when provider history omits turn ids", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-hydration-progress-successor-"));
   const agentId = "00000000-0000-4000-8000-000000000164";
+  const turnId = "accepted-live-turn";
+  const timestamp = "2026-08-02T12:00:00.000Z";
+  const progressItems: AgentTimelineItem[] = [
+    {
+      type: "tool_call",
+      callId: "write-replayed-behind-successor",
+      name: "write",
+      status: "completed",
+      error: null,
+      detail: { type: "write", filePath: "proof.txt", content: "durable successor proof" },
+    },
+    { type: "compaction", status: "completed" },
+    { type: "compaction", status: "completed" },
+  ];
   const storage = new AgentStorage(join(workdir, "agents"), logger);
   const epochs = ["initial-progress-epoch", "first-progress-epoch", "successor-progress-epoch"];
   const durableTimelineStore = new FileAgentTimelineStore(join(workdir, "timelines"), logger, {
@@ -4447,19 +4461,9 @@ test("a successor hydration preserves material progress opened by replayed live 
     override async *streamHistory(): AsyncGenerator<AgentStreamEvent> {
       historyGeneration += 1;
       if (historyGeneration === 2) {
-        yield {
-          type: "timeline",
-          provider: "codex",
-          turnId: "accepted-live-turn",
-          item: {
-            type: "tool_call",
-            callId: "write-replayed-behind-successor",
-            name: "write",
-            status: "completed",
-            error: null,
-            detail: { type: "write", filePath: "proof.txt", content: "durable successor proof" },
-          },
-        };
+        for (const item of progressItems) {
+          yield { type: "timeline", provider: "codex", timestamp, item };
+        }
       }
     }
   }
@@ -4483,23 +4487,11 @@ test("a successor hydration preserves material progress opened by replayed live 
     const created = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
       workspaceId: undefined,
     });
-    const turnId = "accepted-live-turn";
-
     const firstHydration = manager.hydrateTimelineFromProvider(created.id, { force: true });
     session!.pushEvent({ type: "turn_started", provider: "codex", turnId });
-    session!.pushEvent({
-      type: "timeline",
-      provider: "codex",
-      turnId,
-      item: {
-        type: "tool_call",
-        callId: "write-replayed-behind-successor",
-        name: "write",
-        status: "completed",
-        error: null,
-        detail: { type: "write", filePath: "proof.txt", content: "durable successor proof" },
-      },
-    });
+    for (const item of progressItems) {
+      session!.pushEvent({ type: "timeline", provider: "codex", turnId, timestamp, item });
+    }
     session!.pushEvent({
       type: "usage_updated",
       provider: "codex",
@@ -4509,8 +4501,9 @@ test("a successor hydration preserves material progress opened by replayed live 
 
     await firstHydration;
     expect(manager.getMaterialProgress(created.id)).toMatchObject({
-      state: "progressing",
-      observedThroughSeq: 1,
+      state: "stalled",
+      observedThroughSeq: 3,
+      completedCompactionsSinceMaterialProgress: 2,
       lastMaterialProgressKind: "write",
     });
     await manager.hydrateTimelineFromProvider(created.id, { force: true });
@@ -4518,25 +4511,114 @@ test("a successor hydration preserves material progress opened by replayed live 
 
     expect(historyGeneration).toBe(2);
     expect(manager.getMaterialProgress(created.id)).toMatchObject({
-      state: "progressing",
+      state: "stalled",
       timelineEpoch: "successor-progress-epoch",
       continuationBoundarySeq: 1,
-      observedThroughSeq: 1,
+      observedThroughSeq: 3,
+      completedCompactionsSinceMaterialProgress: 2,
       lastMaterialProgressKind: "write",
     });
-    await expect(durableTimelineStore.getCommittedRows(agentId)).resolves.toMatchObject([
-      {
-        seq: 1,
-        turnId,
-        item: { type: "tool_call", callId: "write-replayed-behind-successor" },
-      },
-    ]);
+    const committedRows = await durableTimelineStore.getCommittedRows(agentId);
+    expect(committedRows).toHaveLength(3);
+    expect(committedRows.map((row) => row.turnId)).toEqual([turnId, turnId, turnId]);
+    expect(committedRows.map((row) => row.item)).toEqual(progressItems);
     expect((await storage.get(agentId))?.materialProgress).toMatchObject({
       timelineEpoch: "successor-progress-epoch",
       continuationBoundarySeq: 1,
       acceptedTurnId: turnId,
-      observedThroughSeq: 1,
+      observedThroughSeq: 3,
+      completedCompactionsSinceMaterialProgress: 2,
       lastMaterialProgressKind: "write",
+    });
+  } finally {
+    await manager.closeAgent(agentId).catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("ambiguous provider overlap fails material progress rebinding closed", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-hydration-progress-ambiguous-"));
+  const agentId = "00000000-0000-4000-8000-000000000205";
+  const turnId = "accepted-ambiguous-turn";
+  const compaction: AgentTimelineItem = { type: "compaction", status: "completed" };
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const epochs = [
+    "initial-ambiguous-epoch",
+    "first-ambiguous-epoch",
+    "replacement-ambiguous-epoch",
+  ];
+  const durableTimelineStore = new FileAgentTimelineStore(join(workdir, "timelines"), logger, {
+    epochFactory: () => epochs.shift() ?? "unexpected-ambiguous-epoch",
+  });
+  let session: TestAgentSession | null = null;
+  let historyGeneration = 0;
+
+  class AmbiguousProgressHistorySession extends TestAgentSession {
+    override async *streamHistory(): AsyncGenerator<AgentStreamEvent> {
+      historyGeneration += 1;
+      if (historyGeneration === 2) {
+        yield { type: "timeline", provider: "codex", item: compaction };
+        yield { type: "timeline", provider: "codex", item: compaction };
+      }
+    }
+  }
+
+  class AmbiguousProgressHistoryClient extends TestAgentClient {
+    override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+      session = new AmbiguousProgressHistorySession(config);
+      return session;
+    }
+  }
+
+  const manager = new AgentManager({
+    clients: { codex: new AmbiguousProgressHistoryClient() },
+    registry: storage,
+    durableTimelineStore,
+    logger,
+    idFactory: () => agentId,
+  });
+
+  try {
+    const created = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+    const firstHydration = manager.hydrateTimelineFromProvider(created.id, { force: true });
+    session!.pushEvent({ type: "turn_started", provider: "codex", turnId });
+    session!.pushEvent({ type: "timeline", provider: "codex", turnId, item: compaction });
+    session!.pushEvent({
+      type: "usage_updated",
+      provider: "codex",
+      turnId,
+      usage: { inputTokens: 1 },
+    });
+    await firstHydration;
+    expect(manager.getMaterialProgress(created.id)).toMatchObject({
+      state: "warning",
+      completedCompactionsSinceMaterialProgress: 1,
+    });
+
+    await manager.hydrateTimelineFromProvider(created.id, { force: true });
+    await manager.flush();
+
+    expect(manager.getMaterialProgress(created.id)).toMatchObject({
+      state: "none",
+      timelineEpoch: "replacement-ambiguous-epoch",
+      continuationBoundarySeq: null,
+      observedThroughSeq: 2,
+      completedCompactionsSinceMaterialProgress: 1,
+      reason:
+        "Material progress is unavailable because accepted-turn attribution could not be proven after timeline replacement.",
+    });
+    const committedRows = await durableTimelineStore.getCommittedRows(agentId);
+    expect(committedRows).toHaveLength(2);
+    expect(committedRows.every((row) => row.turnId === undefined)).toBe(true);
+    expect((await storage.get(agentId))?.materialProgress).toMatchObject({
+      timelineEpoch: "replacement-ambiguous-epoch",
+      continuationBoundarySeq: null,
+      observedThroughSeq: 2,
+      completedCompactionsSinceMaterialProgress: 1,
+      unavailableReason:
+        "Material progress is unavailable because accepted-turn attribution could not be proven after timeline replacement.",
     });
   } finally {
     await manager.closeAgent(agentId).catch(() => undefined);
@@ -4550,6 +4632,7 @@ test("provider history consumes ordered live timeline and child overlap exactly 
   const historyStarted = deferred<void>();
   const releaseHistory = deferred<void>();
   let session: TestAgentSession | null = null;
+  const turnId = "overlap-turn";
   const timelineItem = { type: "assistant_message", text: "overlapping event" } as const;
   const childEvent = {
     type: "upsert" as const,
@@ -4590,13 +4673,16 @@ test("provider history consumes ordered live timeline and child overlap exactly 
       broadcast: true,
     });
     await historyStarted.promise;
-    session?.pushEvent({ type: "timeline", provider: "codex", item: timelineItem });
+    session?.pushEvent({ type: "timeline", provider: "codex", turnId, item: timelineItem });
     session?.pushEvent({ type: "provider_subagent", provider: "codex", event: childEvent });
     releaseHistory.resolve();
     await hydration;
     await manager.flush();
 
     expect(manager.getTimeline(agentId)).toEqual([timelineItem]);
+    await expect(manager.getTimelineRows(agentId)).resolves.toMatchObject([
+      { seq: 1, turnId, item: timelineItem },
+    ]);
     expect(manager.listProviderSubagents(agentId)).toEqual([
       expect.objectContaining({ id: "overlap-child", status: "completed" }),
     ]);

@@ -437,6 +437,7 @@ interface BufferedHistoryHydrationOperation {
   onOverlap?: () => Promise<void> | void;
   providerSubagentEvent?: { provider: AgentProvider; event: ProviderSubagentInputEvent };
   timelineItem?: AgentTimelineItem;
+  timelineTurnId?: string;
   eligibleForHistoryOverlap?: boolean;
   resolve?: () => void;
   reject?: (error: unknown) => void;
@@ -815,6 +816,7 @@ export class AgentManager {
               },
               historyHydrationToken,
               item,
+              turnId,
             ),
           )
           .catch((err) => {
@@ -2946,11 +2948,19 @@ export class AgentManager {
 
   private openMaterialProgressContinuation(agent: ActiveManagedAgent, turnId: string): void {
     const timeline = this.timelineStore.fetch(agent.id, { direction: "tail", limit: 1 });
-    agent.materialProgress = openMaterialProgressContinuation({
+    const timelineRows = this.timelineStore.getRows(agent.id);
+    const firstExistingTurnRow = timelineRows.find((row) => row.turnId === turnId);
+    let checkpoint = openMaterialProgressContinuation({
       timelineEpoch: timeline.epoch,
-      boundarySeq: timeline.window.nextSeq,
+      boundarySeq: firstExistingTurnRow?.seq ?? timeline.window.nextSeq,
       turnId,
     });
+    for (const row of timelineRows.filter(
+      (candidate) => candidate.seq >= checkpoint.observedThroughSeq + 1,
+    )) {
+      checkpoint = advanceMaterialProgressCheckpoint(checkpoint, row, timeline.epoch);
+    }
+    agent.materialProgress = checkpoint;
   }
 
   private settleMaterialProgress(
@@ -2997,7 +3007,24 @@ export class AgentManager {
       return createMaterialProgressCheckpoint({ timelineEpoch, nextSeq });
     }
 
+    const priorAcceptedRows = this.timelineStore
+      .getRows(agent.id)
+      .filter(
+        (row) => row.seq >= checkpoint.continuationBoundarySeq! && row.turnId === acceptedTurnId,
+      );
     const firstAcceptedTurnRow = replacementRows.find((row) => row.turnId === acceptedTurnId);
+    if (priorAcceptedRows.length > 0 && firstAcceptedTurnRow === undefined) {
+      return {
+        ...checkpoint,
+        timelineEpoch,
+        continuationBoundarySeq: null,
+        acceptedTurnId: null,
+        turnOutcome: null,
+        observedThroughSeq: Math.max(0, nextSeq - 1),
+        unavailableReason:
+          "Material progress is unavailable because accepted-turn attribution could not be proven after timeline replacement.",
+      };
+    }
     let rebound = openMaterialProgressContinuation({
       timelineEpoch,
       boundarySeq: firstAcceptedTurnRow?.seq ?? nextSeq,
@@ -4116,6 +4143,7 @@ export class AgentManager {
             }
           : {}),
         ...(event.type === "timeline" ? { timelineItem: structuredClone(event.item) } : {}),
+        ...(event.type === "timeline" && event.turnId ? { timelineTurnId: event.turnId } : {}),
         ...(event.type === "provider_subagent"
           ? {
               providerSubagentEvent: {
@@ -4686,10 +4714,20 @@ export class AgentManager {
     const newlyAppliedRows = currentRows.filter(
       (row) => row.seq >= activeHydration.nextUncapturedTimelineSeq,
     );
-    const candidateCarriedRows = [
+    const acceptedTurnId = this.agents.get(agentId)?.materialProgress.acceptedTurnId;
+    const acceptedCanonicalRows = acceptedTurnId
+      ? currentRows.filter((row) => row.turnId === acceptedTurnId)
+      : [];
+    const candidateCarriedRows: AgentTimelineRow[] = [];
+    for (const row of [
+      ...acceptedCanonicalRows,
       ...activeHydration.carriedLiveTimelineRows,
-      ...newlyAppliedRows.map((row) => structuredClone(row)),
-    ];
+      ...newlyAppliedRows.map((appliedRow) => structuredClone(appliedRow)),
+    ]) {
+      if (!candidateCarriedRows.some((candidate) => isDeepStrictEqual(candidate, row))) {
+        candidateCarriedRows.push(structuredClone(row));
+      }
+    }
     const historyRows = incomingHistoryRows.map((row) => structuredClone(row));
     const priorHistoryItems = activeHydration.lastProviderHistoryItems;
     const hasPriorHistoryPrefix =
@@ -4697,15 +4735,72 @@ export class AgentManager {
       priorHistoryItems.every((item, index) => isDeepStrictEqual(item, historyRows[index]?.item));
     let historySearchIndex = hasPriorHistoryPrefix ? priorHistoryItems.length : 0;
     const unmatchedCarriedRows: AgentTimelineRow[] = [];
-    for (const carriedRow of candidateCarriedRows) {
-      const matchingHistoryIndex = historyRows.findIndex(
-        (row, index) => index >= historySearchIndex && isDeepStrictEqual(row.item, carriedRow.item),
+    for (let carriedIndex = 0; carriedIndex < candidateCarriedRows.length; carriedIndex += 1) {
+      const carriedRow = candidateCarriedRows[carriedIndex];
+      const matchingHistoryIndices = historyRows.flatMap((row, index) =>
+        index >= historySearchIndex && isDeepStrictEqual(row.item, carriedRow.item) ? [index] : [],
       );
-      if (matchingHistoryIndex < 0) {
+      const matchingHistoryIndex = matchingHistoryIndices[0];
+      if (matchingHistoryIndex === undefined) {
         unmatchedCarriedRows.push(carriedRow);
       } else {
+        const remainingEquivalentCarriedRows = candidateCarriedRows
+          .slice(carriedIndex)
+          .filter((row) => isDeepStrictEqual(row.item, carriedRow.item)).length;
+        if (
+          matchingHistoryIndices.length === remainingEquivalentCarriedRows &&
+          carriedRow.turnId !== undefined &&
+          historyRows[matchingHistoryIndex].turnId === undefined
+        ) {
+          historyRows[matchingHistoryIndex] = {
+            ...historyRows[matchingHistoryIndex],
+            turnId: carriedRow.turnId,
+          };
+        }
         historySearchIndex = matchingHistoryIndex + 1;
       }
+    }
+
+    const bufferedTimelineOperations = [
+      ...activeHydration.preGateBufferedOperations,
+      ...activeHydration.bufferedOperations,
+    ].filter(
+      (
+        operation,
+      ): operation is BufferedHistoryHydrationOperation & {
+        timelineItem: AgentTimelineItem;
+        timelineTurnId: string;
+      } =>
+        operation.timelineItem !== undefined &&
+        operation.timelineTurnId !== undefined &&
+        operation.eligibleForHistoryOverlap === true,
+    );
+    let bufferedHistorySearchIndex = 0;
+    for (let index = 0; index < bufferedTimelineOperations.length; index += 1) {
+      const operation = bufferedTimelineOperations[index];
+      const matchingHistoryIndices = historyRows.flatMap((row, historyIndex) =>
+        historyIndex >= bufferedHistorySearchIndex &&
+        isDeepStrictEqual(row.item, operation.timelineItem)
+          ? [historyIndex]
+          : [],
+      );
+      const matchingHistoryIndex = matchingHistoryIndices[0];
+      if (matchingHistoryIndex === undefined) continue;
+      const remainingEquivalentOperations = bufferedTimelineOperations
+        .slice(index)
+        .filter((candidate) =>
+          isDeepStrictEqual(candidate.timelineItem, operation.timelineItem),
+        ).length;
+      if (
+        matchingHistoryIndices.length === remainingEquivalentOperations &&
+        historyRows[matchingHistoryIndex].turnId === undefined
+      ) {
+        historyRows[matchingHistoryIndex] = {
+          ...historyRows[matchingHistoryIndex],
+          turnId: operation.timelineTurnId,
+        };
+      }
+      bufferedHistorySearchIndex = matchingHistoryIndex + 1;
     }
     let nextSeq = historyRows.length + 1;
     const carriedRows: AgentTimelineRow[] = [];
@@ -4944,6 +5039,7 @@ export class AgentManager {
     run: () => Promise<void> | void,
     historyHydrationToken?: symbol,
     timelineItem?: AgentTimelineItem,
+    timelineTurnId?: string,
   ): Promise<void> {
     return this.runOrBufferHistoryHydrationOperation(
       agentId,
@@ -4951,6 +5047,7 @@ export class AgentManager {
         kind: "timeline_writer",
         run: async () => run(),
         ...(timelineItem ? { timelineItem: structuredClone(timelineItem) } : {}),
+        ...(timelineTurnId ? { timelineTurnId } : {}),
       },
       historyHydrationToken,
     );
@@ -5329,6 +5426,7 @@ export class AgentManager {
         },
         options.historyHydrationToken,
         event.item,
+        event.turnId,
       );
       flags.shouldDispatchEvent = false;
       flags.shouldNotifyWaiters = false;
@@ -5347,6 +5445,7 @@ export class AgentManager {
       },
       options?.historyHydrationToken,
       event.item,
+      event.turnId,
     );
     flags.shouldDispatchEvent = false;
     flags.shouldNotifyWaiters = true;
