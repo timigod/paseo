@@ -1886,6 +1886,118 @@ describe("OpenCode adapter startTurn error handling", () => {
     ]);
   });
 
+  test("streamHistory attributes replay only to the exact generated user message", async () => {
+    const openCode = new TestOpenCodeClient();
+    openCode.sessionPromptAsyncEvents = [];
+    openCode.sessionGetResponse = {
+      data: { id: "ses_unit_test", directory: "/tmp/test", revert: undefined },
+    };
+    const session = new __openCodeInternals.OpenCodeAgentSession(
+      { provider: "opencode", cwd: "/tmp/test" },
+      openCode.asSdkClient(),
+      "ses_unit_test",
+      createTestLogger(),
+    );
+    try {
+      const { turnId } = await session.startTurn("make the change");
+      const promptCall = openCode.calls.sessionPromptAsync[0] as { messageID?: unknown };
+      expect(promptCall.messageID).toEqual(expect.any(String));
+      const userMessageId = promptCall.messageID as string;
+      openCode.sessionMessagesResponse = {
+        data: [
+          {
+            info: {
+              id: "msg_exact_assistant",
+              sessionID: "ses_unit_test",
+              role: "assistant",
+              parentID: userMessageId,
+              time: { created: 20 },
+            },
+            parts: [
+              {
+                id: "part_exact",
+                sessionID: "ses_unit_test",
+                messageID: "msg_exact_assistant",
+                type: "text",
+                text: "exact",
+              },
+            ],
+          },
+          {
+            info: {
+              id: "msg_unrelated_assistant",
+              sessionID: "ses_unit_test",
+              role: "assistant",
+              parentID: "msg_other_user",
+              time: { created: 30 },
+            },
+            parts: [
+              {
+                id: "part_unrelated",
+                sessionID: "ses_unit_test",
+                messageID: "msg_unrelated_assistant",
+                type: "text",
+                text: "unrelated",
+              },
+            ],
+          },
+        ],
+      };
+      const history: AgentStreamEvent[] = [];
+      for await (const event of session.streamHistory()) history.push(event);
+      expect(history.map((event) => ("turnId" in event ? event.turnId : undefined))).toEqual([
+        turnId,
+        undefined,
+      ]);
+    } finally {
+      await session.close();
+    }
+  });
+
+  test("streamHistory rejects ambiguous latest correlated assistants", async () => {
+    const openCode = new TestOpenCodeClient();
+    openCode.sessionPromptAsyncEvents = [];
+    openCode.sessionGetResponse = {
+      data: { id: "ses_unit_test", directory: "/tmp/test", revert: undefined },
+    };
+    const session = new __openCodeInternals.OpenCodeAgentSession(
+      { provider: "opencode", cwd: "/tmp/test" },
+      openCode.asSdkClient(),
+      "ses_unit_test",
+      createTestLogger(),
+    );
+    try {
+      await session.startTurn("make the change");
+      const userMessageId = (openCode.calls.sessionPromptAsync[0] as { messageID: string })
+        .messageID;
+      openCode.sessionMessagesResponse = {
+        data: ["a", "b"].map((suffix) => ({
+          info: {
+            id: `msg_${suffix}`,
+            sessionID: "ses_unit_test",
+            role: "assistant",
+            parentID: userMessageId,
+            time: { created: 20 },
+          },
+          parts: [
+            {
+              id: `part_${suffix}`,
+              sessionID: "ses_unit_test",
+              messageID: `msg_${suffix}`,
+              type: "text",
+              text: suffix,
+            },
+          ],
+        })),
+      };
+      const history: AgentStreamEvent[] = [];
+      for await (const event of session.streamHistory()) history.push(event);
+      expect(history.every((event) => !("turnId" in event))).toBe(true);
+    } finally {
+      await session.close();
+    }
+  });
+
   test("streamHistory maps persisted OpenCode tool parts through canonical detail branches", async () => {
     const patchText = [
       "*** Begin Patch",
