@@ -120,7 +120,7 @@ export interface ArchiveByScopeRequest {
 
 export interface PendingWorkspaceCleanupRetryRequest {
   directoryPath: string;
-  worktreeIncarnationId: string;
+  worktreeIncarnationId: string | null;
   quarantineMarker?: string | null;
   requestId: string;
   signal?: AbortSignal;

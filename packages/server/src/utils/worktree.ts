@@ -8,8 +8,9 @@ import {
   unlinkSync,
   writeFileSync,
 } from "fs";
-import { copyFile, lstat, rename, rm, stat, writeFile } from "fs/promises";
+import { copyFile, lstat, rename, rm, rmdir, stat, writeFile } from "fs/promises";
 import { join, basename, dirname, isAbsolute, resolve, sep } from "path";
+import { spawn } from "node:child_process";
 import net from "node:net";
 import { createHash, randomUUID } from "node:crypto";
 import stripAnsi from "strip-ansi";
@@ -46,6 +47,7 @@ import { createExternalProcessEnv } from "../server/paseo-env.js";
 import { parseGitRevParsePath, resolveGitRevParsePath } from "./git-rev-parse-path.js";
 import { validateBranchSlug } from "@getpaseo/protocol/branch-slug";
 import { expandTilde, getRealpathAwareRelativePath, isPathInsideRoot } from "./path.js";
+import { findExecutable } from "../executable-resolution/executable-resolution.js";
 import {
   appendWorktreeSetupOutput,
   createWorktreeSetupOutputAccumulator,
@@ -60,6 +62,104 @@ const READ_ONLY_GIT_ENV = {
 } as const;
 const WORKTREE_CLEANUP_MARKER_PREFIX = ".paseo-cleanup-marker-";
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const POSIX_CLEANUP_READY = "PASEO_CLEANUP_READY";
+const POSIX_CLEANUP_DONE = "PASEO_CLEANUP_DONE ";
+const POSIX_PINNED_CLEANUP_SCRIPT = String.raw`
+"use strict";
+const fs = require("node:fs");
+const path = require("node:path");
+const { spawnSync } = require("node:child_process");
+
+const expectedIdentity = process.argv[1];
+const markerName = process.argv[2];
+const trustedParent = process.argv[3];
+const rmExecutable = process.argv[4];
+const pinnedPath = process.cwd();
+
+function fail(kind, message) {
+  process.stderr.write(kind + ":" + message + "\n");
+  process.exit(1);
+}
+
+function validatePinnedDirectory(requireMarker) {
+  if (path.dirname(pinnedPath) !== trustedParent) {
+    fail("AUTHORITY", "Pinned cleanup directory left its trusted parent");
+  }
+  const stats = fs.lstatSync(".");
+  const identity = String(stats.dev) + ":" + String(stats.ino);
+  if (!stats.isDirectory() || identity !== expectedIdentity) {
+    fail("AUTHORITY", "Pinned cleanup directory identity changed");
+  }
+  if (requireMarker) {
+    const markerStats = fs.lstatSync(markerName);
+    if (!markerStats.isFile()) {
+      fail("AUTHORITY", "Pinned cleanup quarantine marker changed");
+    }
+  }
+}
+
+function validateTrustedPath() {
+  let stats;
+  try {
+    stats = fs.lstatSync(pinnedPath);
+  } catch (error) {
+    if (error && error.code === "ENOENT") {
+      fail("AUTHORITY", "Pinned cleanup directory lost its trusted pathname");
+    }
+    throw error;
+  }
+  const identity = String(stats.dev) + ":" + String(stats.ino);
+  if (!stats.isDirectory() || identity !== expectedIdentity) {
+    fail("AUTHORITY", "Cleanup path identity changed for " + pinnedPath);
+  }
+}
+
+function removePinnedContents() {
+  validatePinnedDirectory(true);
+  validateTrustedPath();
+  for (let sweep = 0; sweep < 64; sweep += 1) {
+    validatePinnedDirectory(false);
+    validateTrustedPath();
+    const entries = fs.readdirSync(".");
+    if (entries.length === 0) {
+      validatePinnedDirectory(false);
+      validateTrustedPath();
+      process.stdout.write(${JSON.stringify(POSIX_CLEANUP_DONE)} + JSON.stringify(pinnedPath) + "\n");
+      process.exit(0);
+    }
+    entries.sort((left, right) => Number(left === markerName) - Number(right === markerName));
+    for (const entry of entries) {
+      const result = spawnSync(rmExecutable, ["-rf", "--", "./" + entry], {
+        cwd: ".",
+        encoding: "utf8",
+        stdio: ["ignore", "ignore", "pipe"],
+      });
+      if (result.error || result.status !== 0) {
+        const detail = result.error ? result.error.message : result.stderr.trim();
+        fail("REMOVE", detail || "POSIX removal helper failed");
+      }
+    }
+  }
+  fail("REMOVE", "Pinned cleanup directory did not become empty");
+}
+
+validatePinnedDirectory(true);
+process.stdout.write(${JSON.stringify(`${POSIX_CLEANUP_READY}\n`)});
+process.stdin.setEncoding("utf8");
+let command = "";
+process.stdin.on("data", (chunk) => {
+  command += chunk;
+  if (command.includes("\n")) {
+    if (command.slice(0, command.indexOf("\n")) !== "REMOVE") {
+      fail("AUTHORITY", "Invalid pinned cleanup command");
+    }
+    removePinnedContents();
+  }
+});
+process.stdin.on("end", () => fail("AUTHORITY", "Pinned cleanup command was not received"));
+`;
+
+let posixRmExecutablePromise: Promise<string> | null = null;
 
 export interface WorktreeConfig {
   branchName: string;
@@ -1144,6 +1244,7 @@ export interface DeletePaseoWorktreeOptions {
   worktreesBaseRoot?: string;
   expectedWorktreeIncarnationId?: string | null;
   expectedQuarantineMarker?: string | null;
+  onCleanupDirectoryPinned?: (quarantinePath: string) => void | Promise<void>;
   signal?: AbortSignal;
 }
 
@@ -1156,6 +1257,13 @@ export class WorktreeCleanupRelocatedError extends Error {
   ) {
     super(`Worktree cleanup remains at ${remainingPath}`, { cause });
     this.name = "WorktreeCleanupRelocatedError";
+  }
+}
+
+class WorktreeCleanupAuthorityError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "WorktreeCleanupAuthorityError";
   }
 }
 
@@ -1198,6 +1306,7 @@ export async function deletePaseoWorktree({
   worktreesBaseRoot,
   expectedWorktreeIncarnationId,
   expectedQuarantineMarker,
+  onCleanupDirectoryPinned,
   signal,
 }: DeletePaseoWorktreeOptions): Promise<void> {
   throwIfWorktreeDeletionCanceled(signal);
@@ -1266,7 +1375,7 @@ export async function deletePaseoWorktree({
       quarantineMarker,
       requestedQuarantine,
     }));
-  await removeQuarantinedWorktree({ cwd, quarantined, signal });
+  await removeQuarantinedWorktree({ cwd, quarantined, onCleanupDirectoryPinned, signal });
 }
 
 interface WorktreeCleanupTarget {
@@ -1378,6 +1487,7 @@ async function resolveCleanupIncarnationId(
 async function removeQuarantinedWorktree(input: {
   cwd: string | null;
   quarantined: QuarantinedDirectory | null;
+  onCleanupDirectoryPinned?: (quarantinePath: string) => void | Promise<void>;
   signal?: AbortSignal;
 }): Promise<void> {
   try {
@@ -1401,17 +1511,26 @@ async function removeQuarantinedWorktree(input: {
         input.quarantined.path,
         input.quarantined.identity,
         input.quarantined.quarantineMarker,
+        input.onCleanupDirectoryPinned,
         input.signal,
       );
     }
   } catch (error) {
-    if (input.quarantined && (await readDirectoryIdentity(input.quarantined.path)) !== null) {
-      throw new WorktreeCleanupRelocatedError(
-        input.quarantined.path,
-        input.quarantined.worktreeIncarnationId,
-        error,
-        input.quarantined.quarantineMarker,
-      );
+    if (input.quarantined) {
+      let remainingIdentity: string | null;
+      try {
+        remainingIdentity = await readDirectoryIdentity(input.quarantined.path);
+      } catch {
+        throw error;
+      }
+      if (remainingIdentity === input.quarantined.identity) {
+        throw new WorktreeCleanupRelocatedError(
+          input.quarantined.path,
+          input.quarantined.worktreeIncarnationId,
+          error,
+          input.quarantined.quarantineMarker,
+        );
+      }
     }
     throw error;
   }
@@ -1634,6 +1753,7 @@ async function removeDirectoryWithRetries(
   path: string,
   expectedDirectoryIdentity: string,
   quarantineMarker: string,
+  onDirectoryPinned?: (quarantinePath: string) => void | Promise<void>,
   signal?: AbortSignal,
 ): Promise<void> {
   throwIfWorktreeDeletionCanceled(signal);
@@ -1655,7 +1775,16 @@ async function removeDirectoryWithRetries(
       if (!(await assertDirectoryIdentity(path, expectedDirectoryIdentity))) {
         return;
       }
-      await rm(path, { recursive: true, force: true });
+      if (process.platform === "win32") {
+        await rm(path, { recursive: true, force: true });
+      } else {
+        await removePinnedPosixDirectory({
+          path,
+          expectedDirectoryIdentity,
+          quarantineMarker,
+          onDirectoryPinned,
+        });
+      }
       throwIfWorktreeDeletionCanceled(signal);
       if (!(await pathExists(path))) {
         return;
@@ -1663,6 +1792,7 @@ async function removeDirectoryWithRetries(
       lastError = new Error(`Directory still present after rm: ${path}`);
     } catch (error) {
       throwIfWorktreeDeletionCanceled(signal);
+      if (error instanceof WorktreeCleanupAuthorityError) throw error;
       lastError = error;
     }
   }
@@ -1671,6 +1801,136 @@ async function removeDirectoryWithRetries(
     throw lastError instanceof Error
       ? lastError
       : new Error(`Failed to remove worktree directory: ${path}`);
+  }
+}
+
+async function resolvePosixRmExecutable(): Promise<string> {
+  if (existsSync("/bin/rm")) return "/bin/rm";
+  posixRmExecutablePromise ??= findExecutable("rm").then((executable) => {
+    if (!executable) throw new Error("POSIX removal helper is unavailable");
+    return executable;
+  });
+  return posixRmExecutablePromise;
+}
+
+async function removePinnedPosixDirectory(input: {
+  path: string;
+  expectedDirectoryIdentity: string;
+  quarantineMarker: string;
+  onDirectoryPinned?: (quarantinePath: string) => void | Promise<void>;
+}): Promise<void> {
+  const markerName = basename(
+    getPaseoWorktreeCleanupMarkerPath(input.path, input.quarantineMarker),
+  );
+  const trustedParent = realpathSync(dirname(input.path));
+  const rmExecutable = await resolvePosixRmExecutable();
+  const child = spawn(
+    process.execPath,
+    [
+      "-e",
+      POSIX_PINNED_CLEANUP_SCRIPT,
+      input.expectedDirectoryIdentity,
+      markerName,
+      trustedParent,
+      rmExecutable,
+    ],
+    {
+      cwd: input.path,
+      env: {},
+      stdio: ["pipe", "pipe", "pipe"],
+      windowsHide: true,
+    },
+  );
+  child.stdin.on("error", () => undefined);
+
+  let stdout = "";
+  let stderr = "";
+  let ready = false;
+  let completedPath: string | null = null;
+  let launchError: Error | null = null;
+  let authorizationError: unknown = null;
+  let authorizationTask: Promise<void> | null = null;
+
+  child.stdout.setEncoding("utf8");
+  child.stdout.on("data", (chunk: string) => {
+    stdout += chunk;
+    let newlineIndex = stdout.indexOf("\n");
+    while (newlineIndex !== -1) {
+      const line = stdout.slice(0, newlineIndex);
+      stdout = stdout.slice(newlineIndex + 1);
+      if (line === POSIX_CLEANUP_READY && !ready) {
+        ready = true;
+        authorizationTask = (async () => {
+          try {
+            if (!(await hasPaseoWorktreeCleanupMarker(input.path, input.quarantineMarker))) {
+              throw new WorktreeCleanupAuthorityError(
+                `Cleanup quarantine marker changed for ${input.path}`,
+              );
+            }
+            if (!(await assertDirectoryIdentity(input.path, input.expectedDirectoryIdentity))) {
+              throw new WorktreeCleanupAuthorityError(`Cleanup path disappeared: ${input.path}`);
+            }
+            await input.onDirectoryPinned?.(input.path);
+            child.stdin.end("REMOVE\n");
+          } catch (error) {
+            authorizationError = error;
+            child.kill();
+          }
+        })();
+      } else if (line.startsWith(POSIX_CLEANUP_DONE)) {
+        const parsedPath = JSON.parse(line.slice(POSIX_CLEANUP_DONE.length)) as unknown;
+        if (typeof parsedPath === "string") completedPath = parsedPath;
+      }
+      newlineIndex = stdout.indexOf("\n");
+    }
+  });
+  child.stderr.setEncoding("utf8");
+  child.stderr.on("data", (chunk: string) => {
+    stderr += chunk;
+  });
+  child.on("error", (error) => {
+    launchError = error;
+  });
+
+  const exit = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(
+    (resolvePromise) => {
+      child.on("close", (code, signal) => resolvePromise({ code, signal }));
+    },
+  );
+  await authorizationTask;
+  if (authorizationError) throw authorizationError;
+  if (launchError) throw launchError;
+  if (exit.code !== 0 || !ready || !completedPath) {
+    const detail = stderr.trim() || `helper exited with ${exit.signal ?? exit.code ?? "no status"}`;
+    if (detail.startsWith("AUTHORITY:")) {
+      throw new WorktreeCleanupAuthorityError(detail.slice("AUTHORITY:".length));
+    }
+    throw new Error(`Pinned worktree cleanup failed: ${detail}`);
+  }
+  if (dirname(completedPath) !== trustedParent) {
+    throw new WorktreeCleanupAuthorityError("Pinned cleanup directory left its trusted parent");
+  }
+  try {
+    if (!(await assertDirectoryIdentity(completedPath, input.expectedDirectoryIdentity))) {
+      throw new WorktreeCleanupAuthorityError("Pinned cleanup directory disappeared");
+    }
+  } catch (error) {
+    throw new WorktreeCleanupAuthorityError(
+      error instanceof Error ? error.message : "Pinned cleanup directory identity changed",
+    );
+  }
+  try {
+    await rmdir(completedPath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+
+  const requestedIdentity = await readDirectoryIdentity(input.path);
+  if (requestedIdentity !== null) {
+    if (requestedIdentity !== input.expectedDirectoryIdentity) {
+      throw new WorktreeCleanupAuthorityError(`Cleanup path identity changed for ${input.path}`);
+    }
+    throw new Error(`Directory still present after pinned removal: ${input.path}`);
   }
 }
 

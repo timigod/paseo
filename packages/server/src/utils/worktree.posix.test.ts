@@ -1504,6 +1504,111 @@ describe.skipIf(isPlatform("win32"))("worktree POSIX-only", () => {
       expect(existsSync(quarantinePath)).toBe(true);
     });
 
+    it("does not recursively delete a replacement installed after cleanup is pinned", async () => {
+      const created = await createLegacyWorktreeForTest({
+        branchName: "pinned-replacement-branch",
+        cwd: repoDir,
+        baseBranch: "main",
+        worktreeSlug: "pinned-replacement",
+        paseoHome,
+      });
+      const incarnationId = readPaseoWorktreeIncarnationId(created.worktreePath)!;
+      const quarantineMarker = "00000000-0000-4000-8000-000000000049";
+      const quarantinePath = getPaseoWorktreeCleanupQuarantinePath(
+        created.worktreePath,
+        incarnationId,
+      );
+      const displacedPath = `${quarantinePath}-displaced`;
+
+      await expect(
+        deletePaseoWorktree({
+          cwd: repoDir,
+          worktreePath: created.worktreePath,
+          teardownCwds: [],
+          paseoHome,
+          expectedWorktreeIncarnationId: incarnationId,
+          expectedQuarantineMarker: quarantineMarker,
+          onCleanupDirectoryPinned: (pinnedPath) => {
+            renameSync(pinnedPath, displacedPath);
+            mkdirSync(pinnedPath);
+            writeFileSync(join(pinnedPath, "keep.txt"), "replacement");
+          },
+        }),
+      ).rejects.toThrow("Cleanup path identity changed");
+
+      expect(readFileSync(join(quarantinePath, "keep.txt"), "utf8")).toBe("replacement");
+      expect(existsSync(displacedPath)).toBe(true);
+    });
+
+    it("does not follow a symlink installed after cleanup is pinned", async () => {
+      const created = await createLegacyWorktreeForTest({
+        branchName: "pinned-symlink-branch",
+        cwd: repoDir,
+        baseBranch: "main",
+        worktreeSlug: "pinned-symlink",
+        paseoHome,
+      });
+      const incarnationId = readPaseoWorktreeIncarnationId(created.worktreePath)!;
+      const quarantineMarker = "00000000-0000-4000-8000-000000000050";
+      const quarantinePath = getPaseoWorktreeCleanupQuarantinePath(
+        created.worktreePath,
+        incarnationId,
+      );
+      const displacedPath = `${quarantinePath}-displaced`;
+      const protectedPath = join(tempDir, "protected-symlink-target");
+      mkdirSync(protectedPath);
+      writeFileSync(join(protectedPath, "keep.txt"), "protected");
+
+      await expect(
+        deletePaseoWorktree({
+          cwd: repoDir,
+          worktreePath: created.worktreePath,
+          teardownCwds: [],
+          paseoHome,
+          expectedWorktreeIncarnationId: incarnationId,
+          expectedQuarantineMarker: quarantineMarker,
+          onCleanupDirectoryPinned: (pinnedPath) => {
+            renameSync(pinnedPath, displacedPath);
+            symlinkSync(protectedPath, pinnedPath, "dir");
+          },
+        }),
+      ).rejects.toThrow("Cleanup path identity changed");
+
+      expect(readFileSync(join(protectedPath, "keep.txt"), "utf8")).toBe("protected");
+      expect(existsSync(displacedPath)).toBe(true);
+      expect(existsSync(quarantinePath)).toBe(true);
+    });
+
+    it("refuses to clean a pinned quarantine renamed outside its trusted parent", async () => {
+      const created = await createLegacyWorktreeForTest({
+        branchName: "pinned-rename-branch",
+        cwd: repoDir,
+        baseBranch: "main",
+        worktreeSlug: "pinned-rename",
+        paseoHome,
+      });
+      const incarnationId = readPaseoWorktreeIncarnationId(created.worktreePath)!;
+      const quarantineMarker = "00000000-0000-4000-8000-000000000051";
+      const escapedPath = join(tempDir, "escaped-quarantine");
+
+      await expect(
+        deletePaseoWorktree({
+          cwd: repoDir,
+          worktreePath: created.worktreePath,
+          teardownCwds: [],
+          paseoHome,
+          expectedWorktreeIncarnationId: incarnationId,
+          expectedQuarantineMarker: quarantineMarker,
+          onCleanupDirectoryPinned: (pinnedPath) => {
+            writeFileSync(join(pinnedPath, "keep.txt"), "escaped");
+            renameSync(pinnedPath, escapedPath);
+          },
+        }),
+      ).rejects.toThrow("Pinned cleanup directory lost its trusted pathname");
+
+      expect(readFileSync(join(escapedPath, "keep.txt"), "utf8")).toBe("escaped");
+    });
+
     it("lets a legacy receipt quarantine its original path but not claim a quarantine", async () => {
       const original = await createLegacyWorktreeForTest({
         branchName: "legacy-original-branch",

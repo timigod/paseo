@@ -11,7 +11,7 @@ const DEFAULT_MAX_TARGETS_PER_CYCLE = 8;
 
 export interface WorkspaceCleanupRetryTarget {
   directoryPath: string;
-  worktreeIncarnationId: string;
+  worktreeIncarnationId: string | null;
   quarantineMarker: string | null;
   workspaceIds: string[];
 }
@@ -204,14 +204,14 @@ export function findWorkspaceCleanupRetryTargets(
     const incarnationIds = new Set(
       group.map((workspace) => workspace.cleanupPending?.worktreeIncarnationId ?? null),
     );
-    if (incarnationIds.size !== 1 || incarnationIds.has(null)) continue;
+    if (incarnationIds.size !== 1) continue;
     const quarantineMarkers = new Set(
       group.map((workspace) => workspace.cleanupPending?.quarantineMarker ?? null),
     );
     if (quarantineMarkers.size !== 1) continue;
     targets.push({
       directoryPath,
-      worktreeIncarnationId: [...incarnationIds][0]!,
+      worktreeIncarnationId: [...incarnationIds][0] ?? null,
       quarantineMarker: [...quarantineMarkers][0] ?? null,
       workspaceIds: group.map((workspace) => workspace.workspaceId).sort(),
     });

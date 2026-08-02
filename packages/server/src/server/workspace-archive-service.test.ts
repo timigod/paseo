@@ -1542,7 +1542,7 @@ describe("archiveByScope", () => {
     expect((await registry.get(workspaceId))?.cleanupPending).toBeNull();
   });
 
-  test("an absent cleanup receipt without an incarnation settles as complete", async () => {
+  test("autonomous retry settles an absent legacy receipt without an incarnation", async () => {
     const { tempDir } = createGitRepo();
     const absentPath = path.join(tempDir, ".paseo", "worktrees", "missing", "absent-worktree");
     const workspaceId = "ws-absent-null-incarnation";
@@ -1581,13 +1581,80 @@ describe("archiveByScope", () => {
     });
     deps.workspaceRegistry = registry;
 
-    const result = await archiveByScope(deps, {
-      scope: { kind: "workspace", workspaceId },
-      requestId: "absent-null-incarnation",
+    const service = new WorkspaceCleanupRetryService({
+      workspaceRegistry: registry,
+      retryWorktreeCleanup: async (target, signal) => {
+        requireArchiveCleanupComplete(
+          await retryPendingWorkspaceCleanup(deps, {
+            directoryPath: target.directoryPath,
+            worktreeIncarnationId: target.worktreeIncarnationId,
+            quarantineMarker: target.quarantineMarker,
+            requestId: "retry-absent-null-incarnation",
+            signal,
+          }),
+          "Legacy cleanup retry",
+        );
+      },
+      logger: createLogger(),
+      idlePollMs: 60_000,
+    });
+
+    await service.start();
+    await vi.waitFor(async () => {
+      expect((await registry.get(workspaceId))?.cleanupPending).toBeNull();
+    });
+    await service.stop();
+    expect((await registry.get(workspaceId))?.cleanupPending).toBeNull();
+  });
+
+  test("retry leaves a present legacy receipt pending", async () => {
+    const { tempDir, repoDir } = createGitRepo();
+    const paseoHome = path.join(tempDir, ".paseo");
+    const worktree = await createPaseoOwnedWorktree(repoDir, paseoHome, "present-legacy-cleanup");
+    const workspaceId = "ws-present-null-incarnation";
+    const registry = new FileBackedWorkspaceRegistry(
+      path.join(tempDir, "workspaces.json"),
+      createLogger(),
+    );
+    await registry.initialize();
+    const timestamp = new Date().toISOString();
+    await registry.upsert(
+      createPersistedWorkspaceRecord({
+        workspaceId,
+        projectId: "project-present-null-incarnation",
+        cwd: worktree.worktreePath,
+        kind: "worktree",
+        displayName: "Present legacy cleanup",
+        worktreeRoot: worktree.worktreePath,
+        isPaseoOwnedWorktree: true,
+        mainRepoRoot: repoDir,
+        createdAt: timestamp,
+        updatedAt: timestamp,
+        archivedAt: timestamp,
+        cleanupPending: {
+          directoryPath: worktree.worktreePath,
+          teardownCwd: worktree.worktreePath,
+          mainRepoRoot: repoDir,
+          paseoWorktreesRoot: null,
+          worktreeIncarnationId: null,
+          quarantineMarker: null,
+        },
+      }),
+    );
+    const deps = createArchiveDeps({ paseoHome, activeWorkspaces: [] });
+    deps.workspaceRegistry = registry;
+
+    const result = await retryPendingWorkspaceCleanup(deps, {
+      directoryPath: worktree.worktreePath,
+      worktreeIncarnationId: null,
+      quarantineMarker: null,
+      requestId: "retry-present-null-incarnation",
     });
 
     expect(result.removedDirectory).toBe(false);
-    expect((await registry.get(workspaceId))?.cleanupPending).toBeNull();
+    expect(result.cleanupPendingWorkspaceIds).toEqual([workspaceId]);
+    expect((await registry.get(workspaceId))?.cleanupPending).not.toBeNull();
+    expect(existsSync(worktree.worktreePath)).toBe(true);
   });
 
   test("directory workspace creation waits for cleanup and revalidates after final owner read", async () => {

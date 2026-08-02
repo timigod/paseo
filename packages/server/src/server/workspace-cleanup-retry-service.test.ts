@@ -88,6 +88,12 @@ test("groups archived cleanup by directory, incarnation, and marker", () => {
       workspaceIds: ["ws-conflict-b"],
     },
     {
+      directoryPath: "/worktrees/legacy",
+      worktreeIncarnationId: null,
+      quarantineMarker: null,
+      workspaceIds: ["ws-legacy"],
+    },
+    {
       directoryPath: "/worktrees/shared",
       worktreeIncarnationId: "inc-shared",
       quarantineMarker: null,
