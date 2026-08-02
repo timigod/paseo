@@ -60,6 +60,7 @@ import {
   asDaemonConfigStore,
   asTerminalManager,
   asSessionInternals,
+  createAgentLifecycleDispatchStub,
   createProviderSnapshotManagerStub,
   isSessionOutboundMessage,
   filterByType,
@@ -74,6 +75,7 @@ import {
   type PersistedWorkspaceRecord,
   type WorkspaceMutation,
 } from "./workspace-registry.js";
+import { defaultWorkspaceLifecycleCoordinator } from "./workspace-lifecycle-coordinator.js";
 
 const REPO_CWD = path.resolve("/tmp/repo");
 const UNREGISTERED_CWD = path.resolve("/tmp/unregistered");
@@ -537,6 +539,9 @@ function createSessionForWorkspaceTests(
     onWorkspaceRecovered?: SessionOptions["onWorkspaceRecovered"];
     workspaceGitService?: ReturnType<typeof createNoopWorkspaceGitService>;
     terminalManager?: TerminalManager | null;
+    agentManager?: { [K in keyof SessionOptions["agentManager"]]?: unknown };
+    agentStorage?: { [K in keyof SessionOptions["agentStorage"]]?: unknown };
+    createAgentLifecycleDispatch?: SessionOptions["createAgentLifecycleDispatch"];
     projectRegistry?: SessionOptions["projectRegistry"];
     workspaceRegistry?: SessionOptions["workspaceRegistry"];
     github?: ForgeService;
@@ -566,6 +571,7 @@ function createSessionForWorkspaceTests(
     unarchiveSnapshot: async () => true,
     clearAgentAttention: async () => {},
     notifyAgentState: () => {},
+    ...options.agentManager,
   });
   const workspaceRegistry: SessionOptions["workspaceRegistry"] = options.workspaceRegistry ?? {
     initialize: async () => {},
@@ -654,7 +660,14 @@ function createSessionForWorkspaceTests(
               })
             : null,
         upsert: async () => {},
+        beginPendingAgentCreation: async () => {},
+        planPendingAgentCreationWorktree: async () => {},
+        identifyPendingAgentCreationWorktree: async () => {},
+        removePendingAgentCreation: async () => {},
+        ...options.agentStorage,
       }),
+      createAgentLifecycleDispatch:
+        options.createAgentLifecycleDispatch ?? createAgentLifecycleDispatchStub(),
       projectRegistry: options.projectRegistry ?? {
         initialize: async () => {},
         existsOnDisk: async () => true,
@@ -752,6 +765,100 @@ test("client heartbeat clears attention for the focused terminal", async () => {
   });
 });
 
+test("create_agent_request returns the published agent when first-prompt start times out", async () => {
+  const agentId = "00000000-0000-4000-8000-000000000550";
+  const updatedAt = "2026-08-01T12:00:00.000Z";
+  const snapshot = makeManagedAgent({
+    id: agentId,
+    cwd: REPO_CWD,
+    workspaceId: "ws-repo-running",
+    lifecycle: "idle",
+    updatedAt,
+  }) as unknown as ManagedAgent;
+  const stored = makeStoredAgent({ id: agentId, cwd: REPO_CWD, updatedAt });
+  stored.workspaceId = "ws-repo-running";
+  stored.lastStatus = "idle";
+  stored.autoArchiveObligation = { phase: "armed", target: { kind: "agent" } };
+  const promptStartTimeout = new Error("initial prompt start timed out");
+  const emitted: SessionOutboundMessage[] = [];
+  const beginPendingAgentCreation = vi.fn(async () => ({
+    agentId,
+    createdAt: updatedAt,
+    cleanupTarget: { kind: "agent" as const },
+  }));
+  const removePendingAgentCreation = vi.fn(async () => undefined);
+  const registerAutoArchive = vi.fn(() => ({
+    settled: Promise.resolve("cancelled" as const),
+    cancel: async () => undefined,
+  }));
+  const lifecycleDispatch = createAgentLifecycleDispatchStub();
+  lifecycleDispatch.registerAutoArchive = registerAutoArchive;
+  const streamAgent = vi.fn(() => (async function* noEvents() {})());
+
+  const session = createSessionForWorkspaceTests({
+    onMessage: (message) => emitted.push(message),
+    createAgentLifecycleDispatch: lifecycleDispatch,
+    agentManager: {
+      allocateAgentId: () => agentId,
+      createAgent: vi.fn(async (_config, requestedAgentId, options) => {
+        expect(requestedAgentId).toBe(agentId);
+        expect(options.autoArchiveObligation).toEqual({
+          phase: "armed",
+          target: { kind: "agent" },
+        });
+        return snapshot;
+      }),
+      getAgent: () => snapshot,
+      tryRunOutOfBand: () => false,
+      hasInFlightRun: () => false,
+      streamAgent,
+      waitForAgentRunStart: vi.fn(async () => {
+        throw promptStartTimeout;
+      }),
+    },
+    agentStorage: {
+      beginPendingAgentCreation,
+      removePendingAgentCreation,
+      get: async (requestedAgentId: string) => (requestedAgentId === agentId ? stored : null),
+    },
+  });
+
+  await session.handleMessage({
+    type: "create_agent_request",
+    requestId: "req-create-prompt-timeout",
+    workspaceId: "ws-repo-running",
+    config: { provider: "codex", cwd: REPO_CWD },
+    initialPrompt: "start the assigned work",
+    autoArchive: true,
+    attachments: [],
+  });
+
+  const statuses = filterByType(emitted, "status").map((message) => message.payload);
+  expect(statuses).toEqual([
+    expect.objectContaining({
+      status: "agent_created",
+      requestId: "req-create-prompt-timeout",
+      agentId,
+      agent: expect.objectContaining({ id: agentId }),
+    }),
+  ]);
+  expect(filterByType(emitted, "activity_log")).toContainEqual(
+    expect.objectContaining({
+      payload: expect.objectContaining({
+        type: "error",
+        content: expect.stringContaining("initial prompt start was not confirmed"),
+      }),
+    }),
+  );
+  expect(beginPendingAgentCreation).toHaveBeenCalledWith(agentId);
+  expect(removePendingAgentCreation).toHaveBeenCalledWith(agentId);
+  expect(registerAutoArchive).toHaveBeenCalledWith({
+    agentId,
+    obligation: { phase: "armed", target: { kind: "agent" } },
+  });
+  expect(streamAgent).toHaveBeenCalledWith(agentId, "start the assigned work", undefined);
+});
+
 test("create_agent_request keeps requested child cwd when grouped under an existing parent workspace", async () => {
   const workdir = mkdtempSync(path.join(tmpdir(), "paseo-create-agent-cwd-"));
   try {
@@ -830,6 +937,7 @@ test("create_agent_request keeps requested child cwd when grouped under an exist
         paseoHome: path.join(workdir, "paseo-home"),
         agentManager,
         agentStorage,
+        createAgentLifecycleDispatch: createAgentLifecycleDispatchStub(),
         projectRegistry,
         workspaceRegistry,
         chatService: asChatService(),
@@ -984,6 +1092,7 @@ test("create_agent_request launches from an exact subdirectory in a created work
       paseoHome: path.join(workdir, "paseo-home"),
       agentManager,
       agentStorage,
+      createAgentLifecycleDispatch: createAgentLifecycleDispatchStub(),
       projectRegistry,
       workspaceRegistry,
       chatService: asChatService(),
@@ -1123,6 +1232,7 @@ test("create_agent_request does not title an existing workspace from the agent p
         paseoHome: path.join(workdir, "paseo-home"),
         agentManager,
         agentStorage,
+        createAgentLifecycleDispatch: createAgentLifecycleDispatchStub(),
         projectRegistry,
         workspaceRegistry,
         chatService: asChatService(),
@@ -1417,6 +1527,7 @@ test("archive emits an authoritative agent_update upsert for subscribed clients"
           Object.assign(archivedRecord, record);
         },
       }),
+      createAgentLifecycleDispatch: createAgentLifecycleDispatchStub(),
       projectRegistry: (() => {
         const proj = createPersistedProjectRecord({
           projectId: "proj-1",
@@ -1779,6 +1890,7 @@ test("close_items_request archives agents and kills terminals in one batch", asy
           return archivedRecord;
         },
       }),
+      createAgentLifecycleDispatch: createAgentLifecycleDispatchStub(),
       projectRegistry: (() => {
         const proj = createPersistedProjectRecord({
           projectId: "proj-close",
@@ -1966,6 +2078,7 @@ test("close_items_request archives stored agents that are not currently loaded",
         },
         upsert: upsertStoredRecord,
       }),
+      createAgentLifecycleDispatch: createAgentLifecycleDispatchStub(),
       projectRegistry: (() => {
         const proj = createPersistedProjectRecord({
           projectId: "proj-stored",
@@ -2115,6 +2228,7 @@ test("close_items_request continues after an archive failure", async () => {
           return goodRecord;
         },
       }),
+      createAgentLifecycleDispatch: createAgentLifecycleDispatchStub(),
       projectRegistry: (() => {
         const proj = createPersistedProjectRecord({
           projectId: "proj-err",
@@ -3198,6 +3312,7 @@ test("workspace update stream keeps persisted workspace visible after agents sto
         list: async () => [],
         get: async () => null,
       }),
+      createAgentLifecycleDispatch: createAgentLifecycleDispatchStub(),
       projectRegistry: {
         initialize: async () => {},
         existsOnDisk: async () => true,
@@ -3448,6 +3563,9 @@ test("project.remove.request archives active workspaces and removes the project 
     workspaces.get(workspaceId) ?? null;
   session.workspaceRegistry.list = async () => Array.from(workspaces.values());
   session.workspaceRegistry.archive = async (workspaceId: string, archivedAt: string) => {
+    expect(() =>
+      defaultWorkspaceLifecycleCoordinator.reserveWorkspaceOwnershipMutation(workspaceId),
+    ).toThrow(`Workspace ${workspaceId} is being archived`);
     const existing = workspaces.get(workspaceId);
     if (!existing) return;
     workspaces.set(workspaceId, { ...existing, updatedAt: archivedAt, archivedAt });
@@ -5496,6 +5614,79 @@ test("archive_workspace_request hides non-destructive workspace records", async 
   expect(response?.payload.error).toBeNull();
 });
 
+test("archive_workspace_request never fabricates success when persistence fails", async () => {
+  const emitted: SessionOutboundMessage[] = [];
+  const session = createSessionForWorkspaceTests();
+  const workspace = createPersistedWorkspaceRecord({
+    workspaceId: "ws-archive-persistence-failure",
+    projectId: "proj-archive-persistence-failure",
+    cwd: REPO_CWD,
+    kind: "directory",
+    displayName: "repo",
+    createdAt: "2026-03-01T12:00:00.000Z",
+    updatedAt: "2026-03-01T12:00:00.000Z",
+  });
+
+  session.emit = (message) => {
+    if (isSessionOutboundMessage(message)) emitted.push(message);
+  };
+  session.workspaceRegistry.get = async () => workspace;
+  session.workspaceRegistry.list = async () => [workspace];
+  session.workspaceRegistry.archive = async () => {
+    throw new Error("workspace persistence failed");
+  };
+
+  await session.handleMessage({
+    type: "archive_workspace_request",
+    workspaceId: workspace.workspaceId,
+    requestId: "req-archive-persistence-failure",
+  });
+
+  expect(workspace.archivedAt).toBeNull();
+  const response = emitted.find((message) => message.type === "archive_workspace_response") as
+    | { payload: Record<string, unknown> }
+    | undefined;
+  expect(response?.payload).toMatchObject({
+    archivedAt: null,
+    error: "Failed to archive one or more workspaces",
+  });
+});
+
+test("archive_workspace_request requires a persisted archived timestamp", async () => {
+  const emitted: SessionOutboundMessage[] = [];
+  const session = createSessionForWorkspaceTests();
+  const workspace = createPersistedWorkspaceRecord({
+    workspaceId: "ws-archive-no-timestamp",
+    projectId: "proj-archive-no-timestamp",
+    cwd: REPO_CWD,
+    kind: "directory",
+    displayName: "repo",
+    createdAt: "2026-03-01T12:00:00.000Z",
+    updatedAt: "2026-03-01T12:00:00.000Z",
+  });
+
+  session.emit = (message) => {
+    if (isSessionOutboundMessage(message)) emitted.push(message);
+  };
+  session.workspaceRegistry.get = async () => workspace;
+  session.workspaceRegistry.list = async () => [workspace];
+  session.workspaceRegistry.archive = async () => {};
+
+  await session.handleMessage({
+    type: "archive_workspace_request",
+    workspaceId: workspace.workspaceId,
+    requestId: "req-archive-no-timestamp",
+  });
+
+  const response = emitted.find((message) => message.type === "archive_workspace_response") as
+    | { payload: Record<string, unknown> }
+    | undefined;
+  expect(response?.payload).toMatchObject({
+    archivedAt: null,
+    error: `Workspace archive did not persist: ${workspace.workspaceId}`,
+  });
+});
+
 test("archive_workspace_request archives a worktree-kind workspace and removes the directory on last reference", async () => {
   const tempDir = mkdtempSync(path.join(tmpdir(), "session-worktree-kind-archive-"));
   const repoDir = path.join(tempDir, "repo");
@@ -5526,7 +5717,7 @@ test("archive_workspace_request archives a worktree-kind workspace and removes t
 
   const workspaceId = "ws-worktree-kind-archive";
   const projectId = "proj-worktree-kind-archive";
-  const workspace = createPersistedWorkspaceRecord({
+  let workspace = createPersistedWorkspaceRecord({
     workspaceId,
     projectId,
     cwd: worktree.worktreePath,
@@ -5578,8 +5769,12 @@ test("archive_workspace_request archives a worktree-kind workspace and removes t
   };
   session.workspaceRegistry.get = async () => workspace;
   session.workspaceRegistry.list = async () => [workspace];
+  session.workspaceRegistry.update = async (_id, updater) => {
+    workspace = updater(workspace);
+    return workspace;
+  };
   session.workspaceRegistry.archive = async (_id: string, archivedAt: string) => {
-    workspace.archivedAt = archivedAt;
+    workspace = { ...workspace, archivedAt, updatedAt: archivedAt };
   };
   session.projectRegistry.list = async () => [project];
 
@@ -8517,7 +8712,6 @@ test("workspace auto-name replaces the unchanged prompt title", async () => {
 });
 
 test("workspace auto-name uses the backing root for a nested worktree", async () => {
-  vi.useFakeTimers();
   const tempDir = realpathSync(mkdtempSync(path.join(tmpdir(), "workspace-auto-name-rejected-")));
   const repoDir = path.join(tempDir, "repo");
   mkdirSync(repoDir);
@@ -8588,7 +8782,10 @@ test("workspace auto-name uses the backing root for a nested worktree", async ()
       workspace,
       firstAgentContext: { prompt: "Fix checkout title" },
     });
-    await vi.runAllTimersAsync();
+    // This integration path performs real Git discovery after the 0ms
+    // scheduling boundary. Keep it on the real clock so draining fake timers
+    // cannot advance the command's 30s timeout ahead of process closure.
+    await vi.waitFor(() => expect(emittedCwds).toEqual([workspaceCwd]));
 
     expect(generateCalls).toBe(1);
     expect(stored.get(workspace.workspaceId)).toMatchObject({
@@ -8610,7 +8807,6 @@ test("workspace auto-name uses the backing root for a nested worktree", async ()
     expect(gitMutations).toEqual([]);
     expect(emittedCwds).toEqual([workspaceCwd]);
   } finally {
-    vi.useRealTimers();
     rmSync(tempDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   }
 });

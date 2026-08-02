@@ -50,7 +50,7 @@ import {
 } from "./agent-runtime-capacity.js";
 export { AgentRuntimeCapacityError } from "./agent-runtime-capacity.js";
 import { buildArchivedAgentRecord, type ArchivedStoredAgentRecord } from "./agent-archive.js";
-import type { StoredAgentRecord, AgentStorage } from "./agent-storage.js";
+import type { AutoArchiveObligation, StoredAgentRecord, AgentStorage } from "./agent-storage.js";
 import type { AgentOwner } from "./agent-owner.js";
 import {
   InMemoryAgentTimelineStore,
@@ -249,6 +249,7 @@ export interface CreateAgentOptions {
   // undefined is an explicit decision: the agent never appears in the sidebar.
   workspaceId: string | undefined;
   owner?: AgentOwner;
+  autoArchiveObligation?: AutoArchiveObligation;
 }
 
 export interface AgentManagerOptions {
@@ -1007,6 +1008,17 @@ export class AgentManager {
     return agent ? { ...agent } : null;
   }
 
+  getAgentInitializationState(id: string): {
+    agent: ManagedAgent | null;
+    closeInFlight: boolean;
+  } {
+    const closeInFlight = this.inFlightAgentCloses.has(id);
+    return {
+      agent: closeInFlight ? null : this.getAgent(id),
+      closeInFlight,
+    };
+  }
+
   async waitForAgentClose(agentId: string): Promise<void> {
     await this.inFlightAgentCloses?.get(agentId)?.catch(() => undefined);
   }
@@ -1062,6 +1074,10 @@ export class AgentManager {
     );
   }
 
+  allocateAgentId(): string {
+    return validateAgentId(this.idFactory(), "allocateAgentId");
+  }
+
   private async createAgentInternal(
     config: AgentSessionConfig,
     agentId: string | undefined,
@@ -1095,6 +1111,7 @@ export class AgentManager {
       initialTitle: options.initialTitle,
       workspaceId: options.workspaceId,
       owner: options.owner,
+      autoArchiveObligation: options.autoArchiveObligation,
     });
   }
 
@@ -1119,6 +1136,7 @@ export class AgentManager {
       labels?: Record<string, string>;
       workspaceId?: string;
       owner?: AgentOwner;
+      autoArchiveObligation?: AutoArchiveObligation;
     },
     resumeOptions?: AgentResumeSessionOptions,
   ): Promise<ManagedAgent> {
@@ -1148,6 +1166,7 @@ export class AgentManager {
       labels?: Record<string, string>;
       workspaceId?: string;
       owner?: AgentOwner;
+      autoArchiveObligation?: AutoArchiveObligation;
     },
     resumeOptions?: AgentResumeSessionOptions,
   ): Promise<ManagedAgent> {
@@ -2757,6 +2776,7 @@ export class AgentManager {
           publishWhenReady?: boolean;
           workspaceId?: string;
           owner?: AgentOwner;
+          autoArchiveObligation?: AutoArchiveObligation;
         }
       | undefined,
   ): Promise<ManagedAgent> {
@@ -2799,6 +2819,7 @@ export class AgentManager {
       this.assertAgentRegistrationActive(managed);
       await this.persistSnapshot(managed, {
         title: initialPersistedTitle,
+        autoArchiveObligation: options?.autoArchiveObligation,
       });
       this.assertAgentRegistrationActive(managed);
       if (!options?.publishWhenReady) {
@@ -3144,7 +3165,11 @@ export class AgentManager {
 
   private async persistSnapshot(
     agent: ManagedAgent,
-    options?: { title?: string | null; internal?: boolean },
+    options?: {
+      title?: string | null;
+      internal?: boolean;
+      autoArchiveObligation?: AutoArchiveObligation;
+    },
   ): Promise<void> {
     if (!this.registry) {
       return;

@@ -41,6 +41,7 @@ import {
   asGitHubService,
   asWorkspaceGitService,
   asDaemonConfigStore,
+  createAgentLifecycleDispatchStub,
   createProviderSnapshotManagerStub,
 } from "./test-utils/session-stubs.js";
 import { isPlatform } from "../test-utils/platform.js";
@@ -375,6 +376,7 @@ function createSessionForTest(options: SessionForTestOptions = {}): Session {
       list: vi.fn().mockResolvedValue([]),
       ...options.agentStorage,
     }),
+    createAgentLifecycleDispatch: createAgentLifecycleDispatchStub(),
     projectRegistry: {
       list: vi.fn().mockResolvedValue([]),
       get: vi.fn(),
@@ -4963,9 +4965,11 @@ describe("agent config setters", () => {
   function liveAgentManager(overrides: { [K in keyof SessionOptions["agentManager"]]?: unknown }): {
     [K in keyof SessionOptions["agentManager"]]?: unknown;
   } {
+    const agent = { id: "agent-1" };
     return {
       waitForAgentClose: vi.fn().mockResolvedValue(undefined),
-      getAgent: vi.fn(() => ({ id: "agent-1" })),
+      getAgent: vi.fn(() => agent),
+      getAgentInitializationState: vi.fn(() => ({ agent, closeInFlight: false })),
       ...overrides,
     };
   }

@@ -33,6 +33,39 @@ const PERSISTENCE_HANDLE_SCHEMA = z
   .nullable()
   .optional();
 
+const AUTO_ARCHIVE_TARGET_SCHEMA = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("agent") }),
+  z.object({ kind: z.literal("workspace"), workspaceId: z.string() }),
+]);
+
+const AUTO_ARCHIVE_OBLIGATION_SCHEMA = z.object({
+  phase: z.enum(["armed", "pending"]),
+  target: AUTO_ARCHIVE_TARGET_SCHEMA,
+});
+
+const PENDING_AGENT_CREATION_SCHEMA = z.object({
+  agentId: z.string(),
+  createdAt: z.string(),
+  ownerKind: z.enum(["agent", "standalone-worktree"]).optional().default("agent"),
+  cleanupTarget: z.discriminatedUnion("kind", [
+    z.object({ kind: z.literal("agent") }),
+    z.object({
+      kind: z.literal("worktree"),
+      targetPath: z.string(),
+      worktreeIncarnationId: z.string().uuid(),
+      directoryIdentity: z
+        .object({
+          device: z.string(),
+          inode: z.string(),
+        })
+        .nullable()
+        .optional()
+        .default(null),
+      metadataBaseRefName: z.string().min(1),
+    }),
+  ]),
+});
+
 const STORED_AGENT_SCHEMA = z.object({
   id: z.string(),
   provider: z.string(),
@@ -66,6 +99,7 @@ const STORED_AGENT_SCHEMA = z.object({
   internal: z.boolean().optional(),
   archivedAt: z.string().nullable().optional(),
   owner: AgentOwnerSchema.optional(),
+  autoArchiveObligation: AUTO_ARCHIVE_OBLIGATION_SCHEMA.optional(),
 });
 
 export type SerializableAgentConfig = Pick<
@@ -80,6 +114,8 @@ export type SerializableAgentConfig = Pick<
 >;
 
 export type StoredAgentRecord = z.infer<typeof STORED_AGENT_SCHEMA>;
+export type AutoArchiveObligation = z.infer<typeof AUTO_ARCHIVE_OBLIGATION_SCHEMA>;
+export type PendingAgentCreation = z.infer<typeof PENDING_AGENT_CREATION_SCHEMA>;
 export function parseStoredAgentRecord(value: unknown): StoredAgentRecord {
   return STORED_AGENT_SCHEMA.parse(value);
 }
@@ -125,6 +161,124 @@ export class AgentStorage {
   async upsert(record: StoredAgentRecord): Promise<void> {
     await this.load();
     await this.queueRecordWrite(record);
+  }
+
+  async beginPendingAgentCreation(
+    agentId: string,
+    options?: { ownerKind?: PendingAgentCreation["ownerKind"] },
+  ): Promise<PendingAgentCreation> {
+    const record: PendingAgentCreation = {
+      agentId,
+      createdAt: new Date().toISOString(),
+      ownerKind: options?.ownerKind ?? "agent",
+      cleanupTarget: { kind: "agent" },
+    };
+    await writeJsonFileAtomic(this.pendingCreationPath(agentId), record);
+    return record;
+  }
+
+  async planPendingAgentCreationWorktree(
+    agentId: string,
+    targetPath: string,
+    plan: {
+      worktreeIncarnationId: string;
+      metadataBaseRefName: string;
+    },
+  ): Promise<void> {
+    const record = await this.readPendingAgentCreation(agentId);
+    if (!record) {
+      throw new Error(`Pending agent creation ${agentId} not found`);
+    }
+    await writeJsonFileAtomic(this.pendingCreationPath(agentId), {
+      ...record,
+      cleanupTarget: {
+        kind: "worktree",
+        targetPath,
+        ...plan,
+        directoryIdentity: null,
+      },
+    } satisfies PendingAgentCreation);
+  }
+
+  async identifyPendingAgentCreationWorktree(
+    agentId: string,
+    targetPath: string,
+    reservation: {
+      worktreeIncarnationId: string;
+      directoryIdentity: { device: string; inode: string };
+      metadataBaseRefName: string;
+    },
+  ): Promise<void> {
+    const record = await this.readPendingAgentCreation(agentId);
+    if (
+      !record ||
+      record.cleanupTarget.kind !== "worktree" ||
+      record.cleanupTarget.targetPath !== targetPath ||
+      record.cleanupTarget.worktreeIncarnationId !== reservation.worktreeIncarnationId
+    ) {
+      const recordedTarget =
+        record?.cleanupTarget.kind === "worktree"
+          ? `${record.cleanupTarget.targetPath} (${record.cleanupTarget.worktreeIncarnationId})`
+          : (record?.cleanupTarget.kind ?? "missing");
+      throw new Error(
+        `Pending agent creation ${agentId} does not own ${targetPath} (${reservation.worktreeIncarnationId}); recorded ${recordedTarget}`,
+      );
+    }
+    await writeJsonFileAtomic(this.pendingCreationPath(agentId), {
+      ...record,
+      cleanupTarget: { kind: "worktree", targetPath, ...reservation },
+    } satisfies PendingAgentCreation);
+  }
+
+  async listPendingAgentCreations(): Promise<PendingAgentCreation[]> {
+    let entries: Dirent[];
+    try {
+      entries = await fs.readdir(this.pendingCreationDir(), { withFileTypes: true });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+      throw error;
+    }
+    const records = await Promise.all(
+      entries
+        .filter((entry) => entry.isFile() && entry.name.endsWith(".intent"))
+        .map((entry) =>
+          this.readPendingAgentCreationFile(path.join(this.pendingCreationDir(), entry.name)),
+        ),
+    );
+    return records.filter((record): record is PendingAgentCreation => record !== null);
+  }
+
+  async removePendingAgentCreation(agentId: string): Promise<void> {
+    await fs.rm(this.pendingCreationPath(agentId), { force: true });
+  }
+
+  async update(
+    agentId: string,
+    mutation: (record: StoredAgentRecord) => StoredAgentRecord,
+  ): Promise<StoredAgentRecord> {
+    await this.load();
+    const previousWrite = this.pendingWrites.get(agentId) ?? Promise.resolve();
+    const operation = (async () => {
+      await Promise.allSettled([previousWrite]);
+      const current = this.cache.get(agentId);
+      if (!current) {
+        throw new Error(`Agent ${agentId} not found`);
+      }
+      const next = mutation(current);
+      if (!this.deleting.has(agentId)) {
+        await this.writeRecord(next);
+      }
+      return next;
+    })();
+    const tracked = operation.then(
+      () => undefined,
+      () => undefined,
+    );
+    void tracked.finally(() => {
+      if (this.pendingWrites.get(agentId) === tracked) this.pendingWrites.delete(agentId);
+    });
+    this.pendingWrites.set(agentId, tracked);
+    return operation;
   }
 
   private queueRecordWrite(record: StoredAgentRecord): Promise<void> {
@@ -204,38 +358,46 @@ export class AgentStorage {
 
   async applySnapshot(
     agent: ManagedAgent,
-    options?: { title?: string | null; internal?: boolean },
+    options?: {
+      title?: string | null;
+      internal?: boolean;
+      autoArchiveObligation?: AutoArchiveObligation;
+    },
   ): Promise<void> {
     await this.load();
-    await this.waitForPendingWrite(agent.id);
-    const existing = (await this.get(agent.id)) ?? null;
-    const hasTitleOverride =
-      options !== undefined && Object.prototype.hasOwnProperty.call(options, "title");
-    const hasInternalOverride =
-      options !== undefined && Object.prototype.hasOwnProperty.call(options, "internal");
-    const record = toStoredAgentRecord(agent, {
-      title: hasTitleOverride ? (options?.title ?? null) : (existing?.title ?? null),
-      createdAt: existing?.createdAt,
-      internal: hasInternalOverride ? options?.internal : (agent.internal ?? existing?.internal),
+    const previousWrite = this.pendingWrites.get(agent.id) ?? Promise.resolve();
+    const operation = (async () => {
+      await Promise.allSettled([previousWrite]);
+      const existing = this.cache.get(agent.id) ?? null;
+      const hasTitleOverride =
+        options !== undefined && Object.prototype.hasOwnProperty.call(options, "title");
+      const hasInternalOverride =
+        options !== undefined && Object.prototype.hasOwnProperty.call(options, "internal");
+      const record = toStoredAgentRecord(agent, {
+        title: hasTitleOverride ? (options?.title ?? null) : (existing?.title ?? null),
+        createdAt: existing?.createdAt,
+        internal: hasInternalOverride ? options?.internal : (agent.internal ?? existing?.internal),
+      });
+      record.archivedAt = existing?.archivedAt;
+      record.autoArchiveObligation =
+        options?.autoArchiveObligation ?? existing?.autoArchiveObligation;
+      if (!this.deleting.has(agent.id)) {
+        await this.writeRecord(record);
+      }
+    })();
+    const tracked = operation.then(
+      () => undefined,
+      () => undefined,
+    );
+    void tracked.finally(() => {
+      if (this.pendingWrites.get(agent.id) === tracked) this.pendingWrites.delete(agent.id);
     });
-
-    // Preserve soft-delete/archive status across snapshot flushes.
-    // `archivedAt` is not part of the ManagedAgent snapshot, so a naive projection
-    // would wipe it during normal persistence (including on daemon restart).
-    if (existing && existing.archivedAt !== undefined) {
-      record.archivedAt = existing.archivedAt;
-    }
-    await this.upsert(record);
+    this.pendingWrites.set(agent.id, tracked);
+    await operation;
   }
 
   async setTitle(agentId: string, title: string): Promise<void> {
-    await this.load();
-    await this.waitForPendingWrite(agentId);
-    const record = await this.get(agentId);
-    if (!record) {
-      throw new Error(`Agent ${agentId} not found`);
-    }
-    await this.upsert({ ...record, title });
+    await this.update(agentId, (record) => ({ ...record, title }));
   }
 
   async flush(): Promise<void> {
@@ -332,6 +494,31 @@ export class AgentStorage {
     return records;
   }
 
+  private pendingCreationDir(): string {
+    return path.join(this.baseDir, ".creating");
+  }
+
+  private pendingCreationPath(agentId: string): string {
+    return path.join(this.pendingCreationDir(), `${agentId}.intent`);
+  }
+
+  private async readPendingAgentCreation(agentId: string): Promise<PendingAgentCreation | null> {
+    return this.readPendingAgentCreationFile(this.pendingCreationPath(agentId));
+  }
+
+  private async readPendingAgentCreationFile(
+    filePath: string,
+  ): Promise<PendingAgentCreation | null> {
+    try {
+      const value: unknown = JSON.parse(await fs.readFile(filePath, "utf8"));
+      return PENDING_AGENT_CREATION_SCHEMA.parse(value);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+      this.logger.warn({ err: error, filePath }, "Ignoring invalid pending agent creation");
+      return null;
+    }
+  }
+
   private async readRecordFile(filePath: string): Promise<StoredAgentRecord | null> {
     try {
       const content = await fs.readFile(filePath, "utf8");
@@ -385,10 +572,6 @@ export class AgentStorage {
       this.daemonAgentIdsByExecution.delete(key);
     }
     this.daemonExecutionKeysByAgentId.delete(agentId);
-  }
-
-  private async waitForPendingWrite(agentId: string): Promise<void> {
-    await (this.pendingWrites.get(agentId) ?? Promise.resolve()).catch(() => undefined);
   }
 }
 

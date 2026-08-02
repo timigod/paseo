@@ -3,7 +3,9 @@ import { join } from "node:path";
 import { getPaseoWorktreesRoot, isPaseoOwnedWorktreeCwd } from "../../utils/worktree.js";
 import {
   archiveByScope,
+  requireActiveWorkspaceForArchive,
   resolveWorkspaceIdAtPath,
+  WorkspaceArchiveTargetNotFoundError,
   type ArchiveDependencies,
   type ArchiveScope,
 } from "../workspace-archive-service.js";
@@ -110,10 +112,12 @@ export type ArchiveCommandResult =
   | {
       ok: true;
       removedAgents: string[];
+      removedDirectory: boolean;
+      cleanupPending: boolean;
     }
   | {
       ok: false;
-      code: "NOT_ALLOWED";
+      code: "NOT_ALLOWED" | "UNKNOWN";
       message: string;
       removedAgents: [];
     };
@@ -122,8 +126,32 @@ export async function archiveCommand(
   dependencies: ArchiveCommandDependencies,
   input: ArchiveCommandInput,
 ): Promise<ArchiveCommandResult> {
-  const targetPath = await resolveArchiveTarget(dependencies, input);
   const scope = input.scope ?? "workspace";
+  if (scope === "workspace" && input.workspaceId) {
+    try {
+      await requireActiveWorkspaceForArchive(dependencies, input.workspaceId);
+    } catch (error) {
+      if (!(error instanceof WorkspaceArchiveTargetNotFoundError)) throw error;
+      return {
+        ok: false,
+        code: "UNKNOWN",
+        message: `Workspace not found: ${input.workspaceId}`,
+        removedAgents: [],
+      };
+    }
+    const result = await archiveByScope(dependencies, {
+      scope: { kind: "workspace", workspaceId: input.workspaceId },
+      requestId: input.requestId,
+    });
+    return {
+      ok: true,
+      removedAgents: result.archivedAgentIds,
+      removedDirectory: result.removedDirectory,
+      cleanupPending: result.cleanupPendingWorkspaceIds.length > 0,
+    };
+  }
+
+  const targetPath = await resolveArchiveTarget(dependencies, input);
   const ownership = await isPaseoOwnedWorktreeCwd(targetPath, {
     paseoHome: dependencies.paseoHome,
     worktreesRoot: dependencies.paseoWorktreesBaseRoot,
@@ -147,6 +175,8 @@ export async function archiveCommand(
     return {
       ok: true,
       removedAgents: result.archivedAgentIds,
+      removedDirectory: result.removedDirectory,
+      cleanupPending: result.cleanupPendingWorkspaceIds.length > 0,
     };
   }
 
@@ -154,12 +184,11 @@ export async function archiveCommand(
     input.workspaceId ?? (await resolveWorkspaceIdAtPath(dependencies, targetPath));
 
   if (!workspaceId) {
-    dependencies.sessionLogger?.warn(
-      { targetPath },
-      "Could not resolve workspace for archive; skipping",
-    );
+    dependencies.sessionLogger?.warn({ targetPath }, "Could not resolve workspace for archive");
     return {
-      ok: true,
+      ok: false,
+      code: "UNKNOWN",
+      message: `Workspace not found for archive target: ${targetPath}`,
       removedAgents: [],
     };
   }
@@ -172,6 +201,8 @@ export async function archiveCommand(
   return {
     ok: true,
     removedAgents: result.archivedAgentIds,
+    removedDirectory: result.removedDirectory,
+    cleanupPending: result.cleanupPendingWorkspaceIds.length > 0,
   };
 }
 

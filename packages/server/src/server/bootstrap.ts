@@ -152,8 +152,12 @@ import {
   archiveByScope,
   archivePersistedWorkspaceRecord,
   killTerminalsForWorkspace,
+  requireArchiveCleanupComplete,
+  retryPendingWorkspaceCleanup,
   type ActiveWorkspaceRef,
 } from "./workspace-archive-service.js";
+import { WorkspaceCleanupRetryService } from "./workspace-cleanup-retry-service.js";
+import { defaultWorkspaceLifecycleCoordinator } from "./workspace-lifecycle-coordinator.js";
 import { setupAutoArchiveOnMerge } from "./auto-archive-on-merge/index.js";
 import { wrapSessionMessage, type SessionOutboundMessage } from "./messages.js";
 import type { TerminalManager } from "../terminal/terminal-manager.js";
@@ -215,6 +219,8 @@ import { DaemonExecutions } from "./hub/daemon-executions.js";
 
 const MAX_MCP_DEBUG_BATCH_ITEMS = 10;
 const REDACTED_LOG_VALUE = "[redacted]";
+const DEFAULT_DAEMON_SHUTDOWN_TIMEOUT_MS = 10_000;
+const FORCE_EXIT_SHUTDOWN_RESERVE_MS = 250;
 const DOWNLOAD_OPEN_FLAGS =
   process.platform === "win32" ? constants.O_RDONLY : constants.O_RDONLY | constants.O_NOFOLLOW;
 
@@ -441,8 +447,17 @@ export interface PaseoDaemon {
   scriptRuntimeStore: WorkspaceScriptRuntimeStore;
   browserToolsBroker: BrowserToolsBroker;
   start(): Promise<void>;
-  stop(): Promise<void>;
+  stop(options?: PaseoDaemonStopOptions): Promise<void>;
   getListenTarget(): ListenTarget | null;
+}
+
+export interface PaseoDaemonStopOptions {
+  deadlineAt?: number;
+}
+
+export interface WorkspaceCleanupRetryLifecycle {
+  start(): Promise<void>;
+  stop(): Promise<void>;
 }
 
 export interface PaseoDaemonDependencies {
@@ -451,6 +466,69 @@ export interface PaseoDaemonDependencies {
   hubRelationshipRetryPolicy?: HubRelationshipRetryPolicy;
   createHubDaemonId?: () => string;
   scheduleManagedProcessReapRetry?: (callback: () => void) => () => void;
+  workspaceCleanupRetryService?: WorkspaceCleanupRetryLifecycle;
+}
+
+class DaemonShutdownDeadlineError extends Error {
+  constructor(label: string) {
+    super(`Daemon shutdown deadline reached during: ${label}`);
+    this.name = "DaemonShutdownDeadlineError";
+  }
+}
+
+class LifecycleMutationIngressClosedError extends Error {
+  constructor() {
+    super("Lifecycle mutation ingress is closed");
+    this.name = "LifecycleMutationIngressClosedError";
+  }
+}
+
+class LifecycleMutationIngress {
+  private accepting = true;
+  private readonly inFlight = new Set<Promise<unknown>>();
+
+  run<T>(operation: () => Promise<T>): Promise<T> {
+    if (!this.accepting) {
+      return Promise.reject(new LifecycleMutationIngressClosedError());
+    }
+    const task = Promise.resolve().then(operation);
+    this.inFlight.add(task);
+    void task.then(
+      () => this.inFlight.delete(task),
+      () => this.inFlight.delete(task),
+    );
+    return task;
+  }
+
+  async closeAndDrain(): Promise<void> {
+    this.accepting = false;
+    while (this.inFlight.size > 0) {
+      await Promise.allSettled(Array.from(this.inFlight));
+    }
+  }
+}
+
+function waitForShutdownStep(
+  task: Promise<void>,
+  signal: AbortSignal,
+  label: string,
+): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    let settled = false;
+    const finish = (callback: () => void) => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener("abort", onAbort);
+      callback();
+    };
+    const onAbort = () => finish(() => reject(new DaemonShutdownDeadlineError(label)));
+    signal.addEventListener("abort", onAbort, { once: true });
+    void task.then(
+      () => finish(resolve),
+      (error) => finish(() => reject(error)),
+    );
+    if (signal.aborted) onAbort();
+  });
 }
 
 function createBootstrapManagedProcessRegistry(
@@ -1086,6 +1164,7 @@ export async function createPaseoDaemon(
     agentManager,
     agentStorage,
     terminalManager,
+    workspaceRegistry,
     logger,
     findWorkspaceIdForCwd: findWorkspaceIdForCwdExternal,
     listActiveWorkspaces: listActiveWorkspacesExternal,
@@ -1124,6 +1203,22 @@ export async function createPaseoDaemon(
         },
         autoNameWorkspaceBranchForFirstAgent: (autoNameInput) =>
           workspaceAutoName.scheduleForWorktree(autoNameInput),
+        worktreeCreationJournal: {
+          beginPendingAgentCreation: (creationId, options) =>
+            agentStorage.beginPendingAgentCreation(creationId, options),
+          planPendingAgentCreationWorktree: (creationId, worktreePath, plan) =>
+            agentStorage.planPendingAgentCreationWorktree(creationId, worktreePath, plan),
+          identifyPendingAgentCreationWorktree: (creationId, worktreePath, reservation) =>
+            agentStorage.identifyPendingAgentCreationWorktree(
+              creationId,
+              worktreePath,
+              reservation,
+            ),
+          removePendingAgentCreation: (creationId) =>
+            agentStorage.removePendingAgentCreation(creationId),
+          recoverPendingCreation: (creationId) =>
+            hubAgentLifecycle.recoverPendingAgentCreation(creationId),
+        },
         emitWorkspaceUpdateForWorkspaceId: async (workspaceId) => {
           await emitWorkspaceUpdatesExternal([workspaceId]);
         },
@@ -1154,30 +1249,91 @@ export async function createPaseoDaemon(
     providerSnapshotManager,
     createPaseoWorktree: createPaseoWorktreeForTools,
     ensureWorkspaceForCreate: ensureWorkspaceForCreateAndBroadcastExternal,
+    requireActiveWorkspaceForOwnership: async (workspaceId) => {
+      const workspace = await workspaceRegistry.get(workspaceId);
+      if (!workspace || workspace.archivedAt) {
+        throw new Error(`Workspace not found: ${workspaceId}`);
+      }
+    },
   };
   const createAgent = (input: Parameters<typeof createAgentCommand>[1]) =>
     createAgentCommand(createAgentCommandDependencies, input);
-  const archiveWorkspaceByIdExternal = (workspaceId: string, requestId: string) =>
-    archiveByScope(
-      {
-        paseoHome: config.paseoHome,
-        paseoWorktreesBaseRoot: config.worktreesRoot,
-        github,
-        workspaceGitService,
-        agentManager,
-        agentStorage,
-        findWorkspaceIdForCwd: findWorkspaceIdForCwdExternal,
-        listActiveWorkspaces: listActiveWorkspacesExternal,
-        archiveWorkspaceRecord: archiveWorkspaceRecordExternal,
-        emitWorkspaceUpdatesForWorkspaceIds: emitWorkspaceUpdatesExternal,
-        markWorkspaceArchiving: markWorkspaceArchivingExternal,
-        clearWorkspaceArchiving: clearWorkspaceArchivingExternal,
-        killTerminalsForWorkspace: (workspaceIdToKill) =>
-          killTerminalsForWorkspace({ terminalManager, sessionLogger: logger }, workspaceIdToKill),
-        sessionLogger: logger,
-      },
-      { scope: { kind: "workspace", workspaceId }, requestId },
+  const archiveWorkspaceByIdExternal = async (
+    workspaceId: string,
+    requestId: string,
+    signal?: AbortSignal,
+  ) =>
+    requireArchiveCleanupComplete(
+      await archiveByScope(
+        {
+          paseoHome: config.paseoHome,
+          paseoWorktreesBaseRoot: config.worktreesRoot,
+          github,
+          workspaceGitService,
+          agentManager,
+          agentStorage,
+          findWorkspaceIdForCwd: findWorkspaceIdForCwdExternal,
+          listActiveWorkspaces: listActiveWorkspacesExternal,
+          archiveWorkspaceRecord: archiveWorkspaceRecordExternal,
+          emitWorkspaceUpdatesForWorkspaceIds: emitWorkspaceUpdatesExternal,
+          markWorkspaceArchiving: markWorkspaceArchivingExternal,
+          clearWorkspaceArchiving: clearWorkspaceArchivingExternal,
+          killTerminalsForWorkspace: (workspaceIdToKill) =>
+            killTerminalsForWorkspace(
+              { terminalManager, sessionLogger: logger },
+              workspaceIdToKill,
+            ),
+          workspaceRegistry,
+          sessionLogger: logger,
+        },
+        { scope: { kind: "workspace", workspaceId }, requestId, signal },
+      ),
+      "Workspace archive",
     );
+  const retryPendingWorktreeCleanupExternal: ConstructorParameters<
+    typeof WorkspaceCleanupRetryService
+  >[0]["retryWorktreeCleanup"] = async (target, signal) => {
+    requireArchiveCleanupComplete(
+      await retryPendingWorkspaceCleanup(
+        {
+          paseoHome: config.paseoHome,
+          paseoWorktreesBaseRoot: config.worktreesRoot,
+          github,
+          workspaceGitService,
+          agentManager,
+          agentStorage,
+          findWorkspaceIdForCwd: findWorkspaceIdForCwdExternal,
+          listActiveWorkspaces: listActiveWorkspacesExternal,
+          archiveWorkspaceRecord: archiveWorkspaceRecordExternal,
+          emitWorkspaceUpdatesForWorkspaceIds: emitWorkspaceUpdatesExternal,
+          markWorkspaceArchiving: markWorkspaceArchivingExternal,
+          clearWorkspaceArchiving: clearWorkspaceArchivingExternal,
+          killTerminalsForWorkspace: (workspaceIdToKill) =>
+            killTerminalsForWorkspace(
+              { terminalManager, sessionLogger: logger },
+              workspaceIdToKill,
+            ),
+          workspaceRegistry,
+          sessionLogger: logger,
+        },
+        {
+          directoryPath: target.directoryPath,
+          worktreeIncarnationId: target.worktreeIncarnationId,
+          requestId: `cleanup-retry:${randomUUID()}`,
+          signal,
+        },
+      ),
+      "Workspace cleanup retry",
+    );
+  };
+  const workspaceCleanupRetryService =
+    dependencies.workspaceCleanupRetryService ??
+    new WorkspaceCleanupRetryService({
+      workspaceRegistry,
+      retryWorktreeCleanup: retryPendingWorktreeCleanupExternal,
+      logger,
+    });
+  await workspaceCleanupRetryService.start();
   const hubAgentLifecycle = new CreateAgentLifecycleDispatch({
     paseoHome: config.paseoHome,
     worktreesRoot: config.worktreesRoot,
@@ -1185,12 +1341,15 @@ export async function createPaseoDaemon(
     agentStorage,
     github,
     workspaceGitService,
-    createPaseoWorktreeWorkflow: createPaseoWorktreeForTools,
     archiveAgentForClose: (agentId) =>
       archiveAgentCommand({ agentManager, agentStorage, logger }, agentId),
+    archiveWorkspaceForClose: (workspaceId, signal) =>
+      archiveWorkspaceByIdExternal(workspaceId, randomUUID(), signal),
+    drainWorkspaceLifecycleOperations: () => defaultWorkspaceLifecycleCoordinator.drain(),
     findWorkspaceIdForCwd: findWorkspaceIdForCwdExternal,
     listActiveWorkspaces: listActiveWorkspacesExternal,
     archiveWorkspaceRecord: archiveWorkspaceRecordExternal,
+    workspaceRegistry,
     emit: emitExternalSessionMessage,
     emitAgentRemove: () => undefined,
     emitWorkspaceUpdatesForWorkspaceIds: emitWorkspaceUpdatesExternal,
@@ -1266,7 +1425,7 @@ export async function createPaseoDaemon(
     return result;
   };
   const archiveScheduleWorkspaceExternal = async (workspaceId: string) => {
-    await archiveByScope(
+    const archiveResult = await archiveByScope(
       {
         paseoHome: config.paseoHome,
         paseoWorktreesBaseRoot: config.worktreesRoot,
@@ -1288,6 +1447,7 @@ export async function createPaseoDaemon(
             },
             workspaceIdToKill,
           ),
+        workspaceRegistry,
         sessionLogger: logger,
       },
       {
@@ -1295,6 +1455,7 @@ export async function createPaseoDaemon(
         requestId: "schedule-run-finish",
       },
     );
+    requireArchiveCleanupComplete(archiveResult, "Schedule workspace archive");
   };
   const scheduleService = new ScheduleService({
     paseoHome: config.paseoHome,
@@ -1317,6 +1478,8 @@ export async function createPaseoDaemon(
   logger.info({ elapsed: elapsed() }, "Schedule service initialized");
   logger.info({ elapsed: elapsed() }, "Loading persisted agent registry");
   const persistedRecords = await agentStorage.list();
+  await hubAgentLifecycle.recoverPendingAgentCreations();
+  await hubAgentLifecycle.recoverPersistedAutoArchives();
   logger.info(
     { elapsed: elapsed() },
     `Agent registry loaded (${persistedRecords.length} record${persistedRecords.length === 1 ? "" : "s"}); agents will initialize on demand`,
@@ -1326,6 +1489,7 @@ export async function createPaseoDaemon(
   );
   logger.info({ elapsed: elapsed() }, "Preparing voice and MCP runtime");
 
+  const lifecycleMutationIngress = new LifecycleMutationIngress();
   const createAgentToolHostDependencies = (
     runtime: PaseoToolRuntimeContext,
   ): PaseoToolHostDependencies => ({
@@ -1378,6 +1542,8 @@ export async function createPaseoDaemon(
     browserToolsBroker,
     paseoHome: config.paseoHome,
     worktreesRoot: config.worktreesRoot,
+    runLifecycleMutation: (operation) => lifecycleMutationIngress.run(operation),
+    createAgentLifecycleDispatch: hubAgentLifecycle,
     callerAgentId: runtime.callerAgentId,
     enableVoiceTools: runtime.enableVoiceTools,
     voiceOnly: runtime.voiceOnly,
@@ -1603,6 +1769,7 @@ export async function createPaseoDaemon(
               mcpBaseUrl,
               { allowedOrigins, hostnames: configuredHostnames },
               workspaceAutoName,
+              hubAgentLifecycle,
               config.auth,
               speechService,
               terminalManager,
@@ -1714,27 +1881,62 @@ export async function createPaseoDaemon(
   // whose stop path can dispose it. Reaping remains background, best-effort work.
   managedProcessReconciliation.start();
 
-  const stop = async () => {
-    await managedProcessReconciliation.stop();
-    await hubRelationships.stop();
-    workspaceReconciliation.dispose();
-    scriptHealthMonitor.stop();
-    // Freeze both ingress and registration before taking the agent closure snapshot.
-    wsServer?.prepareForShutdown();
-    agentManager.prepareForShutdown();
-    await closeAllAgents(logger, agentManager);
-    await agentManager.flushForShutdown().catch(() => undefined);
-    detachAgentStoragePersistence();
-    await agentStorage.flush().catch(() => undefined);
-    await providerSnapshotManager.shutdown();
-    terminalManager.killAll();
-    speechService.stop();
-    await scheduleService.stop().catch(() => undefined);
-    await relayTransport?.stop().catch(() => undefined);
-    if (wsServer) {
-      await wsServer.close();
-    }
-    await serviceProxy.stopStandalone();
+  const stop = async (options?: PaseoDaemonStopOptions) => {
+    const errors: unknown[] = [];
+    const outerDeadlineAt = options?.deadlineAt ?? Date.now() + DEFAULT_DAEMON_SHUTDOWN_TIMEOUT_MS;
+    const shutdownDeadlineAt = options?.deadlineAt
+      ? Math.max(Date.now(), outerDeadlineAt - FORCE_EXIT_SHUTDOWN_RESERVE_MS)
+      : outerDeadlineAt;
+    const shutdownController = new AbortController();
+    const deadlineTimer = setTimeout(
+      () => shutdownController.abort(),
+      Math.max(0, shutdownDeadlineAt - Date.now()),
+    );
+    deadlineTimer.unref();
+    const attempt = async (label: string, action: () => void | Promise<void>): Promise<void> => {
+      const task = Promise.resolve().then(action);
+      try {
+        await waitForShutdownStep(task, shutdownController.signal, label);
+      } catch (error) {
+        errors.push(error);
+        logger.error({ err: error }, `Daemon shutdown step failed: ${label}`);
+      }
+    };
+
+    await attempt("managed process reconciliation", () => managedProcessReconciliation.stop());
+    await attempt("hub relationships", () => hubRelationships.stop());
+    await attempt("workspace cleanup retry service", () => workspaceCleanupRetryService.stop());
+    await attempt("workspace reconciliation", () => workspaceReconciliation.dispose());
+    await attempt("script health monitor", () => scriptHealthMonitor.stop());
+    // Freeze every worktree/agent mutation producer and join operations accepted
+    // before the boundary before taking the agent closure snapshot.
+    await attempt("lifecycle mutation ingress", async () => {
+      await Promise.all([
+        wsServer?.prepareForShutdown(),
+        lifecycleMutationIngress.closeAndDrain(),
+        scheduleService.stop(),
+      ]);
+    });
+    await attempt("agent registration", () => agentManager.prepareForShutdown());
+    await attempt("create-agent lifecycle", async () => {
+      const remainingMs = Math.max(0, shutdownDeadlineAt - Date.now());
+      const lifecycleShutdown = await hubAgentLifecycle.shutdown({ timeoutMs: remainingMs });
+      if (!lifecycleShutdown.completed) {
+        throw new Error(
+          `Create-agent lifecycle shutdown remains incomplete for agents: ${lifecycleShutdown.pendingAgentIds.join(", ")}`,
+        );
+      }
+    });
+    await attempt("agents", () => closeAllAgents(logger, agentManager));
+    await attempt("agent persistence", () => agentManager.flushForShutdown());
+    await attempt("agent storage detachment", () => detachAgentStoragePersistence());
+    await attempt("agent storage", () => agentStorage.flush());
+    await attempt("provider snapshots", () => providerSnapshotManager.shutdown());
+    await attempt("terminals", () => terminalManager.killAll());
+    await attempt("speech", () => speechService.stop());
+    await attempt("relay", () => relayTransport?.stop());
+    await attempt("WebSocket server", () => wsServer?.close());
+    await attempt("service proxy", () => serviceProxy.stopStandalone());
     // Force-drop remaining sockets so httpServer.close() resolves promptly.
     // We've already closed wsServer (which sent ws-layer close frames) and
     // stopped every other service, so anything still attached is a TCP
@@ -1742,13 +1944,23 @@ export async function createPaseoDaemon(
     // upgraded WS sockets in the closing handshake, or HTTP keep-alive
     // sockets in CLOSE_WAIT). closeIdleConnections() does not catch
     // upgraded sockets, so we use closeAllConnections() here.
-    httpServer.closeAllConnections();
-    await new Promise<void>((resolve) => {
-      httpServer.close(() => resolve());
-    });
+    await attempt("HTTP connections", () => httpServer.closeAllConnections());
+    await attempt(
+      "HTTP server",
+      () =>
+        new Promise<void>((resolve) => {
+          httpServer.close(() => resolve());
+        }),
+    );
     // Clean up socket files
-    if (listenTarget.type === "socket" && existsSync(listenTarget.path)) {
-      unlinkSync(listenTarget.path);
+    await attempt("socket file", () => {
+      if (listenTarget.type === "socket" && existsSync(listenTarget.path)) {
+        unlinkSync(listenTarget.path);
+      }
+    });
+    clearTimeout(deadlineTimer);
+    if (errors.length > 0) {
+      throw new AggregateError(errors, "One or more daemon shutdown steps failed");
     }
   };
 
@@ -1768,13 +1980,20 @@ export async function createPaseoDaemon(
 
 async function closeAllAgents(logger: Logger, agentManager: AgentManager): Promise<void> {
   const agents = agentManager.listAgents();
-  await Promise.all(
+  const results = await Promise.allSettled(
     agents.map(async (agent) => {
       try {
         await agentManager.closeAgent(agent.id);
       } catch (err) {
         logger.error({ err, agentId: agent.id }, "Failed to close agent");
+        throw err;
       }
     }),
   );
+  const failures = results.flatMap((result) =>
+    result.status === "rejected" ? [result.reason] : [],
+  );
+  if (failures.length > 0) {
+    throw new AggregateError(failures, "Failed to close one or more agents");
+  }
 }

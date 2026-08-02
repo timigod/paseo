@@ -6,6 +6,7 @@ import pino from "pino";
 import {
   createPaseoDaemon,
   type PaseoDaemonConfig,
+  type PaseoDaemonDependencies,
   type PaseoOpenAIConfig,
   type PaseoSpeechConfig,
 } from "../bootstrap.js";
@@ -43,6 +44,7 @@ interface TestPaseoDaemonOptions {
   serviceProxy?: PaseoDaemonConfig["serviceProxy"];
   webUi?: PaseoDaemonConfig["webUi"];
   trustedProxies?: PaseoDaemonConfig["trustedProxies"];
+  dependencies?: PaseoDaemonDependencies;
 }
 
 export interface TestPaseoDaemon {
@@ -92,7 +94,7 @@ export async function createTestPaseoDaemon(
   for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
     const { config, paseoHomeRoot, paseoHome, staticDir } = await prepareTestDaemonConfig(options);
     const logger = options.logger ?? pino({ level: "silent" });
-    const daemon = await createPaseoDaemon(config, logger);
+    const daemon = await createPaseoDaemon(config, logger, options.dependencies);
     try {
       await startDaemonWithTimeout(daemon, TEST_DAEMON_START_TIMEOUT_MS);
       const listenTarget = daemon.getListenTarget();

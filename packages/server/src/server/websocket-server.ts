@@ -6,6 +6,7 @@ import { randomUUID } from "node:crypto";
 import { monitorEventLoopDelay } from "node:perf_hooks";
 import type { AgentManager, AgentMetricsSnapshot } from "./agent/agent-manager.js";
 import type { AgentStorage } from "./agent/agent-storage.js";
+import type { CreateAgentLifecycleDispatch } from "./agent/create-agent-lifecycle-dispatch.js";
 import type { DownloadTokenStore } from "./file-download/token-store.js";
 import type { TerminalManager } from "../terminal/terminal-manager.js";
 import type pino from "pino";
@@ -18,6 +19,7 @@ import type { CheckoutDiffManager, CheckoutDiffMetrics } from "./checkout-diff-m
 import type { DaemonConfigStore, MutableDaemonConfig } from "./daemon-config-store.js";
 import {
   type ServerInfoStatusPayload,
+  type SessionInboundMessage,
   type SessionOutboundMessage,
   type WorkspaceSetupSnapshot,
   type WSHelloMessage,
@@ -451,6 +453,51 @@ const WS_CLOSE_SERVER_SHUTDOWN = 1001;
 const WS_PROTOCOL_VERSION = 1;
 const WS_RUNTIME_METRICS_FLUSH_MS = 30_000;
 
+const SHUTDOWN_TRACKED_SESSION_MUTATIONS = new Set<SessionInboundMessage["type"]>([
+  "agent.detach.request",
+  "agent.fork_context.request",
+  "agent.rewind.request",
+  "agent_permission_response",
+  "archive_agent_request",
+  "archive_workspace_request",
+  "cancel_agent_request",
+  "close_items_request",
+  "create_agent_request",
+  "create_paseo_worktree_request",
+  "create_terminal_request",
+  "delete_agent_request",
+  "hub.execution.agent.create.request",
+  "hub.execution.control.request",
+  "import_agent_request",
+  "kill_terminal_request",
+  "loop/run",
+  "loop/stop",
+  "open_project_request",
+  "paseo_worktree_archive_request",
+  "project.add.request",
+  "project.create_directory.request",
+  "project.github.clone.request",
+  "project.remove.request",
+  "refresh_agent_request",
+  "resume_agent_request",
+  "schedule/create",
+  "schedule/delete",
+  "schedule/pause",
+  "schedule/resume",
+  "schedule/run-once",
+  "schedule/update",
+  "send_agent_message_request",
+  "set_agent_feature_request",
+  "set_agent_mode_request",
+  "set_agent_model_request",
+  "set_agent_thinking_request",
+  "start_workspace_script_request",
+  "workspace.create.request",
+  "workspace.recovery.restore.request",
+  "workspace.script.start.request",
+  "workspace.script.stop.request",
+]);
+
 export class MissingDaemonVersionError extends Error {
   constructor() {
     super("VoiceAssistantWebSocketServer requires a non-empty daemonVersion.");
@@ -495,6 +542,8 @@ export class VoiceAssistantWebSocketServer {
   private readonly wss: WebSocketServer;
   private readonly pendingConnections: Map<WebSocketLike, PendingConnection> = new Map();
   private readonly sessions: Map<WebSocketLike, SessionConnection> = new Map();
+  private readonly inFlightLifecycleMutations = new Set<Promise<void>>();
+  private acceptingLifecycleMutations = true;
   private readonly socketIdentities: Map<WebSocketLike, WebSocketConnectionIdentity> = new Map();
   private readonly externalSessionsByKey: Map<string, TrustedSessionConnection> = new Map();
   private readonly serverId: string;
@@ -502,6 +551,7 @@ export class VoiceAssistantWebSocketServer {
   private readonly daemonRuntimeConfig: DaemonRuntimeConfig | undefined;
   private readonly agentManager: AgentManager;
   private readonly agentStorage: AgentStorage;
+  private readonly createAgentLifecycleDispatch: CreateAgentLifecycleDispatch;
   private readonly projectRegistry: ProjectRegistry;
   private readonly workspaceRegistry: WorkspaceRegistry;
   private readonly chatService: FileBackedChatService;
@@ -565,6 +615,7 @@ export class VoiceAssistantWebSocketServer {
     mcpBaseUrl: string | null,
     wsConfig: WebSocketServerConfig,
     workspaceAutoName: WorkspaceAutoName,
+    createAgentLifecycleDispatch: CreateAgentLifecycleDispatch,
     auth?: DaemonAuthConfig,
     speech?: SpeechService | null,
     terminalManager?: TerminalManager | null,
@@ -609,6 +660,7 @@ export class VoiceAssistantWebSocketServer {
     this.hubRelationships = hubRelationships ?? null;
     this.agentManager = agentManager;
     this.agentStorage = agentStorage;
+    this.createAgentLifecycleDispatch = createAgentLifecycleDispatch;
     this.projectRegistry = projectRegistry ?? createNoopProjectRegistry();
     this.workspaceRegistry = workspaceRegistry ?? createNoopWorkspaceRegistry();
     const requiredServices = requireWebSocketServices({
@@ -939,12 +991,16 @@ export class VoiceAssistantWebSocketServer {
     connectionLogger.info("Hub session attached");
   }
 
-  public prepareForShutdown(): void {
+  public async prepareForShutdown(): Promise<void> {
     this.acceptingConnections = false;
+    this.acceptingLifecycleMutations = false;
+    while (this.inFlightLifecycleMutations.size > 0) {
+      await Promise.allSettled(Array.from(this.inFlightLifecycleMutations));
+    }
   }
 
   public async close(): Promise<void> {
-    this.prepareForShutdown();
+    await this.prepareForShutdown();
     this.unsubscribeSpeechReadiness?.();
     this.unsubscribeSpeechReadiness = null;
     this.unsubscribeDaemonConfigChange?.();
@@ -1317,6 +1373,7 @@ export class VoiceAssistantWebSocketServer {
       worktreesRoot: this.worktreesRoot,
       agentManager: this.agentManager,
       agentStorage: this.agentStorage,
+      createAgentLifecycleDispatch: this.createAgentLifecycleDispatch,
       projectRegistry: this.projectRegistry,
       workspaceRegistry: this.workspaceRegistry,
       chatService: this.chatService,
@@ -2045,9 +2102,24 @@ export class VoiceAssistantWebSocketServer {
       }
 
       if (message.type === "session") {
-        void this.dispatchSessionMessage(ws, activeConnection, message).catch((error: unknown) => {
-          this.handleRawMessageError({ ws, data, error, log: activeConnection.connectionLogger });
-        });
+        const trackedForShutdown = SHUTDOWN_TRACKED_SESSION_MUTATIONS.has(message.message.type);
+        if (trackedForShutdown && !this.acceptingLifecycleMutations) {
+          ws.close(WS_CLOSE_SERVER_SHUTDOWN, "Server shutting down");
+          return;
+        }
+        const dispatch = this.dispatchSessionMessage(ws, activeConnection, message);
+        if (trackedForShutdown) {
+          this.inFlightLifecycleMutations.add(dispatch);
+        }
+        void dispatch
+          .catch((error: unknown) => {
+            this.handleRawMessageError({ ws, data, error, log: activeConnection.connectionLogger });
+          })
+          .finally(() => {
+            if (trackedForShutdown) {
+              this.inFlightLifecycleMutations.delete(dispatch);
+            }
+          });
       }
     } catch (error) {
       this.handleRawMessageError({ ws, data, error, log });

@@ -33,6 +33,8 @@ interface BootstrapResult {
   config: ReturnType<typeof loadConfig>;
 }
 
+const SHUTDOWN_TIMEOUT_MS = 10_000;
+
 function isPidAlive(pid: number): boolean {
   try {
     process.kill(pid, 0);
@@ -137,13 +139,14 @@ async function main() {
       );
 
       shutdownPromise = (async () => {
+        const deadlineAt = Date.now() + SHUTDOWN_TIMEOUT_MS;
         const forceExit = setTimeout(() => {
           logger.warn(
             { signal, reason, ...getProcessDiagnostics() },
             "Forcing shutdown - HTTP server didn't close in time",
           );
           process.exit(1);
-        }, 10000);
+        }, SHUTDOWN_TIMEOUT_MS);
 
         try {
           if (!daemon) {
@@ -151,7 +154,7 @@ async function main() {
             clearTimeout(forceExit);
             return 1;
           }
-          await daemon.stop();
+          await daemon.stop({ deadlineAt });
           clearTimeout(forceExit);
           logger.info("Server closed");
           return options?.successExitCode ?? 0;

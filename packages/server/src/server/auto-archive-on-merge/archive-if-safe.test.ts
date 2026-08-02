@@ -16,6 +16,7 @@ import type { WorkspaceGitRuntimeSnapshot } from "../workspace-git-service.js";
 import { createWorktree, type WorktreeConfig } from "../../utils/worktree.js";
 import type { ForgeService } from "../../../services/forge-service.js";
 import type { StoredAgentRecord } from "../agent/agent-storage.js";
+import { createPersistedWorkspaceRecord } from "../workspace-registry.js";
 
 const CWD = "/tmp/paseo/worktrees/repo/branch";
 const PASEO_HOME = "/tmp/paseo";
@@ -103,8 +104,15 @@ function createHarness(overrides?: {
     agentManager: {} as AutoArchiveArchiveOptions["agentManager"],
     agentStorage: {} as AutoArchiveArchiveOptions["agentStorage"],
     terminalManager: {} as AutoArchiveArchiveOptions["terminalManager"],
+    workspaceRegistry: {
+      get: vi.fn(async () => null),
+      list: vi.fn(async () => []),
+      update: vi.fn(async () => null),
+    },
     findWorkspaceIdForCwd: vi.fn(async () => "ws-auto-archive"),
-    listActiveWorkspaces: vi.fn(async () => []),
+    listActiveWorkspaces: vi.fn(async () => [
+      { workspaceId: "ws-auto-archive", cwd: CWD, kind: "worktree" },
+    ]),
     archiveWorkspaceRecord: vi.fn(),
     markWorkspaceArchiving: vi.fn(),
     clearWorkspaceArchiving: vi.fn(),
@@ -117,6 +125,7 @@ function createHarness(overrides?: {
           archivedAgentIds: [],
           archivedWorkspaceIds: [],
           removedDirectory: false,
+          cleanupPendingWorkspaceIds: [],
         }) satisfies ArchiveResult),
   ) as unknown as ArchiveIfSafeDependencies["archiveByScope"];
   const resolveWorkspaceIdAtPath = vi.fn(
@@ -259,6 +268,26 @@ function createRealOutcomeHarness(input: {
   archivedWorkspaceIds: Set<string>;
 }) {
   const active = [...input.activeWorkspaces];
+  const now = new Date().toISOString();
+  const workspaceRecords = new Map(
+    active.map((workspace) => [
+      workspace.workspaceId,
+      createPersistedWorkspaceRecord({
+        workspaceId: workspace.workspaceId,
+        projectId: "project-auto-archive",
+        cwd: workspace.cwd,
+        kind: workspace.kind,
+        displayName: workspace.workspaceId,
+        ...(workspace.worktreeRoot ? { worktreeRoot: workspace.worktreeRoot } : {}),
+        ...(workspace.isPaseoOwnedWorktree !== undefined
+          ? { isPaseoOwnedWorktree: workspace.isPaseoOwnedWorktree }
+          : {}),
+        ...(workspace.mainRepoRoot ? { mainRepoRoot: workspace.mainRepoRoot } : {}),
+        createdAt: now,
+        updatedAt: now,
+      }),
+    ]),
+  );
   const logger = pino({ level: "silent" });
   vi.spyOn(logger, "info").mockImplementation(() => undefined);
   vi.spyOn(logger, "warn").mockImplementation(() => undefined);
@@ -310,6 +339,17 @@ function createRealOutcomeHarness(input: {
       listDirectories: () => [],
       getTerminals: vi.fn().mockResolvedValue([]),
     } as unknown as AutoArchiveArchiveOptions["terminalManager"],
+    workspaceRegistry: {
+      get: async (workspaceId) => workspaceRecords.get(workspaceId) ?? null,
+      list: async () => Array.from(workspaceRecords.values()),
+      update: async (workspaceId, updater) => {
+        const existing = workspaceRecords.get(workspaceId);
+        if (!existing) return null;
+        const updated = updater(existing);
+        workspaceRecords.set(workspaceId, updated);
+        return updated;
+      },
+    },
     findWorkspaceIdForCwd: async (cwd: string) => {
       const match = active.find((workspace) => workspace.cwd === cwd);
       return match?.workspaceId ?? null;
@@ -318,6 +358,13 @@ function createRealOutcomeHarness(input: {
       active.filter((workspace) => !input.archivedWorkspaceIds.has(workspace.workspaceId)),
     archiveWorkspaceRecord: async (workspaceId: string) => {
       input.archivedWorkspaceIds.add(workspaceId);
+      const existing = workspaceRecords.get(workspaceId);
+      if (existing) {
+        workspaceRecords.set(workspaceId, {
+          ...existing,
+          archivedAt: new Date().toISOString(),
+        });
+      }
       const index = active.findIndex((workspace) => workspace.workspaceId === workspaceId);
       if (index !== -1) {
         active.splice(index, 1);
@@ -465,6 +512,57 @@ describe("archiveIfSafe", () => {
     expect(harness.inFlight.has(CWD)).toBe(false);
   });
 
+  test("does not report success for an inactive resolved workspace without cleanup", async () => {
+    const harness = createHarness();
+    const now = new Date().toISOString();
+    const archived = createPersistedWorkspaceRecord({
+      workspaceId: "ws-auto-archive",
+      projectId: "project-auto-archive",
+      cwd: CWD,
+      kind: "worktree",
+      displayName: "Archived",
+      createdAt: now,
+      updatedAt: now,
+      archivedAt: now,
+    });
+    harness.options.listActiveWorkspaces = vi.fn(async () => []);
+    harness.options.workspaceRegistry.get = vi.fn(async () => archived);
+
+    await runArchiveIfSafe(harness);
+
+    expect(harness.deps.archiveByScope).not.toHaveBeenCalled();
+    expect(harness.log.info).not.toHaveBeenCalledWith(
+      { cwd: CWD },
+      "Auto-archived worktree after PR merge",
+    );
+    expect(harness.log.warn).toHaveBeenCalledWith(
+      { cwd: CWD, workspaceId: "ws-auto-archive" },
+      "Auto-archive resolved an inactive workspace without pending cleanup; skipping",
+    );
+  });
+
+  test("does not report success while durable cleanup remains pending", async () => {
+    const harness = createHarness({
+      archiveByScope: async () => ({
+        archivedAgentIds: [],
+        archivedWorkspaceIds: ["ws-auto-archive"],
+        removedDirectory: false,
+        cleanupPendingWorkspaceIds: ["ws-auto-archive"],
+      }),
+    });
+
+    await runArchiveIfSafe(harness);
+
+    expect(harness.log.info).not.toHaveBeenCalledWith(
+      { cwd: CWD },
+      "Auto-archived worktree after PR merge",
+    );
+    expect(harness.log.warn).toHaveBeenCalledWith(
+      { err: expect.any(Error), cwd: CWD },
+      "Auto-archive after merge failed",
+    );
+  });
+
   test("archives a clean Paseo-owned worktree after merge", async () => {
     const harness = createHarness();
 
@@ -483,6 +581,7 @@ describe("archiveIfSafe", () => {
       expect.objectContaining({
         paseoHome: PASEO_HOME,
         workspaceGitService: harness.options.workspaceGitService,
+        workspaceRegistry: harness.options.workspaceRegistry,
       }),
       {
         scope: { kind: "workspace", workspaceId: "ws-auto-archive" },

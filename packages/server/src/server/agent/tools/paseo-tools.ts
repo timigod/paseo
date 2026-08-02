@@ -21,6 +21,7 @@ import {
 import { curateAgentActivity } from "../activity-curator.js";
 import { selectItemsByProjectedLimit } from "../timeline-projection.js";
 import type { AgentStorage } from "../agent-storage.js";
+import type { CreateAgentLifecycleDispatch } from "../create-agent-lifecycle-dispatch.js";
 import { ensureAgentLoaded } from "../agent-loading.js";
 import { isStoredAgentProviderAvailable } from "../../persistence-hooks.js";
 import {
@@ -35,7 +36,10 @@ import type { FirstAgentContext } from "../../messages.js";
 import { everyMsToFiveFieldCron } from "@getpaseo/protocol/schedule/cadence";
 import { expandUserPath, isSameOrDescendantPath, resolvePathFromBase } from "../../path-utils.js";
 import type { TerminalManager } from "../../../terminal/terminal-manager.js";
-import type { CreatePaseoWorktreeWorkflowFn } from "../../worktree-session.js";
+import type {
+  CreatePaseoWorktreeWorkflowFn,
+  CreatePaseoWorktreeWorkflowResult,
+} from "../../worktree-session.js";
 import type { ScheduleService } from "../../schedule/service.js";
 import {
   ScheduleRunSchema,
@@ -90,6 +94,10 @@ import type {
   PaseoToolExecutionContext,
   PaseoToolResult,
 } from "./types.js";
+import {
+  defaultWorkspaceLifecycleCoordinator,
+  type WorkspaceLifecycleCoordinator,
+} from "../../workspace-lifecycle-coordinator.js";
 
 export interface PaseoToolHostDependencies {
   agentManager: AgentManager;
@@ -107,7 +115,7 @@ export interface PaseoToolHostDependencies {
   listActiveWorkspaces?: ArchiveDependencies["listActiveWorkspaces"];
   archiveWorkspaceRecord?: ArchiveDependencies["archiveWorkspaceRecord"];
   emitWorkspaceUpdatesForWorkspaceIds?: ArchiveDependencies["emitWorkspaceUpdatesForWorkspaceIds"];
-  workspaceRegistry?: Pick<WorkspaceRegistry, "get" | "list" | "upsert">;
+  workspaceRegistry?: Pick<WorkspaceRegistry, "get" | "list" | "update" | "upsert">;
   projectRegistry?: Pick<ProjectRegistry, "get" | "list">;
   createDirectoryWorkspace?: (
     cwd: string,
@@ -127,6 +135,12 @@ export interface PaseoToolHostDependencies {
   browserToolsBroker?: BrowserToolsBroker | null;
   paseoHome?: string;
   worktreesRoot?: string;
+  lifecycleCoordinator?: WorkspaceLifecycleCoordinator;
+  runLifecycleMutation?: <T>(operation: () => Promise<T>) => Promise<T>;
+  createAgentLifecycleDispatch?: Pick<
+    CreateAgentLifecycleDispatch,
+    "cleanupCreatedWorktreeAfterFailedAgentCreate" | "recoverPendingAgentCreation"
+  >;
   /**
    * ID of the agent that is using this tool catalog.
    * Used for cwd/mode inheritance when agents spawn child agents.
@@ -141,6 +155,48 @@ export interface PaseoToolHostDependencies {
   enableVoiceTools?: boolean;
   voiceOnly?: boolean;
   logger: Logger;
+}
+
+const LIFECYCLE_MUTATION_TOOL_NAMES = new Set([
+  "create_workspace",
+  "archive_workspace",
+  "create_agent",
+  "send_agent_prompt",
+  "cancel_agent",
+  "archive_agent",
+  "kill_agent",
+  "update_agent",
+  "rename_workspace",
+  "start_workspace_script",
+  "stop_workspace_script",
+  "create_terminal",
+  "kill_terminal",
+  "send_terminal_keys",
+  "create_schedule",
+  "create_heartbeat",
+  "delete_heartbeat",
+  "pause_schedule",
+  "resume_schedule",
+  "delete_schedule",
+  "update_schedule",
+  "run_schedule_once",
+  "set_agent_mode",
+  "respond_to_permission",
+]);
+
+async function requireActiveWorkspaceForOwnership(
+  options: Pick<PaseoToolHostDependencies, "listActiveWorkspaces" | "workspaceRegistry">,
+  workspaceId: string,
+): Promise<void> {
+  if (!options.listActiveWorkspaces && !options.workspaceRegistry) return;
+  const workspace = options.listActiveWorkspaces
+    ? (await options.listActiveWorkspaces()).find(
+        (candidate) => candidate.workspaceId === workspaceId,
+      )
+    : await options.workspaceRegistry?.get(workspaceId);
+  if (!workspace || ("archivedAt" in workspace && workspace.archivedAt)) {
+    throw new Error(`Workspace not found: ${workspaceId}`);
+  }
 }
 
 function parseTimestamp(value: string | null | undefined): number {
@@ -595,7 +651,10 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
       if (!tool) {
         throw new Error(`Paseo tool not found: ${name}`);
       }
-      return tool.handler(await parseToolInput(tool, input), context);
+      const operation = async () => tool.handler(await parseToolInput(tool, input), context);
+      return options.runLifecycleMutation && LIFECYCLE_MUTATION_TOOL_NAMES.has(name)
+        ? options.runLifecycleMutation(operation)
+        : operation();
     },
   });
 
@@ -1357,6 +1416,7 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
         workspaceId: z.string(),
         archivedAgentIds: z.array(z.string()),
         removedDirectory: z.boolean(),
+        cleanupPending: z.boolean(),
       },
     },
     async ({ workspaceId }) => {
@@ -1364,7 +1424,10 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
         throw new Error("Active workspace lister is required to archive workspaces");
       }
       const workspace = await requireActiveWorkspaceForArchive(
-        { listActiveWorkspaces: options.listActiveWorkspaces },
+        {
+          listActiveWorkspaces: options.listActiveWorkspaces,
+          workspaceRegistry: options.workspaceRegistry,
+        },
         workspaceId,
       );
       const result = await archiveByScope(
@@ -1385,6 +1448,7 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
           workspaceId,
           archivedAgentIds: result.archivedAgentIds,
           removedDirectory: result.removedDirectory,
+          cleanupPending: result.cleanupPendingWorkspaceIds.length > 0,
         }),
       };
     },
@@ -1422,43 +1486,71 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
         requestedBackground = resolvedArgs.parsedArgs.background;
         notifyOnFinish = resolvedArgs.parsedArgs.notifyOnFinish ?? false;
       }
-      const {
-        snapshot,
-        background: createdInBackground,
-        initialPromptStarted,
-      } = await createAgentCommand(
-        {
-          agentManager,
-          agentStorage,
-          logger: childLogger,
-          paseoHome: options.paseoHome,
-          worktreesRoot: options.worktreesRoot,
-          terminalManager,
-          providerSnapshotManager,
-          createPaseoWorktree: options.createPaseoWorktree,
-          ...(options.ensureWorkspaceForCreate
-            ? { ensureWorkspaceForCreate: options.ensureWorkspaceForCreate }
-            : {}),
-        },
-        {
-          kind: "mcp",
-          provider: parsedArgs.provider,
-          title: parsedArgs.title,
-          initialPrompt: parsedArgs.initialPrompt,
-          cwd: resolvedArgs.cwd,
-          workspaceId: resolvedArgs.workspaceId,
-          thinking: parsedArgs.settings?.thinkingOptionId,
-          features: parsedArgs.settings?.features,
-          labels: parsedArgs.labels,
-          mode: parsedArgs.settings?.modeId,
-          background: requestedBackground,
-          notifyOnFinish,
-          detached: resolvedArgs.detached,
-          callerAgentId,
-          callerContext,
-          worktree,
-        },
-      );
+      let createdWorktreeForCleanup: CreatePaseoWorktreeWorkflowResult | null = null;
+      let createdAgentId: string | null = null;
+      let pendingCreationAgentId: string | undefined;
+      const createResult = await (async () => {
+        try {
+          return await createAgentCommand(
+            {
+              agentManager,
+              agentStorage,
+              logger: childLogger,
+              paseoHome: options.paseoHome,
+              worktreesRoot: options.worktreesRoot,
+              terminalManager,
+              providerSnapshotManager,
+              lifecycleCoordinator:
+                options.lifecycleCoordinator ?? defaultWorkspaceLifecycleCoordinator,
+              requireActiveWorkspaceForOwnership: (workspaceId) =>
+                requireActiveWorkspaceForOwnership(options, workspaceId),
+              createPaseoWorktree: options.createPaseoWorktree,
+              ...(options.ensureWorkspaceForCreate
+                ? { ensureWorkspaceForCreate: options.ensureWorkspaceForCreate }
+                : {}),
+            },
+            {
+              kind: "mcp",
+              provider: parsedArgs.provider,
+              title: parsedArgs.title,
+              initialPrompt: parsedArgs.initialPrompt,
+              cwd: resolvedArgs.cwd,
+              workspaceId: resolvedArgs.workspaceId,
+              thinking: parsedArgs.settings?.thinkingOptionId,
+              features: parsedArgs.settings?.features,
+              labels: parsedArgs.labels,
+              mode: parsedArgs.settings?.modeId,
+              background: requestedBackground,
+              notifyOnFinish,
+              detached: resolvedArgs.detached,
+              callerAgentId,
+              callerContext,
+              worktree,
+              onPendingAgentCreation: (agentId) => {
+                pendingCreationAgentId = agentId;
+              },
+              onWorktreeCreated: (createdWorktree) => {
+                createdWorktreeForCleanup = createdWorktree;
+              },
+              onCreated: ({ agentId }) => {
+                createdAgentId = agentId;
+              },
+            },
+          );
+        } catch (error) {
+          await options.createAgentLifecycleDispatch?.cleanupCreatedWorktreeAfterFailedAgentCreate({
+            createdWorktree: createdWorktreeForCleanup,
+            createdAgentId,
+          });
+          if (pendingCreationAgentId) {
+            await options.createAgentLifecycleDispatch?.recoverPendingAgentCreation(
+              pendingCreationAgentId,
+            );
+          }
+          throw error;
+        }
+      })();
+      const { snapshot, background: createdInBackground, initialPromptStarted } = createResult;
 
       try {
         if (!createdInBackground && initialPromptStarted) {
@@ -2370,12 +2462,18 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
 
       const resolvedCwd = resolveScopedCwd(cwd, { required: true });
       const workspaceId = await resolveTerminalWorkspaceId(resolvedCwd);
-
-      const terminal = await terminalManager.createTerminal({
-        cwd: resolvedCwd,
+      const lifecycleCoordinator =
+        options.lifecycleCoordinator ?? defaultWorkspaceLifecycleCoordinator;
+      const terminal = await lifecycleCoordinator.runWorkspaceOwnershipMutation(
         workspaceId,
-        ...(name?.trim() ? { name: name.trim() } : {}),
-      });
+        () => requireActiveWorkspaceForOwnership(options, workspaceId),
+        () =>
+          terminalManager.createTerminal({
+            cwd: resolvedCwd,
+            workspaceId,
+            ...(name?.trim() ? { name: name.trim() } : {}),
+          }),
+      );
 
       return {
         content: [],
@@ -3167,9 +3265,11 @@ function archiveWorktreeDependencies(
     findWorkspaceIdForCwd: options.findWorkspaceIdForCwd,
     listActiveWorkspaces: options.listActiveWorkspaces,
     archiveWorkspaceRecord: options.archiveWorkspaceRecord,
+    workspaceRegistry: options.workspaceRegistry,
     emitWorkspaceUpdatesForWorkspaceIds: options.emitWorkspaceUpdatesForWorkspaceIds,
     markWorkspaceArchiving: options.markWorkspaceArchiving,
     clearWorkspaceArchiving: options.clearWorkspaceArchiving,
+    lifecycleCoordinator: options.lifecycleCoordinator ?? defaultWorkspaceLifecycleCoordinator,
     killTerminalsForWorkspace: (workspaceId: string) =>
       killTerminalsForWorkspace(
         {

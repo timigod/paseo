@@ -5,7 +5,10 @@ import { createBranchChangeRouteHandler } from "./script-route-branch-handler.js
 import { createServiceProxySubsystem, type ServiceProxySubsystem } from "./service-proxy.js";
 import { Session, type SessionOptions } from "./session.js";
 import { asInternals, createStub } from "./test-utils/class-mocks.js";
-import { createProviderSnapshotManagerStub } from "./test-utils/session-stubs.js";
+import {
+  createAgentLifecycleDispatchStub,
+  createProviderSnapshotManagerStub,
+} from "./test-utils/session-stubs.js";
 import { createTestLogger } from "../test-utils/test-logger.js";
 import { WorkspaceScriptRuntimeStore } from "./workspace-script-runtime-store.js";
 import type {
@@ -13,7 +16,11 @@ import type {
   WorkspaceGitRuntimeSnapshot,
   WorkspaceGitService,
 } from "./workspace-git-service.js";
-import type { SessionOutboundMessage, WorkspaceDescriptorPayload } from "./messages.js";
+import type {
+  SessionOutboundMessage,
+  WorkspaceDescriptorPayload,
+  WorkspaceSetupSnapshot,
+} from "./messages.js";
 import {
   createPersistedProjectRecord,
   createPersistedWorkspaceRecord,
@@ -120,6 +127,7 @@ function createSessionForWorkspaceGitWatchTests(options?: {
   ) => void;
   serviceProxy?: ServiceProxySubsystem;
   scriptRuntimeStore?: WorkspaceScriptRuntimeStore;
+  workspaceSetupSnapshots?: Map<string, WorkspaceSetupSnapshot>;
 }): {
   session: Session;
   emitted: Array<{ type: string; payload: unknown }>;
@@ -197,6 +205,7 @@ function createSessionForWorkspaceGitWatchTests(options?: {
       list: async () => [],
       get: async () => null,
     }),
+    createAgentLifecycleDispatch: createAgentLifecycleDispatchStub(),
     projectRegistry: createStub<SessionOptions["projectRegistry"]>({
       subscribeToMutations: () => () => {},
       initialize: async () => {},
@@ -257,6 +266,7 @@ function createSessionForWorkspaceGitWatchTests(options?: {
     terminalManager: null,
     serviceProxy: options?.serviceProxy,
     scriptRuntimeStore: options?.scriptRuntimeStore,
+    workspaceSetupSnapshots: options?.workspaceSetupSnapshots,
     onBranchChanged: options?.onBranchChanged,
     getDaemonTcpPort: () => 6767,
   });
@@ -532,6 +542,43 @@ describe("workspace git watch targets", () => {
 
     expect(runtimeStore.listForWorkspace("ws-10")).toEqual([]);
 
+    await session.cleanup();
+  });
+
+  test("archiving a workspace clears its cached setup snapshot", async () => {
+    const setupSnapshots = new Map<string, WorkspaceSetupSnapshot>([
+      [
+        "ws-10",
+        {
+          status: "completed",
+          detail: {
+            type: "worktree_setup",
+            worktreePath: "/tmp/repo",
+            branchName: "main",
+            log: "done",
+            commands: [],
+          },
+          error: null,
+        },
+      ],
+    ]);
+    const { session, projects, workspaces } = createSessionForWorkspaceGitWatchTests({
+      workspaceSetupSnapshots: setupSnapshots,
+    });
+    seedGitWorkspace({
+      projects,
+      workspaces,
+      projectId: "proj-1",
+      workspaceId: "ws-10",
+      cwd: "/tmp/repo",
+      name: "main",
+    });
+
+    await asInternals<{ archiveWorkspaceRecord: (workspaceId: string) => Promise<void> }>(
+      session,
+    ).archiveWorkspaceRecord("ws-10");
+
+    expect(setupSnapshots.has("ws-10")).toBe(false);
     await session.cleanup();
   });
 

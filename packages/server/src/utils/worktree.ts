@@ -1,10 +1,17 @@
-import { execFile } from "child_process";
-import { promisify } from "util";
-import { existsSync, mkdirSync, realpathSync, rmSync, statSync } from "fs";
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
+} from "fs";
 import { copyFile, rm, stat } from "fs/promises";
 import { join, basename, dirname, isAbsolute, resolve, sep } from "path";
 import net from "node:net";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import stripAnsi from "strip-ansi";
 import {
   buildStringCommandShellInvocation,
@@ -31,15 +38,21 @@ import {
 } from "./worktree-metadata.js";
 import { runGitCommand } from "./run-git-command.js";
 import { spawnProcess } from "./spawn.js";
+import { terminateWithTreeKill } from "./tree-kill.js";
 import { resolvePaseoHome } from "../server/paseo-home.js";
 import { createExternalProcessEnv } from "../server/paseo-env.js";
 import { parseGitRevParsePath, resolveGitRevParsePath } from "./git-rev-parse-path.js";
 import { validateBranchSlug } from "@getpaseo/protocol/branch-slug";
 import { expandTilde, getRealpathAwareRelativePath, isPathInsideRoot } from "./path.js";
+import {
+  appendWorktreeSetupOutput,
+  createWorktreeSetupOutputAccumulator,
+  getWorktreeSetupCommandOutputLimit,
+  renderWorktreeSetupOutput,
+} from "./worktree-setup-output.js";
 
 export { slugify, validateBranchSlug } from "@getpaseo/protocol/branch-slug";
 
-const execFileAsync = promisify(execFile);
 const READ_ONLY_GIT_ENV = {
   GIT_OPTIONAL_LOCKS: "0",
 } as const;
@@ -203,6 +216,43 @@ export interface CreateWorktreeOptions {
   runSetup: boolean;
   paseoHome?: string;
   worktreesRoot?: string;
+  onWorktreePathPlanned?: (worktreePath: string, plan: WorktreeCreationPlan) => Promise<void>;
+  onWorktreePathResolved?: (
+    worktreePath: string,
+    reservation: WorktreeCreationReservation,
+  ) => Promise<void>;
+}
+
+export interface WorktreeCreationPlan {
+  worktreeIncarnationId: string;
+  metadataBaseRefName: string;
+}
+
+export interface WorktreeCreationReservation {
+  worktreeIncarnationId: string;
+  directoryIdentity: {
+    device: string;
+    inode: string;
+  };
+  metadataBaseRefName: string;
+}
+
+export interface WorktreeCreationJournalCallbacks {
+  onWorktreePathPlanned: (worktreePath: string, plan: WorktreeCreationPlan) => Promise<void>;
+  onWorktreePathResolved: (
+    worktreePath: string,
+    reservation: WorktreeCreationReservation,
+  ) => Promise<void>;
+}
+
+const WORKTREE_CREATION_MARKER_FILENAME = ".paseo-worktree-creation";
+
+export function readWorktreeCreationMarker(worktreePath: string): string | null {
+  try {
+    return readFileSync(join(worktreePath, WORKTREE_CREATION_MARKER_FILENAME), "utf8").trim();
+  } catch {
+    return null;
+  }
 }
 
 interface ResolveExistingWorktreeForSlugOptions {
@@ -410,50 +460,20 @@ export function processCarriageReturns(text: string): string {
   return output.join("");
 }
 
-async function execSetupCommand(
-  command: string,
-  options: { cwd: string; env: NodeJS.ProcessEnv },
-): Promise<WorktreeSetupCommandResult> {
-  const startedAt = Date.now();
-  const shellInvocation = buildStringCommandShellInvocation({ command });
-  try {
-    const { stdout, stderr } = await execFileAsync(shellInvocation.shell, shellInvocation.args, {
-      cwd: options.cwd,
-      env: options.env,
-    });
-    return {
-      command,
-      cwd: options.cwd,
-      stdout: stdout ?? "",
-      stderr: stderr ?? "",
-      exitCode: 0,
-      durationMs: Date.now() - startedAt,
-    };
-  } catch (error) {
-    const execErr = error as { stdout?: string; stderr?: string; code?: unknown } | undefined;
-    return {
-      command,
-      cwd: options.cwd,
-      stdout: execErr?.stdout ?? "",
-      stderr: execErr?.stderr ?? (error instanceof Error ? error.message : String(error)),
-      exitCode: typeof execErr?.code === "number" ? execErr.code : null,
-      durationMs: Date.now() - startedAt,
-    };
-  }
-}
-
 async function execSetupCommandStreamed(options: {
   command: string;
   cwd: string;
   env: NodeJS.ProcessEnv;
   index: number;
   total: number;
+  maxOutputBytes: number;
   onEvent?: (event: WorktreeSetupCommandProgressEvent) => void;
+  signal?: AbortSignal;
 }): Promise<WorktreeSetupCommandResult> {
   return new Promise((resolvePromise) => {
     const startedAt = Date.now();
-    const stdoutChunks: string[] = [];
-    const stderrChunks: string[] = [];
+    const stdoutAccumulator = createWorktreeSetupOutputAccumulator(options.maxOutputBytes);
+    const stderrAccumulator = createWorktreeSetupOutputAccumulator(options.maxOutputBytes);
     let settled = false;
 
     const emitOutput = (stream: "stdout" | "stderr", chunk: string) => {
@@ -462,9 +482,9 @@ async function execSetupCommandStreamed(options: {
         return;
       }
       if (stream === "stdout") {
-        stdoutChunks.push(text);
+        appendWorktreeSetupOutput(stdoutAccumulator, text);
       } else {
-        stderrChunks.push(text);
+        appendWorktreeSetupOutput(stderrAccumulator, text);
       }
       options.onEvent?.({
         type: "output",
@@ -482,11 +502,20 @@ async function execSetupCommandStreamed(options: {
         return;
       }
       settled = true;
+      options.signal?.removeEventListener("abort", abortCommand);
+      const combinedBytes = stdoutAccumulator.totalBytes + stderrAccumulator.totalBytes;
+      const stdoutOutputBytes =
+        combinedBytes === 0
+          ? 0
+          : Math.floor((options.maxOutputBytes * stdoutAccumulator.totalBytes) / combinedBytes);
+      const stderrOutputBytes = options.maxOutputBytes - stdoutOutputBytes;
+      const stdout = renderWorktreeSetupOutput(stdoutAccumulator, stdoutOutputBytes).text;
+      const stderr = renderWorktreeSetupOutput(stderrAccumulator, stderrOutputBytes).text;
       const result: WorktreeSetupCommandResult = {
         command: options.command,
         cwd: options.cwd,
-        stdout: stdoutChunks.join(""),
-        stderr: stderrChunks.join(""),
+        stdout,
+        stderr,
         exitCode,
         durationMs: Date.now() - startedAt,
       };
@@ -519,6 +548,15 @@ async function execSetupCommandStreamed(options: {
       shell: false,
       stdio: ["ignore", "pipe", "pipe"],
     });
+    const abortCommand = () => {
+      emitOutput("stderr", "Worktree lifecycle command canceled");
+      void terminateWithTreeKill(child, {
+        gracefulTimeoutMs: 1_000,
+        forceTimeoutMs: 1_000,
+      }).finally(() => finish(null));
+    };
+    options.signal?.addEventListener("abort", abortCommand, { once: true });
+    if (options.signal?.aborted) abortCommand();
 
     child.stdout?.on("data", (chunk: Buffer | string) => {
       emitOutput("stdout", chunk.toString());
@@ -638,20 +676,17 @@ export async function runWorktreeSetupCommands(options: {
   const setupEnv = createStringCommandShellEnv(createExternalProcessEnv(process.env, runtimeEnv));
 
   const results: WorktreeSetupCommandResult[] = [];
+  const maxOutputBytes = getWorktreeSetupCommandOutputLimit(setupCommands.length);
   for (const [index, cmd] of setupCommands.entries()) {
-    const result = options.onEvent
-      ? await execSetupCommandStreamed({
-          command: cmd,
-          cwd: options.worktreePath,
-          env: setupEnv,
-          index: index + 1,
-          total: setupCommands.length,
-          onEvent: options.onEvent,
-        })
-      : await execSetupCommand(cmd, {
-          cwd: options.worktreePath,
-          env: setupEnv,
-        });
+    const result = await execSetupCommandStreamed({
+      command: cmd,
+      cwd: options.worktreePath,
+      env: setupEnv,
+      index: index + 1,
+      total: setupCommands.length,
+      maxOutputBytes,
+      onEvent: options.onEvent,
+    });
     results.push(result);
 
     if (result.exitCode !== 0) {
@@ -731,6 +766,7 @@ export async function runWorktreeTeardownCommands(options: {
   teardownCwd?: string;
   branchName?: string;
   repoRootPath?: string;
+  signal?: AbortSignal;
 }): Promise<WorktreeTeardownCommandResult[]> {
   const teardownCwd = options.teardownCwd ?? options.worktreePath;
   if (getRealpathAwareRelativePath(options.worktreePath, teardownCwd) === null) {
@@ -762,10 +798,16 @@ export async function runWorktreeTeardownCommands(options: {
   );
 
   const results: WorktreeTeardownCommandResult[] = [];
-  for (const cmd of teardownCommands) {
-    const result = await execSetupCommand(cmd, {
+  const maxOutputBytes = getWorktreeSetupCommandOutputLimit(teardownCommands.length);
+  for (const [index, cmd] of teardownCommands.entries()) {
+    const result = await execSetupCommandStreamed({
+      command: cmd,
       cwd: teardownCwd,
       env: teardownEnv,
+      index: index + 1,
+      total: teardownCommands.length,
+      maxOutputBytes,
+      signal: options.signal,
     });
     results.push(result);
 
@@ -906,6 +948,19 @@ function normalizePathForOwnership(input: string): string {
   } catch {
     return resolve(input);
   }
+}
+
+function normalizePlannedPathForOwnership(input: string): string {
+  const resolvedInput = resolve(input);
+  const missingSegments: string[] = [];
+  let existingAncestor = resolvedInput;
+  while (!existsSync(existingAncestor)) {
+    const parent = dirname(existingAncestor);
+    if (parent === existingAncestor) break;
+    missingSegments.unshift(basename(existingAncestor));
+    existingAncestor = parent;
+  }
+  return join(normalizePathForOwnership(existingAncestor), ...missingSegments);
 }
 
 function resolveRepoRootFromGitCommonDir(commonDir: string): string {
@@ -1083,6 +1138,36 @@ export interface DeletePaseoWorktreeOptions {
   worktreesRoot?: string;
   paseoHome?: string;
   worktreesBaseRoot?: string;
+  signal?: AbortSignal;
+}
+
+function throwIfWorktreeDeletionCanceled(signal: AbortSignal | undefined): void {
+  if (!signal?.aborted) return;
+  const error = new Error("Worktree deletion canceled");
+  error.name = "AbortError";
+  throw error;
+}
+
+async function waitForWorktreeDeletionRetry(delayMs: number, signal?: AbortSignal): Promise<void> {
+  throwIfWorktreeDeletionCanceled(signal);
+  if (delayMs === 0) return;
+
+  await new Promise<void>((resolvePromise, reject) => {
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolvePromise();
+    }, delayMs);
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(
+        Object.assign(new Error("Worktree deletion canceled"), {
+          name: "AbortError",
+        }),
+      );
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+    if (signal?.aborted) onAbort();
+  });
 }
 
 export async function deletePaseoWorktree({
@@ -1093,6 +1178,7 @@ export async function deletePaseoWorktree({
   worktreesRoot,
   paseoHome,
   worktreesBaseRoot,
+  signal,
 }: DeletePaseoWorktreeOptions): Promise<void> {
   if (!worktreePath && !worktreeSlug) {
     throw new Error("worktreePath or worktreeSlug is required");
@@ -1132,17 +1218,22 @@ export async function deletePaseoWorktree({
       await runWorktreeTeardownCommands({
         worktreePath: resolvedWorktree,
         teardownCwd,
+        signal,
       });
     }
   }
+
+  throwIfWorktreeDeletionCanceled(signal);
 
   if (cwd) {
     try {
       await runGitCommand(["worktree", "remove", resolvedWorktree, "--force"], {
         cwd,
         timeout: 120_000,
+        signal,
       });
     } catch {
+      throwIfWorktreeDeletionCanceled(signal);
       // `git worktree remove` fails if the admin dir is already gone (e.g. a
       // prior archive attempt removed it before the working tree could be
       // fully cleaned up), or if the repo root has moved. Fall through to the
@@ -1150,12 +1241,13 @@ export async function deletePaseoWorktree({
     }
   }
 
-  await removeDirectoryWithRetries(resolvedWorktree);
+  await removeDirectoryWithRetries(resolvedWorktree, signal);
 
   if (cwd) {
     try {
-      await runGitCommand(["worktree", "prune"], { cwd, timeout: 30_000 });
+      await runGitCommand(["worktree", "prune"], { cwd, timeout: 30_000, signal });
     } catch {
+      throwIfWorktreeDeletionCanceled(signal);
       // not critical; git will prune lazily
     }
   }
@@ -1194,7 +1286,8 @@ async function pathExists(path: string): Promise<boolean> {
   }
 }
 
-async function removeDirectoryWithRetries(path: string): Promise<void> {
+async function removeDirectoryWithRetries(path: string, signal?: AbortSignal): Promise<void> {
+  throwIfWorktreeDeletionCanceled(signal);
   if (!(await pathExists(path))) {
     return;
   }
@@ -1202,16 +1295,16 @@ async function removeDirectoryWithRetries(path: string): Promise<void> {
   const delaysMs = [0, 100, 300, 700, 1500];
   let lastError: unknown = null;
   for (const delay of delaysMs) {
-    if (delay > 0) {
-      await new Promise((resolvePromise) => setTimeout(resolvePromise, delay));
-    }
+    await waitForWorktreeDeletionRetry(delay, signal);
     try {
       await rm(path, { recursive: true, force: true });
+      throwIfWorktreeDeletionCanceled(signal);
       if (!(await pathExists(path))) {
         return;
       }
       lastError = new Error(`Directory still present after rm: ${path}`);
     } catch (error) {
+      throwIfWorktreeDeletionCanceled(signal);
       lastError = error;
     }
   }
@@ -1233,17 +1326,74 @@ export const createWorktree = async ({
   runSetup,
   paseoHome,
   worktreesRoot,
+  onWorktreePathPlanned,
+  onWorktreePathResolved,
 }: CreateWorktreeOptions): Promise<WorktreeConfig> => {
+  if (Boolean(onWorktreePathPlanned) !== Boolean(onWorktreePathResolved)) {
+    throw new Error("Worktree creation journaling requires both planning and identity callbacks");
+  }
   const sourcePlan = await resolveWorktreeSourcePlan({ cwd, source, desiredSlug: worktreeSlug });
   let worktreePath = join(await getPaseoWorktreesRoot(cwd, paseoHome, worktreesRoot), worktreeSlug);
-  mkdirSync(dirname(worktreePath), { recursive: true });
 
-  // Also handle worktree path collision
+  // Also handle worktree path collision. Journaled creation first persists the
+  // exact candidate path and incarnation, then atomically claims the directory.
   let finalWorktreePath = worktreePath;
   let pathSuffix = 1;
-  while (existsSync(finalWorktreePath)) {
-    finalWorktreePath = `${worktreePath}-${pathSuffix}`;
-    pathSuffix++;
+  const worktreeIncarnationId = randomUUID();
+  if (onWorktreePathPlanned && onWorktreePathResolved) {
+    while (true) {
+      const normalizedCandidatePath = normalizePlannedPathForOwnership(finalWorktreePath);
+      if (existsSync(normalizedCandidatePath)) {
+        finalWorktreePath = `${worktreePath}-${pathSuffix}`;
+        pathSuffix++;
+        continue;
+      }
+      await onWorktreePathPlanned(normalizedCandidatePath, {
+        worktreeIncarnationId,
+        metadataBaseRefName: sourcePlan.metadataBaseRefName,
+      });
+      mkdirSync(dirname(normalizedCandidatePath), { recursive: true });
+      try {
+        mkdirSync(normalizedCandidatePath);
+        finalWorktreePath = normalizedCandidatePath;
+        break;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+        finalWorktreePath = `${worktreePath}-${pathSuffix}`;
+        pathSuffix++;
+      }
+    }
+  } else {
+    mkdirSync(dirname(finalWorktreePath), { recursive: true });
+    while (existsSync(finalWorktreePath)) {
+      finalWorktreePath = `${worktreePath}-${pathSuffix}`;
+      pathSuffix++;
+    }
+  }
+
+  const normalizedWorktreePath = normalizePathForOwnership(finalWorktreePath);
+  if (onWorktreePathPlanned && onWorktreePathResolved) {
+    const markerPath = join(normalizedWorktreePath, WORKTREE_CREATION_MARKER_FILENAME);
+    try {
+      writeFileSync(markerPath, `${worktreeIncarnationId}\n`, {
+        encoding: "utf8",
+        flag: "wx",
+        mode: 0o600,
+      });
+      const directoryStat = statSync(normalizedWorktreePath, { bigint: true });
+      await onWorktreePathResolved(normalizedWorktreePath, {
+        worktreeIncarnationId,
+        directoryIdentity: {
+          device: directoryStat.dev.toString(),
+          inode: directoryStat.ino.toString(),
+        },
+        metadataBaseRefName: sourcePlan.metadataBaseRefName,
+      });
+      unlinkSync(markerPath);
+    } catch (error) {
+      rmSync(normalizedWorktreePath, { recursive: true, force: true });
+      throw error;
+    }
   }
 
   // Primitive owner for `git worktree add`; callers route through createWorktreeCore.
@@ -1251,7 +1401,7 @@ export const createWorktree = async ({
     cwd,
     timeout: 120_000,
   });
-  worktreePath = normalizePathForOwnership(finalWorktreePath);
+  worktreePath = normalizedWorktreePath;
 
   if (sourcePlan.pushRemote) {
     await configureWorktreePushRemote({
@@ -1270,6 +1420,7 @@ export const createWorktree = async ({
 
   writePaseoWorktreeMetadata(worktreePath, {
     baseRefName: sourcePlan.metadataBaseRefName,
+    incarnationId: worktreeIncarnationId,
     ...(sourcePlan.changeRequestLookupTarget
       ? { changeRequestLookupTarget: sourcePlan.changeRequestLookupTarget }
       : {}),

@@ -1,3 +1,4 @@
+import { stat } from "node:fs/promises";
 import { basename, resolve } from "node:path";
 import type { Logger } from "pino";
 import {
@@ -16,6 +17,10 @@ import type { WorkspaceGitService } from "../../workspace-git-service.js";
 import type { CreatePaseoWorktreeWorkflowResult } from "../../worktree-session.js";
 import { deriveProjectKey } from "../../project-key.js";
 import { areEquivalentPaths, createRealpathAwarePathMatcher } from "../../../utils/path.js";
+import {
+  defaultWorkspaceLifecycleCoordinator,
+  type WorkspaceLifecycleCoordinator,
+} from "../../workspace-lifecycle-coordinator.js";
 
 export interface ResolveOrCreateWorkspaceIdInput {
   createdWorktree: CreatePaseoWorktreeWorkflowResult | null;
@@ -90,8 +95,20 @@ export function createWorkspaceProvisioningService(deps: {
   projectRegistry: ProjectRegistry;
   workspaceGitService: Pick<WorkspaceGitService, "getCheckout" | "peekSnapshot">;
   logger: Logger;
+  lifecycleCoordinator?: Pick<WorkspaceLifecycleCoordinator, "runDirectoryExclusive">;
+  isDirectory?: (path: string) => Promise<boolean>;
 }): WorkspaceProvisioningService {
   const { serverId, workspaceRegistry, projectRegistry, workspaceGitService, logger } = deps;
+  const lifecycleCoordinator = deps.lifecycleCoordinator ?? defaultWorkspaceLifecycleCoordinator;
+  const isDirectory =
+    deps.isDirectory ??
+    (async (targetPath: string) => {
+      try {
+        return (await stat(targetPath)).isDirectory();
+      } catch {
+        return false;
+      }
+    });
 
   async function runInImportWorkspace<T>(
     input: ImportWorkspaceInput,
@@ -189,6 +206,18 @@ export function createWorkspaceProvisioningService(deps: {
     context?: { expectsInitialAgent?: boolean },
   ): Promise<PersistedWorkspaceRecord> {
     const normalizedCwd = resolve(cwd);
+    return lifecycleCoordinator.runDirectoryExclusive(normalizedCwd, async () => {
+      await requireDirectoryAfterLifecycleWait(normalizedCwd);
+      return createWorkspaceForDirectoryUnlocked(normalizedCwd, title, projectId, context);
+    });
+  }
+
+  async function createWorkspaceForDirectoryUnlocked(
+    normalizedCwd: string,
+    title?: string | null,
+    projectId?: string,
+    context?: { expectsInitialAgent?: boolean },
+  ): Promise<PersistedWorkspaceRecord> {
     const checkout = await workspaceGitService.getCheckout(normalizedCwd);
     const project = projectId
       ? await refreshProjectKind(await requireActiveProject(projectId), normalizedCwd, checkout)
@@ -207,6 +236,12 @@ export function createWorkspaceProvisioningService(deps: {
     return workspace;
   }
 
+  async function requireDirectoryAfterLifecycleWait(cwd: string): Promise<void> {
+    if (!(await isDirectory(cwd))) {
+      throw new Error(`Working directory does not exist or is not a directory: ${cwd}`);
+    }
+  }
+
   async function createWorkspaceForWorktree(
     input: CreateWorktreeWorkspaceInput,
   ): Promise<PersistedWorkspaceRecord> {
@@ -214,31 +249,46 @@ export function createWorkspaceProvisioningService(deps: {
     const repoRoot = resolve(input.repoRoot);
     const cwd = resolve(input.cwd);
     const worktreeRoot = resolve(input.worktreeRoot);
-    const project = await resolveSourceProjectForWorktree({
-      sourceCwd,
-      projectId: input.projectId,
-      repoRoot,
+    return lifecycleCoordinator.runDirectoryExclusive(worktreeRoot, async () => {
+      const matchesWorktreeRoot = createRealpathAwarePathMatcher(worktreeRoot);
+      const activeOwner = (await workspaceRegistry.list())
+        .filter(
+          (workspace) =>
+            !workspace.archivedAt && matchesWorktreeRoot(workspace.worktreeRoot ?? workspace.cwd),
+        )
+        .sort(
+          (left, right) =>
+            Date.parse(left.createdAt) - Date.parse(right.createdAt) ||
+            left.workspaceId.localeCompare(right.workspaceId),
+        )[0];
+      if (activeOwner) return activeOwner;
+
+      const project = await resolveSourceProjectForWorktree({
+        sourceCwd,
+        projectId: input.projectId,
+        repoRoot,
+      });
+      const timestamp = new Date().toISOString();
+      const workspace = createPersistedWorkspaceRecord({
+        workspaceId: generateWorkspaceId(),
+        projectId: project.projectId,
+        ...initialWorkspacePlacement({
+          source: "created_worktree",
+          cwd,
+          worktreeRoot,
+          branch: input.branch,
+          baseBranch: input.baseBranch,
+          mainRepoRoot: repoRoot,
+        }),
+        title: input.title,
+        createdAt: timestamp,
+        updatedAt: timestamp,
+      });
+      await workspaceRegistry.upsert(workspace, {
+        expectsInitialAgent: input.expectsInitialAgent,
+      });
+      return workspace;
     });
-    const timestamp = new Date().toISOString();
-    const workspace = createPersistedWorkspaceRecord({
-      workspaceId: generateWorkspaceId(),
-      projectId: project.projectId,
-      ...initialWorkspacePlacement({
-        source: "created_worktree",
-        cwd,
-        worktreeRoot,
-        branch: input.branch,
-        baseBranch: input.baseBranch,
-        mainRepoRoot: repoRoot,
-      }),
-      title: input.title,
-      createdAt: timestamp,
-      updatedAt: timestamp,
-    });
-    await workspaceRegistry.upsert(workspace, {
-      expectsInitialAgent: input.expectsInitialAgent,
-    });
-    return workspace;
   }
 
   async function resolveSourceProjectForWorktree(input: {
@@ -284,31 +334,36 @@ export function createWorkspaceProvisioningService(deps: {
 
   async function findOrCreateWorkspaceForDirectory(cwd: string): Promise<PersistedWorkspaceRecord> {
     const normalizedCwd = resolve(cwd);
-    const workspaces = await workspaceRegistry.list();
-    const active = workspaces
-      .filter(
-        (workspace) => !workspace.archivedAt && areEquivalentPaths(workspace.cwd, normalizedCwd),
-      )
-      .sort(
-        (left, right) =>
-          Date.parse(left.createdAt) - Date.parse(right.createdAt) ||
-          left.workspaceId.localeCompare(right.workspaceId),
-      )[0];
-    if (active) return refreshWorkspaceRecord(active);
-    const archived = workspaces
-      .filter(
-        (workspace) => workspace.archivedAt && areEquivalentPaths(workspace.cwd, normalizedCwd),
-      )
-      .sort(
-        (left, right) =>
-          Date.parse(left.createdAt) - Date.parse(right.createdAt) ||
-          left.workspaceId.localeCompare(right.workspaceId),
-      )[0];
-    if (archived) {
-      const project = await projectRegistry.get(archived.projectId);
-      if (project && !project.archivedAt) return ensureWorkspaceRecordUnarchived(archived);
-    }
-    return createWorkspaceForDirectory(normalizedCwd);
+    return lifecycleCoordinator.runDirectoryExclusive(normalizedCwd, async () => {
+      await requireDirectoryAfterLifecycleWait(normalizedCwd);
+      const workspaces = await workspaceRegistry.list();
+      const active = workspaces
+        .filter(
+          (workspace) => !workspace.archivedAt && areEquivalentPaths(workspace.cwd, normalizedCwd),
+        )
+        .sort(
+          (left, right) =>
+            Date.parse(left.createdAt) - Date.parse(right.createdAt) ||
+            left.workspaceId.localeCompare(right.workspaceId),
+        )[0];
+      if (active) return refreshWorkspaceRecord(active);
+      const archived = workspaces
+        .filter(
+          (workspace) => workspace.archivedAt && areEquivalentPaths(workspace.cwd, normalizedCwd),
+        )
+        .sort(
+          (left, right) =>
+            Date.parse(left.createdAt) - Date.parse(right.createdAt) ||
+            left.workspaceId.localeCompare(right.workspaceId),
+        )[0];
+      if (archived) {
+        const project = await projectRegistry.get(archived.projectId);
+        if (project && !project.archivedAt) {
+          return ensureWorkspaceRecordUnarchivedUnlocked(archived);
+        }
+      }
+      return createWorkspaceForDirectoryUnlocked(normalizedCwd);
+    });
   }
 
   async function resolveOrCreateWorkspaceIdForCreateAgent(
@@ -324,6 +379,16 @@ export function createWorkspaceProvisioningService(deps: {
   }
 
   async function ensureWorkspaceRecordUnarchived(
+    workspace: PersistedWorkspaceRecord,
+  ): Promise<PersistedWorkspaceRecord> {
+    const normalizedCwd = resolve(workspace.cwd);
+    return lifecycleCoordinator.runDirectoryExclusive(normalizedCwd, async () => {
+      await requireDirectoryAfterLifecycleWait(normalizedCwd);
+      return ensureWorkspaceRecordUnarchivedUnlocked(workspace);
+    });
+  }
+
+  async function ensureWorkspaceRecordUnarchivedUnlocked(
     workspace: PersistedWorkspaceRecord,
   ): Promise<PersistedWorkspaceRecord> {
     const project = await projectRegistry.get(workspace.projectId);

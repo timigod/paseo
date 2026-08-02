@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 interface FakeSpawnBehavior {
   delayMs?: number;
+  deferCloseOnKill?: boolean;
   emitError?: Error;
   exitCode?: number | null;
   stderrData?: Buffer | string;
@@ -69,6 +70,9 @@ class FakeChildProcess extends EventEmitter {
     this.killed = true;
     this.killSignals.push(signal);
     this.clearTimers();
+    if (this.behavior.deferCloseOnKill) {
+      return true;
+    }
     this.schedule(() => {
       this.finishClose({
         exitCode: null,
@@ -76,6 +80,11 @@ class FakeChildProcess extends EventEmitter {
       });
     }, 0);
     return true;
+  }
+
+  public closeKilledProcess(): void {
+    const signal = this.killSignals.at(-1) ?? null;
+    this.finishClose({ exitCode: null, signal });
   }
 
   public dispose(): void {
@@ -103,7 +112,10 @@ class FakeChildProcess extends EventEmitter {
     if (this.behavior.emitError) {
       this.schedule(() => {
         if (this.closed) return;
-        this.finishError(this.behavior.emitError);
+        this.emit("error", this.behavior.emitError);
+        this.schedule(() => {
+          this.finishClose({ exitCode: null, signal: null });
+        }, 0);
       }, this.behavior.delayMs ?? 0);
       return;
     }
@@ -129,15 +141,6 @@ class FakeChildProcess extends EventEmitter {
     this.clearTimers();
     fakeSpawnController.activeCount -= 1;
     this.emit("close", exitCode, signal);
-  }
-
-  private finishError(error: Error): void {
-    if (this.closed) return;
-
-    this.closed = true;
-    this.clearTimers();
-    fakeSpawnController.activeCount -= 1;
-    this.emit("error", error);
   }
 
   private schedule(callback: () => void, delayMs: number): void {
@@ -230,6 +233,74 @@ describe("runGitCommand", () => {
     });
   });
 
+  it("cancels active and queued git commands without starting the queued process", async () => {
+    const { runGitCommand } = await loadRunGitCommand(1);
+    const activeController = new AbortController();
+    const queuedController = new AbortController();
+
+    enqueueSpawnBehaviors({ delayMs: 5_000 }, { delayMs: 0 });
+    const active = runGitCommand(["status"], {
+      cwd: process.cwd(),
+      signal: activeController.signal,
+    });
+    await vi.waitFor(() => expect(fakeSpawnController.processes).toHaveLength(1));
+    const queued = runGitCommand(["rev-parse", "--show-toplevel"], {
+      cwd: process.cwd(),
+      signal: queuedController.signal,
+    });
+
+    queuedController.abort();
+    await expect(queued).rejects.toThrow("Git command canceled: git rev-parse --show-toplevel");
+    expect(fakeSpawnController.processes).toHaveLength(1);
+
+    activeController.abort();
+    await expect(active).rejects.toThrow("Git command canceled: git status");
+    expect(fakeSpawnController.processes[0]?.killSignals).toEqual(["SIGKILL"]);
+    await vi.waitFor(() => expect(fakeSpawnController.activeCount).toBe(0));
+    expect(fakeSpawnController.processes).toHaveLength(1);
+
+    const preAbortedController = new AbortController();
+    preAbortedController.abort();
+    await expect(
+      runGitCommand(["status", "--short"], {
+        cwd: process.cwd(),
+        signal: preAbortedController.signal,
+      }),
+    ).rejects.toThrow("Git command canceled: git status --short");
+    await Promise.resolve();
+    expect(fakeSpawnController.processes).toHaveLength(1);
+  });
+
+  it("keeps an active cancellation pending until the killed process closes", async () => {
+    const { runGitCommand } = await loadRunGitCommand(1);
+    const controller = new AbortController();
+
+    enqueueSpawnBehaviors({ delayMs: 5_000, deferCloseOnKill: true });
+    const command = runGitCommand(["worktree", "remove", "/tmp/example", "--force"], {
+      cwd: process.cwd(),
+      signal: controller.signal,
+    });
+    const observedRejection = vi.fn();
+    void command.catch(observedRejection);
+    await vi.waitFor(() => expect(fakeSpawnController.processes).toHaveLength(1));
+
+    controller.abort();
+    await Promise.resolve();
+
+    expect(observedRejection).not.toHaveBeenCalled();
+    expect(fakeSpawnController.activeCount).toBe(1);
+    expect(fakeSpawnController.processes[0]?.killSignals).toEqual(["SIGKILL"]);
+
+    fakeSpawnController.processes[0]?.closeKilledProcess();
+
+    await expect(command).rejects.toMatchObject({
+      name: "AbortError",
+      message: "Git command canceled: git worktree remove /tmp/example --force",
+    });
+    expect(observedRejection).toHaveBeenCalledOnce();
+    expect(fakeSpawnController.activeCount).toBe(0);
+  });
+
   it("resolves truncated stdout, caps output, and kills the child process", async () => {
     const { runGitCommand } = await loadRunGitCommand(1);
 
@@ -252,17 +323,15 @@ describe("runGitCommand", () => {
 
   it("rejects process errors and frees the limiter for the next command", async () => {
     const { runGitCommand } = await loadRunGitCommand(1);
+    const spawnError = new Error("spawn exploded");
 
-    enqueueSpawnBehaviors(
-      { emitError: new Error("spawn exploded") },
-      { delayMs: 0, stdoutData: "ok" },
-    );
+    enqueueSpawnBehaviors({ emitError: spawnError }, { delayMs: 0, stdoutData: "ok" });
 
     await expect(
       runGitCommand(["status"], {
         cwd: process.cwd(),
       }),
-    ).rejects.toThrow("spawn exploded");
+    ).rejects.toBe(spawnError);
 
     await expect(
       runGitCommand(["status"], {

@@ -1,4 +1,5 @@
 import { execFileSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { describe, expect, it, vi } from "vitest";
@@ -56,6 +57,7 @@ import type { BrowserToolsBroker, BrowserToolsExecuteInput } from "../browser-to
 import type { BrowserToolsResponsePayload } from "../browser-tools/errors.js";
 import { readPaseoWorktreeMetadata } from "../../utils/worktree-metadata.js";
 import { createWorkspaceProvisioningService } from "../session/workspace-provisioning/workspace-provisioning-service.js";
+import { WorkspaceLifecycleCoordinator } from "../workspace-lifecycle-coordinator.js";
 
 const REPO_CWD = resolvePath("/tmp/repo");
 const TARGET_CWD = resolvePath("/tmp/target");
@@ -193,7 +195,9 @@ interface TestDeps {
 }
 
 function buildAgentManagerSpies() {
+  const getAgent = vi.fn();
   return {
+    allocateAgentId: vi.fn(() => randomUUID()),
     createAgent: vi.fn(),
     waitForAgentEvent: vi.fn().mockResolvedValue({
       status: "idle",
@@ -209,7 +213,11 @@ function buildAgentManagerSpies() {
     updateAgentMetadata: vi.fn().mockResolvedValue(undefined),
     archiveAgent: vi.fn().mockResolvedValue({ archivedAt: new Date().toISOString() }),
     notifyAgentState: vi.fn(),
-    getAgent: vi.fn(),
+    getAgent,
+    getAgentInitializationState: vi.fn((agentId: string) => ({
+      agent: getAgent(agentId),
+      closeInFlight: false,
+    })),
     listAgents: vi.fn().mockReturnValue([]),
     getTimeline: vi.fn().mockReturnValue([]),
     resumeAgentFromPersistence: vi.fn(),
@@ -236,6 +244,16 @@ function buildAgentStorageSpies() {
     upsert: vi.fn().mockResolvedValue(undefined),
     applySnapshot: vi.fn(),
     list: vi.fn().mockResolvedValue([]),
+    beginPendingAgentCreation: vi.fn().mockImplementation(async (agentId: string) => ({
+      agentId,
+      createdAt: new Date().toISOString(),
+      ownerKind: "agent" as const,
+      cleanupTarget: { kind: "agent" as const },
+    })),
+    planPendingAgentCreationWorktree: vi.fn().mockResolvedValue(undefined),
+    identifyPendingAgentCreationWorktree: vi.fn().mockResolvedValue(undefined),
+    listPendingAgentCreations: vi.fn().mockResolvedValue([]),
+    removePendingAgentCreation: vi.fn().mockResolvedValue(undefined),
     remove: vi.fn(),
   };
 }
@@ -271,6 +289,89 @@ function createTerminalManagerStub(overrides: Partial<TerminalManager> = {}): Te
     ...overrides,
   } as unknown as TerminalManager;
 }
+
+it("holds workspace ownership while an MCP terminal is being attached", async () => {
+  const { agentManager, agentStorage } = createTestDeps();
+  const lifecycleCoordinator = new WorkspaceLifecycleCoordinator();
+  let releaseTerminal: (() => void) | undefined;
+  let markTerminalStarted: (() => void) | undefined;
+  const terminalStarted = new Promise<void>((resolve) => {
+    markTerminalStarted = resolve;
+  });
+  const terminalGate = new Promise<void>((resolve) => {
+    releaseTerminal = resolve;
+  });
+  const createTerminal = vi.fn(async ({ cwd }: { cwd: string }) => {
+    markTerminalStarted?.();
+    await terminalGate;
+    return { id: "terminal-owned", name: "Owned terminal", cwd };
+  });
+  const server = await createAgentMcpServer({
+    agentManager,
+    agentStorage,
+    terminalManager: createTerminalManagerStub({
+      createTerminal: createTerminal as unknown as TerminalManager["createTerminal"],
+    }),
+    providerSnapshotManager: createProviderSnapshotManagerStub().manager,
+    ensureWorkspaceForCreate: async () => "ws-terminal-owned",
+    listActiveWorkspaces: async () => [
+      {
+        workspaceId: "ws-terminal-owned",
+        cwd: "/tmp/terminal-owned",
+        kind: "local_checkout",
+      },
+    ],
+    lifecycleCoordinator,
+    logger: createTestLogger(),
+  });
+
+  const terminalTask = registeredTool(server, "create_terminal").handler({
+    cwd: "/tmp/terminal-owned",
+    name: "Owned terminal",
+  });
+  await terminalStarted;
+  const archiveReservation = lifecycleCoordinator.reserveWorkspaceArchive(["ws-terminal-owned"]);
+  let ownershipReleased = false;
+  const waitTask = lifecycleCoordinator
+    .waitForWorkspaceOwnershipMutations(["ws-terminal-owned"])
+    .then(() => {
+      ownershipReleased = true;
+      return undefined;
+    });
+  await Promise.resolve();
+  expect(ownershipReleased).toBe(false);
+
+  releaseTerminal?.();
+  await terminalTask;
+  await waitTask;
+  expect(ownershipReleased).toBe(true);
+  archiveReservation.release();
+});
+
+it("rejects an MCP terminal attach after workspace archive", async () => {
+  const { agentManager, agentStorage } = createTestDeps();
+  const createTerminal = vi.fn();
+  const server = await createAgentMcpServer({
+    agentManager,
+    agentStorage,
+    terminalManager: createTerminalManagerStub({
+      createTerminal: createTerminal as unknown as TerminalManager["createTerminal"],
+    }),
+    providerSnapshotManager: createProviderSnapshotManagerStub().manager,
+    ensureWorkspaceForCreate: async () => "ws-terminal-archived",
+    listActiveWorkspaces: async () => [],
+    lifecycleCoordinator: new WorkspaceLifecycleCoordinator(),
+    logger: createTestLogger(),
+  });
+
+  await expect(
+    registeredTool(server, "create_terminal").handler({
+      cwd: "/tmp/terminal-archived",
+      name: "Archived terminal",
+    }),
+  ).rejects.toThrow("Workspace not found: ws-terminal-archived");
+  expect(createTerminal).not.toHaveBeenCalled();
+});
 
 type ProviderSnapshotManagerStub = ReturnType<typeof createProviderSnapshotManagerStub>;
 
@@ -758,6 +859,10 @@ function createPaseoWorktreeForMcpTest(options: {
     logger: createTestLogger(),
     generateWorkspaceName: options.generateWorkspaceName ?? (async () => null),
   });
+  const worktreeCreationStorage = new AgentStorage(
+    join(options.paseoHome, "test-worktree-creation-journal"),
+    createTestLogger(),
+  );
 
   return async (input, serviceOptions) => {
     options.setupContinuations?.push(serviceOptions?.setupContinuation?.kind);
@@ -776,9 +881,30 @@ function createPaseoWorktreeForMcpTest(options: {
         warmWorkspaceGitData: async () => {},
         autoNameWorkspaceBranchForFirstAgent: (autoNameInput) =>
           workspaceAutoName.scheduleForWorktree(autoNameInput),
-        emitWorkspaceUpdateForWorkspaceId: async (workspaceId) => {
-          options.broadcasts.push(workspaceId);
+        worktreeCreationJournal: {
+          beginPendingAgentCreation: (creationId, journalOptions) =>
+            worktreeCreationStorage.beginPendingAgentCreation(creationId, journalOptions),
+          planPendingAgentCreationWorktree: (creationId, worktreePath, plan) =>
+            worktreeCreationStorage.planPendingAgentCreationWorktree(
+              creationId,
+              worktreePath,
+              plan,
+            ),
+          identifyPendingAgentCreationWorktree: (creationId, worktreePath, reservation) =>
+            worktreeCreationStorage.identifyPendingAgentCreationWorktree(
+              creationId,
+              worktreePath,
+              reservation,
+            ),
+          removePendingAgentCreation: (creationId) =>
+            worktreeCreationStorage.removePendingAgentCreation(creationId),
+          recoverPendingCreation: (creationId) =>
+            worktreeCreationStorage.removePendingAgentCreation(creationId),
         },
+        // The helper records the initial publication synchronously below. Keep
+        // background setup refreshes out of that assertion stream; auto-name
+        // refreshes use the WorkspaceAutoName dependency above.
+        emitWorkspaceUpdateForWorkspaceId: async () => {},
         cacheWorkspaceSetupSnapshot: () => {},
         emit: () => {},
         sessionLogger: createTestLogger(),
@@ -803,6 +929,7 @@ function createPaseoWorktreeForMcpTest(options: {
           startAfterAgentCreate: ({ agentId }) => {
             options.startedAgentSetupIds?.push(agentId);
           },
+          releaseWithoutStarting: () => {},
         },
       };
     }
@@ -1783,12 +1910,82 @@ describe("create_agent MCP tool", () => {
         expect.objectContaining({
           cwd: expect.stringContaining("agent-worktree"),
         }),
-        undefined,
+        expect.any(String),
         { workspaceId: createdWorkspaceIds[0] },
       );
     } finally {
       await removeTempDir(tempDir);
     }
+  });
+
+  it("cleans and recovers a native MCP worktree journal when create_agent fails", async () => {
+    const { agentManager, agentStorage, spies } = createTestDeps();
+    const createdWorktree = {
+      worktree: {
+        branchName: "failed-agent-worktree",
+        worktreePath: "/tmp/worktrees/failed-agent-worktree",
+      },
+      intent: {
+        kind: "branch-off" as const,
+        branchName: "failed-agent-worktree",
+        baseBranch: "main",
+      },
+      workspace: createPersistedWorkspaceRecord({
+        workspaceId: "ws-failed-agent-worktree",
+        projectId: REPO_CWD,
+        cwd: "/tmp/worktrees/failed-agent-worktree",
+        kind: "worktree",
+        displayName: "failed-agent-worktree",
+        createdAt: "2026-08-01T00:00:00.000Z",
+        updatedAt: "2026-08-01T00:00:00.000Z",
+      }),
+      repoRoot: REPO_CWD,
+      created: true,
+      setupContinuation: {
+        kind: "agent" as const,
+        startAfterAgentCreate: vi.fn(),
+        releaseWithoutStarting: vi.fn(),
+      },
+    };
+    const cleanupCreatedWorktreeAfterFailedAgentCreate = vi.fn().mockResolvedValue(undefined);
+    const recoverPendingAgentCreation = vi.fn().mockResolvedValue(undefined);
+    spies.agentManager.createAgent.mockRejectedValue(new Error("provider creation failed"));
+
+    const server = await createAgentMcpServer({
+      agentManager,
+      agentStorage,
+      providerSnapshotManager: createOpenCodeManager().manager,
+      createPaseoWorktree: vi.fn().mockResolvedValue(createdWorktree),
+      createAgentLifecycleDispatch: {
+        cleanupCreatedWorktreeAfterFailedAgentCreate,
+        recoverPendingAgentCreation,
+      },
+      logger,
+    });
+
+    await expect(
+      registeredTool(server, "create_agent").handler({
+        ...detachedWorktreeWorkspace(REPO_CWD, {
+          kind: "branch-off",
+          worktreeSlug: "failed-agent-worktree",
+          branchName: "failed-agent-worktree",
+          baseBranch: "main",
+        }),
+        title: "Failed worktree agent",
+        provider: "codex/gpt-5.4",
+        initialPrompt: "Fail after creating the worktree",
+        background: true,
+      }),
+    ).rejects.toThrow("provider creation failed");
+
+    const pendingAgentId = z
+      .string()
+      .parse(spies.agentStorage.beginPendingAgentCreation.mock.calls[0]?.[0]);
+    expect(cleanupCreatedWorktreeAfterFailedAgentCreate).toHaveBeenCalledWith({
+      createdWorktree,
+      createdAgentId: null,
+    });
+    expect(recoverPendingAgentCreation).toHaveBeenCalledWith(pendingAgentId);
   });
 
   it("creates a create_agent branch-off worktree without invoking the legacy metadata branch rename", async () => {
@@ -2132,7 +2329,7 @@ describe("create_agent MCP tool", () => {
         expect.objectContaining({
           title: "Explicit Agent Title",
         }),
-        undefined,
+        expect.any(String),
         { workspaceId },
       );
       expect(workspace).toMatchObject({
@@ -2401,6 +2598,7 @@ describe("create_agent MCP tool", () => {
                 startAfterAgentCreate: ({ agentId }: { agentId: string }) => {
                   startedAgentSetupIds.push(agentId);
                 },
+                releaseWithoutStarting: () => {},
               },
             }
           : {}),
@@ -2455,7 +2653,7 @@ describe("create_agent MCP tool", () => {
     expect(startedAgentSetupIds).toEqual(["agent-pr-worktree"]);
     expect(spies.agentManager.createAgent).toHaveBeenCalledWith(
       expect.objectContaining({ cwd: "/tmp/worktrees/pr-123" }),
-      undefined,
+      expect.any(String),
       { workspaceId: "ws-pr-123" },
     );
     await waitForUnexpectedWorkspaceNamingSideEffects();
@@ -2469,6 +2667,7 @@ describe("create_agent MCP tool", () => {
     const paseoHome = join(tempDir, ".paseo");
     const broadcasts: string[] = [];
     const setupContinuations: Array<"workspace" | "agent" | undefined> = [];
+    const runLifecycleMutation = vi.fn(async <T>(operation: () => Promise<T>) => operation());
 
     try {
       execFileSync("git", ["init", repoDir], { stdio: "pipe" });
@@ -2505,6 +2704,7 @@ describe("create_agent MCP tool", () => {
           WorkspaceGitService,
           "getSnapshot" | "listWorktrees" | "resolveRepoRoot"
         >,
+        runLifecycleMutation,
         logger,
       });
       const tool = registeredTool(server, "create_workspace");
@@ -2521,6 +2721,7 @@ describe("create_agent MCP tool", () => {
       expect(response.structuredContent.workspaceId).toBe(broadcasts[0]);
       expect(workspaceGitService.getSnapshot).not.toHaveBeenCalled();
       expect(setupContinuations).toEqual([undefined]);
+      expect(runLifecycleMutation).toHaveBeenCalledOnce();
       expect(broadcasts).toHaveLength(1);
       expect(broadcasts[0]).toMatch(/^wks_[0-9a-f]{16}$/);
     } finally {
@@ -3579,6 +3780,34 @@ describe("send_agent_prompt MCP tool", () => {
     expect(response.structuredContent.guidance).toBe(
       "You will get notified when the prompted agent finishes, errors, or needs permission. Do not poll for status; continue with other work until the notification arrives.",
     );
+  });
+
+  it("runs prompts inside lifecycle shutdown admission", async () => {
+    const { agentManager, agentStorage, spies } = createTestDeps();
+    const runLifecycleMutation = vi.fn(async <T>(operation: () => Promise<T>) => operation());
+    spies.agentManager.getAgent.mockReturnValue({
+      id: "child-agent",
+      cwd: existingCwd,
+      lifecycle: "running",
+      currentModeId: null,
+      availableModes: [],
+      config: { title: "Child" },
+    } as ManagedAgent);
+    const server = await createAgentMcpServer({
+      agentManager,
+      agentStorage,
+      providerSnapshotManager: createOpenCodeManager().manager,
+      runLifecycleMutation,
+      logger,
+    });
+
+    await invokeToolWithParsedInput(registeredTool(server, "send_agent_prompt"), {
+      agentId: "child-agent",
+      prompt: "Follow up",
+      background: true,
+    });
+
+    expect(runLifecycleMutation).toHaveBeenCalledOnce();
   });
 
   it("keeps top-level prompts blocking by default", async () => {

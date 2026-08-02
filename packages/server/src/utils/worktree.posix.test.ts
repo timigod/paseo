@@ -21,6 +21,7 @@ import {
   type CreateWorktreeOptions,
   type WorktreeConfig,
 } from "./worktree";
+import { MAX_WORKTREE_SETUP_TOTAL_OUTPUT_BYTES } from "./worktree-setup-output.js";
 import type { PaseoConfig } from "@getpaseo/protocol/paseo-config-schema";
 import { getPaseoWorktreeMetadataPath } from "./worktree-metadata.js";
 import { execFileSync } from "child_process";
@@ -799,6 +800,37 @@ describe.skipIf(isPlatform("win32"))("worktree POSIX-only", () => {
       expect(progressEvents.some((event) => event.type === "command_completed")).toBe(true);
     });
 
+    it("bounds retained output across noisy setup commands and reports exact omitted bytes", async () => {
+      const outputBytesPerStream = Buffer.byteLength("prefix--suffix") + 70_000;
+      const noisyCommand =
+        "node -e \"process.stdout.write('prefix-' + 'x'.repeat(70000) + '-suffix'); process.stderr.write('prefix-' + 'y'.repeat(70000) + '-suffix')\"";
+      writeFileSync(
+        join(repoDir, "paseo.json"),
+        JSON.stringify({ worktree: { setup: Array.from({ length: 5 }, () => noisyCommand) } }),
+      );
+
+      const results = await runWorktreeSetupCommands({
+        worktreePath: repoDir,
+        branchName: "main",
+        cleanupOnFailure: false,
+      });
+
+      expect(results).toHaveLength(5);
+      let retainedOutputBytes = 0;
+      for (const result of results) {
+        for (const output of [result.stdout, result.stderr]) {
+          const marker = output.match(/\n\.\.\.<(\d+) bytes omitted>\.\.\.\n/);
+          expect(marker).not.toBeNull();
+          const retained = output.replace(marker?.[0] ?? "", "");
+          expect(Number(marker?.[1])).toBe(outputBytesPerStream - Buffer.byteLength(retained));
+          expect(retained).toContain("prefix-");
+          expect(retained).toContain("-suffix");
+          retainedOutputBytes += Buffer.byteLength(output);
+        }
+      }
+      expect(retainedOutputBytes).toBeLessThanOrEqual(MAX_WORKTREE_SETUP_TOTAL_OUTPUT_BYTES);
+    }, 15_000);
+
     it("reuses persisted worktree runtime port across resolutions", async () => {
       const result = await createLegacyWorktreeForTest({
         branchName: "main",
@@ -1319,6 +1351,46 @@ describe.skipIf(isPlatform("win32"))("worktree POSIX-only", () => {
 
       expect(existsSync(created.worktreePath)).toBe(true);
       expect(existsSync(join(repoDir, "teardown-start.log"))).toBe(true);
+    });
+
+    it("cancels a running teardown process tree before deleting the worktree", async () => {
+      writeFileSync(
+        join(repoDir, "paseo.json"),
+        JSON.stringify({
+          worktree: {
+            teardown: ['node -e "setInterval(() => {}, 1000)"'],
+          },
+        }),
+      );
+      execFileSync("git", ["add", "paseo.json"], { cwd: repoDir });
+      execFileSync(
+        "git",
+        ["-c", "commit.gpgsign=false", "commit", "-m", "add cancellable teardown"],
+        { cwd: repoDir },
+      );
+      const created = await createLegacyWorktreeForTest({
+        branchName: "teardown-cancel-branch",
+        cwd: repoDir,
+        baseBranch: "main",
+        worktreeSlug: "teardown-cancel-test",
+        paseoHome,
+      });
+      const controller = new AbortController();
+      const abortTimer = setTimeout(() => controller.abort(), 100);
+
+      try {
+        await expect(
+          deletePaseoWorktree({
+            cwd: repoDir,
+            worktreePath: created.worktreePath,
+            paseoHome,
+            signal: controller.signal,
+          }),
+        ).rejects.toThrow("Worktree teardown command failed");
+      } finally {
+        clearTimeout(abortTimer);
+      }
+      expect(existsSync(created.worktreePath)).toBe(true);
     });
   });
 });

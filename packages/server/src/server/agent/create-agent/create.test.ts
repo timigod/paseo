@@ -1,4 +1,5 @@
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { mkdirSync, mkdtempSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { expect, test, vi } from "vitest";
@@ -9,8 +10,10 @@ import { createProviderSnapshotManagerStub } from "../../test-utils/session-stub
 import { AgentManager } from "../agent-manager.js";
 import { AgentStorage } from "../agent-storage.js";
 import type { CreatePaseoWorktreeWorkflowResult } from "../../worktree-session.js";
+import type { CreatePaseoWorktreeInput } from "../../paseo-worktree-service.js";
 import { createAgentCommand } from "./create.js";
 import type { ManagedAgent } from "../agent-manager.js";
+import { WorkspaceLifecycleCoordinator } from "../../workspace-lifecycle-coordinator.js";
 
 const logger = createTestLogger();
 
@@ -36,7 +39,11 @@ function fakeWorktreeCreator(args: { repoRoot: string; createdWorkspaceId: strin
       workspace: { workspaceId: args.createdWorkspaceId, cwd: workspaceCwd },
       repoRoot: args.repoRoot,
       created: true,
-      setupContinuation: { kind: "agent" as const, startAfterAgentCreate: () => {} },
+      setupContinuation: {
+        kind: "agent" as const,
+        startAfterAgentCreate: () => {},
+        releaseWithoutStarting: () => {},
+      },
     }) as unknown as CreatePaseoWorktreeWorkflowResult;
 }
 
@@ -79,6 +86,214 @@ test("session create forwards clientMessageId to the initial prompt run options"
   });
 });
 
+test("session create persists and arms auto-archive before starting the initial prompt", async () => {
+  const order: string[] = [];
+  const snapshot = {
+    id: "agent-auto-archive-gap",
+    provider: "codex",
+    cwd: "/tmp/paseo-create-test",
+    runtimeInfo: null,
+  } as ManagedAgent;
+  const createAgent = vi.fn(async (_config, _agentId, options) => {
+    expect(options.autoArchiveObligation).toEqual({
+      phase: "armed",
+      target: { kind: "agent" },
+    });
+    order.push("persisted");
+    return snapshot;
+  });
+  const streamAgent = vi.fn(() => {
+    order.push("prompt");
+    return (async function* noop() {})();
+  });
+
+  await createAgentCommand(
+    {
+      agentManager: {
+        createAgent,
+        getAgent: vi.fn(() => snapshot),
+        tryRunOutOfBand: vi.fn(() => false),
+        hasInFlightRun: vi.fn(() => false),
+        streamAgent,
+        waitForAgentRunStart: vi.fn(async () => undefined),
+      } as unknown as AgentManager,
+      agentStorage: {} as AgentStorage,
+      logger,
+      providerSnapshotManager: createProviderSnapshotManagerStub().manager,
+    },
+    {
+      kind: "session",
+      config: { provider: "codex", cwd: "/tmp/paseo-create-test" },
+      workspaceId: "ws-create-test",
+      initialPrompt: "finish immediately",
+      labels: {},
+      provisionalTitle: null,
+      firstAgentContext: {},
+      autoArchiveObligation: { phase: "armed", target: { kind: "agent" } },
+      onCreated: () => order.push("armed"),
+      buildSessionConfig: async (config) => ({ sessionConfig: config }),
+    },
+  );
+
+  expect(order).toEqual(["persisted", "armed", "prompt"]);
+});
+
+test("session create reports a durable agent when initial prompt start is not confirmed", async () => {
+  const agentId = "00000000-0000-4000-8000-000000000401";
+  const promptStartTimeout = new Error("initial prompt start timed out");
+  const snapshot = {
+    id: agentId,
+    provider: "codex",
+    cwd: "/tmp/paseo-create-test",
+    runtimeInfo: null,
+  } as ManagedAgent;
+  const liveSnapshot = { ...snapshot, lifecycle: "running" as const };
+  const removePendingAgentCreation = vi.fn(async () => undefined);
+  const onCreated = vi.fn();
+
+  const result = await createAgentCommand(
+    {
+      agentManager: {
+        createAgent: vi.fn(async () => snapshot),
+        getAgent: vi.fn(() => liveSnapshot),
+        tryRunOutOfBand: vi.fn(() => false),
+        hasInFlightRun: vi.fn(() => false),
+        streamAgent: vi.fn(() => (async function* noop() {})()),
+        waitForAgentRunStart: vi.fn(async () => {
+          throw promptStartTimeout;
+        }),
+      } as unknown as AgentManager,
+      agentStorage: {
+        removePendingAgentCreation,
+      } as unknown as AgentStorage,
+      logger,
+      providerSnapshotManager: createProviderSnapshotManagerStub().manager,
+    },
+    {
+      kind: "session",
+      agentId,
+      config: { provider: "codex", cwd: "/tmp/paseo-create-test" },
+      workspaceId: "ws-create-test",
+      initialPrompt: "start the work",
+      labels: {},
+      provisionalTitle: null,
+      firstAgentContext: {},
+      autoArchiveObligation: { phase: "armed", target: { kind: "agent" } },
+      onCreated,
+      buildSessionConfig: async (config) => ({ sessionConfig: config }),
+    },
+  );
+
+  expect(result).toMatchObject({
+    snapshot,
+    liveSnapshot,
+    initialPromptStarted: false,
+    initialPromptError: promptStartTimeout,
+  });
+  expect(removePendingAgentCreation).toHaveBeenCalledWith(agentId);
+  expect(onCreated).toHaveBeenCalledWith({
+    agentId,
+    autoArchiveObligation: { phase: "armed", target: { kind: "agent" } },
+  });
+});
+
+test("legacy worktree create keeps its journal through durable agent registration", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "create-agent-journal-test-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const agentManager = createRealAgentManager(storage);
+  const agentId = agentManager.allocateAgentId();
+  const resolvedWorktreePath = join(workdir, "worktrees", "feature-2");
+  const removalOrder: string[] = [];
+  const removePendingAgentCreation = storage.removePendingAgentCreation.bind(storage);
+
+  try {
+    await storage.beginPendingAgentCreation(agentId);
+    vi.spyOn(storage, "removePendingAgentCreation").mockImplementation(async (removingAgentId) => {
+      expect(removingAgentId).toBe(agentId);
+      expect(await storage.get(agentId)).toMatchObject({
+        id: agentId,
+        autoArchiveObligation: {
+          phase: "armed",
+          target: { kind: "workspace", workspaceId: "ws-created-worktree" },
+        },
+      });
+      removalOrder.push("registered");
+      await removePendingAgentCreation(removingAgentId);
+    });
+
+    const { snapshot } = await createAgentCommand(
+      {
+        agentManager,
+        agentStorage: storage,
+        logger,
+        providerSnapshotManager: createProviderSnapshotManagerStub().manager,
+      },
+      {
+        kind: "session",
+        agentId,
+        config: { provider: "codex", cwd: workdir },
+        workspaceId: "ws-source",
+        labels: {},
+        provisionalTitle: null,
+        firstAgentContext: { attachments: [] },
+        autoArchiveObligation: { phase: "armed", target: { kind: "agent" } },
+        buildSessionConfig: async (config, _git, _worktreeName, _context, journal) => {
+          const plan = {
+            worktreeIncarnationId: "30704df3-6339-4c9c-8277-1416544ed7cc",
+            metadataBaseRefName: "main",
+          };
+          await journal?.onWorktreePathPlanned(resolvedWorktreePath, plan);
+          expect(await storage.listPendingAgentCreations()).toMatchObject([
+            { cleanupTarget: { kind: "worktree", directoryIdentity: null } },
+          ]);
+          mkdirSync(resolvedWorktreePath, { recursive: true });
+          const directoryStat = statSync(resolvedWorktreePath, {
+            bigint: true,
+          });
+          await journal?.onWorktreePathResolved(resolvedWorktreePath, {
+            ...plan,
+            directoryIdentity: {
+              device: directoryStat.dev.toString(),
+              inode: directoryStat.ino.toString(),
+            },
+          });
+          expect(await storage.listPendingAgentCreations()).toEqual([
+            expect.objectContaining({
+              agentId,
+              cleanupTarget: {
+                kind: "worktree",
+                targetPath: resolvedWorktreePath,
+                worktreeIncarnationId: "30704df3-6339-4c9c-8277-1416544ed7cc",
+                directoryIdentity: {
+                  device: directoryStat.dev.toString(),
+                  inode: directoryStat.ino.toString(),
+                },
+                metadataBaseRefName: "main",
+              },
+            }),
+          ]);
+          removalOrder.push("worktree-resolved");
+          return {
+            sessionConfig: { ...config, cwd: resolvedWorktreePath },
+            setupContinuation: {
+              kind: "agent",
+              startAfterAgentCreate: () => undefined,
+              releaseWithoutStarting: () => undefined,
+            },
+            createdWorkspaceId: "ws-created-worktree",
+          };
+        },
+      },
+    );
+
+    expect(snapshot.id).toBe(agentId);
+    expect(removalOrder).toEqual(["worktree-resolved", "registered"]);
+    await expect(storage.listPendingAgentCreations()).resolves.toEqual([]);
+  } finally {
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
 test("session create validates the requested mode against the provider's modes", async () => {
   const snapshot = {
     id: "agent-1",
@@ -119,6 +334,266 @@ test("session create validates the requested mode against the provider's modes",
       requestedMode: "plan",
     }),
   );
+  expect(createAgent).not.toHaveBeenCalled();
+});
+
+test.each([
+  ["validation failure", new Error("invalid provider mode")],
+  [
+    "validation abort",
+    Object.assign(new Error("provider resolution aborted"), { name: "AbortError" }),
+  ],
+])("session create releases setup reservation after %s", async (_caseName, failure) => {
+  const releaseWithoutStarting = vi.fn();
+  const startAfterAgentCreate = vi.fn();
+  const stub = createProviderSnapshotManagerStub();
+  stub.resolveCreateConfig.mockRejectedValue(failure);
+  const dependencies: Parameters<typeof createAgentCommand>[0] = {
+    agentManager: {
+      createAgent: vi.fn(),
+    } as unknown as Parameters<typeof createAgentCommand>[0]["agentManager"],
+    agentStorage: {} as Parameters<typeof createAgentCommand>[0]["agentStorage"],
+    logger: createTestLogger(),
+    providerSnapshotManager: stub.manager,
+  };
+
+  await expect(
+    createAgentCommand(dependencies, {
+      kind: "session",
+      config: { provider: "opencode", cwd: "/tmp/paseo-create-test" },
+      workspaceId: "ws-source",
+      labels: {},
+      provisionalTitle: null,
+      firstAgentContext: { attachments: [] },
+      buildSessionConfig: async (config) => ({
+        sessionConfig: config,
+        setupContinuation: {
+          kind: "agent",
+          startAfterAgentCreate,
+          releaseWithoutStarting,
+        },
+        createdWorkspaceId: "ws-created",
+      }),
+    }),
+  ).rejects.toThrow(failure.message);
+
+  expect(releaseWithoutStarting).toHaveBeenCalledOnce();
+  expect(startAfterAgentCreate).not.toHaveBeenCalled();
+});
+
+test("session create releases setup reservation when agent creation fails", async () => {
+  const releaseWithoutStarting = vi.fn();
+  const startAfterAgentCreate = vi.fn();
+  const createFailure = new Error("agent creation failed");
+  const dependencies: Parameters<typeof createAgentCommand>[0] = {
+    agentManager: {
+      createAgent: vi.fn(async () => {
+        throw createFailure;
+      }),
+    } as unknown as Parameters<typeof createAgentCommand>[0]["agentManager"],
+    agentStorage: {} as Parameters<typeof createAgentCommand>[0]["agentStorage"],
+    logger: createTestLogger(),
+    providerSnapshotManager: createProviderSnapshotManagerStub().manager,
+  };
+
+  await expect(
+    createAgentCommand(dependencies, {
+      kind: "session",
+      config: { provider: "codex", cwd: "/tmp/paseo-create-test" },
+      workspaceId: "ws-source",
+      labels: {},
+      provisionalTitle: null,
+      firstAgentContext: { attachments: [] },
+      buildSessionConfig: async (config) => ({
+        sessionConfig: config,
+        setupContinuation: {
+          kind: "agent",
+          startAfterAgentCreate,
+          releaseWithoutStarting,
+        },
+        createdWorkspaceId: "ws-created",
+      }),
+    }),
+  ).rejects.toThrow(createFailure.message);
+
+  expect(releaseWithoutStarting).toHaveBeenCalledOnce();
+  expect(startAfterAgentCreate).not.toHaveBeenCalled();
+});
+
+test.each(["worktree callback", "provider resolution"] as const)(
+  "MCP create releases a reserved setup continuation after %s fails",
+  async (failurePoint) => {
+    const pendingAgentId = "00000000-0000-4000-8000-000000000560";
+    const releaseWithoutStarting = vi.fn();
+    const startAfterAgentCreate = vi.fn();
+    const createAgent = vi.fn();
+    const providerSnapshotManager = createProviderSnapshotManagerStub();
+    if (failurePoint === "provider resolution") {
+      providerSnapshotManager.resolveCreateConfig.mockRejectedValue(
+        new Error("provider resolution failed"),
+      );
+    }
+    const createdWorktree = {
+      worktree: { worktreePath: "/tmp/paseo-mcp-create/worktree" },
+      intent: {},
+      workspace: {
+        workspaceId: "ws-mcp-created",
+        cwd: "/tmp/paseo-mcp-create/worktree",
+      },
+      repoRoot: "/tmp/paseo-mcp-create",
+      created: true,
+      setupContinuation: {
+        kind: "agent" as const,
+        startAfterAgentCreate,
+        releaseWithoutStarting,
+      },
+    } as unknown as CreatePaseoWorktreeWorkflowResult;
+    const beginPendingAgentCreation = vi.fn(async () => ({
+      agentId: pendingAgentId,
+      createdAt: "2026-08-01T00:00:00.000Z",
+      cleanupTarget: { kind: "agent" as const },
+    }));
+    const removePendingAgentCreation = vi.fn(async () => undefined);
+
+    await expect(
+      createAgentCommand(
+        {
+          agentManager: {
+            allocateAgentId: () => pendingAgentId,
+            createAgent,
+          } as unknown as AgentManager,
+          agentStorage: {
+            beginPendingAgentCreation,
+            listPendingAgentCreations: async () => [
+              {
+                agentId: pendingAgentId,
+                createdAt: "2026-08-01T00:00:00.000Z",
+                cleanupTarget: { kind: "agent" as const },
+              },
+            ],
+            removePendingAgentCreation,
+          } as unknown as AgentStorage,
+          logger,
+          providerSnapshotManager: providerSnapshotManager.manager,
+          createPaseoWorktree: vi.fn(async () => createdWorktree),
+        },
+        {
+          kind: "mcp",
+          provider: "opencode/test-model",
+          title: "MCP worktree child",
+          initialPrompt: "do the work",
+          background: true,
+          notifyOnFinish: false,
+          worktree: { worktreeName: "worktree", baseBranch: "main" },
+          ...(failurePoint === "worktree callback"
+            ? {
+                onWorktreeCreated: () => {
+                  throw new Error("worktree callback failed");
+                },
+              }
+            : {}),
+        },
+      ),
+    ).rejects.toThrow(failurePoint === "worktree callback" ? "callback" : "provider resolution");
+
+    expect(releaseWithoutStarting).toHaveBeenCalledOnce();
+    expect(startAfterAgentCreate).not.toHaveBeenCalled();
+    expect(createAgent).not.toHaveBeenCalled();
+    expect(beginPendingAgentCreation).toHaveBeenCalledWith(pendingAgentId);
+    expect(removePendingAgentCreation).toHaveBeenCalledWith(pendingAgentId);
+  },
+);
+
+test("agent creation holds workspace ownership until the agent is attached", async () => {
+  const lifecycleCoordinator = new WorkspaceLifecycleCoordinator();
+  let releaseCreate: (() => void) | undefined;
+  let markCreateStarted: (() => void) | undefined;
+  const createStarted = new Promise<void>((resolve) => {
+    markCreateStarted = resolve;
+  });
+  const createGate = new Promise<void>((resolve) => {
+    releaseCreate = resolve;
+  });
+  const snapshot = {
+    id: "agent-owned",
+    provider: "codex",
+    cwd: "/tmp/paseo-create-owned",
+    workspaceId: "ws-owned",
+    runtimeInfo: null,
+  } as ManagedAgent;
+  const createTask = createAgentCommand(
+    {
+      agentManager: {
+        createAgent: vi.fn(async () => {
+          markCreateStarted?.();
+          await createGate;
+          return snapshot;
+        }),
+      } as unknown as AgentManager,
+      agentStorage: {} as AgentStorage,
+      logger,
+      providerSnapshotManager: createProviderSnapshotManagerStub().manager,
+      lifecycleCoordinator,
+    },
+    {
+      kind: "session",
+      config: { provider: "codex", cwd: snapshot.cwd },
+      workspaceId: "ws-owned",
+      labels: {},
+      provisionalTitle: null,
+      firstAgentContext: {},
+      buildSessionConfig: async (config) => ({ sessionConfig: config }),
+    },
+  );
+
+  await createStarted;
+  const archiveReservation = lifecycleCoordinator.reserveWorkspaceArchive(["ws-owned"]);
+  let ownershipReleased = false;
+  const waitTask = lifecycleCoordinator
+    .waitForWorkspaceOwnershipMutations(["ws-owned"])
+    .then(() => {
+      ownershipReleased = true;
+      return undefined;
+    });
+  await Promise.resolve();
+  expect(ownershipReleased).toBe(false);
+
+  releaseCreate?.();
+  await createTask;
+  await waitTask;
+  expect(ownershipReleased).toBe(true);
+  archiveReservation.release();
+});
+
+test("agent creation rejects an ownership attach after workspace archive", async () => {
+  const createAgent = vi.fn();
+  const requireActiveWorkspaceForOwnership = vi.fn(async () => {
+    throw new Error("Workspace not found: ws-archived");
+  });
+
+  await expect(
+    createAgentCommand(
+      {
+        agentManager: { createAgent } as unknown as AgentManager,
+        agentStorage: {} as AgentStorage,
+        logger,
+        providerSnapshotManager: createProviderSnapshotManagerStub().manager,
+        lifecycleCoordinator: new WorkspaceLifecycleCoordinator(),
+        requireActiveWorkspaceForOwnership,
+      },
+      {
+        kind: "session",
+        config: { provider: "codex", cwd: "/tmp/paseo-create-archived" },
+        workspaceId: "ws-archived",
+        labels: {},
+        provisionalTitle: null,
+        firstAgentContext: {},
+        buildSessionConfig: async (config) => ({ sessionConfig: config }),
+      },
+    ),
+  ).rejects.toThrow("Workspace not found: ws-archived");
+
+  expect(requireActiveWorkspaceForOwnership).toHaveBeenCalledWith("ws-archived");
   expect(createAgent).not.toHaveBeenCalled();
 });
 
@@ -264,7 +739,11 @@ test("session create stamps the new worktree's workspaceId when a setup continua
         firstAgentContext: { attachments: [] },
         buildSessionConfig: async (config) => ({
           sessionConfig: config,
-          setupContinuation: { kind: "agent", startAfterAgentCreate: () => {} },
+          setupContinuation: {
+            kind: "agent",
+            startAfterAgentCreate: () => {},
+            releaseWithoutStarting: () => {},
+          },
           createdWorkspaceId: "ws-new-worktree",
         }),
       },
@@ -375,6 +854,91 @@ test("mcp create exposes the created worktree before dispatching the initial pro
     );
 
     expect(observed).toEqual({ createdWorktree, lifecycle: "idle" });
+  } finally {
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("mcp worktree create journals the exact path incarnation through durable agent publication", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "create-agent-mcp-journal-test-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const agentManager = createRealAgentManager(storage);
+  const agentId = "00000000-0000-4000-8000-000000000561";
+  const worktreePath = join(workdir, "worktree");
+  const workspaceCwd = join(worktreePath, "packages", "app");
+  const worktreeIncarnationId = randomUUID();
+  let observedPending: Awaited<ReturnType<AgentStorage["listPendingAgentCreations"]>> = [];
+  const createAgent = agentManager.createAgent.bind(agentManager);
+  vi.spyOn(agentManager, "allocateAgentId").mockReturnValue(agentId);
+  vi.spyOn(agentManager, "createAgent").mockImplementation(async (...args) => {
+    observedPending = await storage.listPendingAgentCreations();
+    return createAgent(...args);
+  });
+
+  try {
+    await createAgentCommand(
+      {
+        agentManager,
+        agentStorage: storage,
+        logger,
+        providerSnapshotManager: createProviderSnapshotManagerStub().manager,
+        createPaseoWorktree: async (input: CreatePaseoWorktreeInput) => {
+          await input.onWorktreePathPlanned?.(worktreePath, {
+            worktreeIncarnationId,
+            metadataBaseRefName: "main",
+          });
+          mkdirSync(workspaceCwd, { recursive: true });
+          const directoryStat = statSync(worktreePath, { bigint: true });
+          await input.onWorktreePathResolved?.(worktreePath, {
+            worktreeIncarnationId,
+            directoryIdentity: {
+              device: directoryStat.dev.toString(),
+              inode: directoryStat.ino.toString(),
+            },
+            metadataBaseRefName: "main",
+          });
+          return {
+            worktree: { worktreePath },
+            intent: {},
+            workspace: { workspaceId: "ws-mcp-journal", cwd: workspaceCwd },
+            repoRoot: workdir,
+            created: true,
+            setupContinuation: {
+              kind: "agent",
+              startAfterAgentCreate: () => {},
+              releaseWithoutStarting: () => {},
+            },
+          } as unknown as CreatePaseoWorktreeWorkflowResult;
+        },
+      },
+      {
+        kind: "mcp",
+        provider: "codex",
+        cwd: workdir,
+        title: "journaled worktree",
+        background: true,
+        notifyOnFinish: false,
+        worktree: { worktreeName: "feature", baseBranch: "main" },
+      },
+    );
+
+    expect(observedPending).toEqual([
+      expect.objectContaining({
+        agentId,
+        cleanupTarget: {
+          kind: "worktree",
+          targetPath: worktreePath,
+          worktreeIncarnationId,
+          directoryIdentity: {
+            device: statSync(worktreePath, { bigint: true }).dev.toString(),
+            inode: statSync(worktreePath, { bigint: true }).ino.toString(),
+          },
+          metadataBaseRefName: "main",
+        },
+      }),
+    ]);
+    await expect(storage.listPendingAgentCreations()).resolves.toEqual([]);
+    await expect(storage.get(agentId)).resolves.toMatchObject({ id: agentId });
   } finally {
     rmSync(workdir, { recursive: true, force: true });
   }

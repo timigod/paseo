@@ -1,21 +1,28 @@
 import { randomUUID } from "node:crypto";
+import { existsSync, statSync } from "node:fs";
+import { rm } from "node:fs/promises";
+import { resolve as resolvePath } from "node:path";
 import type pino from "pino";
 
 import type { ForgeService } from "../../services/forge-service.js";
-import { isPaseoOwnedWorktreeCwd } from "../../utils/worktree.js";
-import { archiveByScope, type ActiveWorkspaceRef } from "../workspace-archive-service.js";
-import type {
-  CreatePaseoWorktreeWorkflowFn,
-  CreatePaseoWorktreeWorkflowResult,
-} from "../worktree-session.js";
+import { withTimeout } from "../../utils/promise-timeout.js";
+import { isPaseoOwnedWorktreeCwd, readWorktreeCreationMarker } from "../../utils/worktree.js";
+import {
+  readPaseoWorktreeMetadata,
+  writePaseoWorktreeMetadata,
+} from "../../utils/worktree-metadata.js";
+import {
+  archiveByScope,
+  requireArchiveCleanupComplete,
+  type ActiveWorkspaceRef,
+  WorkspaceCleanupPendingError,
+} from "../workspace-archive-service.js";
+import type { CreatePaseoWorktreeWorkflowResult } from "../worktree-session.js";
 import type { WorkspaceGitService } from "../workspace-git-service.js";
-import type {
-  CreateAgentWorktreeTarget,
-  FirstAgentContext,
-  SessionOutboundMessage,
-} from "../messages.js";
+import type { WorkspaceRegistry } from "../workspace-registry.js";
+import type { SessionOutboundMessage } from "../messages.js";
 import type { AgentManager, AgentSubscriber, SubscribeOptions } from "./agent-manager.js";
-import type { AgentStorage } from "./agent-storage.js";
+import type { AgentStorage, AutoArchiveObligation, PendingAgentCreation } from "./agent-storage.js";
 
 interface CreateAgentLifecycleDispatchDependencies {
   paseoHome: string;
@@ -24,11 +31,13 @@ interface CreateAgentLifecycleDispatchDependencies {
   agentStorage: AgentStorage;
   github: ForgeService;
   workspaceGitService: WorkspaceGitService;
-  createPaseoWorktreeWorkflow: CreatePaseoWorktreeWorkflowFn;
   archiveAgentForClose: (agentId: string) => Promise<unknown>;
+  archiveWorkspaceForClose: (workspaceId: string, signal?: AbortSignal) => Promise<unknown>;
+  drainWorkspaceLifecycleOperations: () => Promise<void>;
   findWorkspaceIdForCwd: (cwd: string) => Promise<string | null>;
   listActiveWorkspaces: () => Promise<ActiveWorkspaceRef[]>;
   archiveWorkspaceRecord: (workspaceId: string) => Promise<void>;
+  workspaceRegistry: Pick<WorkspaceRegistry, "get" | "list" | "update" | "subscribeToMutations">;
   emit: (message: SessionOutboundMessage) => void;
   emitAgentRemove: (agentId: string) => void;
   emitWorkspaceUpdatesForWorkspaceIds: (workspaceIds: Iterable<string>) => Promise<void>;
@@ -39,6 +48,7 @@ interface CreateAgentLifecycleDispatchDependencies {
 }
 
 export interface LifecycleRegistration {
+  readonly settled: Promise<"completed" | "cancelled" | "unresolved">;
   cancel(): Promise<void>;
 }
 
@@ -46,32 +56,24 @@ interface AgentLifecycleEvents {
   subscribe(callback: AgentSubscriber, options?: SubscribeOptions): () => void;
 }
 
-const inactiveRegistration: LifecycleRegistration = { cancel: async () => undefined };
+const inactiveRegistration: LifecycleRegistration = {
+  settled: Promise.resolve("cancelled"),
+  cancel: async () => undefined,
+};
 
-type AutoArchiveTarget =
-  | { kind: "agent-only" }
-  | { kind: "created-worktree"; result: CreatePaseoWorktreeWorkflowResult };
+export interface LifecycleDispatchShutdownResult {
+  completed: boolean;
+  pendingAgentIds: string[];
+}
 
 export class CreateAgentLifecycleDispatch {
-  private readonly autoArchiveAgentIds = new Set<string>();
+  private readonly autoArchiveTasks = new Map<string, Promise<void>>();
+  private readonly autoArchiveRegistrations = new Map<string, LifecycleRegistration>();
+  private readonly failedCreateCleanupTasks = new Map<string, Promise<void>>();
+  private readonly shutdownController = new AbortController();
+  private shuttingDown = false;
 
   constructor(private readonly dependencies: CreateAgentLifecycleDispatchDependencies) {}
-
-  async createWorktreeForRequest(input: {
-    cwd: string;
-    target: CreateAgentWorktreeTarget | undefined;
-    firstAgentContext: FirstAgentContext;
-    hasLegacyGitOptions: boolean;
-  }): Promise<CreatePaseoWorktreeWorkflowResult | null> {
-    if (input.target && input.hasLegacyGitOptions) {
-      throw new Error("create_agent_request worktree cannot be combined with git options");
-    }
-    if (!input.target) {
-      return null;
-    }
-
-    return this.createWorktreeForTarget(input.cwd, input.target, input.firstAgentContext);
-  }
 
   registerAutoArchiveIfRequested(input: {
     autoArchive: boolean | undefined;
@@ -82,10 +84,200 @@ export class CreateAgentLifecycleDispatch {
       return inactiveRegistration;
     }
 
-    return this.registerAutoArchiveOnTerminalState(
-      input.agentId,
-      toAutoArchiveTarget(input.createdWorktree),
+    return this.registerAutoArchive({
+      agentId: input.agentId,
+      obligation: {
+        phase: "armed",
+        target: input.createdWorktree
+          ? { kind: "workspace", workspaceId: input.createdWorktree.workspace.workspaceId }
+          : { kind: "agent" },
+      },
+    });
+  }
+
+  registerAutoArchive(input: {
+    agentId: string;
+    obligation: AutoArchiveObligation;
+  }): LifecycleRegistration {
+    if (input.obligation.phase === "pending") {
+      void this.autoArchiveAgentOnce(input.agentId, input.obligation.target).catch(() => undefined);
+      return inactiveRegistration;
+    }
+    return this.registerAutoArchiveOnTerminalState(input.agentId, input.obligation.target);
+  }
+
+  async recoverPersistedAutoArchives(): Promise<void> {
+    const records = await this.dependencies.agentStorage.list();
+    for (const record of records) {
+      if (!record.autoArchiveObligation) continue;
+      void this.autoArchiveAgentOnce(record.id, record.autoArchiveObligation.target).catch(
+        () => undefined,
+      );
+    }
+  }
+
+  async recoverPendingAgentCreations(): Promise<void> {
+    const records = await this.dependencies.agentStorage.listPendingAgentCreations();
+    for (const record of records) {
+      await this.recoverPendingAgentCreation(record.agentId);
+    }
+  }
+
+  async recoverPendingAgentCreation(agentId: string): Promise<void> {
+    const pending = (await this.dependencies.agentStorage.listPendingAgentCreations()).find(
+      (record) => record.agentId === agentId,
     );
+    if (!pending) return;
+
+    if (pending.cleanupTarget.kind === "agent") {
+      await this.dependencies.agentStorage.removePendingAgentCreation(agentId);
+      return;
+    }
+    if (await this.pendingAgentWasPublished(pending)) {
+      await this.dependencies.agentStorage.removePendingAgentCreation(agentId);
+      return;
+    }
+
+    const pendingWorktree = { ...pending, cleanupTarget: pending.cleanupTarget };
+    const targetPath = resolvePath(pendingWorktree.cleanupTarget.targetPath);
+    try {
+      if (!existsSync(targetPath) && !(await this.activeWorkspaceOwnsPath(targetPath))) {
+        await this.dependencies.agentStorage.removePendingAgentCreation(agentId);
+        return;
+      }
+
+      if (
+        existsSync(targetPath) &&
+        (await this.recoverExistingPendingDirectory(pendingWorktree, targetPath))
+      ) {
+        return;
+      }
+
+      await this.archiveWorktreePath(targetPath);
+      await this.dependencies.agentStorage.removePendingAgentCreation(agentId);
+    } catch (error) {
+      this.dependencies.logger.warn(
+        { err: error, agentId, worktreePath: targetPath },
+        "Failed to recover pending agent creation",
+      );
+    }
+  }
+
+  private async pendingAgentWasPublished(pending: PendingAgentCreation): Promise<boolean> {
+    if ((pending.ownerKind ?? "agent") !== "agent") return false;
+    return Boolean(await this.dependencies.agentStorage.get(pending.agentId));
+  }
+
+  private async activeWorkspaceOwnsPath(targetPath: string): Promise<boolean> {
+    return (await this.dependencies.workspaceRegistry.list()).some(
+      (workspace) =>
+        !workspace.archivedAt &&
+        resolvePath(workspace.worktreeRoot ?? workspace.cwd) === targetPath,
+    );
+  }
+
+  private async activeWorkspaceWithPublishedAgentOwnsPath(targetPath: string): Promise<boolean> {
+    const owningWorkspaceIds = new Set(
+      (await this.dependencies.workspaceRegistry.list())
+        .filter(
+          (workspace) =>
+            !workspace.archivedAt &&
+            resolvePath(workspace.worktreeRoot ?? workspace.cwd) === targetPath,
+        )
+        .map((workspace) => workspace.workspaceId),
+    );
+    if (owningWorkspaceIds.size === 0) return false;
+    return (await this.dependencies.agentStorage.list()).some(
+      (record) => record.workspaceId && owningWorkspaceIds.has(record.workspaceId),
+    );
+  }
+
+  private classifyPendingDirectoryOwnership(
+    pending: PendingAgentCreation & {
+      cleanupTarget: Extract<PendingAgentCreation["cleanupTarget"], { kind: "worktree" }>;
+    },
+    targetPath: string,
+  ): "owned" | "replaced" | "ambiguous" {
+    const expectedDirectoryIdentity = pending.cleanupTarget.directoryIdentity;
+    if (!expectedDirectoryIdentity) {
+      return readWorktreeCreationMarker(targetPath) === pending.cleanupTarget.worktreeIncarnationId
+        ? "owned"
+        : "ambiguous";
+    }
+    const targetStat = statSync(targetPath, { bigint: true });
+    return targetStat.dev.toString() === expectedDirectoryIdentity.device &&
+      targetStat.ino.toString() === expectedDirectoryIdentity.inode
+      ? "owned"
+      : "replaced";
+  }
+
+  private async recoverExistingPendingDirectory(
+    pending: PendingAgentCreation & {
+      cleanupTarget: Extract<PendingAgentCreation["cleanupTarget"], { kind: "worktree" }>;
+    },
+    targetPath: string,
+  ): Promise<boolean> {
+    const agentId = pending.agentId;
+    if (await this.activeWorkspaceWithPublishedAgentOwnsPath(targetPath)) {
+      await this.dependencies.agentStorage.removePendingAgentCreation(agentId);
+      return true;
+    }
+    const directoryOwnership = this.classifyPendingDirectoryOwnership(pending, targetPath);
+    if (directoryOwnership === "replaced") {
+      this.dependencies.logger.warn(
+        { agentId, worktreePath: targetPath },
+        "Pending agent creation no longer owns its worktree path",
+      );
+      await this.dependencies.agentStorage.removePendingAgentCreation(agentId);
+      return true;
+    }
+    if (directoryOwnership === "ambiguous") {
+      // The process may have stopped after mkdir and before persisting the
+      // directory identity. Without the matching in-directory marker we
+      // cannot distinguish our directory from a replacement, so retain the
+      // durable cleanup obligation and fail closed.
+      this.dependencies.logger.warn(
+        { agentId, worktreePath: targetPath },
+        "Pending agent creation has ambiguous pre-identity worktree ownership",
+      );
+      return true;
+    }
+
+    if (!existsSync(resolvePath(targetPath, ".git"))) {
+      await rm(targetPath, { recursive: true, force: true });
+      await this.dependencies.agentStorage.removePendingAgentCreation(agentId);
+      return true;
+    }
+    const metadata = readPaseoWorktreeMetadata(targetPath);
+    if (
+      metadata?.incarnationId &&
+      metadata.incarnationId !== pending.cleanupTarget.worktreeIncarnationId
+    ) {
+      this.dependencies.logger.warn(
+        { agentId, worktreePath: targetPath },
+        "Pending agent creation found a replacement worktree incarnation",
+      );
+      await this.dependencies.agentStorage.removePendingAgentCreation(agentId);
+      return true;
+    }
+    if (!metadata?.incarnationId) {
+      writePaseoWorktreeMetadata(targetPath, {
+        baseRefName: metadata?.baseRefName ?? pending.cleanupTarget.metadataBaseRefName,
+        incarnationId: pending.cleanupTarget.worktreeIncarnationId,
+        ...(metadata?.changeRequestLookupTarget
+          ? { changeRequestLookupTarget: metadata.changeRequestLookupTarget }
+          : {}),
+      });
+    }
+
+    if (
+      pending.ownerKind === "standalone-worktree" &&
+      (await this.activeWorkspaceOwnsPath(targetPath))
+    ) {
+      await this.dependencies.agentStorage.removePendingAgentCreation(agentId);
+      return true;
+    }
+    return false;
   }
 
   async cleanupCreatedWorktreeAfterFailedAgentCreate(input: {
@@ -93,95 +285,158 @@ export class CreateAgentLifecycleDispatch {
     createdAgentId: string | null;
   }): Promise<void> {
     const { createdWorktree, createdAgentId } = input;
-    if (!createdWorktree || createdAgentId) {
+    if (!createdWorktree?.created || createdAgentId) {
       return;
     }
 
-    await this.archiveAutoCreatedWorktree({
+    const worktreePath = createdWorktree.worktree.worktreePath;
+    const existingTask = this.failedCreateCleanupTasks.get(worktreePath);
+    if (existingTask) return existingTask;
+
+    const cleanupTask = this.archiveAutoCreatedWorktree({
       agentId: null,
       createdWorktree,
     }).catch((archiveError) => {
       this.dependencies.logger.warn(
-        {
-          err: archiveError,
-          worktreePath: createdWorktree.worktree.worktreePath,
-        },
+        { err: archiveError, worktreePath },
         "Failed to clean up worktree after create_agent_request failed",
       );
     });
-  }
-
-  private async createWorktreeForTarget(
-    cwd: string,
-    target: CreateAgentWorktreeTarget,
-    firstAgentContext: FirstAgentContext,
-  ): Promise<CreatePaseoWorktreeWorkflowResult> {
-    const baseInput = {
-      cwd,
-      firstAgentContext,
-      runSetup: false,
-      paseoHome: this.dependencies.paseoHome,
-      worktreesRoot: this.dependencies.worktreesRoot,
-    } as const;
-
-    switch (target.mode) {
-      case "branch-off":
-        return this.dependencies.createPaseoWorktreeWorkflow(
-          {
-            ...baseInput,
-            worktreeSlug: target.newBranch,
-            action: "branch-off",
-            ...(target.base ? { refName: target.base } : {}),
-          },
-          target.base ? { resolveDefaultBranch: async () => target.base! } : undefined,
-        );
-      case "checkout-branch":
-        return this.dependencies.createPaseoWorktreeWorkflow({
-          ...baseInput,
-          action: "checkout",
-          refName: target.branch,
-        });
-      case "checkout-pr":
-        return this.dependencies.createPaseoWorktreeWorkflow({
-          ...baseInput,
-          action: "checkout",
-          githubPrNumber: target.prNumber,
-        });
-      default:
-        throw new Error("Unsupported create_agent_request worktree target");
+    this.failedCreateCleanupTasks.set(worktreePath, cleanupTask);
+    try {
+      await cleanupTask;
+    } finally {
+      if (this.failedCreateCleanupTasks.get(worktreePath) === cleanupTask) {
+        this.failedCreateCleanupTasks.delete(worktreePath);
+      }
     }
   }
 
   private registerAutoArchiveOnTerminalState(
     agentId: string,
-    target: AutoArchiveTarget,
+    target: AutoArchiveObligation["target"],
   ): LifecycleRegistration {
-    return registerAgentAutoArchive({
+    if (this.shuttingDown) return inactiveRegistration;
+    const existing = this.autoArchiveRegistrations.get(agentId);
+    if (existing) return existing;
+
+    const subscribeToMutations = this.dependencies.workspaceRegistry.subscribeToMutations?.bind(
+      this.dependencies.workspaceRegistry,
+    );
+    const registration = registerAgentAutoArchive({
       agentManager: this.dependencies.agentManager,
       agentId,
       archive: () => this.autoArchiveAgentOnce(agentId, target),
+      shouldRetry: (error) => !(error instanceof WorkspaceCleanupPendingError),
+      subscribeToRearm: subscribeToMutations
+        ? (rearm) => subscribeToMutations((mutation) => rearm(mutation.workspaceId))
+        : undefined,
+      rearmKeysForError: (error) =>
+        error instanceof WorkspaceCleanupPendingError ? error.workspaceIds : [],
     });
+    this.autoArchiveRegistrations.set(agentId, registration);
+    void registration.settled.then(() => {
+      if (this.autoArchiveRegistrations.get(agentId) === registration) {
+        this.autoArchiveRegistrations.delete(agentId);
+      }
+      return undefined;
+    });
+    return registration;
   }
 
-  private async autoArchiveAgentOnce(agentId: string, target: AutoArchiveTarget): Promise<void> {
-    if (this.autoArchiveAgentIds.has(agentId)) {
-      return;
-    }
-    this.autoArchiveAgentIds.add(agentId);
-
+  async shutdown(options?: { timeoutMs?: number }): Promise<LifecycleDispatchShutdownResult> {
+    this.shuttingDown = true;
+    this.shutdownController.abort();
+    const registrations = Array.from(this.autoArchiveRegistrations.entries());
+    const cancellation = Promise.allSettled(
+      registrations.map(([, registration]) => registration.cancel()),
+    ).then(async (results) => {
+      await Promise.allSettled(Array.from(this.autoArchiveTasks.values()));
+      await this.dependencies.drainWorkspaceLifecycleOperations();
+      await Promise.allSettled(Array.from(this.failedCreateCleanupTasks.values()));
+      await this.dependencies.drainWorkspaceLifecycleOperations();
+      return results;
+    });
+    let cancellationResults: PromiseSettledResult<void>[] | null = null;
     try {
-      if (target.kind === "created-worktree") {
-        await this.archiveAutoCreatedWorktree({
-          agentId,
-          createdWorktree: target.result,
-        });
-        return;
-      }
+      cancellationResults = await withTimeout(
+        cancellation,
+        options?.timeoutMs ?? 10_000,
+        "Timed out shutting down create-agent lifecycle registrations",
+      );
+    } catch (error) {
+      this.dependencies.logger.error(
+        { err: error, agentIds: registrations.map(([registeredAgentId]) => registeredAgentId) },
+        "Create-agent lifecycle shutdown remains incomplete",
+      );
+    }
+    const unresolvedAgentIds = cancellationResults
+      ? registrations.flatMap(([agentId], index) =>
+          cancellationResults[index]?.status === "rejected" ? [agentId] : [],
+        )
+      : registrations.map(([agentId]) => agentId);
+    const pendingAgentIds = Array.from(
+      new Set([
+        ...unresolvedAgentIds,
+        ...this.autoArchiveRegistrations.keys(),
+        ...this.autoArchiveTasks.keys(),
+      ]),
+    );
+    return {
+      completed:
+        cancellationResults !== null &&
+        pendingAgentIds.length === 0 &&
+        this.failedCreateCleanupTasks.size === 0,
+      pendingAgentIds,
+    };
+  }
 
-      await this.dependencies.archiveAgentForClose(agentId);
+  private async autoArchiveAgentOnce(
+    agentId: string,
+    target: AutoArchiveObligation["target"],
+  ): Promise<void> {
+    const existingTask = this.autoArchiveTasks.get(agentId);
+    if (existingTask) return existingTask;
+
+    const archiveTask = this.runAutoArchiveAgent(agentId, target);
+    this.autoArchiveTasks.set(agentId, archiveTask);
+    try {
+      await archiveTask;
     } catch (error) {
       this.dependencies.logger.warn({ err: error, agentId }, "Failed to auto-archive agent");
+      throw error;
+    } finally {
+      if (this.autoArchiveTasks.get(agentId) === archiveTask) {
+        this.autoArchiveTasks.delete(agentId);
+      }
     }
+  }
+
+  private async runAutoArchiveAgent(
+    agentId: string,
+    target: AutoArchiveObligation["target"],
+  ): Promise<void> {
+    await this.dependencies.agentStorage.update(agentId, (record) => ({
+      ...record,
+      autoArchiveObligation: { phase: "pending", target },
+    }));
+    if (target.kind === "workspace") {
+      await this.dependencies.archiveWorkspaceForClose(
+        target.workspaceId,
+        this.shutdownController.signal,
+      );
+      const workspace = await this.dependencies.workspaceRegistry.get(target.workspaceId);
+      if (!workspace?.archivedAt || workspace.cleanupPending) {
+        throw new WorkspaceCleanupPendingError("Workspace auto-archive verification", [
+          target.workspaceId,
+        ]);
+      }
+    } else {
+      await this.dependencies.archiveAgentForClose(agentId);
+    }
+    await this.dependencies.agentStorage.update(agentId, (record) => {
+      return { ...record, autoArchiveObligation: undefined };
+    });
   }
 
   private async archiveAutoCreatedWorktree(options: {
@@ -198,7 +453,15 @@ export class CreateAgentLifecycleDispatch {
       throw new Error("Auto-created worktree is not a Paseo-owned worktree");
     }
 
-    await archiveByScope(
+    await this.archiveWorktreePath(worktreePath, createdWorktree.workspace.workspaceId);
+
+    if (options.agentId) {
+      this.dependencies.emitAgentRemove(options.agentId);
+    }
+  }
+
+  private async archiveWorktreePath(worktreePath: string, workspaceId?: string): Promise<void> {
+    const archiveResult = await archiveByScope(
       {
         paseoHome: this.dependencies.paseoHome,
         paseoWorktreesBaseRoot: this.dependencies.worktreesRoot,
@@ -209,6 +472,7 @@ export class CreateAgentLifecycleDispatch {
         findWorkspaceIdForCwd: this.dependencies.findWorkspaceIdForCwd,
         listActiveWorkspaces: this.dependencies.listActiveWorkspaces,
         archiveWorkspaceRecord: this.dependencies.archiveWorkspaceRecord,
+        workspaceRegistry: this.dependencies.workspaceRegistry,
         emitWorkspaceUpdatesForWorkspaceIds: this.dependencies.emitWorkspaceUpdatesForWorkspaceIds,
         markWorkspaceArchiving: this.dependencies.markWorkspaceArchiving,
         clearWorkspaceArchiving: this.dependencies.clearWorkspaceArchiving,
@@ -216,14 +480,13 @@ export class CreateAgentLifecycleDispatch {
         sessionLogger: this.dependencies.logger,
       },
       {
-        scope: { kind: "workspace", workspaceId: createdWorktree.workspace.workspaceId },
+        scope: workspaceId
+          ? { kind: "workspace", workspaceId }
+          : { kind: "worktree", targetPath: worktreePath },
         requestId: randomUUID(),
       },
     );
-
-    if (options.agentId) {
-      this.dependencies.emitAgentRemove(options.agentId);
-    }
+    requireArchiveCleanupComplete(archiveResult, "Auto-created worktree archive");
   }
 }
 
@@ -231,19 +494,138 @@ export function registerAgentAutoArchive(input: {
   agentManager: AgentLifecycleEvents;
   agentId: string;
   archive: () => Promise<unknown>;
+  retryBaseMs?: number;
+  retryMaxMs?: number;
+  shouldRetry?: (error: unknown) => boolean;
+  subscribeToRearm?: (rearm: (key: string) => void) => () => void;
+  rearmKeysForError?: (error: unknown) => readonly string[];
 }): LifecycleRegistration {
   let unsubscribe: (() => void) | null = null;
+  let unsubscribeRearm: (() => void) | null = null;
   let archiveTask: Promise<unknown> | null = null;
-  const release = () => {
-    if (!unsubscribe) return;
-    const subscribed = unsubscribe;
-    unsubscribe = null;
-    subscribed();
+  let retryTimer: ReturnType<typeof setTimeout> | null = null;
+  let lastArchiveFailure: unknown | null = null;
+  let consecutiveFailures = 0;
+  let mutationVersion = 0;
+  const mutationVersionByKey = new Map<string, number>();
+  let awaitingRearm = false;
+  let terminalObserved = false;
+  let canceled = false;
+  let settleRegistration!: (result: "completed" | "cancelled" | "unresolved") => void;
+  let registrationSettled = false;
+  const settled = new Promise<"completed" | "cancelled" | "unresolved">((resolve) => {
+    settleRegistration = resolve;
+  });
+  const retryBaseMs = input.retryBaseMs ?? 1_000;
+  const retryMaxMs = input.retryMaxMs ?? 60_000;
+  const settle = (result: "completed" | "cancelled" | "unresolved") => {
+    if (registrationSettled) return;
+    registrationSettled = true;
+    settleRegistration(result);
   };
+  const release = () => {
+    const subscribedToAgent = unsubscribe;
+    unsubscribe = null;
+    subscribedToAgent?.();
+    const subscribedToRearm = unsubscribeRearm;
+    unsubscribeRearm = null;
+    subscribedToRearm?.();
+  };
+  const scheduleRetry = () => {
+    if (canceled || retryTimer) return;
+    const delay = Math.min(retryMaxMs, retryBaseMs * 2 ** Math.max(0, consecutiveFailures - 1));
+    retryTimer = setTimeout(() => {
+      retryTimer = null;
+      attemptArchive();
+    }, delay);
+    (retryTimer as unknown as { unref?: () => void }).unref?.();
+  };
+  if (input.subscribeToRearm) {
+    unsubscribeRearm = input.subscribeToRearm((key) => {
+      mutationVersion += 1;
+      mutationVersionByKey.set(key, mutationVersion);
+      const rearmKeys = lastArchiveFailure
+        ? (input.rearmKeysForError?.(lastArchiveFailure) ?? null)
+        : null;
+      if (
+        !canceled &&
+        terminalObserved &&
+        awaitingRearm &&
+        !archiveTask &&
+        (rearmKeys === null || rearmKeys.includes(key))
+      ) {
+        awaitingRearm = false;
+        consecutiveFailures = 0;
+        attemptArchive();
+      }
+    });
+  }
+  function attemptArchive(): void {
+    if (canceled || archiveTask) return;
+    const attemptMutationVersion = mutationVersion;
+    const task = Promise.resolve().then(input.archive);
+    archiveTask = task;
+    void task.then(
+      () => {
+        if (archiveTask !== task) return;
+        archiveTask = null;
+        lastArchiveFailure = null;
+        consecutiveFailures = 0;
+        if (retryTimer) {
+          clearTimeout(retryTimer);
+          retryTimer = null;
+        }
+        release();
+        settle("completed");
+        return undefined;
+      },
+      (error: unknown) => {
+        if (archiveTask !== task) return;
+        archiveTask = null;
+        lastArchiveFailure = error;
+        consecutiveFailures += 1;
+        const retryAllowed = input.shouldRetry?.(error) ?? true;
+        if (!retryAllowed) {
+          awaitingRearm = true;
+          const rearmKeys = input.rearmKeysForError?.(error) ?? null;
+          const relevantMutationObserved = rearmKeys
+            ? rearmKeys.some((key) => (mutationVersionByKey.get(key) ?? 0) > attemptMutationVersion)
+            : mutationVersion !== attemptMutationVersion;
+          if (!canceled && terminalObserved && relevantMutationObserved) {
+            awaitingRearm = false;
+            consecutiveFailures = 0;
+            attemptArchive();
+          }
+        } else {
+          scheduleRetry();
+        }
+        return undefined;
+      },
+    );
+  }
   const registration: LifecycleRegistration = {
+    settled,
     async cancel() {
+      canceled = true;
+      awaitingRearm = false;
+      if (retryTimer) {
+        clearTimeout(retryTimer);
+        retryTimer = null;
+      }
       release();
-      await archiveTask;
+      try {
+        const pendingArchive = archiveTask;
+        if (pendingArchive) {
+          await pendingArchive.catch(() => undefined);
+        }
+        if (lastArchiveFailure) {
+          throw lastArchiveFailure;
+        }
+        settle("cancelled");
+      } catch (error) {
+        settle("unresolved");
+        throw error;
+      }
     },
   };
   unsubscribe = input.agentManager.subscribe(
@@ -256,18 +638,10 @@ export function registerAgentAutoArchive(input: {
       ) {
         return;
       }
-      release();
-      archiveTask = input.archive();
+      terminalObserved = true;
+      attemptArchive();
     },
     { agentId: input.agentId, replayState: false },
   );
   return registration;
-}
-
-function toAutoArchiveTarget(
-  createdWorktree: CreatePaseoWorktreeWorkflowResult | null,
-): AutoArchiveTarget {
-  return createdWorktree
-    ? { kind: "created-worktree", result: createdWorktree }
-    : { kind: "agent-only" };
 }
