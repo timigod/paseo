@@ -52,6 +52,7 @@ export interface StopLocalDaemonOptions {
   timeoutMs?: number;
   killTimeoutMs?: number;
   force?: boolean;
+  platform?: NodeJS.Platform;
 }
 
 export interface StopLocalDaemonResult {
@@ -675,6 +676,7 @@ export function startLocalDaemonForeground(
 async function requestLifecycleShutdown(
   state: LocalDaemonState,
   timeoutMs: number,
+  platform: NodeJS.Platform = process.platform,
 ): Promise<LifecycleShutdownAttempt> {
   const host = resolveTcpHostFromListen(state.listen);
   if (!host) {
@@ -697,7 +699,10 @@ async function requestLifecycleShutdown(
   try {
     const response = await client.shutdownServer({ timeout: Math.min(remainingTimeoutMs(), 5000) });
     // COMPAT(shutdownTermination): added in v0.2.5, remove fallback after 2027-02-02.
-    return { requested: true, termination: response.termination ?? "graceful" };
+    return {
+      requested: true,
+      termination: response.termination ?? (platform === "win32" ? "forceful" : "graceful"),
+    };
   } catch (error) {
     return {
       requested: false,
@@ -719,7 +724,11 @@ export async function stopLocalDaemon(
   const deadline = Date.now() + timeoutMs;
   const remainingTimeoutMs = () => Math.max(1, deadline - Date.now());
 
-  const shutdownAttempt = await requestLifecycleShutdown(state, remainingTimeoutMs());
+  const shutdownAttempt = await requestLifecycleShutdown(
+    state,
+    remainingTimeoutMs(),
+    options.platform,
+  );
   const lifecycleRequested = shutdownAttempt.requested;
   const lifecycleForced = shutdownAttempt.requested && shutdownAttempt.termination === "forceful";
 

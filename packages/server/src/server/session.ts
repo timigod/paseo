@@ -2433,6 +2433,7 @@ export class Session {
     const payload: { status: string } & Record<string, unknown> = {
       status: "restart_requested",
       clientId: this.clientId,
+      termination: this.daemonRuntimeConfig?.shutdownTermination ?? "graceful",
     };
     if (reason && reason.trim().length > 0) {
       payload.reason = reason;

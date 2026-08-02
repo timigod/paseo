@@ -425,4 +425,27 @@ describe("shared messages stream parsing", () => {
     expect(legacy).not.toHaveProperty("payload.termination");
     expect(current).toHaveProperty("payload.termination", "forceful");
   });
+
+  it("parses restart acknowledgements across termination metadata versions", () => {
+    const legacy = SessionOutboundMessageSchema.parse({
+      type: "status",
+      payload: {
+        status: "restart_requested",
+        clientId: "client-legacy",
+        requestId: "restart-legacy",
+      },
+    });
+    const current = SessionOutboundMessageSchema.parse({
+      type: "status",
+      payload: {
+        status: "restart_requested",
+        clientId: "client-current",
+        requestId: "restart-current",
+        termination: "forceful",
+      },
+    });
+
+    expect(legacy).not.toHaveProperty("payload.termination");
+    expect(current).toHaveProperty("payload.termination", "forceful");
+  });
 });

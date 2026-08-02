@@ -16,8 +16,25 @@ interface RestartResult {
   action: "restarted";
   home: string;
   pid: string;
+  forced: boolean;
+  usedLifecycleRpc: boolean;
+  reason: Awaited<ReturnType<typeof stopLocalDaemon>>["reason"];
   message: string;
 }
+
+export interface RestartCommandRuntime {
+  stopLocalDaemon(
+    options: Parameters<typeof stopLocalDaemon>[0],
+  ): ReturnType<typeof stopLocalDaemon>;
+  startLocalDaemonDetached(
+    options: DaemonStartOptions,
+  ): ReturnType<typeof startLocalDaemonDetached>;
+}
+
+const defaultRestartCommandRuntime: RestartCommandRuntime = {
+  stopLocalDaemon,
+  startLocalDaemonDetached,
+};
 
 const restartResultSchema: OutputSchema<RestartResult> = {
   idField: "action",
@@ -76,9 +93,28 @@ function toStartOptions(options: CommandOptions): DaemonStartOptions {
   return startOptions;
 }
 
+function resolveRestartMessage(
+  stopResult: Awaited<ReturnType<typeof stopLocalDaemon>>,
+  before: string,
+  after: string,
+): string {
+  if (stopResult.reason === "not_running") {
+    return `Local daemon started (${before} -> ${after})`;
+  }
+  if (stopResult.reason === "lifecycle_shutdown_rpc") {
+    const mode = stopResult.forced ? "forceful" : "graceful";
+    return `Local daemon restarted after ${mode} lifecycle shutdown (${before} -> ${after})`;
+  }
+  if (stopResult.reason === "owner_pid_sigkill") {
+    return `Local daemon restarted after force-stopping the owner process (${before} -> ${after})`;
+  }
+  return `Local daemon restarted after owner PID signal (${before} -> ${after})`;
+}
+
 export async function runRestartCommand(
   options: CommandOptions,
   _command: Command,
+  runtime: RestartCommandRuntime = defaultRestartCommandRuntime,
 ): Promise<RestartCommandResult> {
   const timeoutMs = parseTimeoutMs(options.timeout);
   const force = options.force === true;
@@ -87,7 +123,7 @@ export async function runRestartCommand(
   try {
     let stopResult: Awaited<ReturnType<typeof stopLocalDaemon>>;
     try {
-      stopResult = await stopLocalDaemon({
+      stopResult = await runtime.stopLocalDaemon({
         home: startOptions.home,
         timeoutMs,
         force,
@@ -96,7 +132,7 @@ export async function runRestartCommand(
       const isTimeout =
         err instanceof Error && err.message.includes("Timed out waiting for daemon PID");
       if (!force && isTimeout) {
-        stopResult = await stopLocalDaemon({
+        stopResult = await runtime.stopLocalDaemon({
           home: startOptions.home,
           timeoutMs,
           force: true,
@@ -106,7 +142,7 @@ export async function runRestartCommand(
       }
     }
 
-    const startup = await startLocalDaemonDetached(startOptions);
+    const startup = await runtime.startLocalDaemonDetached(startOptions);
     const before = stopResult.pid === null ? "not running" : `PID ${stopResult.pid}`;
     const after = startup.pid === null ? "unknown PID" : `PID ${startup.pid}`;
 
@@ -116,7 +152,10 @@ export async function runRestartCommand(
         action: "restarted",
         home: stopResult.home,
         pid: startup.pid === null ? "-" : String(startup.pid),
-        message: `Local daemon restarted (${before} -> ${after})`,
+        forced: stopResult.forced,
+        usedLifecycleRpc: stopResult.usedLifecycleRpc,
+        reason: stopResult.reason,
+        message: resolveRestartMessage(stopResult, before, after),
       },
       schema: restartResultSchema,
     };

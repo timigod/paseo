@@ -2938,6 +2938,8 @@ export const RestartRequestedStatusPayloadSchema = z.object({
   clientId: z.string(),
   reason: z.string().optional(),
   requestId: z.string(),
+  // Added in v0.2.5; remains optional so newer clients accept older daemon acknowledgements.
+  termination: z.enum(["graceful", "forceful"]).optional(),
 });
 
 export const ShutdownRequestedStatusPayloadSchema = z.object({

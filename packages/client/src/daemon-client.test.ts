@@ -2962,6 +2962,7 @@ test("restartServer remains restart-only and sends restart_server_request", asyn
         clientId: "clsk_unit_test",
         reason: "settings_update",
         requestId: "req-restart-1",
+        termination: "forceful",
       },
     }),
   );
@@ -2971,6 +2972,46 @@ test("restartServer remains restart-only and sends restart_server_request", asyn
     clientId: "clsk_unit_test",
     reason: "settings_update",
     requestId: "req-restart-1",
+    termination: "forceful",
+  });
+});
+
+test("restartServer accepts a legacy acknowledgement without termination", async () => {
+  const logger = createMockLogger();
+  const mock = createMockTransport();
+
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "clsk_unit_test",
+    logger,
+    reconnect: { enabled: false },
+    transportFactory: () => mock.transport,
+  });
+  clients.push(client);
+
+  const connectPromise = client.connect();
+  mock.triggerOpen();
+  await connectPromise;
+
+  const promise = client.restartServer("settings_update", "req-restart-legacy");
+
+  mock.triggerMessage(
+    wrapSessionMessage({
+      type: "status",
+      payload: {
+        status: "restart_requested",
+        clientId: "clsk_unit_test",
+        reason: "settings_update",
+        requestId: "req-restart-legacy",
+      },
+    }),
+  );
+
+  await expect(promise).resolves.toEqual({
+    status: "restart_requested",
+    clientId: "clsk_unit_test",
+    reason: "settings_update",
+    requestId: "req-restart-legacy",
   });
 });
 

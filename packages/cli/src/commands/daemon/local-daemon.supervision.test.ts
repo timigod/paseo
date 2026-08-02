@@ -95,6 +95,49 @@ function expectSupervisorLaunch(argv: string[]): void {
   expect(joined).not.toContain("dist/server/server/daemon-worker.js");
 }
 
+async function stopWithLifecycleAcknowledgement(options: {
+  platform: NodeJS.Platform;
+  termination?: "graceful" | "forceful";
+}) {
+  const home = await createPaseoHome({ version: 1 });
+  const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+    stdio: "ignore",
+  });
+  const childClosed = once(child, "close");
+  await once(child, "spawn");
+  const pid = child.pid;
+  if (!pid) {
+    throw new Error("fixture process did not expose a PID");
+  }
+  await writeFile(path.join(home, "paseo.pid"), JSON.stringify({ pid, listen: "127.0.0.1:6767" }));
+
+  const shutdownServer = vi.fn(async () => {
+    child.kill(options.platform === "win32" ? "SIGKILL" : "SIGTERM");
+    return {
+      status: "shutdown_requested" as const,
+      clientId: "cli-test",
+      requestId: "shutdown-test",
+      ...(options.termination ? { termination: options.termination } : {}),
+    };
+  });
+  const close = vi.fn(async () => undefined);
+  vi.mocked(tryConnectToDaemon).mockResolvedValue({ shutdownServer, close } as never);
+
+  try {
+    const result = await stopLocalDaemon({
+      home,
+      timeoutMs: 2_000,
+      platform: options.platform,
+    });
+    return { result, home, pid, shutdownServer, close };
+  } finally {
+    if (child.exitCode === null && child.signalCode === null) {
+      child.kill("SIGKILL");
+    }
+    await childClosed;
+  }
+}
+
 describe("local daemon launch supervision", () => {
   beforeEach(() => {
     vi.useRealTimers();
@@ -221,50 +264,49 @@ describe("local daemon launch supervision", () => {
   });
 
   test("reports successful Windows lifecycle shutdown as forceful", async () => {
-    const home = await createPaseoHome({ version: 1 });
-    const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
-      stdio: "ignore",
+    const { result, home, pid, shutdownServer, close } = await stopWithLifecycleAcknowledgement({
+      platform: "win32",
+      termination: "forceful",
     });
-    const childClosed = once(child, "close");
-    await once(child, "spawn");
-    const pid = child.pid;
-    if (!pid) {
-      throw new Error("fixture process did not expose a PID");
-    }
-    await writeFile(
-      path.join(home, "paseo.pid"),
-      JSON.stringify({ pid, listen: "127.0.0.1:6767" }),
-    );
 
-    const shutdownServer = vi.fn(async () => {
-      child.kill("SIGKILL");
-      return {
-        status: "shutdown_requested" as const,
-        clientId: "cli-test",
-        requestId: "shutdown-windows",
-        termination: "forceful" as const,
-      };
+    expect(result).toEqual({
+      action: "stopped",
+      home,
+      pid,
+      forced: true,
+      usedLifecycleRpc: true,
+      reason: "lifecycle_shutdown_rpc",
+      message: "Daemon stopped via forceful lifecycle shutdown",
     });
-    const close = vi.fn(async () => undefined);
-    vi.mocked(tryConnectToDaemon).mockResolvedValue({ shutdownServer, close } as never);
+    expect(shutdownServer).toHaveBeenCalledOnce();
+    expect(close).toHaveBeenCalledOnce();
+  });
 
-    try {
-      await expect(stopLocalDaemon({ home, timeoutMs: 2_000 })).resolves.toEqual({
-        action: "stopped",
-        home,
-        pid,
-        forced: true,
-        usedLifecycleRpc: true,
-        reason: "lifecycle_shutdown_rpc",
-        message: "Daemon stopped via forceful lifecycle shutdown",
-      });
-      expect(shutdownServer).toHaveBeenCalledOnce();
-      expect(close).toHaveBeenCalledOnce();
-    } finally {
-      if (child.exitCode === null && child.signalCode === null) {
-        child.kill("SIGKILL");
-      }
-      await childClosed;
-    }
+  test("infers forceful shutdown from Windows for a legacy lifecycle acknowledgement", async () => {
+    const { result, home, pid } = await stopWithLifecycleAcknowledgement({ platform: "win32" });
+
+    expect(result).toEqual({
+      action: "stopped",
+      home,
+      pid,
+      forced: true,
+      usedLifecycleRpc: true,
+      reason: "lifecycle_shutdown_rpc",
+      message: "Daemon stopped via forceful lifecycle shutdown",
+    });
+  });
+
+  test("infers graceful shutdown from POSIX for a legacy lifecycle acknowledgement", async () => {
+    const { result, home, pid } = await stopWithLifecycleAcknowledgement({ platform: "darwin" });
+
+    expect(result).toEqual({
+      action: "stopped",
+      home,
+      pid,
+      forced: false,
+      usedLifecycleRpc: true,
+      reason: "lifecycle_shutdown_rpc",
+      message: "Daemon stopped gracefully",
+    });
   });
 });

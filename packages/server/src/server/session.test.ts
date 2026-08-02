@@ -465,6 +465,50 @@ function createSessionForTest(options: SessionForTestOptions = {}): Session {
 }
 
 describe("session daemon lifecycle", () => {
+  test("acknowledges forceful restart before emitting the lifecycle intent", async () => {
+    const events: Array<{ kind: "message" | "intent"; value: unknown }> = [];
+    const session = createSessionForTest({
+      onMessage: (message) => events.push({ kind: "message", value: message }),
+      daemonRuntimeConfig: {
+        listen: "127.0.0.1:6767",
+        relay: null,
+        shutdownTermination: "forceful",
+      },
+      onLifecycleIntent: (intent) => events.push({ kind: "intent", value: intent }),
+    });
+
+    await session.handleMessage({
+      type: "restart_server_request",
+      requestId: "restart-forceful",
+      reason: "settings_update",
+    });
+
+    expect(events).toEqual([
+      {
+        kind: "message",
+        value: {
+          type: "status",
+          payload: {
+            status: "restart_requested",
+            clientId: "test-client",
+            requestId: "restart-forceful",
+            reason: "settings_update",
+            termination: "forceful",
+          },
+        },
+      },
+      {
+        kind: "intent",
+        value: {
+          type: "restart",
+          clientId: "test-client",
+          requestId: "restart-forceful",
+          reason: "settings_update",
+        },
+      },
+    ]);
+  });
+
   test("acknowledges forceful shutdown before emitting the lifecycle intent", async () => {
     const events: Array<{ kind: "message" | "intent"; value: unknown }> = [];
     const session = createSessionForTest({
