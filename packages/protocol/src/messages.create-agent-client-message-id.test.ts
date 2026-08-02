@@ -54,3 +54,20 @@ describe("create_agent_request clientMessageId", () => {
     expect(parsed.success).toBe(false);
   });
 });
+
+describe("create_agent_request idempotencyKey", () => {
+  it("accepts an optional stable create identity", () => {
+    const parsed = SessionInboundMessageSchema.parse({
+      type: "create_agent_request",
+      requestId: "transport-request-1",
+      idempotencyKey: "fleet-create-1",
+      config: { provider: "codex", cwd: "/tmp/project" },
+    });
+
+    expect(parsed.type).toBe("create_agent_request");
+    if (parsed.type !== "create_agent_request") {
+      throw new Error("Expected create_agent_request");
+    }
+    expect(parsed.idempotencyKey).toBe("fleet-create-1");
+  });
+});

@@ -28,6 +28,7 @@ export function addRunOptions(cmd: Command, options: { optionalPrompt?: boolean 
       // ownership transfer. Added in v0.2.0; remove after 2027-01-17.
       .addOption(new Option("--detach", "Legacy alias for --background").hideHelp())
       .option("--title <title>", "Assign a title to the agent")
+      .option("--idempotency-key <key>", "Reuse the original agent when retrying a create")
       .addOption(new Option("--name <name>", "Hidden alias for --title").hideHelp())
       .option(
         "--provider <provider>",
@@ -110,6 +111,7 @@ export interface AgentRunOptions extends CommandOptions {
   background?: boolean;
   detach?: boolean;
   title?: string;
+  idempotencyKey?: string;
   name?: string;
   provider?: string;
   model?: string;
@@ -384,6 +386,17 @@ function validateRunOptions(prompt: string, options: AgentRunOptions, outputSche
 
   validateRunWorkspaceOptions(options);
 
+  const idempotencyKey = options.idempotencyKey?.trim();
+  if (
+    idempotencyKey !== undefined &&
+    (idempotencyKey.length === 0 || idempotencyKey.length > 200)
+  ) {
+    throw {
+      code: "INVALID_OPTIONS",
+      message: "--idempotency-key must contain 1 to 200 characters",
+    } satisfies CommandError;
+  }
+
   if (outputSchema && runsInBackground(options)) {
     throw {
       code: "INVALID_OPTIONS",
@@ -633,6 +646,7 @@ export async function runRunCommand(
             workspaceId,
             callerAgentId,
             title: resolvedTitle,
+            idempotencyKey: options.idempotencyKey?.trim(),
             modeId: options.mode,
             model: resolvedProviderModel.model,
             thinkingOptionId,
@@ -704,6 +718,7 @@ export async function runRunCommand(
       workspaceId,
       callerAgentId,
       title: resolvedTitle,
+      idempotencyKey: options.idempotencyKey?.trim(),
       modeId: options.mode,
       model: resolvedProviderModel.model,
       thinkingOptionId,

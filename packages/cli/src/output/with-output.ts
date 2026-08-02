@@ -91,6 +91,9 @@ export function withOutput<T, Args extends unknown[]>(
       if (output) {
         process.stdout.write(output + "\n");
       }
+      if (result.exitCode !== undefined) {
+        process.exitCode = result.exitCode;
+      }
     } catch (error) {
       const commandError = toCommandError(error);
       const errorOutput = renderError(commandError, outputOptions);

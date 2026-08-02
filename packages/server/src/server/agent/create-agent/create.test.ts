@@ -717,6 +717,35 @@ test("session create stamps the requested workspaceId when no worktree setup run
   }
 });
 
+test("session create uses a reserved id for idempotent retries", async () => {
+  const createAgent = vi.fn().mockResolvedValue({ id: "00000000-0000-4000-8000-000000000010" });
+  const dependencies = {
+    agentManager: { createAgent } as unknown as Parameters<
+      typeof createAgentCommand
+    >[0]["agentManager"],
+    agentStorage: {} as Parameters<typeof createAgentCommand>[0]["agentStorage"],
+    logger: createTestLogger(),
+    providerSnapshotManager: createProviderSnapshotManagerStub().manager,
+  };
+
+  await createAgentCommand(dependencies, {
+    kind: "session",
+    agentId: "00000000-0000-4000-8000-000000000010",
+    config: { provider: "codex", cwd: "/tmp/project" },
+    workspaceId: "ws-source",
+    labels: {},
+    provisionalTitle: null,
+    firstAgentContext: { attachments: [] },
+    buildSessionConfig: async (config) => ({ sessionConfig: config }),
+  });
+
+  expect(createAgent).toHaveBeenCalledWith(
+    expect.any(Object),
+    "00000000-0000-4000-8000-000000000010",
+    expect.any(Object),
+  );
+});
+
 test("session create stamps the new worktree's workspaceId when a setup continuation runs", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "create-agent-test-"));
   const storage = new AgentStorage(join(workdir, "agents"), logger);

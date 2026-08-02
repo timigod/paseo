@@ -2097,6 +2097,7 @@ test("sends create_agent_request with workspace and caller identity", async () =
     cwd: "/tmp/project/.paseo/worktrees/feature-a",
     workspaceId: "ws-feature-a",
     callerAgentId: "parent-agent",
+    idempotencyKey: "fleet-create-1",
     title: "Compat agent",
     modeId: "default",
   });
@@ -2108,6 +2109,7 @@ test("sends create_agent_request with workspace and caller identity", async () =
       type: "create_agent_request",
       workspaceId: "ws-feature-a",
       callerAgentId: "parent-agent",
+      idempotencyKey: "fleet-create-1",
     }),
   );
 

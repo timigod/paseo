@@ -53,6 +53,8 @@ export interface SingleResult<T> {
   data: T;
   /** Schema describing how to render this data (for item type T) */
   schema: OutputSchema<T>;
+  /** Process status to apply after rendering successful output */
+  exitCode?: number;
 }
 
 /** Result type for commands returning a list */
@@ -62,6 +64,8 @@ export interface ListResult<T> {
   data: T[];
   /** Schema describing how to render this data (for item type T) */
   schema: OutputSchema<T>;
+  /** Process status to apply after rendering successful output */
+  exitCode?: number;
 }
 
 /** Union type for all command results */

@@ -13,4 +13,5 @@ it("exposes the focused fleet control surface", () => {
   const runHelp = fleet?.commands.find((command) => command.name() === "run")?.helpInformation();
   expect(runHelp).toContain("--prompt-file <path>");
   expect(runHelp).toContain("--host <host>");
+  expect(runHelp).toContain("--idempotency-key <key>");
 });

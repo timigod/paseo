@@ -92,6 +92,14 @@ describe("runRunCommand option validation", () => {
     await expectInvalidOptions({ newWorkspace: "container" }, /Unsupported new workspace kind/);
   });
 
+  it("rejects a blank create idempotency key before connecting", async () => {
+    await expectInvalidOptions({ idempotencyKey: "   " }, /--idempotency-key/);
+  });
+
+  it("rejects a create idempotency key longer than 200 characters", async () => {
+    await expectInvalidOptions({ idempotencyKey: "x".repeat(201) }, /--idempotency-key/);
+  });
+
   it("rejects two workspace creation flags", async () => {
     await expectInvalidOptions(
       { newWorkspace: "local", worktree: "legacy-slug" },

@@ -232,6 +232,9 @@ export const PersistedConfigSchema = z
     daemon: z
       .object({
         listen: z.string().optional(),
+        // COMPAT(maxActiveAgents): accepted by pre-release v0.2.8 builds on 2026-07-30;
+        // capacity enforcement remains removed. Remove after 2027-02-02.
+        maxActiveAgents: z.number().int().positive().optional(),
         hostnames: z.union([z.literal(true), z.array(z.string())]).optional(),
         allowedHosts: z.union([z.literal(true), z.array(z.string())]).optional(),
         trustedProxies: z.union([z.literal(true), z.array(z.string())]).optional(),

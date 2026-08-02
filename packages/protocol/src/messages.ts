@@ -1264,6 +1264,7 @@ export const CreateAgentRequestMessageSchema = z.object({
   worktreeName: z.string().optional(),
   initialPrompt: z.string().optional(),
   clientMessageId: z.string().optional(),
+  idempotencyKey: z.string().min(1).max(200).optional(),
   outputSchema: z.record(z.string(), z.unknown()).optional(),
   images: z.array(ImageAttachmentSchema).optional(),
   attachments: AgentAttachmentsSchema,

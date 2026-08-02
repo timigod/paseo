@@ -345,6 +345,7 @@ export interface CreateAgentRequestOptions extends AgentConfigOverrides {
   callerAgentId?: string;
   initialPrompt?: string;
   clientMessageId?: string;
+  idempotencyKey?: string;
   outputSchema?: Record<string, unknown>;
   images?: CreateAgentRequestMessage["images"];
   attachments?: CreateAgentRequestMessage["attachments"];
@@ -2380,6 +2381,7 @@ export class DaemonClient {
       ...(options.callerAgentId !== undefined ? { callerAgentId: options.callerAgentId } : {}),
       ...(options.initialPrompt ? { initialPrompt: options.initialPrompt } : {}),
       ...(options.clientMessageId ? { clientMessageId: options.clientMessageId } : {}),
+      ...(options.idempotencyKey ? { idempotencyKey: options.idempotencyKey } : {}),
       ...(options.outputSchema ? { outputSchema: options.outputSchema } : {}),
       ...(options.images && options.images.length > 0 ? { images: options.images } : {}),
       ...(options.attachments && options.attachments.length > 0

@@ -36,6 +36,18 @@ describe("PersistedConfigSchema daemon auth config", () => {
   });
 });
 
+describe("PersistedConfigSchema daemon maxActiveAgents compatibility", () => {
+  test("accepts a formerly supported positive agent limit", () => {
+    const parsed = PersistedConfigSchema.parse({ daemon: { maxActiveAgents: 4 } });
+
+    expect(parsed.daemon?.maxActiveAgents).toBe(4);
+  });
+
+  test.each([0, -1, 1.5])("rejects invalid agent limit %s", (maxActiveAgents) => {
+    expect(() => PersistedConfigSchema.parse({ daemon: { maxActiveAgents } })).toThrow();
+  });
+});
+
 describe("PersistedConfigSchema daemon append system prompt config", () => {
   test("accepts optional append system prompt", () => {
     const parsed = PersistedConfigSchema.parse({

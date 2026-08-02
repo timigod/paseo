@@ -93,7 +93,12 @@ function requireFleetHost(value: string | undefined, hosts: readonly FleetHost[]
 
 async function runFleetStatusCommand(): Promise<ListResult<FleetHostSummary>> {
   const statuses = await collectFleetStatus(loadFleetConfig());
-  return { type: "list", data: statuses.map(summarizeFleetHostStatus), schema: fleetStatusSchema };
+  return {
+    type: "list",
+    data: statuses.map(summarizeFleetHostStatus),
+    schema: fleetStatusSchema,
+    exitCode: statuses.every(({ state }) => state === "ready") ? 0 : 1,
+  };
 }
 
 async function runFleetDoctorCommand(): Promise<
@@ -110,6 +115,7 @@ async function runFleetDoctorCommand(): Promise<
         { header: "RECOMMENDATION", field: "recommendation" },
       ],
     },
+    exitCode: result.state === "ready" ? 0 : 1,
   };
 }
 
@@ -171,16 +177,15 @@ async function runFleetRunCommand(
   };
 }
 
-async function runFleetFinishCommand(
+export async function runFleetFinishCommand(
   query: string,
   options: AgentFinishOptions & { host?: string },
   command: Command,
 ): Promise<SingleResult<AgentFinishResult>> {
   const config = loadFleetConfig();
   const pinnedHost = requireFleetHost(options.host, config.hosts);
-  const hosts = pinnedHost ? [pinnedHost] : config.hosts;
   const results = await Promise.all(
-    hosts.map(async (host) => {
+    config.hosts.map(async (host) => {
       let client: Awaited<ReturnType<typeof connectToDaemon>> | null = null;
       try {
         client = await connectToDaemon({ host: host.endpoint });
@@ -198,7 +203,11 @@ async function runFleetFinishCommand(
     results.flatMap((result) => result.matches ?? []),
     results.flatMap((result) => (result.failure ? [result.failure] : [])),
   );
-  return runFinishCommand(location.agentId, { ...options, host: location.host.endpoint }, command);
+  return runFinishCommand(
+    location.agentId,
+    { ...options, host: (pinnedHost ?? location.host).endpoint },
+    command,
+  );
 }
 
 export function createFleetCommand(): Command {

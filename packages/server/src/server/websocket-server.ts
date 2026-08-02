@@ -7,6 +7,7 @@ import { monitorEventLoopDelay } from "node:perf_hooks";
 import type { AgentManager, AgentMetricsSnapshot } from "./agent/agent-manager.js";
 import type { AgentStorage } from "./agent/agent-storage.js";
 import type { CreateAgentLifecycleDispatch } from "./agent/create-agent-lifecycle-dispatch.js";
+import { CreateAgentRequestStore } from "./agent/create-agent-request-store.js";
 import type { DownloadTokenStore } from "./file-download/token-store.js";
 import type { TerminalManager } from "../terminal/terminal-manager.js";
 import type pino from "pino";
@@ -604,6 +605,7 @@ export class VoiceAssistantWebSocketServer {
   private readonly voiceCallerContexts = new Map<string, VoiceCallerContext>();
   private readonly workspaceSetupSnapshots = new Map<string, WorkspaceSetupSnapshot>();
   private readonly providerSnapshotManager: ProviderSnapshotManager;
+  private readonly createAgentRequestStore: CreateAgentRequestStore;
   private onLifecycleIntent!: ((intent: SessionLifecycleIntent) => void) | null;
   private onBranchChanged!:
     | ((workspaceId: string, oldBranch: string | null, newBranch: string | null) => void)
@@ -683,6 +685,12 @@ export class VoiceAssistantWebSocketServer {
     this.agentManager = agentManager;
     this.agentStorage = agentStorage;
     this.createAgentLifecycleDispatch = createAgentLifecycleDispatch;
+    this.createAgentRequestStore = new CreateAgentRequestStore({
+      paseoHome,
+      hasAgent: async (agentId) =>
+        this.agentManager.getAgent(agentId) !== null ||
+        (await this.agentStorage.get(agentId)) !== null,
+    });
     this.projectRegistry = projectRegistry ?? createNoopProjectRegistry();
     this.workspaceRegistry = workspaceRegistry ?? createNoopWorkspaceRegistry();
     const requiredServices = requireWebSocketServices({
@@ -1410,6 +1418,7 @@ export class VoiceAssistantWebSocketServer {
       agentManager: this.agentManager,
       agentStorage: this.agentStorage,
       createAgentLifecycleDispatch: this.createAgentLifecycleDispatch,
+      createAgentRequestStore: this.createAgentRequestStore,
       projectRegistry: this.projectRegistry,
       workspaceRegistry: this.workspaceRegistry,
       chatService: this.chatService,
