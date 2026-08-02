@@ -33,6 +33,7 @@ import {
   type AgentProvider,
   type AgentRunOptions,
   type AgentRunResult,
+  type AgentRuntimeCapacityReservation,
   type AgentSession,
   type AgentSessionConfig,
   type AgentStreamEvent,
@@ -43,6 +44,11 @@ import {
   type ImportableProviderSession,
   type ListImportableSessionsOptions,
 } from "./agent-sdk-types.js";
+import {
+  HostAgentRuntimeCapacityController,
+  UNMANAGED_AGENT_RUNTIME_RESERVATION,
+} from "./agent-runtime-capacity.js";
+export { AgentRuntimeCapacityError } from "./agent-runtime-capacity.js";
 import { buildArchivedAgentRecord, type ArchivedStoredAgentRecord } from "./agent-archive.js";
 import type { StoredAgentRecord, AgentStorage } from "./agent-storage.js";
 import type { AgentOwner } from "./agent-owner.js";
@@ -114,6 +120,13 @@ export type AgentRunCancellationResult =
 interface PreparedSessionConfig {
   storedConfig: AgentSessionConfig;
   launchConfig: AgentSessionConfig;
+}
+
+function resolveMaxActiveAgentRuntimes(value: number | undefined): number | null {
+  if (value !== undefined && (!Number.isInteger(value) || value <= 0)) {
+    throw new RangeError("maxActiveAgentRuntimes must be a positive integer");
+  }
+  return value ?? null;
 }
 
 interface NormalizeConfigOptions {
@@ -253,6 +266,7 @@ export interface AgentManagerOptions {
   paseoToolCatalogFactory?: PaseoToolCatalogFactory;
   appendSystemPrompt?: string;
   agentStreamCoalesceWindowMs?: number;
+  maxActiveAgentRuntimes?: number;
   rescueTimeouts?: AgentManagerRescueTimeouts;
   logger: Logger;
 }
@@ -572,6 +586,8 @@ export class AgentManager {
   private readonly backgroundTasks = new Set<Promise<void>>();
   private readonly agentRegistrationTasks = new Set<Promise<void>>();
   private readonly inFlightAgentCloses = new Map<string, Promise<void>>();
+  private readonly retainedAgentRuntimeCleanups = new Set<AgentSession>();
+  private retainedAgentRuntimeCleanupRetry: Promise<void> | null = null;
   private readonly agentStreamCoalescer: AgentStreamCoalescer;
   private mcpBaseUrl: string | null;
   private readonly mcpAuthToken: string | null;
@@ -583,6 +599,7 @@ export class AgentManager {
   private onWorkspaceStateMayHaveChanged?: (params: { cwd: string }) => void;
   private logger: Logger;
   private readonly rescueTimeouts: Required<AgentManagerRescueTimeouts>;
+  private readonly runtimeCapacity: HostAgentRuntimeCapacityController;
   private acceptingAgentRegistrations = true;
 
   constructor(options: AgentManagerOptions) {
@@ -596,6 +613,9 @@ export class AgentManager {
     this.configurePaseoTools(options);
     this.appendSystemPrompt = options.appendSystemPrompt ?? "";
     this.logger = options.logger.child({ module: "agent", component: "agent-manager" });
+    this.runtimeCapacity = new HostAgentRuntimeCapacityController(
+      resolveMaxActiveAgentRuntimes(options.maxActiveAgentRuntimes),
+    );
     this.rescueTimeouts = {
       reloadSessionCloseMs:
         options.rescueTimeouts?.reloadSessionCloseMs ?? RELOAD_SESSION_CLOSE_TIMEOUT_MS,
@@ -622,6 +642,7 @@ export class AgentManager {
   }
 
   registerClient(provider: AgentProvider, client: AgentClient): void {
+    this.configureClientRuntimeCapacity(provider, client);
     this.clients.set(provider, client);
   }
 
@@ -629,6 +650,16 @@ export class AgentManager {
     providerDefinitions: ProviderEnabledMap;
     clients: ProviderClientMap;
   }): void {
+    const clients = Object.entries(input.clients).filter(
+      (entry): entry is [AgentProvider, AgentClient] => entry[1] !== undefined,
+    );
+    for (const [provider, client] of clients) {
+      this.assertClientRuntimeCapacityInjection(provider, client);
+    }
+    for (const [provider, client] of clients) {
+      this.configureClientRuntimeCapacity(provider, client);
+    }
+
     this.providerEnabled.clear();
     for (const [provider, definition] of Object.entries(input.providerDefinitions)) {
       if (definition) {
@@ -637,11 +668,25 @@ export class AgentManager {
     }
 
     this.clients.clear();
-    for (const [provider, client] of Object.entries(input.clients)) {
-      if (client) {
-        this.clients.set(provider, client);
-      }
+    for (const [provider, client] of clients) {
+      this.clients.set(provider, client);
     }
+  }
+
+  private assertClientRuntimeCapacityInjection(provider: AgentProvider, client: AgentClient): void {
+    if (
+      client.managesRuntimeCapacityAtSource &&
+      typeof client.configureRuntimeCapacityController !== "function"
+    ) {
+      throw new Error(
+        `Provider '${provider}' claims source-managed runtime capacity without configureRuntimeCapacityController`,
+      );
+    }
+  }
+
+  private configureClientRuntimeCapacity(provider: AgentProvider, client: AgentClient): void {
+    this.assertClientRuntimeCapacityInjection(provider, client);
+    client.configureRuntimeCapacityController?.(this.runtimeCapacity);
   }
 
   getRegisteredProviderIds(): AgentProvider[] {
@@ -893,28 +938,32 @@ export class AgentManager {
       );
     }
 
-    if (client.listCommands) {
-      return await client.listCommands(normalizedConfig);
+    const listCommands = client.listCommands?.bind(client);
+    if (listCommands) {
+      return await listCommands(normalizedConfig);
     }
 
-    const session = await client.createSession(normalizedConfig);
-    try {
-      if (!session.listCommands) {
-        throw new Error(
-          `Provider '${normalizedConfig.provider}' does not support listing commands`,
-        );
-      }
-      return await session.listCommands();
-    } finally {
+    return await this.trackAgentRegistrationOperation(async (reservation) => {
+      const session = await client.createSession(normalizedConfig);
+      this.trackStartedAgentRuntime(session, reservation);
       try {
-        await session.close();
-      } catch (error) {
-        this.logger.warn(
-          { err: error, provider: normalizedConfig.provider },
-          "Failed to close draft command listing session",
-        );
+        if (!session.listCommands) {
+          throw new Error(
+            `Provider '${normalizedConfig.provider}' does not support listing commands`,
+          );
+        }
+        return await session.listCommands();
+      } finally {
+        try {
+          await this.closeTrackedAgentRuntime(session);
+        } catch (error) {
+          this.logger.warn(
+            { err: error, provider: normalizedConfig.provider },
+            "Failed to close draft command listing session",
+          );
+        }
       }
-    }
+    }, normalizedConfig.provider);
   }
 
   async listDraftFeatures(config: AgentSessionConfig): Promise<AgentFeature[]> {
@@ -930,23 +979,27 @@ export class AgentManager {
       );
     }
 
-    if (client.listFeatures) {
-      return await client.listFeatures(normalizedConfig);
+    const listFeatures = client.listFeatures?.bind(client);
+    if (listFeatures) {
+      return await listFeatures(normalizedConfig);
     }
 
-    const session = await client.createSession(normalizedConfig);
-    try {
-      return session.features ?? [];
-    } finally {
+    return await this.trackAgentRegistrationOperation(async (reservation) => {
+      const session = await client.createSession(normalizedConfig);
+      this.trackStartedAgentRuntime(session, reservation);
       try {
-        await session.close();
-      } catch (error) {
-        this.logger.warn(
-          { err: error, provider: normalizedConfig.provider },
-          "Failed to close draft feature listing session",
-        );
+        return session.features ?? [];
+      } finally {
+        try {
+          await this.closeTrackedAgentRuntime(session);
+        } catch (error) {
+          this.logger.warn(
+            { err: error, provider: normalizedConfig.provider },
+            "Failed to close draft feature listing session",
+          );
+        }
       }
-    }
+    }, normalizedConfig.provider);
   }
 
   getAgent(id: string): ManagedAgent | null {
@@ -1003,13 +1056,17 @@ export class AgentManager {
     agentId: string | undefined,
     options: CreateAgentOptions,
   ): Promise<ManagedAgent> {
-    return this.trackAgentRegistrationOperation(this.createAgentInternal(config, agentId, options));
+    return this.trackAgentRegistrationOperation(
+      (reservation) => this.createAgentInternal(config, agentId, options, reservation),
+      config.provider,
+    );
   }
 
   private async createAgentInternal(
     config: AgentSessionConfig,
     agentId: string | undefined,
     options: CreateAgentOptions,
+    reservation: AgentRuntimeCapacityReservation,
   ): Promise<ManagedAgent> {
     this.assertAcceptingAgentRegistrations();
     const resolvedAgentId = validateAgentId(agentId ?? this.idFactory(), "createAgent");
@@ -1032,6 +1089,7 @@ export class AgentManager {
     const providerLaunchConfig = this.resolveProviderLaunchConfig(launchConfig, launchContext);
     const createOptions = this.buildCreateSessionOptions(options);
     const session = await client.createSession(providerLaunchConfig, launchContext, createOptions);
+    this.trackStartedAgentRuntime(session, reservation);
     return this.registerSession(session, storedConfig, resolvedAgentId, {
       labels: options.labels,
       initialTitle: options.initialTitle,
@@ -1065,11 +1123,21 @@ export class AgentManager {
     resumeOptions?: AgentResumeSessionOptions,
   ): Promise<ManagedAgent> {
     return this.trackAgentRegistrationOperation(
-      this.resumeAgentFromPersistenceInternal(handle, overrides, agentId, options, resumeOptions),
+      (reservation) =>
+        this.resumeAgentFromPersistenceInternal(
+          reservation,
+          handle,
+          overrides,
+          agentId,
+          options,
+          resumeOptions,
+        ),
+      handle.provider,
     );
   }
 
   private async resumeAgentFromPersistenceInternal(
+    reservation: AgentRuntimeCapacityReservation,
     handle: AgentPersistenceHandle,
     overrides?: Partial<AgentSessionConfig>,
     agentId?: string,
@@ -1114,6 +1182,7 @@ export class AgentManager {
       launchContext,
       resumeOptions,
     );
+    this.trackStartedAgentRuntime(session, reservation);
     return this.registerSession(session, storedConfig, resolvedAgentId, {
       ...options,
       persistence: handle,
@@ -1127,16 +1196,22 @@ export class AgentManager {
     workspaceId: string;
     labels?: Record<string, string>;
   }): Promise<ManagedAgent> {
-    return this.trackAgentRegistrationOperation(this.importProviderSessionInternal(input));
+    return this.trackAgentRegistrationOperation(
+      (reservation) => this.importProviderSessionInternal(input, reservation),
+      input.provider,
+    );
   }
 
-  private async importProviderSessionInternal(input: {
-    provider: AgentProvider;
-    providerHandleId: string;
-    cwd: string;
-    workspaceId: string;
-    labels?: Record<string, string>;
-  }): Promise<ManagedAgent> {
+  private async importProviderSessionInternal(
+    input: {
+      provider: AgentProvider;
+      providerHandleId: string;
+      cwd: string;
+      workspaceId: string;
+      labels?: Record<string, string>;
+    },
+    reservation: AgentRuntimeCapacityReservation,
+  ): Promise<ManagedAgent> {
     this.assertAcceptingAgentRegistrations();
     const resolvedAgentId = validateAgentId(this.idFactory(), "importProviderSession");
     this.requireEnabledProvider(input.provider);
@@ -1162,6 +1237,7 @@ export class AgentManager {
       },
       { config: providerLaunchConfig, storedConfig, launchContext },
     );
+    this.trackStartedAgentRuntime(imported.session, reservation);
     let handedToRegistration = false;
     try {
       const importedConfig = await this.normalizeConfig(
@@ -1204,12 +1280,15 @@ export class AgentManager {
     overrides?: Partial<AgentSessionConfig>,
     options?: { rehydrateFromDisk?: boolean },
   ): Promise<ManagedAgent> {
+    const provider = this.agents.get(agentId)?.provider;
     return this.trackAgentRegistrationOperation(
-      this.reloadAgentSessionInternal(agentId, overrides, options),
+      (reservation) => this.reloadAgentSessionInternal(reservation, agentId, overrides, options),
+      provider,
     );
   }
 
   private async reloadAgentSessionInternal(
+    reservation: AgentRuntimeCapacityReservation,
     agentId: string,
     overrides?: Partial<AgentSessionConfig>,
     options?: { rehydrateFromDisk?: boolean },
@@ -1240,6 +1319,7 @@ export class AgentManager {
     const session = handle
       ? await client.resumeSession(handle, providerLaunchConfig, launchContext)
       : await client.createSession(providerLaunchConfig, launchContext);
+    this.trackStartedAgentRuntime(session, reservation);
 
     let handedToRegistration = false;
     try {
@@ -1287,7 +1367,7 @@ export class AgentManager {
   private async closeReloadedSession(session: AgentSession, agentId: string): Promise<void> {
     try {
       const result = await this.waitWithTimeout({
-        operation: session.close(),
+        operation: this.closeTrackedAgentRuntime(session),
         timeoutMs: this.rescueTimeouts.reloadSessionCloseMs,
         onLateError: (error) => {
           this.logger.warn(
@@ -1374,7 +1454,7 @@ export class AgentManager {
     const closedAgent = this.prepareAgentForClosure(agent, "agent closed");
     let closeError: unknown;
     try {
-      await agent.session.close();
+      await this.closeTrackedAgentRuntime(agent.session);
     } catch (error) {
       closeError = error;
     }
@@ -2659,29 +2739,32 @@ export class AgentManager {
     session: AgentSession,
     config: AgentSessionConfig,
     agentId: string,
-    options?: {
-      createdAt?: Date;
-      updatedAt?: Date;
-      lastUserMessageAt?: Date | null;
-      labels?: Record<string, string>;
-      timeline?: AgentTimelineItem[];
-      timelineRows?: AgentTimelineRow[];
-      timelineNextSeq?: number;
-      persistence?: AgentPersistenceHandle;
-      historyPrimed?: boolean;
-      lastUsage?: AgentUsage;
-      lastError?: string;
-      attention?: AttentionState;
-      initialTitle?: string | null;
-      publishWhenReady?: boolean;
-      workspaceId?: string;
-      owner?: AgentOwner;
-    },
+    options:
+      | {
+          createdAt?: Date;
+          updatedAt?: Date;
+          lastUserMessageAt?: Date | null;
+          labels?: Record<string, string>;
+          timeline?: AgentTimelineItem[];
+          timelineRows?: AgentTimelineRow[];
+          timelineNextSeq?: number;
+          persistence?: AgentPersistenceHandle;
+          historyPrimed?: boolean;
+          lastUsage?: AgentUsage;
+          lastError?: string;
+          attention?: AttentionState;
+          initialTitle?: string | null;
+          publishWhenReady?: boolean;
+          workspaceId?: string;
+          owner?: AgentOwner;
+        }
+      | undefined,
   ): Promise<ManagedAgent> {
     let registered = false;
+    let resolvedAgentId = agentId;
     try {
       this.assertAcceptingAgentRegistrations();
-      const resolvedAgentId = validateAgentId(agentId, "registerSession");
+      resolvedAgentId = validateAgentId(agentId, "registerSession");
       if (this.agents.has(resolvedAgentId)) {
         throw new Error(`Agent with id ${resolvedAgentId} already exists`);
       }
@@ -2732,7 +2815,11 @@ export class AgentManager {
       this.subscribeToSession(managed);
       return { ...managed };
     } catch (error) {
-      if (!registered) {
+      const installedAgent = this.agents.get(resolvedAgentId);
+      if (registered && installedAgent?.session === session) {
+        this.prepareAgentForClosure(installedAgent, "agent registration failed");
+        await this.closeUnregisteredSession(session);
+      } else if (!registered) {
         await this.closeUnregisteredSession(session);
       }
       throw error;
@@ -2753,7 +2840,7 @@ export class AgentManager {
 
   private async closeUnregisteredSession(session: AgentSession): Promise<void> {
     try {
-      await session.close();
+      await this.closeTrackedAgentRuntime(session);
     } catch (error) {
       this.logger.warn({ err: error }, "Failed to close unregistered agent session");
     }
@@ -3935,7 +4022,57 @@ export class AgentManager {
     });
   }
 
-  private trackAgentRegistrationOperation<T>(result: Promise<T>): Promise<T> {
+  private trackStartedAgentRuntime(
+    session: AgentSession,
+    reservation: AgentRuntimeCapacityReservation,
+  ): void {
+    reservation.track(session);
+  }
+
+  private async closeTrackedAgentRuntime(session: AgentSession): Promise<void> {
+    try {
+      await session.close();
+      this.runtimeCapacity.release(session);
+      this.retainedAgentRuntimeCleanups.delete(session);
+    } catch (error) {
+      this.retainedAgentRuntimeCleanups.add(session);
+      throw error;
+    }
+  }
+
+  private async retryRetainedAgentRuntimeCleanups(): Promise<void> {
+    if (this.retainedAgentRuntimeCleanupRetry) {
+      await this.retainedAgentRuntimeCleanupRetry;
+      return;
+    }
+    if (this.retainedAgentRuntimeCleanups.size === 0) {
+      return;
+    }
+
+    const retry = Promise.all(
+      Array.from(this.retainedAgentRuntimeCleanups, async (session) => {
+        try {
+          await this.closeTrackedAgentRuntime(session);
+        } catch (error) {
+          this.logger.warn({ err: error }, "Failed to retry retained agent runtime cleanup");
+        }
+      }),
+    ).then(() => undefined);
+    this.retainedAgentRuntimeCleanupRetry = retry;
+    try {
+      await retry;
+    } finally {
+      if (this.retainedAgentRuntimeCleanupRetry === retry) {
+        this.retainedAgentRuntimeCleanupRetry = null;
+      }
+    }
+  }
+
+  private trackAgentRegistrationOperation<T>(
+    operation: (reservation: AgentRuntimeCapacityReservation) => Promise<T>,
+    provider?: AgentProvider,
+  ): Promise<T> {
+    const result = this.runAgentRegistrationOperation(operation, provider);
     const settled = result.then(
       () => undefined,
       () => undefined,
@@ -3946,6 +4083,23 @@ export class AgentManager {
       return undefined;
     });
     return result;
+  }
+
+  private async runAgentRegistrationOperation<T>(
+    operation: (reservation: AgentRuntimeCapacityReservation) => Promise<T>,
+    provider?: AgentProvider,
+  ): Promise<T> {
+    this.assertAcceptingAgentRegistrations();
+    await this.retryRetainedAgentRuntimeCleanups();
+    this.assertAcceptingAgentRegistrations();
+    const reservation = this.clients.get(provider ?? "")?.managesRuntimeCapacityAtSource
+      ? UNMANAGED_AGENT_RUNTIME_RESERVATION
+      : this.runtimeCapacity.reserve();
+    try {
+      return await operation(reservation);
+    } finally {
+      reservation.release();
+    }
   }
 
   /**
@@ -3962,6 +4116,7 @@ export class AgentManager {
    */
   async flushForShutdown(): Promise<void> {
     await this.flushTasks({ includeAgentRegistrations: true });
+    await this.retryRetainedAgentRuntimeCleanups();
   }
 
   private async flushTasks(options: { includeAgentRegistrations: boolean }): Promise<void> {

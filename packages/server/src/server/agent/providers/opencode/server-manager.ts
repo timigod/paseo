@@ -28,6 +28,10 @@ import {
   type ProviderRuntimeSettings,
 } from "../../provider-launch-config.js";
 import { resolveOpenCodeHomeDir } from "./paths.js";
+import type {
+  AgentRuntimeCapacityController,
+  AgentRuntimeCapacityReservation,
+} from "../../agent-sdk-types.js";
 
 const OPENCODE_SERVER_GRACEFUL_SHUTDOWN_TIMEOUT_MS = 5_000;
 const OPENCODE_SERVER_FORCE_SHUTDOWN_TIMEOUT_MS = 1_000;
@@ -46,6 +50,7 @@ export interface OpenCodeServerAcquisition {
 }
 
 export interface OpenCodeServerManagerLike {
+  configureRuntimeCapacityController(controller: AgentRuntimeCapacityController): void;
   acquireCurrent(): Promise<OpenCodeServerAcquisition>;
   acquireNew(): Promise<OpenCodeServerAcquisition>;
   acquireDedicated(env: Record<string, string>): Promise<OpenCodeServerAcquisition>;
@@ -120,6 +125,7 @@ export class OpenCodeServerManager implements OpenCodeServerManagerLike {
   private readonly createManagedProcessIdentityToken: () => string;
   private readonly verifyProcessGroupIdentity: OpenCodeProcessGroupIdentityVerifier;
   private readonly verifyProcessIdentity: OpenCodeProcessIdentityVerifier;
+  private runtimeCapacity: AgentRuntimeCapacityController | null = null;
 
   constructor(options: OpenCodeServerManagerOptions) {
     this.logger = options.logger;
@@ -132,13 +138,44 @@ export class OpenCodeServerManager implements OpenCodeServerManagerLike {
       options.resolveCommandPrefix ??
       (() => resolveProviderCommandPrefix(this.runtimeSettings?.command, resolveOpenCodeBinary));
     this.resolveHomeDir = options.resolveHomeDir ?? resolveOpenCodeHomeDir;
-    this.spawnServerProcess = options.spawnServerProcess ?? spawnProcess;
+    const spawnServerProcess = options.spawnServerProcess ?? spawnProcess;
+    this.spawnServerProcess = (command, args, spawnOptions) => {
+      let reservation: AgentRuntimeCapacityReservation | null =
+        this.runtimeCapacity?.reserve() ?? null;
+      try {
+        const child = spawnServerProcess(command, args, spawnOptions);
+        reservation?.track(child);
+        reservation = null;
+        return child;
+      } catch (error) {
+        reservation?.release();
+        throw error;
+      }
+    };
     this.createManagedProcessIdentityToken =
       options.createManagedProcessIdentityToken ?? randomUUID;
     this.verifyProcessGroupIdentity =
       options.verifyProcessGroupIdentity ?? inspectSystemProcessGroupIdentity;
     this.verifyProcessIdentity =
       options.verifyProcessIdentity ?? verifySystemManagedProcessIdentity;
+  }
+
+  configureRuntimeCapacityController(controller: AgentRuntimeCapacityController): void {
+    if (
+      this.runtimeCapacity &&
+      this.runtimeCapacity !== controller &&
+      (this.currentServer ||
+        this.retiredServers.size > 0 ||
+        this.pendingStarts.size > 0 ||
+        this.startPromise ||
+        this.newServerPromise ||
+        this.shutdownPromise)
+    ) {
+      throw new Error(
+        "OpenCode server manager already has a different runtime capacity controller",
+      );
+    }
+    this.runtimeCapacity = controller;
   }
 
   static getInstance(
@@ -714,6 +751,7 @@ export class OpenCodeServerManager implements OpenCodeServerManagerLike {
       clearTimeout(retryTimer);
       this.cleanupRetryTimers.delete(server);
     }
+    this.runtimeCapacity?.release(server.process);
     this.retiredServers.delete(server);
   }
 

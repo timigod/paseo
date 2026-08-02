@@ -392,11 +392,14 @@ function wrapClientProvider(
 ): AgentClient {
   const listImportableSessions = inner.listImportableSessions?.bind(inner);
   const importSession = inner.importSession?.bind(inner);
+  const listCommands = inner.listCommands?.bind(inner);
   const listFeatures = inner.listFeatures?.bind(inner);
 
   return {
     provider,
     capabilities: inner.capabilities,
+    managesRuntimeCapacityAtSource: inner.managesRuntimeCapacityAtSource,
+    configureRuntimeCapacityController: inner.configureRuntimeCapacityController?.bind(inner),
     createSession: async (config, launchContext) =>
       wrapSessionProvider(
         provider,
@@ -445,6 +448,9 @@ function wrapClientProvider(
       : undefined,
     resolveCreateConfig: inner.resolveCreateConfig?.bind(inner),
     isCreateConfigUnattended: inner.isCreateConfigUnattended?.bind(inner),
+    listCommands: listCommands
+      ? async (config) => await listCommands({ ...config, provider: inner.provider })
+      : undefined,
     listFeatures: listFeatures
       ? async (config) => await listFeatures({ ...config, provider: inner.provider })
       : undefined,
@@ -481,6 +487,7 @@ function wrapClientProvider(
       : undefined,
     isAvailable: () => inner.isAvailable(),
     getDiagnostic: inner.getDiagnostic?.bind(inner),
+    shutdown: inner.shutdown?.bind(inner),
   };
 }
 

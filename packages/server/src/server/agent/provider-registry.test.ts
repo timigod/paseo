@@ -6,7 +6,9 @@ import type {
   AgentFeature,
   AgentModelDefinition,
   AgentMode,
+  AgentRuntimeCapacityController,
   AgentSessionConfig,
+  AgentSlashCommand,
   ProviderCatalog,
 } from "./agent-sdk-types.js";
 
@@ -43,7 +45,10 @@ const mockState = vi.hoisted(() => {
     },
     isCommandAvailable: vi.fn(async (_command: string) => false),
     runtimeModels: new Map<string, AgentModelDefinition[]>(),
+    cursorListCommandConfigs: [] as AgentSessionConfig[],
     cursorListFeaturesConfigs: [] as AgentSessionConfig[],
+    cursorCapacityControllers: [] as AgentRuntimeCapacityController[],
+    cursorShutdownCalls: 0,
     reset() {
       this.constructorArgs.claude = [];
       this.constructorArgs.codex = [];
@@ -55,7 +60,10 @@ const mockState = vi.hoisted(() => {
       this.isCommandAvailable.mockReset();
       this.isCommandAvailable.mockImplementation(async (_command: string) => false);
       this.runtimeModels.clear();
+      this.cursorListCommandConfigs = [];
       this.cursorListFeaturesConfigs = [];
+      this.cursorCapacityControllers = [];
+      this.cursorShutdownCalls = 0;
     },
   };
 });
@@ -343,6 +351,7 @@ vi.mock("./providers/cursor-acp-agent.js", () => ({
       supportsToolInvocations: true,
     };
     readonly provider = "acp";
+    readonly managesRuntimeCapacityAtSource = true as const;
     readonly runtimeSettings?: unknown;
 
     constructor(options: {
@@ -381,6 +390,19 @@ vi.mock("./providers/cursor-acp-agent.js", () => ({
 
     async isAvailable(): Promise<boolean> {
       return true;
+    }
+
+    configureRuntimeCapacityController(controller: AgentRuntimeCapacityController): void {
+      mockState.cursorCapacityControllers.push(controller);
+    }
+
+    async shutdown(): Promise<void> {
+      mockState.cursorShutdownCalls += 1;
+    }
+
+    async listCommands(config: AgentSessionConfig): Promise<AgentSlashCommand[]> {
+      mockState.cursorListCommandConfigs.push(config);
+      return [{ name: "review", description: "Review changes", argumentHint: "", kind: "command" }];
     }
 
     async listFeatures(config: AgentSessionConfig): Promise<AgentFeature[]> {
@@ -712,7 +734,7 @@ test("cursor provider extending acp uses CursorACPAgentClient", () => {
   expect(mockState.constructorArgs.genericAcp).toEqual([]);
 });
 
-test("wrapped cursor client lists ACP features through the inner provider", async () => {
+test("wrapped cursor client preserves source runtime capacity admission", async () => {
   const registry = buildProviderRegistry(logger, {
     providerOverrides: {
       cursor: {
@@ -724,6 +746,20 @@ test("wrapped cursor client lists ACP features through the inner provider", asyn
   });
 
   const client = registry.cursor.createClient(logger);
+  const controller: AgentRuntimeCapacityController = {
+    reserve: () => ({ track: () => undefined, release: () => undefined }),
+    release: () => undefined,
+  };
+  client.configureRuntimeCapacityController?.(controller);
+
+  await expect(
+    client.listCommands?.({
+      provider: "cursor",
+      cwd: "/tmp/cursor",
+    }),
+  ).resolves.toEqual([
+    { name: "review", description: "Review changes", argumentHint: "", kind: "command" },
+  ]);
 
   await expect(
     client.listFeatures?.({
@@ -745,6 +781,16 @@ test("wrapped cursor client lists ACP features through the inner provider", asyn
       cwd: "/tmp/cursor",
     },
   ]);
+  expect(mockState.cursorListCommandConfigs).toEqual([
+    {
+      provider: "acp",
+      cwd: "/tmp/cursor",
+    },
+  ]);
+  expect(client.managesRuntimeCapacityAtSource).toBe(true);
+  expect(mockState.cursorCapacityControllers).toEqual([controller]);
+  await client.shutdown?.();
+  expect(mockState.cursorShutdownCalls).toBe(1);
 });
 
 test("traecli provider extending acp uses TraeACPAgentClient", () => {

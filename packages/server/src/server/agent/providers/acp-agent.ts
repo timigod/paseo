@@ -6,7 +6,7 @@ import path from "node:path";
 import { Readable, Writable } from "node:stream";
 
 import { terminateWithTreeKill } from "../../../utils/tree-kill.js";
-import type { ProcessTerminator } from "../../../utils/tree-kill.js";
+import type { ProcessTerminator, TerminateWithTreeKillResult } from "../../../utils/tree-kill.js";
 import type {
   ReadableStream as NodeReadableStream,
   WritableStream as NodeWritableStream,
@@ -76,6 +76,8 @@ import {
   type AgentPromptInput,
   type AgentRunOptions,
   type AgentRunResult,
+  type AgentRuntimeCapacityController,
+  type AgentRuntimeCapacityReservation,
   type AgentRuntimeInfo,
   type AgentSession,
   type AgentSessionConfig,
@@ -119,6 +121,24 @@ function assertChildWithPipes(
 ): asserts child is ChildProcessWithoutNullStreams {
   if (!child.stdin || !child.stdout || !child.stderr) {
     throw new Error("Child process did not expose stdio pipes");
+  }
+}
+
+function spawnCapacityTrackedACPProcess(
+  runtimeCapacity: AgentRuntimeCapacityController | null | undefined,
+  spawn: () => ChildProcess,
+): ChildProcessWithoutNullStreams {
+  let reservation: AgentRuntimeCapacityReservation | null = runtimeCapacity?.reserve() ?? null;
+  try {
+    const child = spawn();
+    assertChildWithPipes(child);
+    reservation?.track(child);
+    reservation = null;
+    child.once("exit", () => runtimeCapacity?.release(child));
+    return child;
+  } catch (error) {
+    reservation?.release();
+    throw error;
   }
 }
 
@@ -427,6 +447,7 @@ interface ACPAgentSessionOptions {
   waitForInitialCommands?: boolean;
   initialCommandsWaitTimeoutMs?: number;
   terminateProcess?: ProcessTerminator;
+  runtimeCapacity?: AgentRuntimeCapacityController;
 }
 
 export interface SpawnedACPProcess {
@@ -697,6 +718,7 @@ export function deriveFeaturesFromACP(
 export class ACPAgentClient implements AgentClient {
   readonly provider: string;
   readonly capabilities: AgentCapabilityFlags;
+  readonly managesRuntimeCapacityAtSource = true as const;
 
   protected readonly logger: Logger;
   protected readonly runtimeSettings?: ProviderRuntimeSettings;
@@ -729,6 +751,10 @@ export class ACPAgentClient implements AgentClient {
   private readonly initialCommandsWaitTimeoutMs: number;
   private readonly extensionCommandsParser?: ACPExtensionCommandsParser;
   protected readonly terminateProcess: ProcessTerminator;
+  private runtimeCapacity: AgentRuntimeCapacityController | null = null;
+  private readonly retainedSessionCleanups = new Set<ACPAgentSession>();
+  private readonly retainedProbeCleanups = new Set<UninitializedACPProcess>();
+  private retainedRuntimeCleanupRetry: Promise<void> | null = null;
 
   constructor(options: ACPAgentClientOptions) {
     this.provider = options.provider;
@@ -757,10 +783,28 @@ export class ACPAgentClient implements AgentClient {
     this.extensionCommandsParser = options.extensionCommandsParser;
   }
 
+  configureRuntimeCapacityController(controller: AgentRuntimeCapacityController): void {
+    if (this.runtimeCapacity && this.runtimeCapacity !== controller) {
+      throw new Error(`${this.provider} already has a different runtime capacity controller`);
+    }
+    this.runtimeCapacity = controller;
+  }
+
+  async shutdown(): Promise<void> {
+    await this.retryRetainedRuntimeCleanups();
+    const retained = this.retainedSessionCleanups.size + this.retainedProbeCleanups.size;
+    if (retained > 0) {
+      throw new Error(
+        `Failed to close ${retained} retained ACP runtime${retained === 1 ? "" : "s"}`,
+      );
+    }
+  }
+
   async createSession(
     config: AgentSessionConfig,
     launchContext?: AgentLaunchContext,
   ): Promise<AgentSession> {
+    await this.retryRetainedRuntimeCleanups();
     this.assertProvider(config);
     const session = new ACPAgentSession(
       { ...config, provider: this.provider },
@@ -787,10 +831,16 @@ export class ACPAgentClient implements AgentClient {
         extensionCommandsParser: this.extensionCommandsParser,
         waitForInitialCommands: this.waitForInitialCommands,
         initialCommandsWaitTimeoutMs: this.initialCommandsWaitTimeoutMs,
+        runtimeCapacity: this.runtimeCapacity ?? undefined,
       },
     );
-    await session.initializeNewSession();
-    return session;
+    try {
+      await session.initializeNewSession();
+      return session;
+    } catch (error) {
+      this.retainedSessionCleanups.add(session);
+      throw error;
+    }
   }
 
   async resumeSession(
@@ -798,6 +848,7 @@ export class ACPAgentClient implements AgentClient {
     overrides?: Partial<AgentSessionConfig>,
     launchContext?: AgentLaunchContext,
   ): Promise<AgentSession> {
+    await this.retryRetainedRuntimeCleanups();
     if (handle.provider !== this.provider) {
       throw new Error(`Cannot resume ${handle.provider} handle with ${this.provider} provider`);
     }
@@ -838,9 +889,15 @@ export class ACPAgentClient implements AgentClient {
       extensionCommandsParser: this.extensionCommandsParser,
       waitForInitialCommands: this.waitForInitialCommands,
       initialCommandsWaitTimeoutMs: this.initialCommandsWaitTimeoutMs,
+      runtimeCapacity: this.runtimeCapacity ?? undefined,
     });
-    await session.initializeResumedSession();
-    return session;
+    try {
+      await session.initializeResumedSession();
+      return session;
+    } catch (error) {
+      this.retainedSessionCleanups.add(session);
+      throw error;
+    }
   }
 
   async fetchCatalog(options: FetchCatalogOptions): Promise<ProviderCatalog> {
@@ -995,22 +1052,24 @@ export class ACPAgentClient implements AgentClient {
       probe.initialize = initialize;
       return initializedProbe;
     } catch (error) {
-      await terminateChildProcess(transport.child, 2_000, this.terminateProcess);
+      await this.closeProbe(probe);
       throw error;
     }
   }
 
   protected async spawnTransport(launchEnv?: Record<string, string>): Promise<ACPProcessTransport> {
+    await this.retryRetainedRuntimeCleanups();
     const { command, args } = await this.resolveLaunchCommand();
-    const child = spawnProcess(command, args, {
-      cwd: process.cwd(),
-      ...createProviderEnvSpec({
-        runtimeSettings: this.runtimeSettings,
-        overlays: [launchEnv],
+    const child = spawnCapacityTrackedACPProcess(this.runtimeCapacity, () =>
+      spawnProcess(command, args, {
+        cwd: process.cwd(),
+        ...createProviderEnvSpec({
+          runtimeSettings: this.runtimeSettings,
+          overlays: [launchEnv],
+        }),
+        stdio: ["pipe", "pipe", "pipe"],
       }),
-      stdio: ["pipe", "pipe", "pipe"],
-    });
-    assertChildWithPipes(child);
+    );
 
     const stderrChunks: string[] = [];
     child.stderr.on("data", (chunk: Buffer | string) => {
@@ -1106,9 +1165,56 @@ export class ACPAgentClient implements AgentClient {
       if (probe.initialize?.agentCapabilities?.sessionCapabilities?.close) {
         // No active session to close here; ignore capability.
       }
-    } finally {
-      await terminateChildProcess(probe.child, 2_000, this.terminateProcess);
+      await this.terminateRuntime(probe.child);
+      this.retainedProbeCleanups.delete(probe);
+    } catch (error) {
+      this.retainedProbeCleanups.add(probe);
+      throw error;
     }
+  }
+
+  private async retryRetainedRuntimeCleanups(): Promise<void> {
+    if (this.retainedRuntimeCleanupRetry) {
+      await this.retainedRuntimeCleanupRetry;
+      return;
+    }
+    if (this.retainedSessionCleanups.size === 0 && this.retainedProbeCleanups.size === 0) {
+      return;
+    }
+
+    const retry = Promise.all([
+      ...Array.from(this.retainedSessionCleanups, async (session) => {
+        try {
+          await session.close();
+          this.retainedSessionCleanups.delete(session);
+        } catch (error) {
+          this.logger.warn({ err: error }, "Failed to retry retained ACP session cleanup");
+        }
+      }),
+      ...Array.from(this.retainedProbeCleanups, async (probe) => {
+        try {
+          await this.closeProbe(probe);
+        } catch (error) {
+          this.logger.warn({ err: error }, "Failed to retry retained ACP probe cleanup");
+        }
+      }),
+    ]).then(() => undefined);
+    this.retainedRuntimeCleanupRetry = retry;
+    try {
+      await retry;
+    } finally {
+      if (this.retainedRuntimeCleanupRetry === retry) {
+        this.retainedRuntimeCleanupRetry = null;
+      }
+    }
+  }
+
+  private async terminateRuntime(child: ChildProcessWithoutNullStreams): Promise<void> {
+    const result = await terminateChildProcess(child, 2_000, this.terminateProcess);
+    if (result === "kill-timeout") {
+      throw new Error("ACP process termination did not report process exit");
+    }
+    this.runtimeCapacity?.release(child);
   }
 
   protected async runACPRequest<T>(request: () => Promise<T>): Promise<T> {
@@ -1212,7 +1318,7 @@ export class ACPAgentClient implements AgentClient {
       if (transport) {
         const cleanupStartedAt = Date.now();
         try {
-          await terminateChildProcess(transport.child, 2_000, this.terminateProcess);
+          await this.closeProbe(transport);
           rows.push({
             label: "ACP cleanup",
             value: `ok (${formatDurationMs(cleanupStartedAt)})`,
@@ -1327,14 +1433,17 @@ export class ACPAgentSession implements AgentSession, ACPClient {
   private activeForegroundTurnId: string | null = null;
   private fallbackAssistantMessageId: string | null = null;
   private closed = false;
+  private closePromise: Promise<void> | null = null;
   private historyPending = false;
   private replayingHistory = false;
   private bootstrapThreadEventPending = false;
   private readonly terminateProcess: ProcessTerminator;
+  private readonly runtimeCapacity?: AgentRuntimeCapacityController;
 
   constructor(config: AgentSessionConfig, options: ACPAgentSessionOptions) {
     this.provider = options.provider;
     this.terminateProcess = options.terminateProcess ?? terminateWithTreeKill;
+    this.runtimeCapacity = options.runtimeCapacity;
     this.capabilities = options.capabilities;
     this.logger = options.logger.child({ module: "agent", provider: options.provider });
     this.runtimeSettings = options.runtimeSettings;
@@ -1478,7 +1587,7 @@ export class ACPAgentSession implements AgentSession, ACPClient {
     prompt: AgentPromptInput,
     options?: AgentRunOptions,
   ): Promise<{ turnId: string }> {
-    if (this.closed) {
+    if (this.closed || this.closePromise) {
       throw new Error(`${this.provider} session is closed`);
     }
     if (!this.connection || !this.sessionId) {
@@ -2037,8 +2146,24 @@ export class ACPAgentSession implements AgentSession, ACPClient {
     if (this.closed) {
       return;
     }
-    this.closed = true;
+    if (this.closePromise) {
+      await this.closePromise;
+      return;
+    }
 
+    const close = this.closeOnce();
+    this.closePromise = close;
+    try {
+      await close;
+      this.closed = true;
+    } finally {
+      if (this.closePromise === close) {
+        this.closePromise = null;
+      }
+    }
+  }
+
+  private async closeOnce(): Promise<void> {
     this.deliverTranslatedEvents(this.flushPendingUserMessage());
     this.settleCommandsReady();
 
@@ -2073,7 +2198,16 @@ export class ACPAgentSession implements AgentSession, ACPClient {
     this.terminalEntries.clear();
 
     if (this.child) {
-      await this.terminateProcess(this.child, { gracefulTimeoutMs: 2_000, forceTimeoutMs: 2_000 });
+      const child = this.child;
+      const result = await this.terminateProcess(child, {
+        gracefulTimeoutMs: 2_000,
+        forceTimeoutMs: 2_000,
+      });
+      if (result !== "kill-timeout") {
+        this.runtimeCapacity?.release(child);
+      } else {
+        throw new Error("ACP process termination did not report process exit");
+      }
     }
 
     this.subscribers.clear();
@@ -2320,22 +2454,23 @@ export class ACPAgentSession implements AgentSession, ACPClient {
 
     const command = prefix.command;
     const args = [...prefix.args, ...this.defaultCommand.slice(1)];
-    const child = spawnProcess(command, args, {
-      cwd: this.config.cwd,
-      ...createProviderEnvSpec({
-        runtimeSettings: this.runtimeSettings,
-        overlays: [this.launchEnv],
+    const child = spawnCapacityTrackedACPProcess(this.runtimeCapacity, () =>
+      spawnProcess(command, args, {
+        cwd: this.config.cwd,
+        ...createProviderEnvSpec({
+          runtimeSettings: this.runtimeSettings,
+          overlays: [this.launchEnv],
+        }),
+        stdio: ["pipe", "pipe", "pipe"],
       }),
-      stdio: ["pipe", "pipe", "pipe"],
-    });
-    assertChildWithPipes(child);
+    );
 
     const stderrChunks: string[] = [];
     child.stderr.on("data", (chunk: Buffer | string) => {
       stderrChunks.push(chunk.toString());
     });
     child.once("exit", (code, signal) => {
-      if (this.closed) {
+      if (this.closed || this.closePromise) {
         return;
       }
       if (this.activeForegroundTurnId) {
@@ -3475,9 +3610,9 @@ async function terminateChildProcess(
   child: ChildProcessWithoutNullStreams,
   timeoutMs: number,
   terminate: ProcessTerminator,
-): Promise<void> {
+): Promise<TerminateWithTreeKillResult> {
   try {
-    await terminate(child, { gracefulTimeoutMs: timeoutMs, forceTimeoutMs: timeoutMs });
+    return await terminate(child, { gracefulTimeoutMs: timeoutMs, forceTimeoutMs: timeoutMs });
   } finally {
     child.stdin.destroy();
     child.stdout.destroy();

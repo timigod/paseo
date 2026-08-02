@@ -16,6 +16,7 @@ import {
   TestOpenCodeClient,
   TestOpenCodeHarness,
 } from "./opencode/test-utils/test-opencode-harness.js";
+import { AgentManager } from "../agent-manager.js";
 import type {
   AgentSessionConfig,
   AgentStreamEvent,
@@ -34,6 +35,19 @@ function tmpCwd(): string {
 }
 
 const TEST_MODEL = "opencode/big-pickle";
+
+interface Deferred<T> {
+  promise: Promise<T>;
+  resolve(value: T): void;
+}
+
+function deferred<T>(): Deferred<T> {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((next) => {
+    resolve = next;
+  });
+  return { promise, resolve };
+}
 
 interface TurnResult {
   events: AgentStreamEvent[];
@@ -246,6 +260,126 @@ describe("OpenCodeAgentClient adapter smoke tests", () => {
     provider: "opencode",
     cwd,
     model: TEST_MODEL,
+  });
+
+  class AvailableOpenCodeAgentClient extends OpenCodeAgentClient {
+    override async isAvailable(): Promise<boolean> {
+      return true;
+    }
+  }
+
+  test("rejects an injected server manager without capacity controller injection", () => {
+    const runtime = new TestOpenCodeHarness();
+    Reflect.defineProperty(runtime, "configureRuntimeCapacityController", {
+      configurable: true,
+      value: undefined,
+    });
+
+    expect(
+      () =>
+        new OpenCodeAgentClient(logger, undefined, {
+          serverManager: runtime,
+          createClient: runtime.createClient,
+        }),
+    ).toThrow("OpenCode server manager must support runtime capacity controller injection");
+  });
+
+  test("charges the shared OpenCode runtime once across concurrent draft commands", async () => {
+    const runtime = new TestOpenCodeHarness();
+    const firstOpenCode = new TestOpenCodeClient();
+    const firstCommandStarted = deferred<void>();
+    const finishFirstCommand = deferred<void>();
+    firstOpenCode.commandListImplementation = async () => {
+      firstCommandStarted.resolve();
+      await finishFirstCommand.promise;
+      return { data: [] };
+    };
+    runtime.enqueueClient(firstOpenCode);
+    const client = new AvailableOpenCodeAgentClient(logger, undefined, {
+      serverManager: runtime,
+      createClient: runtime.createClient,
+    });
+    const manager = new AgentManager({
+      clients: { opencode: client },
+      logger,
+      maxActiveAgentRuntimes: 1,
+    });
+    const config = buildConfig(process.cwd());
+    const expectedCommands = [
+      {
+        name: "compact",
+        description: "Compact the current session",
+        argumentHint: "",
+        kind: "command",
+      },
+      {
+        name: "summarize",
+        description: "Compact the current session",
+        argumentHint: "",
+        kind: "command",
+      },
+    ];
+
+    const first = manager.listDraftCommands(config);
+    await firstCommandStarted.promise;
+    const second = manager.listDraftCommands(config);
+    expect({
+      acquisitions: runtime.acquisitions,
+    }).toEqual({
+      acquisitions: [{ kind: "current", releaseCount: 0 }],
+    });
+
+    finishFirstCommand.resolve();
+    await expect(first).resolves.toEqual(expectedCommands);
+    await expect(second).resolves.toEqual(expectedCommands);
+    expect(runtime.acquisitions).toEqual([
+      { kind: "current", releaseCount: 1 },
+      { kind: "current", releaseCount: 1 },
+    ]);
+  });
+
+  test("routes catalog, import, draft, and agent creation through source admission", async () => {
+    const runtime = new TestOpenCodeHarness();
+    const client = new AvailableOpenCodeAgentClient(logger, undefined, {
+      serverManager: runtime,
+      createClient: runtime.createClient,
+    });
+    const manager = new AgentManager({
+      clients: { opencode: client },
+      logger,
+      maxActiveAgentRuntimes: 1,
+    });
+    const config = buildConfig(process.cwd());
+
+    const catalogClient = new TestOpenCodeClient();
+    catalogClient.providerListResponse = {
+      data: {
+        connected: ["opencode"],
+        all: [{ id: "opencode", name: "OpenCode", source: "api", models: {} }],
+      },
+    };
+    runtime.enqueueClient(catalogClient);
+    await expect(
+      client.fetchCatalog({ scope: "workspace", cwd: process.cwd(), force: false }),
+    ).resolves.toMatchObject({ models: [] });
+
+    runtime.enqueueClient(new TestOpenCodeClient());
+    await expect(manager.listImportableSessions()).resolves.toEqual([]);
+
+    runtime.enqueueClient(new TestOpenCodeClient());
+    await expect(manager.listDraftCommands(config)).resolves.toHaveLength(2);
+    await expect(manager.listDraftFeatures(config)).resolves.toHaveLength(1);
+
+    runtime.enqueueClient(new TestOpenCodeClient());
+    const agent = await manager.createAgent(config, undefined, {});
+    await manager.closeAgent(agent.id);
+
+    expect(runtime.acquisitions.map(({ kind, releaseCount }) => ({ kind, releaseCount }))).toEqual([
+      { kind: "current", releaseCount: 1 },
+      { kind: "current", releaseCount: 1 },
+      { kind: "current", releaseCount: 1 },
+      { kind: "dedicated", releaseCount: 1 },
+    ]);
   });
 
   test("creates a session with valid id and provider", async () => {
