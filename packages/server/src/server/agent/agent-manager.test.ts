@@ -623,6 +623,43 @@ class HeldRuntimeInfoClient extends TestAgentClient {
   }
 }
 
+type InitializationTerminalEvent = Extract<
+  AgentStreamEvent,
+  { type: "turn_completed" | "turn_failed" | "turn_canceled" }
+>;
+
+class InitializationTerminalSession extends TestAgentSession {
+  subscriptionCount = 0;
+  closeCount = 0;
+
+  constructor(
+    config: AgentSessionConfig,
+    private readonly terminalEvent: InitializationTerminalEvent,
+    private readonly onAvailableModes?: () => void,
+  ) {
+    super(config);
+  }
+
+  override subscribe(callback: (event: AgentStreamEvent) => void): () => void {
+    this.subscriptionCount += 1;
+    const unsubscribe = super.subscribe(callback);
+    return () => {
+      this.subscriptionCount -= 1;
+      unsubscribe();
+    };
+  }
+
+  override async getAvailableModes() {
+    this.pushEvent(this.terminalEvent);
+    this.onAvailableModes?.();
+    return [];
+  }
+
+  override async close(): Promise<void> {
+    this.closeCount += 1;
+  }
+}
+
 class StreamingAssistantSession implements AgentSession {
   readonly provider = "codex" as const;
   readonly capabilities = TEST_CAPABILITIES;
@@ -1481,6 +1518,101 @@ test("does not persist an initializing session after shutdown closes it", async 
   } finally {
     rmSync(workdir, { recursive: true, force: true });
   }
+});
+
+test.each([
+  {
+    name: "completed",
+    event: { type: "turn_completed", provider: "codex", turnId: "restored-turn" } as const,
+    lifecycle: "idle" as const,
+    lastError: undefined,
+  },
+  {
+    name: "failed",
+    event: {
+      type: "turn_failed",
+      provider: "codex",
+      turnId: "restored-turn",
+      error: "restored turn failed",
+    } as const,
+    lifecycle: "error" as const,
+    lastError: "restored turn failed",
+  },
+  {
+    name: "canceled",
+    event: {
+      type: "turn_canceled",
+      provider: "codex",
+      turnId: "restored-turn",
+      reason: "interrupted",
+    } as const,
+    lifecycle: "idle" as const,
+    lastError: undefined,
+  },
+])("restored session keeps $name events emitted during initialization", async (testCase) => {
+  const agentId = "00000000-0000-4000-8000-000000000107";
+  const session = new InitializationTerminalSession(
+    { provider: "codex", cwd: process.cwd() },
+    testCase.event,
+  );
+  const client = new (class extends TestAgentClient {
+    override async resumeSession(): Promise<AgentSession> {
+      return session;
+    }
+  })();
+  const manager = new AgentManager({ clients: { codex: client }, logger });
+
+  try {
+    const snapshot = await manager.resumeAgentFromPersistence(
+      { provider: "codex", sessionId: "provider-session-1" },
+      { cwd: process.cwd() },
+      agentId,
+      { resumeRunning: true },
+    );
+    await manager.flush();
+
+    expect(snapshot.lifecycle).toBe(testCase.lifecycle);
+    expect(snapshot.lastError).toBe(testCase.lastError);
+    expect(manager.getAgent(agentId)?.lifecycle).toBe(testCase.lifecycle);
+    expect(manager.hasInFlightRun(agentId)).toBe(false);
+    expect(session.subscriptionCount).toBe(1);
+  } finally {
+    await manager.closeAgent(agentId).catch(() => undefined);
+  }
+
+  expect(session.subscriptionCount).toBe(0);
+  expect(session.closeCount).toBe(1);
+});
+
+test("restored session initialization failure removes its subscription and tracked run", async () => {
+  const agentId = "00000000-0000-4000-8000-000000000108";
+  let manager: AgentManager;
+  const session = new InitializationTerminalSession(
+    { provider: "codex", cwd: process.cwd() },
+    { type: "turn_completed", provider: "codex", turnId: "restored-turn" },
+    () => manager.prepareForShutdown(),
+  );
+  const client = new (class extends TestAgentClient {
+    override async resumeSession(): Promise<AgentSession> {
+      return session;
+    }
+  })();
+  manager = new AgentManager({ clients: { codex: client }, logger });
+
+  await expect(
+    manager.resumeAgentFromPersistence(
+      { provider: "codex", sessionId: "provider-session-1" },
+      { cwd: process.cwd() },
+      agentId,
+      { resumeRunning: true },
+    ),
+  ).rejects.toBeInstanceOf(AgentManagerShuttingDownError);
+  await manager.flushForShutdown();
+
+  expect(manager.listAgents()).toEqual([]);
+  expect(manager.hasInFlightRun(agentId)).toBe(false);
+  expect(session.subscriptionCount).toBe(0);
+  expect(session.closeCount).toBe(1);
 });
 
 test("reload leaves a closed durable snapshot when shutdown starts during the swap", async () => {

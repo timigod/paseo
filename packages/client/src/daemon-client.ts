@@ -2969,7 +2969,11 @@ export class DaemonClient {
     return payload;
   }
 
-  async cancelAgent(agentId: string): Promise<CancelAgentOutcome> {
+  async cancelAgent(agentId: string): Promise<void> {
+    await this.cancelAgentWithOutcome(agentId);
+  }
+
+  async cancelAgentWithOutcome(agentId: string): Promise<CancelAgentOutcome> {
     const requestId = this.createRequestId();
     const message = SessionInboundMessageSchema.parse({
       type: "cancel_agent_request",

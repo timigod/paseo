@@ -24,6 +24,7 @@ expectTypeOf<
 expectTypeOf<
   "exploreFileSystem" extends keyof DaemonClient ? true : false
 >().toEqualTypeOf<false>();
+expectTypeOf<DaemonClient["cancelAgent"]>().toEqualTypeOf<(agentId: string) => Promise<void>>();
 
 function createMockLogger() {
   return {
@@ -161,7 +162,7 @@ afterEach(async () => {
   vi.unstubAllGlobals();
 });
 
-test("cancelAgent returns explicit outcomes and marks legacy receipts unknown", async () => {
+test("cancelAgent keeps its void contract while outcome-aware cancellation handles new responses", async () => {
   const mock = createMockTransport();
   const client = new DaemonClient({
     url: "ws://test",
@@ -189,9 +190,25 @@ test("cancelAgent returns explicit outcomes and marks legacy receipts unknown", 
       },
     }),
   );
-  await expect(explicitPromise).resolves.toBe("not_running");
+  await expect(explicitPromise).resolves.toBeUndefined();
 
-  const legacyPromise = client.cancelAgent("agent-1");
+  const outcomePromise = client.cancelAgentWithOutcome("agent-1");
+  const outcomeRequest = parseSentFrame(mock.sent.at(-1));
+  mock.triggerMessage(
+    wrapSessionMessage({
+      type: "cancel_agent_response",
+      payload: {
+        requestId: outcomeRequest.requestId,
+        agentId: "agent-1",
+        agent: null,
+        outcome: "not_running",
+        error: null,
+      },
+    }),
+  );
+  await expect(outcomePromise).resolves.toBe("not_running");
+
+  const legacyPromise = client.cancelAgentWithOutcome("agent-1");
   const legacyRequest = parseSentFrame(mock.sent.at(-1));
   mock.triggerMessage(
     wrapSessionMessage({

@@ -116,7 +116,7 @@ test("persisted-running agent stays controllable while restart requests load it 
     const timelinePromise = client.fetchAgentTimeline(fixture.healthyAgentId, {
       requestId: "req-persisted-running-timeline",
     });
-    const cancelPromise = client.cancelAgent(fixture.healthyAgentId);
+    const cancelPromise = client.cancelAgentWithOutcome(fixture.healthyAgentId);
     releaseInitialization.resolve();
 
     const [finish, cancelOutcome] = await Promise.all([

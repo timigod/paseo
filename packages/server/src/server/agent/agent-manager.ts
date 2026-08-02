@@ -3117,6 +3117,11 @@ export class AgentManager {
       this.assertAcceptingAgentRegistrations();
       this.agents.set(resolvedAgentId, managed);
       registered = true;
+      if (options?.resumeRunning) {
+        managed.lifecycle = "running";
+        this.runs.trackAutonomousRun(managed.id, null);
+        this.subscribeToSession(managed);
+      }
       // Initialize previousStatus to track transitions
       this.previousStatuses.set(resolvedAgentId, managed.lifecycle);
       await this.refreshRuntimeInfo(managed, { emit: false });
@@ -3134,15 +3139,19 @@ export class AgentManager {
 
       await this.refreshSessionState(managed, { emit: false });
       this.assertAgentRegistrationActive(managed);
-      managed.lifecycle = options?.resumeRunning ? "running" : "idle";
       if (options?.resumeRunning) {
-        this.runs.trackAutonomousRun(managed.id, null);
+        await this.drainSessionEvents(managed.id);
+      } else {
+        managed.lifecycle = "idle";
       }
+      this.assertAgentRegistrationActive(managed);
       this.touchUpdatedAt(managed);
       await this.persistSnapshot(managed);
       this.assertAgentRegistrationActive(managed);
       this.emitState(managed, { persist: false });
-      this.subscribeToSession(managed);
+      if (!options?.resumeRunning) {
+        this.subscribeToSession(managed);
+      }
       return { ...managed };
     } catch (error) {
       const installedAgent = this.agents.get(resolvedAgentId);
