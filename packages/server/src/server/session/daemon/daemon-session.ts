@@ -1,5 +1,6 @@
 import type pino from "pino";
 import type { ProviderAvailability } from "../../agent/agent-manager.js";
+import type { AgentRuntimeCapacitySnapshot } from "../../agent/agent-runtime-capacity.js";
 import type { SessionInboundMessage, SessionOutboundMessage } from "../../messages.js";
 import { getPidLockInfo } from "../../pid-lock.js";
 import { generateLocalPairingOffer } from "../../pairing-offer.js";
@@ -48,6 +49,7 @@ export interface DaemonSessionOptions {
   listProjects: () => Promise<PersistedProjectRecord[]>;
   listWorkspaces: () => Promise<PersistedWorkspaceRecord[]>;
   listProviderAvailability: () => Promise<ProviderAvailability[]>;
+  getAgentRuntimeCapacity: () => AgentRuntimeCapacitySnapshot;
   getWebSocketRuntimeMetrics?: () => DaemonWebSocketRuntimeDiagnosticSnapshot | null;
   logger: pino.Logger;
   hubRelationships?: HubRelationshipManagement;
@@ -71,6 +73,7 @@ export class DaemonSession {
   private readonly listProjects: () => Promise<PersistedProjectRecord[]>;
   private readonly listWorkspaces: () => Promise<PersistedWorkspaceRecord[]>;
   private readonly listProviderAvailability: () => Promise<ProviderAvailability[]>;
+  private readonly getAgentRuntimeCapacity: () => AgentRuntimeCapacitySnapshot;
   private readonly getWebSocketRuntimeMetrics: () => DaemonWebSocketRuntimeDiagnosticSnapshot | null;
   private readonly logger: pino.Logger;
   private readonly selfUpdate: DaemonSelfUpdateSessionController;
@@ -87,6 +90,7 @@ export class DaemonSession {
     this.listProjects = options.listProjects;
     this.listWorkspaces = options.listWorkspaces;
     this.listProviderAvailability = options.listProviderAvailability;
+    this.getAgentRuntimeCapacity = options.getAgentRuntimeCapacity;
     this.getWebSocketRuntimeMetrics = options.getWebSocketRuntimeMetrics ?? (() => null);
     this.logger = options.logger;
     this.hubRelationships = options.hubRelationships ?? null;
@@ -153,6 +157,7 @@ export class DaemonSession {
   async handleGetStatusRequest(
     msg: Extract<SessionInboundMessage, { type: "daemon.get_status.request" }>,
   ): Promise<void> {
+    const runtimeCapacity = this.getAgentRuntimeCapacity();
     try {
       const pidInfo = await getPidLockInfo(this.paseoHome);
       const providers = (await this.listProviderAvailability()).map((p) => ({
@@ -172,6 +177,7 @@ export class DaemonSession {
           listen: this.daemonRuntimeConfig?.listen ?? null,
           relay: this.daemonRuntimeConfig?.relay ?? null,
           providers,
+          runtimeCapacity,
         },
       });
     } catch (error) {
@@ -188,6 +194,7 @@ export class DaemonSession {
           listen: null,
           relay: null,
           providers: [],
+          runtimeCapacity,
         },
       });
     }

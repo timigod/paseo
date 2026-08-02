@@ -3,6 +3,13 @@ import type {
   AgentRuntimeCapacityReservation,
 } from "./agent-sdk-types.js";
 
+export interface AgentRuntimeCapacitySnapshot {
+  limit: number | null;
+  live: number;
+  reserved: number;
+  free: number | null;
+}
+
 export class AgentRuntimeCapacityError extends Error {
   constructor(
     public readonly limit: number,
@@ -21,6 +28,17 @@ export class HostAgentRuntimeCapacityController implements AgentRuntimeCapacityC
   private reservations = 0;
 
   constructor(private readonly limit: number | null) {}
+
+  snapshot(): AgentRuntimeCapacitySnapshot {
+    const live = this.liveRuntimes.size;
+    const reserved = this.reservations;
+    return {
+      limit: this.limit,
+      live,
+      reserved,
+      free: this.limit === null ? null : Math.max(0, this.limit - live - reserved),
+    };
+  }
 
   reserve(): AgentRuntimeCapacityReservation {
     const live = this.liveRuntimes.size;

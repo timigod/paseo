@@ -10,6 +10,7 @@ import {
 } from "./daemon-session.js";
 import type { DaemonWebSocketRuntimeDiagnosticSnapshot } from "./diagnostics.js";
 import type { ProviderAvailability } from "../../agent/agent-manager.js";
+import type { AgentRuntimeCapacitySnapshot } from "../../agent/agent-runtime-capacity.js";
 import type { HubRelationshipManagement } from "../../hub/relationship-controller.js";
 import type { SessionOutboundMessage } from "../../messages.js";
 
@@ -40,6 +41,7 @@ function makeSubsystem(overrides: {
   daemonVersion?: string;
   daemonRuntimeConfig?: DaemonRuntimeConfig;
   listProviderAvailability?: () => Promise<ProviderAvailability[]>;
+  getAgentRuntimeCapacity?: () => AgentRuntimeCapacitySnapshot;
   getWebSocketRuntimeMetrics?: () => DaemonWebSocketRuntimeDiagnosticSnapshot | null;
   hubRelationships?: HubRelationshipManagement;
 }) {
@@ -61,6 +63,9 @@ function makeSubsystem(overrides: {
     listProjects: async () => [],
     listWorkspaces: async () => [],
     listProviderAvailability: overrides.listProviderAvailability ?? (async () => []),
+    getAgentRuntimeCapacity:
+      overrides.getAgentRuntimeCapacity ??
+      (() => ({ limit: null, live: 0, reserved: 0, free: null })),
     getWebSocketRuntimeMetrics: overrides.getWebSocketRuntimeMetrics,
     hubRelationships: overrides.hubRelationships,
     logger: pino({ level: "silent" }),
@@ -132,6 +137,7 @@ describe("DaemonSession", () => {
         { provider: "claude", available: true, error: null },
         { provider: "codex", available: false, error: "boom" },
       ],
+      getAgentRuntimeCapacity: () => ({ limit: 12, live: 10, reserved: 1, free: 1 }),
     });
 
     await subsystem.handleGetStatusRequest({ type: "daemon.get_status.request", requestId: "s-1" });
@@ -152,6 +158,7 @@ describe("DaemonSession", () => {
             { provider: "claude", available: true, error: null },
             { provider: "codex", available: false, error: "boom" },
           ],
+          runtimeCapacity: { limit: 12, live: 10, reserved: 1, free: 1 },
         },
       },
     ]);
@@ -182,6 +189,7 @@ describe("DaemonSession", () => {
           listen: null,
           relay: null,
           providers: [],
+          runtimeCapacity: { limit: null, live: 0, reserved: 0, free: null },
         },
       },
     ]);

@@ -3788,6 +3788,14 @@ export const GetDaemonConfigResponseMessageSchema = z.object({
     .passthrough(),
 });
 
+// COMPAT(runtimeCapacityStatus): added in v0.2.6, keep optional until 2027-02-02
+export const DaemonRuntimeCapacityStatusSchema = z.object({
+  limit: z.number().int().positive().nullable(),
+  live: z.number().int().nonnegative(),
+  reserved: z.number().int().nonnegative(),
+  free: z.number().int().nonnegative().nullable(),
+});
+
 export const DaemonGetStatusResponseSchema = z.object({
   type: z.literal("daemon.get_status.response"),
   payload: z
@@ -3816,6 +3824,7 @@ export const DaemonGetStatusResponseSchema = z.object({
           error: z.string().nullable().optional(),
         }),
       ),
+      runtimeCapacity: DaemonRuntimeCapacityStatusSchema.optional(),
     })
     .passthrough(),
 });
