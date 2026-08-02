@@ -548,6 +548,56 @@ describe("WorkspaceGitServiceImpl", () => {
     service.dispose();
   });
 
+  test("refresh preserves typed Git pressure from shortstat lookup", async () => {
+    const pressure = new GitCommandBackpressureError(8, 64, 8, 64);
+    const service = createService({
+      getCheckoutShortstat: vi.fn(async () => {
+        throw pressure;
+      }),
+    });
+
+    await expect(service.refresh(REPO_CWD)).rejects.toBe(pressure);
+    service.dispose();
+  });
+
+  test("refresh preserves typed Git pressure from forge authentication", async () => {
+    const pressure = new GitCommandBackpressureError(8, 64, 8, 64);
+    const github = {
+      ...createGitHubServiceStub(),
+      isAuthenticated: vi.fn(async () => {
+        throw pressure;
+      }),
+    };
+    const service = createService({ forgeOverrides: { github } });
+
+    await expect(
+      service.getSnapshot(REPO_CWD, {
+        force: true,
+        includeForge: true,
+        reason: "forge-auth-pressure",
+      }),
+    ).rejects.toBe(pressure);
+    service.dispose();
+  });
+
+  test("refresh preserves typed Git pressure from forge status lookup", async () => {
+    const pressure = new GitCommandBackpressureError(8, 64, 8, 64);
+    const service = createService({
+      getPullRequestStatus: vi.fn(async () => {
+        throw pressure;
+      }),
+    });
+
+    await expect(
+      service.getSnapshot(REPO_CWD, {
+        force: true,
+        includeForge: true,
+        reason: "forge-status-pressure",
+      }),
+    ).rejects.toBe(pressure);
+    service.dispose();
+  });
+
   test("cold getSnapshot calls share one workspace target setup and cache the snapshot", async () => {
     const checkoutStatusDeferred = createDeferred<CheckoutStatusGit>();
     const getCheckoutStatus = vi.fn(async () => checkoutStatusDeferred.promise);

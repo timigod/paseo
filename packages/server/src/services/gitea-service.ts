@@ -2,7 +2,7 @@ import { z } from "zod";
 import pLimit from "p-limit";
 import { parseGitHubRemoteIdentity, parseGitRemoteLocation } from "@getpaseo/protocol/git-remote";
 import { findExecutable } from "../executable-resolution/executable-resolution.js";
-import { runGitCommand } from "../utils/run-git-command.js";
+import { runGitCommand, throwIfGitCommandBackpressure } from "../utils/run-git-command.js";
 import { execCommand } from "../utils/spawn.js";
 import {
   createCachedCliPathResolver,
@@ -399,7 +399,8 @@ async function defaultResolveCurrentBranch(cwd: string): Promise<string | null> 
     const { stdout } = await runGitCommand(["branch", "--show-current"], { cwd });
     const branch = stdout.trim();
     return branch.length > 0 ? branch : null;
-  } catch {
+  } catch (error) {
+    throwIfGitCommandBackpressure(error);
     return null;
   }
 }

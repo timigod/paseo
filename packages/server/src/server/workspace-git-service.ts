@@ -2553,7 +2553,10 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
 
     const diffStat = await this.deps
       .getCheckoutShortstat(cwd, context, { force: request.force })
-      .catch(() => null);
+      .catch((error) => {
+        throwIfGitCommandBackpressure(error);
+        return null;
+      });
     this.assertWorkspaceTargetOpen(target);
     if (target.repositoryFactsGeneration !== repositoryFactsGeneration) {
       return facts;
@@ -2884,6 +2887,7 @@ async function loadForgeSnapshot(options: {
     try {
       await forgeService.isAuthenticated({ cwd: options.cwd });
     } catch (error) {
+      throwIfGitCommandBackpressure(error);
       return buildForgeSnapshot(forgeAuthStateFromError(error), null, null);
     }
   }
@@ -2900,6 +2904,7 @@ async function loadForgeSnapshot(options: {
     );
     return buildForgeSnapshot(result.authState, result.status, result.error ?? null);
   } catch (error) {
+    throwIfGitCommandBackpressure(error);
     // The auth probe succeeded, so a failure here is a command error, not an
     // auth problem — surface it as an error while keeping features enabled.
     return buildForgeSnapshot(

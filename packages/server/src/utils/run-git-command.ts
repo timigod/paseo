@@ -1,5 +1,4 @@
 import { existsSync } from "node:fs";
-import pLimit from "p-limit";
 import type { Logger } from "pino";
 import type { ProcessEnvRecord } from "../server/paseo-env.js";
 import {
@@ -19,17 +18,15 @@ const gitConcurrency = parseIntegerEnv("PASEO_GIT_CONCURRENCY", 8, 1, MAX_GIT_CO
 const gitMaxPending = parseIntegerEnv(
   "PASEO_GIT_MAX_PENDING",
   DEFAULT_MAX_PENDING,
-  0,
+  1,
   MAX_GIT_PENDING,
 );
-const gitLimit = pLimit(gitConcurrency);
 const gitRuntimeMetrics = new GitCommandRuntimeMetricsWindow(
   gitConcurrency,
   Date.now,
   gitMaxPending,
 );
 const admittedGitCommands = new Set<Promise<unknown>>();
-let gitCommandAdmissionCount = 0;
 
 export interface GitCommandOptions {
   cwd: string;
@@ -49,6 +46,118 @@ export interface GitCommandResult {
   exitCode: number | null;
   signal: NodeJS.Signals | null;
 }
+
+interface GitExecutorEntry {
+  run: () => Promise<unknown>;
+  resolve: (value: unknown) => void;
+  reject: (error: unknown) => void;
+}
+
+interface SubmittedGitTask<T> {
+  promise: Promise<T>;
+  cancel: (error: Error) => boolean;
+}
+
+class GitCommandExecutor {
+  private readonly starting: GitExecutorEntry[] = [];
+  private readonly queue: GitExecutorEntry[] = [];
+  private runningCount = 0;
+  private pumpScheduled = false;
+
+  constructor(private readonly concurrency: number) {}
+
+  get activeCount(): number {
+    return this.runningCount + this.starting.length;
+  }
+
+  get pendingCount(): number {
+    return this.queue.length;
+  }
+
+  get admittedCount(): number {
+    return this.activeCount + this.pendingCount;
+  }
+
+  submit<T>(run: () => Promise<T>): SubmittedGitTask<T> {
+    let resolvePromise!: (value: T | PromiseLike<T>) => void;
+    let rejectPromise!: (error: unknown) => void;
+    const promise = new Promise<T>((resolve, reject) => {
+      resolvePromise = resolve;
+      rejectPromise = reject;
+    });
+    const entry: GitExecutorEntry = {
+      run,
+      resolve: (value) => resolvePromise(value as T),
+      reject: rejectPromise,
+    };
+    if (this.activeCount < this.concurrency) {
+      this.starting.push(entry);
+    } else {
+      this.queue.push(entry);
+    }
+    this.schedulePump();
+
+    return {
+      promise,
+      cancel: (error) => {
+        const startingIndex = this.starting.indexOf(entry);
+        const queueIndex = this.queue.indexOf(entry);
+        if (startingIndex < 0 && queueIndex < 0) return false;
+        if (startingIndex >= 0) {
+          this.starting.splice(startingIndex, 1);
+          this.promotePending();
+        } else {
+          this.queue.splice(queueIndex, 1);
+        }
+        entry.reject(error);
+        return true;
+      },
+    };
+  }
+
+  private schedulePump(): void {
+    if (this.pumpScheduled) return;
+    this.pumpScheduled = true;
+    queueMicrotask(() => {
+      this.pumpScheduled = false;
+      this.pump();
+    });
+  }
+
+  private pump(): void {
+    while (this.runningCount < this.concurrency) {
+      const entry = this.starting.shift();
+      if (!entry) return;
+      this.runningCount += 1;
+
+      let task: Promise<unknown>;
+      try {
+        task = entry.run();
+      } catch (error) {
+        entry.reject(error);
+        this.finishTask();
+        continue;
+      }
+      void task.then(entry.resolve, entry.reject).finally(() => this.finishTask());
+    }
+  }
+
+  private finishTask(): void {
+    this.runningCount = Math.max(0, this.runningCount - 1);
+    this.promotePending();
+    this.schedulePump();
+  }
+
+  private promotePending(): void {
+    while (this.activeCount < this.concurrency) {
+      const entry = this.queue.shift();
+      if (!entry) return;
+      this.starting.push(entry);
+    }
+  }
+}
+
+const gitExecutor = new GitCommandExecutor(gitConcurrency);
 
 export interface GitCommandMetric {
   args: string[];
@@ -124,7 +233,10 @@ export function stopGitCommandMetrics(): GitCommandMetricsSnapshot {
 }
 
 export function snapshotGitCommandRuntimeMetrics(): GitCommandRuntimeMetricsSnapshot {
-  return gitRuntimeMetrics.snapshotAndReset();
+  return gitRuntimeMetrics.snapshotAndReset({
+    active: gitExecutor.activeCount,
+    pending: gitExecutor.pendingCount,
+  });
 }
 
 /** Wait for all commands admitted before and during the drain to leave the global executor. */
@@ -211,37 +323,19 @@ export function runGitCommand(
   options: GitCommandOptions,
 ): Promise<GitCommandResult> {
   const operation = getGitOperation(args);
-  const pending = Math.max(0, gitCommandAdmissionCount - gitLimit.activeCount);
-  if (gitCommandAdmissionCount >= gitConcurrency + gitMaxPending) {
+  const active = gitExecutor.activeCount;
+  const pending = gitExecutor.pendingCount;
+  if (gitExecutor.admittedCount >= gitConcurrency + gitMaxPending) {
     gitRuntimeMetrics.reject(operation);
-    gitRuntimeMetrics.observeLimiter(gitLimit.activeCount, pending);
+    gitRuntimeMetrics.observeLimiter(active, pending);
     return Promise.reject(
-      new GitCommandBackpressureError(gitLimit.activeCount, pending, gitConcurrency, gitMaxPending),
+      new GitCommandBackpressureError(active, pending, gitConcurrency, gitMaxPending),
     );
   }
 
   const runtimeMetric = gitRuntimeMetrics.submit(operation);
   const cancellationError = createGitCancellationError(args);
-  let state: "queued" | "started" | "canceled" = "queued";
-  let admissionReleased = false;
-  gitCommandAdmissionCount += 1;
-  const releaseAdmission = () => {
-    if (admissionReleased) return;
-    admissionReleased = true;
-    gitCommandAdmissionCount = Math.max(0, gitCommandAdmissionCount - 1);
-  };
-  const cancelQueued = (): Error | null => {
-    if (state !== "queued") return null;
-    state = "canceled";
-    gitRuntimeMetrics.cancel(runtimeMetric);
-    releaseAdmission();
-    return cancellationError;
-  };
-  const promise = gitLimit(() => {
-    if (state === "canceled") {
-      throw cancellationError;
-    }
-    state = "started";
+  const submitted = gitExecutor.submit(() => {
     if (options.signal?.aborted) {
       gitRuntimeMetrics.start(runtimeMetric);
       gitRuntimeMetrics.finish(runtimeMetric, { success: false, timedOut: false });
@@ -479,23 +573,25 @@ export function runGitCommand(
       });
     });
   });
+  const promise = submitted.promise;
+  const cancelQueued = (): Error | null => {
+    if (!submitted.cancel(cancellationError)) return null;
+    gitRuntimeMetrics.cancel(runtimeMetric);
+    gitRuntimeMetrics.observeLimiter(gitExecutor.activeCount, gitExecutor.pendingCount);
+    return cancellationError;
+  };
   admittedGitCommands.add(promise);
   void promise.then(
     () => {
       admittedGitCommands.delete(promise);
-      releaseAdmission();
       return undefined;
     },
     () => {
       admittedGitCommands.delete(promise);
-      releaseAdmission();
       return undefined;
     },
   );
-  gitRuntimeMetrics.observeLimiter(
-    gitLimit.activeCount,
-    Math.max(0, gitCommandAdmissionCount - gitLimit.activeCount),
-  );
+  gitRuntimeMetrics.observeLimiter(gitExecutor.activeCount, gitExecutor.pendingCount);
   return waitForGitCommand(promise, options.signal, cancelQueued);
 }
 

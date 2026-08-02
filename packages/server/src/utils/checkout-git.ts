@@ -548,7 +548,8 @@ async function readGitFileContentAtRef(
       envOverlay: READ_ONLY_GIT_ENV,
     });
     return stdout;
-  } catch {
+  } catch (error) {
+    throwIfGitCommandBackpressure(error);
     return null;
   }
 }
@@ -561,7 +562,8 @@ async function tryResolveMergeBase(cwd: string, baseRef: string): Promise<string
     });
     const sha = stdout.trim();
     return sha.length > 0 ? sha : null;
-  } catch {
+  } catch (error) {
+    throwIfGitCommandBackpressure(error);
     return null;
   }
 }
@@ -1045,7 +1047,8 @@ async function getWorktreePathForBranch(cwd: string, branchName: string): Promis
     const entries = parseWorktreeList(stdout);
     const ref = branchName.startsWith("refs/heads/") ? branchName : `refs/heads/${branchName}`;
     return entries.find((entry) => entry.branchRef === ref)?.path ?? null;
-  } catch {
+  } catch (error) {
+    throwIfGitCommandBackpressure(error);
     return null;
   }
 }
@@ -1386,11 +1389,13 @@ export async function resolveRepositoryDefaultBranch(
             envOverlay: READ_ONLY_GIT_ENV,
           });
           return localName;
-        } catch {
+        } catch (error) {
+          throwIfGitCommandBackpressure(error);
           return remoteShort;
         }
       }
-    } catch {
+    } catch (error) {
+      throwIfGitCommandBackpressure(error);
       // ignore
     }
 
@@ -2291,7 +2296,10 @@ async function tryResolveCheckoutCommitsBaseRef(
   if (!normalizedBaseRef || normalizedBaseRef === currentBranch) {
     return null;
   }
-  return resolveMostAheadBaseRef(cwd, normalizedBaseRef).catch(() => null);
+  return resolveMostAheadBaseRef(cwd, normalizedBaseRef).catch((error) => {
+    throwIfGitCommandBackpressure(error);
+    return null;
+  });
 }
 
 export async function listCheckoutCommits({
@@ -2475,7 +2483,8 @@ async function countUntrackedAdditions(cwd: string): Promise<number> {
       }
     }
     return additions;
-  } catch {
+  } catch (error) {
+    throwIfGitCommandBackpressure(error);
     return 0;
   }
 }
@@ -2490,7 +2499,8 @@ async function getCheckoutShortstatUncached(
   if (!context?.facts?.isGit) {
     try {
       await requireGitRepo(cwd);
-    } catch {
+    } catch (error) {
+      throwIfGitCommandBackpressure(error);
       return null;
     }
   }
@@ -2537,7 +2547,8 @@ async function getCheckoutShortstatUncached(
       return { additions: untrackedAdditions, deletions: 0 };
     }
     return null;
-  } catch {
+  } catch (error) {
+    throwIfGitCommandBackpressure(error);
     return null;
   }
 }
@@ -2558,7 +2569,8 @@ async function resolveShortstatComparisonRef(input: {
       return facts?.isGit && facts.resolvedBaseRef === localBaseRef && facts.comparisonBaseRef
         ? facts.comparisonBaseRef
         : await resolveBestComparisonBaseRef(cwd, localBaseRef);
-    } catch {
+    } catch (error) {
+      throwIfGitCommandBackpressure(error);
       return null;
     }
   }
@@ -3191,7 +3203,8 @@ export async function mergeToBase(
           cwd: operationCwd,
           timeout: 120_000,
         });
-      } catch {
+      } catch (error) {
+        throwIfGitCommandBackpressure(error);
         // ignore
       }
     }

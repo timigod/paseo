@@ -286,6 +286,7 @@ describe("runGitCommand", () => {
     ["leading whitespace", " 64"],
     ["trailing whitespace", "64 "],
     ["unsafe integer", "9007199254740992"],
+    ["zero", "0"],
     ["negative", "-1"],
     ["above cap", "1025"],
   ])("falls back for invalid pending limit: %s", async (_label, value) => {
@@ -297,7 +298,7 @@ describe("runGitCommand", () => {
   it.each([
     ["concurrency minimum", "1", "64", { concurrencyLimit: 1, maxPending: 64 }],
     ["concurrency maximum", "32", "64", { concurrencyLimit: 32, maxPending: 64 }],
-    ["pending minimum", "8", "0", { concurrencyLimit: 8, maxPending: 0 }],
+    ["pending minimum", "8", "1", { concurrencyLimit: 8, maxPending: 1 }],
     ["pending maximum", "8", "1024", { concurrencyLimit: 8, maxPending: 1_024 }],
   ])("accepts the exact %s", async (_label, concurrency, maxPending, expected) => {
     const { snapshotGitCommandRuntimeMetrics } = await loadRunGitCommandEnv(
@@ -418,7 +419,7 @@ describe("runGitCommand", () => {
   });
 
   it("releases a pre-aborted handoff reservation before the limiter callback runs", async () => {
-    const { runGitCommand, snapshotGitCommandRuntimeMetrics } = await loadRunGitCommand(1, 0);
+    const { runGitCommand, snapshotGitCommandRuntimeMetrics } = await loadRunGitCommand(1, 1);
     const controller = new AbortController();
     enqueueSpawnBehaviors({ stdoutData: "replacement" });
 
@@ -441,6 +442,60 @@ describe("runGitCommand", () => {
       active: 0,
       pending: 0,
     });
+  });
+
+  it("physically removes canceled queue entries during sustained churn", async () => {
+    const { drainGitCommands, runGitCommand, snapshotGitCommandRuntimeMetrics } =
+      await loadRunGitCommand(1, 1);
+    const activeController = new AbortController();
+    enqueueSpawnBehaviors(
+      { delayMs: 5_000, deferCloseOnKill: true },
+      { stdoutData: "replacement" },
+      { stdoutData: "retry" },
+    );
+
+    const active = runGitCommand(["status", "active"], {
+      cwd: process.cwd(),
+      signal: activeController.signal,
+    });
+    await vi.waitFor(() => expect(fakeSpawnController.processes).toHaveLength(1));
+
+    const cancellations: Promise<unknown>[] = [];
+    for (let index = 0; index < 5_000; index += 1) {
+      const controller = new AbortController();
+      const canceled = runGitCommand(["status", `canceled-${index}`], {
+        cwd: process.cwd(),
+        signal: controller.signal,
+      });
+      controller.abort();
+      cancellations.push(canceled);
+    }
+    const outcomes = await Promise.allSettled(cancellations);
+
+    expect(outcomes.every((outcome) => outcome.status === "rejected")).toBe(true);
+    expect(snapshotGitCommandRuntimeMetrics()).toMatchObject({
+      active: 1,
+      pending: 0,
+      canceled: 5_000,
+    });
+
+    const replacement = runGitCommand(["status", "replacement"], { cwd: process.cwd() });
+    activeController.abort();
+    fakeSpawnController.processes[0]?.closeKilledProcess();
+    await expect(active).rejects.toMatchObject({ name: "AbortError" });
+    for (let index = 0; index < 20; index += 1) {
+      await Promise.resolve();
+    }
+    expect(fakeSpawnController.spawnedArgs.map((args) => args.at(-1))).toEqual([
+      "active",
+      "replacement",
+    ]);
+    await expect(replacement).resolves.toMatchObject({ stdout: "replacement" });
+    await drainGitCommands();
+
+    await expect(runGitCommand(["status", "retry"], { cwd: process.cwd() })).resolves.toMatchObject(
+      { stdout: "retry" },
+    );
   });
 
   it("settles repeated queued aborts once and never later spawns the command", async () => {
