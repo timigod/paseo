@@ -35,9 +35,29 @@ export interface DaemonConnectionCommandError {
 
 const DEFAULT_HOST = "localhost:6767";
 const DEFAULT_TIMEOUT = 15000;
+const WEBSOCKET_CLOSE_TIMEOUT_MS = 1000;
 const PID_FILENAME = "paseo.pid";
 
 type CliDaemonClientConfig = Omit<DaemonClientConfig, "clientType" | "appVersion" | "capabilities">;
+
+interface TerminableWebSocket extends WebSocketLike {
+  terminate(): void;
+  once(event: "close", listener: () => void): void;
+}
+
+interface WebSocketCloseTimer {
+  unref(): void;
+}
+
+interface WebSocketCloseTimers {
+  setTimeout(callback: () => void, delayMs: number): WebSocketCloseTimer;
+  clearTimeout(timer: WebSocketCloseTimer): void;
+}
+
+const nodeWebSocketCloseTimers: WebSocketCloseTimers = {
+  setTimeout: (callback, delayMs) => setTimeout(callback, delayMs),
+  clearTimeout: (timer) => clearTimeout(timer as ReturnType<typeof setTimeout>),
+};
 
 export function createCliDaemonClient(config: CliDaemonClientConfig): DaemonClient {
   return new DaemonClient({
@@ -269,11 +289,47 @@ function createNodeWebSocketFactory() {
     url: string,
     options?: { headers?: Record<string, string>; protocols?: string[]; socketPath?: string },
   ): WebSocketLike => {
-    return new WebSocket(url, options?.protocols, {
+    const socket = new WebSocket(url, options?.protocols, {
       headers: options?.headers,
       ...(options?.socketPath ? { socketPath: options.socketPath } : {}),
-    }) as unknown as WebSocketLike;
+    }) as unknown as TerminableWebSocket;
+    return installBoundedWebSocketClose(socket);
   };
+}
+
+export function installBoundedWebSocketClose(
+  socket: TerminableWebSocket,
+  timers: WebSocketCloseTimers = nodeWebSocketCloseTimers,
+  timeoutMs = WEBSOCKET_CLOSE_TIMEOUT_MS,
+): WebSocketLike {
+  // Node's `ws.close()` has no handshake timeout. Bound only the CLI socket's graceful close.
+  const gracefulClose = socket.close.bind(socket);
+  let terminateTimer: WebSocketCloseTimer | null = null;
+
+  socket.once("close", () => {
+    if (terminateTimer) {
+      timers.clearTimeout(terminateTimer);
+      terminateTimer = null;
+    }
+  });
+
+  socket.close = (code?: number, reason?: string) => {
+    try {
+      gracefulClose(code, reason);
+    } finally {
+      if (socket.readyState !== WebSocket.CLOSED && !terminateTimer) {
+        terminateTimer = timers.setTimeout(() => {
+          terminateTimer = null;
+          if (socket.readyState !== WebSocket.CLOSED) {
+            socket.terminate();
+          }
+        }, timeoutMs);
+        terminateTimer.unref();
+      }
+    }
+  };
+
+  return socket;
 }
 
 /**
