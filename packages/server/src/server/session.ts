@@ -3792,6 +3792,7 @@ export class Session {
     try {
       if (createdPlacement) {
         await requestContext?.checkpoint("placement_created", placement);
+        await this.syncRequestCreatedDirectoryWorkspaceGitObserver(createdPlacement);
       }
       if (requestContext?.phase === "placement_created" && !placement) {
         throw new Error("Create receipt is missing its durable workspace placement");
@@ -3819,6 +3820,26 @@ export class Session {
         createdAgentId: null,
       });
       throw error;
+    }
+  }
+
+  private async syncRequestCreatedDirectoryWorkspaceGitObserver(
+    placement: RequestCreatedPlacement,
+  ): Promise<void> {
+    if (placement.kind !== "directory") return;
+
+    try {
+      const workspace = await this.workspaceRegistry.get(placement.workspaceId);
+      if (!workspace || workspace.archivedAt) return;
+      await this.syncWorkspaceGitObserverForWorkspace(workspace);
+    } catch (error) {
+      // Observer setup is supporting live UI state, not authority for the
+      // already-persisted workspace placement. Keep agent creation moving;
+      // later workspace synchronisation will retry observer setup.
+      this.sessionLogger.warn(
+        { err: error, workspaceId: placement.workspaceId },
+        "Failed to sync git observer for request-created directory workspace",
+      );
     }
   }
 
@@ -3858,7 +3879,6 @@ export class Session {
             : undefined,
         },
       );
-      await this.syncWorkspaceGitObserverForWorkspace(workspace);
       return {
         workspaceId: workspace.workspaceId,
         cwd: workspace.cwd,

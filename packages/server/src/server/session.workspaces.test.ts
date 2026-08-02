@@ -9156,9 +9156,12 @@ test("create_agent_request rejects ordinary host capacity before creating its wo
   expect(workspaceUpsert).not.toHaveBeenCalled();
 });
 
-test("failed atomic create archives its non-idempotent request-owned directory workspace", async () => {
+test("observer failure cannot orphan a non-idempotent request-owned directory workspace", async () => {
   const emitted: SessionOutboundMessage[] = [];
   const workspaces = new Map<string, PersistedWorkspaceRecord>();
+  const registerWorkspace = vi.fn(() => {
+    throw new Error("injected observer registration failure");
+  });
   const archive = vi.fn(async (workspaceId: string, archivedAt: string) => {
     const workspace = workspaces.get(workspaceId);
     if (workspace) {
@@ -9167,6 +9170,18 @@ test("failed atomic create archives its non-idempotent request-owned directory w
   });
   const session = createSessionForWorkspaceTests({
     onMessage: (message) => emitted.push(message),
+    workspaceGitService: createNoopWorkspaceGitService({
+      getCheckout: async (cwd: string) => ({
+        cwd,
+        isGit: true,
+        currentBranch: "main",
+        remoteUrl: null,
+        worktreeRoot: cwd,
+        isPaseoOwnedWorktree: false,
+        mainRepoRoot: cwd,
+      }),
+      registerWorkspace,
+    }),
     agentManager: {
       createAgent: async () => {
         throw new Error("provider rejected startup");
@@ -9199,17 +9214,22 @@ test("failed atomic create archives its non-idempotent request-owned directory w
   expect(findByType(emitted, "status")?.payload).toMatchObject({
     status: "agent_create_failed",
     requestId: "req-provider-reject-cleanup",
+    error: expect.stringContaining("provider rejected startup"),
   });
+  expect(registerWorkspace).toHaveBeenCalledOnce();
   expect(archive).toHaveBeenCalledOnce();
   expect([...workspaces.values()]).toEqual([
     expect.objectContaining({ cwd: REPO_CWD, archivedAt: expect.any(String) }),
   ]);
 });
 
-test("idempotent retry reuses its durable placement instead of archiving or duplicating it", async () => {
+test("observer failure leaves keyed retry on the same durable directory placement", async () => {
   const paseoHome = mkdtempSync(path.join(tmpdir(), "paseo-idempotent-placement-"));
   const emitted: SessionOutboundMessage[] = [];
   const workspaces = new Map<string, PersistedWorkspaceRecord>();
+  const registerWorkspace = vi.fn(() => {
+    throw new Error("injected observer registration failure");
+  });
   const upsert = vi.fn(async (workspace: PersistedWorkspaceRecord) => {
     workspaces.set(workspace.workspaceId, workspace);
   });
@@ -9220,6 +9240,18 @@ test("idempotent retry reuses its durable placement instead of archiving or dupl
   const session = createSessionForWorkspaceTests({
     paseoHome,
     onMessage: (message) => emitted.push(message),
+    workspaceGitService: createNoopWorkspaceGitService({
+      getCheckout: async (cwd: string) => ({
+        cwd,
+        isGit: true,
+        currentBranch: "main",
+        remoteUrl: null,
+        worktreeRoot: cwd,
+        isPaseoOwnedWorktree: false,
+        mainRepoRoot: cwd,
+      }),
+      registerWorkspace,
+    }),
     agentManager: { createAgent },
     workspaceRegistry: {
       initialize: async () => undefined,
@@ -9248,6 +9280,7 @@ test("idempotent retry reuses its durable placement instead of archiving or dupl
     await session.handleMessage({ ...request, requestId: "req-idempotent-placement-retry" });
 
     expect(createAgent).toHaveBeenCalledTimes(2);
+    expect(registerWorkspace).toHaveBeenCalledOnce();
     expect(upsert).toHaveBeenCalledOnce();
     expect(workspaces.size).toBe(1);
     expect(archive).not.toHaveBeenCalled();
