@@ -1,7 +1,13 @@
 import type { AgentSnapshotPayload } from "@getpaseo/protocol/messages";
 import { connectToDaemon } from "../../utils/client.js";
 import { fetchAllAgents, fetchAllWorkspaces } from "../../utils/inventory.js";
-import type { FleetHostObservation } from "./routing.js";
+import {
+  getFleetCapacityLimit,
+  getFleetCapacityUsed,
+  getFleetFreeSlots,
+  type FleetHostObservation,
+  type FleetRuntimeCapacityStatus,
+} from "./routing.js";
 import type { FleetConfig, FleetHost } from "./topology.js";
 
 export type FleetTaskState = "running" | "idle" | "needs_permission";
@@ -25,6 +31,11 @@ export interface FleetHostSummary {
   agentInventoryReady: boolean;
   workspaceInventoryReady: boolean;
   activeAgents: number;
+  capacity: number;
+  capacityUsed: number;
+  capacitySource: "daemon_runtime" | "agent_records";
+  freeSlots: number;
+  runtimeCapacity: FleetRuntimeCapacityStatus | null;
   pendingPermissions: number;
   issue: string | null;
 }
@@ -110,6 +121,8 @@ async function inspectConnectedFleetHost(input: {
   const providerReady = readDaemonProbe(daemonResult, provider, issues);
   const activeTasks = readAgentProbe(agentsResult, issues);
   const workspaceProbe = readWorkspaceProbe(workspacesResult, issues);
+  const runtimeCapacity =
+    daemonResult.status === "fulfilled" ? (daemonResult.value.runtimeCapacity ?? null) : null;
   const agentInventoryReady = agentsResult.status === "fulfilled";
   const degraded = !providerReady || !agentInventoryReady || !workspaceProbe.ready;
   const needsPermission = activeTasks.some(({ state }) => state === "needs_permission");
@@ -120,6 +133,7 @@ async function inspectConnectedFleetHost(input: {
     agentInventoryReady,
     workspaceInventoryReady: workspaceProbe.ready,
     activeAgents: activeTasks.length,
+    runtimeCapacity,
     workspaceIds: workspaceProbe.workspaceIds,
     state: resolveFleetState(needsPermission, degraded),
     activeTasks,
@@ -144,6 +158,7 @@ export async function inspectFleetHost(input: {
       agentInventoryReady: false,
       workspaceInventoryReady: false,
       activeAgents: 0,
+      runtimeCapacity: null,
       workspaceIds: [],
       state: "degraded",
       activeTasks: [],
@@ -162,6 +177,7 @@ export async function inspectFleetHost(input: {
 }
 
 export function summarizeFleetHostStatus(status: FleetHostStatus): FleetHostSummary {
+  const capacityUsed = getFleetCapacityUsed(status);
   return {
     host: status.host.id,
     state: status.state,
@@ -170,6 +186,11 @@ export function summarizeFleetHostStatus(status: FleetHostStatus): FleetHostSumm
     agentInventoryReady: status.agentInventoryReady,
     workspaceInventoryReady: status.workspaceInventoryReady,
     activeAgents: status.activeAgents,
+    capacity: getFleetCapacityLimit(status),
+    capacityUsed,
+    capacitySource: status.runtimeCapacity ? "daemon_runtime" : "agent_records",
+    freeSlots: getFleetFreeSlots(status),
+    runtimeCapacity: status.runtimeCapacity ?? null,
     pendingPermissions: status.activeTasks.reduce(
       (count, task) => count + task.pendingPermissionCount,
       0,

@@ -65,7 +65,12 @@ const fleetStatusSchema: OutputSchema<FleetHostSummary> = {
   columns: [
     { header: "HOST", field: "host" },
     { header: "STATE", field: "state" },
-    { header: "ACTIVE", field: "activeAgents", align: "right" },
+    {
+      header: "CAPACITY",
+      field: (status) => `${status.capacityUsed}/${status.capacity}`,
+      align: "right",
+    },
+    { header: "AGENTS", field: "activeAgents", align: "right" },
     {
       header: "PERMISSIONS",
       field: (status) => status.pendingPermissions,

@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import type { DaemonGetStatusResponse } from "@getpaseo/protocol/messages";
 import type { CommandError } from "../../output/index.js";
 import type { FleetHost } from "./topology.js";
 import { translateFleetCwd } from "./topology.js";
@@ -10,7 +11,34 @@ export interface FleetHostObservation {
   agentInventoryReady: boolean;
   workspaceInventoryReady: boolean;
   activeAgents: number;
+  runtimeCapacity?: FleetRuntimeCapacityStatus | null;
   workspaceIds: readonly string[];
+}
+
+export type FleetRuntimeCapacityStatus = NonNullable<
+  DaemonGetStatusResponse["payload"]["runtimeCapacity"]
+>;
+
+export function getFleetCapacityUsed(observation: FleetHostObservation): number {
+  return observation.runtimeCapacity
+    ? observation.runtimeCapacity.live + observation.runtimeCapacity.reserved
+    : observation.activeAgents;
+}
+
+export function getFleetCapacityLimit(observation: FleetHostObservation): number {
+  const runtimeLimit = observation.runtimeCapacity?.limit;
+  return runtimeLimit == null
+    ? observation.host.capacity
+    : Math.min(observation.host.capacity, runtimeLimit);
+}
+
+export function getFleetFreeSlots(observation: FleetHostObservation): number {
+  const configuredFree = Math.max(
+    0,
+    getFleetCapacityLimit(observation) - getFleetCapacityUsed(observation),
+  );
+  const runtimeFree = observation.runtimeCapacity?.free;
+  return runtimeFree == null ? configuredFree : Math.min(configuredFree, runtimeFree);
 }
 
 export type FleetRouteReason =
@@ -53,14 +81,11 @@ export function selectFleetHost(input: {
     if (!sourceHost && localHost && host.id !== localHost.id) return false;
     return true;
   });
-  const isEligible = ({
-    reachable,
-    providerReady,
-    agentInventoryReady,
-    activeAgents,
-    host,
-  }: FleetHostObservation): boolean =>
-    reachable && providerReady && agentInventoryReady && activeAgents < host.capacity;
+  const isEligible = (observation: FleetHostObservation): boolean =>
+    observation.reachable &&
+    observation.providerReady &&
+    observation.agentInventoryReady &&
+    getFleetFreeSlots(observation) > 0;
   const candidates = routeDomain.filter(isEligible);
 
   if (idempotencyKey) {
@@ -106,7 +131,8 @@ export function selectFleetHost(input: {
 
   const selected = [...candidates].sort(
     (left, right) =>
-      left.activeAgents - right.activeAgents || left.host.id.localeCompare(right.host.id),
+      getFleetCapacityUsed(left) - getFleetCapacityUsed(right) ||
+      left.host.id.localeCompare(right.host.id),
   )[0]!;
 
   return {
