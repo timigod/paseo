@@ -250,7 +250,7 @@ describe("CreateAgentRequestStore", () => {
     expect(retryCreate).not.toHaveBeenCalled();
   });
 
-  it("migrates matching version-1 receipts without recreating an existing agent", async () => {
+  it("migrates a succeeded version-1 receipt as accepted without redispatching", async () => {
     const home = createHome();
     const file = path.join(home, "create-agent-requests.json");
     const agentId = "00000000-0000-4000-8000-000000000015";
@@ -264,7 +264,7 @@ describe("CreateAgentRequestStore", () => {
             key: "legacy-key",
             fingerprint: REQUEST_A,
             agentId,
-            state: "pending",
+            state: "succeeded",
             updatedAt: "2026-08-01T00:00:00.000Z",
           },
         ],
@@ -291,6 +291,49 @@ describe("CreateAgentRequestStore", () => {
         agentId,
         state: "succeeded",
         phase: "prompt_dispatched",
+      }),
+    ]);
+  });
+
+  it("fails closed for a pending version-1 receipt whose agent exists", async () => {
+    const home = createHome();
+    const file = path.join(home, "create-agent-requests.json");
+    const agentId = "00000000-0000-4000-8000-000000000017";
+    writeFileSync(
+      file,
+      JSON.stringify({
+        version: 1,
+        receipts: [
+          {
+            key: "legacy-pending-key",
+            fingerprint: REQUEST_A,
+            agentId,
+            state: "pending",
+            updatedAt: "2026-08-01T00:00:00.000Z",
+          },
+        ],
+      }),
+    );
+    const store = new CreateAgentRequestStore({
+      paseoHome: home,
+      daemonId: "daemon-a",
+      hasAgent: async (candidate) => candidate === agentId,
+      now: () => new Date("2026-08-02T00:00:00.000Z"),
+    });
+    const create = vi.fn(async () => {});
+
+    await expect(
+      store.run(scopedInput({ key: "legacy-pending-key", fingerprint: REQUEST_A, create })),
+    ).rejects.toThrow(
+      `Initial prompt delivery for agent ${agentId} is indeterminate; inspect the agent before manually resubmitting`,
+    );
+    expect(create).not.toHaveBeenCalled();
+    const migrated = JSON.parse(readFileSync(file, "utf8"));
+    expect(migrated.receipts).toEqual([
+      expect.objectContaining({
+        callerId: "cli-client",
+        state: "pending",
+        phase: "prompt_dispatching",
       }),
     ]);
   });

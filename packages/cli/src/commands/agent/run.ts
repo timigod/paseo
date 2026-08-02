@@ -15,8 +15,10 @@ import { parseDuration } from "../../utils/duration.js";
 import { collectMultiple } from "../../utils/command-options.js";
 import { resolveProviderAndModel } from "../../utils/provider-model.js";
 import { buildWorkspaceSource } from "../workspace/create.js";
+import { parseAgentRunIntent, type AgentRunIntent } from "./run-intent.js";
 
 export { resolveProviderAndModel } from "../../utils/provider-model.js";
+export { type AgentRunIntent } from "./run-intent.js";
 
 export function addRunOptions(cmd: Command, options: { optionalPrompt?: boolean } = {}): Command {
   return (
@@ -604,173 +606,241 @@ export async function runRunCommand(
   options: AgentRunOptions,
   _command: Command,
 ): Promise<SingleResult<AgentRunResult>> {
+  const inputs = resolveLocalRunInputs(prompt, options);
   const host = getDaemonHost({ host: options.host });
-  const outputSchema = options.outputSchema ? loadOutputSchema(options.outputSchema) : undefined;
-
-  validateRunOptions(prompt, options, outputSchema);
-  const waitTimeoutMs = parseWaitTimeoutOption(options.waitTimeout);
-
-  const resolvedProviderModel = resolveProviderAndModel(options);
-  const resolvedTitle = options.title ?? options.name;
-
   const client = await connectToDaemonOrThrow(options.host, host);
 
   try {
-    // Resolve working directory
-    const cwd = options.cwd ?? process.cwd();
-    const thinkingOptionId = options.thinking?.trim();
-    if (options.thinking !== undefined && !thinkingOptionId) {
-      const error: CommandError = {
-        code: "INVALID_THINKING_OPTION",
-        message: "--thinking cannot be empty",
-        details:
-          'Provide a thinking option ID. Use "paseo provider models <provider> --thinking" to list valid IDs.',
-      };
-      throw error;
-    }
+    const intent = await resolveAgentRunIntent(client, inputs, options);
+    return await executeAgentRunIntent(client, intent);
+  } catch (err) {
+    throw normalizeRunError(err);
+  } finally {
+    await client.close().catch(() => {});
+  }
+}
 
-    const images = loadRunImages(options.image);
+interface LocalRunInputs {
+  prompt: string;
+  outputSchema: Record<string, unknown> | undefined;
+  waitTimeoutMs: number;
+  resolvedProviderModel: ReturnType<typeof resolveProviderAndModel>;
+  resolvedTitle: string | undefined;
+  cwd: string;
+  thinkingOptionId: string | undefined;
+  images: ReturnType<typeof loadRunImages>;
+  requestEnv: Record<string, string> | undefined;
+  labels: Record<string, string> | undefined;
+  background: boolean;
+}
 
-    const labels = parseRunLabels(options.label);
-    const env = parseRunEnv(options.env);
-    const requestEnv = Object.keys(env).length > 0 ? env : undefined;
+function resolveLocalRunInputs(prompt: string, options: AgentRunOptions): LocalRunInputs {
+  const outputSchema = options.outputSchema ? loadOutputSchema(options.outputSchema) : undefined;
+  validateRunOptions(prompt, options, outputSchema);
+  const thinkingOptionId = options.thinking?.trim();
+  if (options.thinking !== undefined && !thinkingOptionId) {
+    throw {
+      code: "INVALID_THINKING_OPTION",
+      message: "--thinking cannot be empty",
+      details:
+        'Provide a thinking option ID. Use "paseo provider models <provider> --thinking" to list valid IDs.',
+    } satisfies CommandError;
+  }
+  const env = parseRunEnv(options.env);
+  const labels = parseRunLabels(options.label);
+  return {
+    prompt,
+    outputSchema,
+    waitTimeoutMs: parseWaitTimeoutOption(options.waitTimeout),
+    resolvedProviderModel: resolveProviderAndModel(options),
+    resolvedTitle: options.title ?? options.name,
+    cwd: options.cwd ?? process.cwd(),
+    thinkingOptionId,
+    images: loadRunImages(options.image),
+    requestEnv: Object.keys(env).length > 0 ? env : undefined,
+    labels: Object.keys(labels).length > 0 ? labels : undefined,
+    background: runsInBackground(options),
+  };
+}
 
-    const workspace = await resolveRunWorkspace(client, options, cwd);
-    const workspaceId = workspace.id;
-    const callerAgentId = resolveRunCallerAgentId();
-    const runCwd = workspace.cwd;
-
-    if (outputSchema) {
-      let structuredAgent: AgentSnapshotPayload | null = null;
-
-      const callStructuredTurn = async (structuredPrompt: string): Promise<string> => {
-        if (!structuredAgent) {
-          structuredAgent = await client.createAgent({
-            provider: resolvedProviderModel.provider,
-            cwd: runCwd,
-            workspaceId,
-            workspaceSource: workspace.source,
-            callerAgentId,
-            title: resolvedTitle,
-            idempotencyKey: options.idempotencyKey?.trim(),
-            modeId: options.mode,
-            model: resolvedProviderModel.model,
-            thinkingOptionId,
-            initialPrompt: structuredPrompt,
-            outputSchema,
-            images,
-            env: requestEnv,
-            labels: Object.keys(labels).length > 0 ? labels : undefined,
-          });
-        } else {
-          await client.sendMessage(structuredAgent.id, structuredPrompt);
-        }
-
-        const state = await client.waitForFinish(structuredAgent.id, waitTimeoutMs);
-        if (state.status === "timeout") {
-          throw new StructuredRunStatusError("timeout", "Timed out waiting for structured output");
-        }
-        if (state.status === "permission") {
-          throw new StructuredRunStatusError(
-            "permission",
-            "Agent is waiting for permission before producing structured output",
-          );
-        }
-        if (state.status === "error") {
-          throw new StructuredRunStatusError(
-            "error",
-            state.error ?? "Agent failed before producing structured output",
-          );
-        }
-
-        const lastMessage = await resolveStructuredResponseMessage({
-          client,
-          agentId: structuredAgent.id,
-          lastMessage: state.lastMessage,
-        });
-        if (!lastMessage) {
-          throw new StructuredRunStatusError(
-            "empty",
-            "Agent finished without a structured output message",
-          );
-        }
-
-        return lastMessage;
-      };
-
-      const output = await fetchStructuredOutput(callStructuredTurn, prompt, outputSchema);
-
-      if (!structuredAgent) {
-        const error: CommandError = {
-          code: "OUTPUT_SCHEMA_FAILED",
-          message: "Agent finished without a structured output message",
-        };
-        throw error;
-      }
-
-      await client.close();
-
-      return {
-        type: "single",
-        data: toRunResult(structuredAgent, "completed"),
-        schema: structuredRunSchema(output),
-      };
-    }
-
-    // Create the agent
-    const agent = await client.createAgent({
-      provider: resolvedProviderModel.provider,
-      cwd: runCwd,
-      workspaceId,
-      workspaceSource: workspace.source,
-      callerAgentId,
-      title: resolvedTitle,
-      idempotencyKey: options.idempotencyKey?.trim(),
+async function resolveAgentRunIntent(
+  client: ConnectedDaemonClient,
+  inputs: LocalRunInputs,
+  options: AgentRunOptions,
+): Promise<AgentRunIntent> {
+  const { CreateAgentRequestMessageSchema } = await import("@getpaseo/protocol/messages");
+  const workspace = await resolveRunWorkspace(client, options, inputs.cwd);
+  const request = CreateAgentRequestMessageSchema.parse({
+    type: "create_agent_request",
+    requestId: "resolved-run-intent",
+    config: {
+      provider: inputs.resolvedProviderModel.provider,
+      cwd: workspace.cwd,
+      title: inputs.resolvedTitle,
       modeId: options.mode,
-      model: resolvedProviderModel.model,
-      thinkingOptionId,
-      initialPrompt: prompt,
-      images,
-      env: requestEnv,
-      labels: Object.keys(labels).length > 0 ? labels : undefined,
-    });
+      model: inputs.resolvedProviderModel.model,
+      thinkingOptionId: inputs.thinkingOptionId,
+    },
+    workspaceId: workspace.id,
+    workspaceSource: workspace.source,
+    callerAgentId: resolveRunCallerAgentId(),
+    initialPrompt: inputs.prompt,
+    idempotencyKey: options.idempotencyKey?.trim(),
+    outputSchema: inputs.outputSchema,
+    images: inputs.images,
+    env: inputs.requestEnv,
+    labels: inputs.labels,
+  });
+  const { requestId: _requestId, ...create } = request;
+  return parseAgentRunIntent({
+    create,
+    prompt: inputs.prompt,
+    waitTimeoutMs: inputs.waitTimeoutMs,
+    background: inputs.background,
+  });
+}
 
-    // Default run behavior is foreground: wait for completion unless background execution is set.
-    if (!runsInBackground(options)) {
-      const state = await client.waitForFinish(agent.id, waitTimeoutMs);
-      await client.close();
+export async function prepareAgentRunIntent(
+  prompt: string,
+  options: AgentRunOptions,
+): Promise<{ intent: AgentRunIntent; daemonId: string }> {
+  const inputs = resolveLocalRunInputs(prompt, options);
+  const host = getDaemonHost({ host: options.host });
+  const client = await connectToDaemonOrThrow(options.host, host);
+  try {
+    const intent = await resolveAgentRunIntent(client, inputs, options);
+    return { intent, daemonId: requireDaemonIdentity(client) };
+  } catch (error) {
+    throw normalizeRunError(error);
+  } finally {
+    await client.close().catch(() => {});
+  }
+}
 
-      const finalAgent = state.final ?? agent;
-      const status: AgentRunResult["status"] = state.status === "idle" ? "completed" : state.status;
-
-      return {
-        type: "single",
-        data: toRunResult(finalAgent, status),
-        schema: agentRunSchema,
-      };
+export async function runAgentRunIntent(input: {
+  intent: AgentRunIntent;
+  host: string;
+  expectedDaemonId: string;
+  idempotencyKey: string;
+}): Promise<SingleResult<AgentRunResult>> {
+  const persistedIntent = await parseAgentRunIntent(input.intent);
+  const { idempotencyKey: _persistedIdempotencyKey, ...create } = persistedIntent.create;
+  const intent = await parseAgentRunIntent({
+    ...persistedIntent,
+    create: {
+      ...create,
+      idempotencyKey: input.idempotencyKey,
+    },
+  });
+  const client = await connectToDaemonOrThrow(input.host, getDaemonHost({ host: input.host }));
+  try {
+    const actualDaemonId = requireDaemonIdentity(client);
+    if (actualDaemonId !== input.expectedDaemonId) {
+      throw {
+        code: "FLEET_DAEMON_IDENTITY_MISMATCH",
+        message: `Fleet host now points to daemon ${actualDaemonId}, not original daemon ${input.expectedDaemonId}`,
+        details: "Restore the original daemon mapping or use a new idempotency key.",
+      } satisfies CommandError;
     }
+    return await executeAgentRunIntent(client, intent);
+  } catch (error) {
+    throw normalizeRunError(error);
+  } finally {
+    await client.close().catch(() => {});
+  }
+}
 
-    await client.close();
+function requireDaemonIdentity(client: ConnectedDaemonClient): string {
+  const daemonId = client.getLastServerInfoMessage()?.serverId.trim();
+  if (!daemonId) {
+    throw {
+      code: "FLEET_DAEMON_IDENTITY_UNAVAILABLE",
+      message: "The fleet host did not provide a stable daemon identity",
+      details: "Update the host before using retry-safe fleet creation.",
+    } satisfies CommandError;
+  }
+  return daemonId;
+}
 
+async function executeAgentRunIntent(
+  client: ConnectedDaemonClient,
+  intent: AgentRunIntent,
+): Promise<SingleResult<AgentRunResult>> {
+  const { type: _type, ...createOptions } = intent.create;
+  const outputSchema = intent.create.outputSchema;
+  if (outputSchema) {
+    let structuredAgent: AgentSnapshotPayload | null = null;
+    const callStructuredTurn = async (structuredPrompt: string): Promise<string> => {
+      if (!structuredAgent) {
+        structuredAgent = await client.createAgent({
+          ...createOptions,
+          initialPrompt: structuredPrompt,
+        });
+      } else {
+        await client.sendMessage(structuredAgent.id, structuredPrompt);
+      }
+      const state = await client.waitForFinish(structuredAgent.id, intent.waitTimeoutMs);
+      if (state.status === "timeout") {
+        throw new StructuredRunStatusError("timeout", "Timed out waiting for structured output");
+      }
+      if (state.status === "permission") {
+        throw new StructuredRunStatusError(
+          "permission",
+          "Agent is waiting for permission before producing structured output",
+        );
+      }
+      if (state.status === "error") {
+        throw new StructuredRunStatusError(
+          "error",
+          state.error ?? "Agent failed before producing structured output",
+        );
+      }
+      const lastMessage = await resolveStructuredResponseMessage({
+        client,
+        agentId: structuredAgent.id,
+        lastMessage: state.lastMessage,
+      });
+      if (!lastMessage) {
+        throw new StructuredRunStatusError(
+          "empty",
+          "Agent finished without a structured output message",
+        );
+      }
+      return lastMessage;
+    };
+    const output = await fetchStructuredOutput(callStructuredTurn, intent.prompt, outputSchema);
+    if (!structuredAgent) {
+      throw {
+        code: "OUTPUT_SCHEMA_FAILED",
+        message: "Agent finished without a structured output message",
+      } satisfies CommandError;
+    }
     return {
       type: "single",
-      data: toRunResult(agent),
-      schema: agentRunSchema,
+      data: toRunResult(structuredAgent, "completed"),
+      schema: structuredRunSchema(output),
     };
-  } catch (err) {
-    await client.close().catch(() => {});
-
-    if (err && typeof err === "object" && "code" in err) {
-      throw err;
-    }
-
-    const message = err instanceof Error ? err.message : String(err);
-    const error: CommandError = {
-      code: "AGENT_CREATE_FAILED",
-      message: `Failed to create agent: ${message}`,
-    };
-    throw error;
   }
+
+  const agent = await client.createAgent(createOptions);
+  if (!intent.background) {
+    const state = await client.waitForFinish(agent.id, intent.waitTimeoutMs);
+    const finalAgent = state.final ?? agent;
+    const status: AgentRunResult["status"] = state.status === "idle" ? "completed" : state.status;
+    return { type: "single", data: toRunResult(finalAgent, status), schema: agentRunSchema };
+  }
+  return { type: "single", data: toRunResult(agent), schema: agentRunSchema };
+}
+
+function normalizeRunError(error: unknown): unknown {
+  if (error && typeof error === "object" && "code" in error) {
+    return error;
+  }
+  const message = error instanceof Error ? error.message : String(error);
+  return {
+    code: "AGENT_CREATE_FAILED",
+    message: `Failed to create agent: ${message}`,
+  } satisfies CommandError;
 }
 
 export function resolveRunCallerAgentId(

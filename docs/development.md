@@ -441,6 +441,11 @@ into the repository.
 provider. `defaults.model` and `defaults.thinking` are optional. Command-line flags override these
 defaults for one run.
 
+When `fleet run` uses an idempotency key, the CLI persists the fully resolved create intent and the
+daemon identity before creation. A retry can follow a changed endpoint for the same configured host,
+but it fails closed if that endpoint now reaches a different daemon or the original host was removed.
+Use a new idempotency key when intentionally changing the prompt, model, workspace source, or host.
+
 `fleet status --json` and `fleet doctor --json` are safe-by-default summaries. They include logical
 host IDs, health booleans, aggregate agent and permission counts, and generic issue categories. They
 do not include endpoints, code roots, workspace IDs, agent IDs, task titles, permission arguments, or

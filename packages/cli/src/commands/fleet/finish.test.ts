@@ -9,11 +9,18 @@ const mocks = vi.hoisted(() => ({
 
 vi.mock("../../utils/client.js", () => ({ connectToDaemon: mocks.connectToDaemon }));
 vi.mock("../../utils/inventory.js", () => ({ fetchAllAgents: mocks.fetchAllAgents }));
+vi.mock("../agent/run.js", () => ({
+  addRunOptions: (command: unknown) => command,
+  prepareAgentRunIntent: vi.fn(),
+  runAgentRunIntent: vi.fn(),
+  runRunCommand: vi.fn(),
+}));
 vi.mock("../agent/finish.js", () => ({
   addFinishOptions: (command: unknown) => command,
   runFinishCommand: mocks.runFinishCommand,
 }));
-vi.mock("./topology.js", () => ({
+vi.mock("./topology.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./topology.js")>()),
   findFleetHost: (value: string, hosts: Array<{ id: string }>) =>
     hosts.find(({ id }) => id === value),
   findFleetHostForCwd: vi.fn(),

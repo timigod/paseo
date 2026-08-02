@@ -9,7 +9,7 @@ vi.mock("../../utils/client.js", () => ({
   getDaemonHost: () => "127.0.0.1:6767",
 }));
 
-import { runRunCommand } from "./run.js";
+import { runAgentRunIntent, runRunCommand, type AgentRunIntent } from "./run.js";
 
 const originalAgentId = process.env.PASEO_AGENT_ID;
 const originalWorkspaceId = process.env.PASEO_WORKSPACE_ID;
@@ -101,5 +101,72 @@ describe("run create idempotency", () => {
         },
       }),
     );
+  });
+
+  it("rejects an endpoint remapped to a different daemon before creating", async () => {
+    const createAgent = vi.fn();
+    mocks.connectToDaemon.mockResolvedValue({
+      createAgent,
+      getLastServerInfoMessage: () => ({ status: "server_info", serverId: "daemon-b" }),
+      close: vi.fn().mockResolvedValue(undefined),
+    });
+    const intent: AgentRunIntent = {
+      create: {
+        type: "create_agent_request",
+        config: { provider: "codex", cwd: "/tmp/project", model: "gpt-5.4" },
+        initialPrompt: "repair the fleet",
+        idempotencyKey: "fleet-create-1",
+        workspaceSource: { kind: "directory", path: "/tmp/project" },
+        labels: {},
+      },
+      prompt: "repair the fleet",
+      waitTimeoutMs: 0,
+      background: true,
+    };
+
+    await expect(
+      runAgentRunIntent({
+        intent,
+        host: "builder-a.internal:7777",
+        expectedDaemonId: "daemon-a",
+        idempotencyKey: "fleet-create-1",
+      }),
+    ).rejects.toMatchObject({
+      code: "FLEET_DAEMON_IDENTITY_MISMATCH",
+      message: expect.stringContaining("daemon-b"),
+    });
+    expect(mocks.connectToDaemon).toHaveBeenCalledWith({ host: "builder-a.internal:7777" });
+    expect(createAgent).not.toHaveBeenCalled();
+  });
+
+  it("fails closed when the daemon does not provide a stable identity", async () => {
+    const createAgent = vi.fn();
+    mocks.connectToDaemon.mockResolvedValue({
+      createAgent,
+      getLastServerInfoMessage: () => null,
+      close: vi.fn().mockResolvedValue(undefined),
+    });
+    const intent: AgentRunIntent = {
+      create: {
+        type: "create_agent_request",
+        config: { provider: "codex", cwd: "/tmp/project" },
+        initialPrompt: "repair the fleet",
+        workspaceSource: { kind: "directory", path: "/tmp/project" },
+        labels: {},
+      },
+      prompt: "repair the fleet",
+      waitTimeoutMs: 0,
+      background: true,
+    };
+
+    await expect(
+      runAgentRunIntent({
+        intent,
+        host: "builder-a.internal:7777",
+        expectedDaemonId: "daemon-a",
+        idempotencyKey: "fleet-create-1",
+      }),
+    ).rejects.toMatchObject({ code: "FLEET_DAEMON_IDENTITY_UNAVAILABLE" });
+    expect(createAgent).not.toHaveBeenCalled();
   });
 });

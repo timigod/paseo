@@ -62,6 +62,8 @@ const CreateAgentRequestReceiptFileSchema = z
   })
   .strict();
 
+// COMPAT(createAgentReceiptV1): version 1 lacked prompt-delivery checkpoints and caller scope.
+// Added in v0.2.5; remove after 2027-02-02.
 const LegacyCreateAgentRequestReceiptSchema = z
   .object({
     key: z.string().regex(CREATE_AGENT_REQUEST_KEY_PATTERN),
@@ -389,7 +391,7 @@ export class CreateAgentRequestStore {
         fingerprint: parsed.data.fingerprint,
         agentId: parsed.data.agentId,
         state: parsed.data.state,
-        phase: "reserved",
+        phase: parsed.data.state === "succeeded" ? "prompt_dispatched" : "reserved",
         updatedAt: parsed.data.updatedAt,
       };
       const legacyKey = fingerprintIdentity(receipt);
@@ -421,7 +423,7 @@ export class CreateAgentRequestStore {
       ...legacy,
       ...input.identity,
       ...(legacy.state === "pending" && agentExists
-        ? { state: "succeeded" as const, phase: "prompt_dispatched" as const }
+        ? { phase: "prompt_dispatching" as const }
         : {}),
       updatedAt: this.now().toISOString(),
     };

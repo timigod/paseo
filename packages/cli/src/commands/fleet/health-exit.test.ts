@@ -22,7 +22,14 @@ vi.mock("./status.js", () => ({
     return { state, hosts, recommendation: "Diagnostic result" };
   },
 }));
-vi.mock("./topology.js", () => ({
+vi.mock("../agent/run.js", () => ({
+  addRunOptions: (command: unknown) => command,
+  prepareAgentRunIntent: vi.fn(),
+  runAgentRunIntent: vi.fn(),
+  runRunCommand: vi.fn(),
+}));
+vi.mock("./topology.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./topology.js")>()),
   findFleetHost: vi.fn(),
   findFleetHostForCwd: vi.fn(),
   findFleetHostForHostname: vi.fn(),

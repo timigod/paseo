@@ -9,7 +9,10 @@ import { getOrCreateCliClientId } from "../../utils/client-id.js";
 import { fetchAllAgents } from "../../utils/inventory.js";
 import {
   addRunOptions,
+  prepareAgentRunIntent,
+  runAgentRunIntent,
   runRunCommand,
+  type AgentRunIntent,
   type AgentRunOptions,
   type AgentRunResult,
 } from "../agent/run.js";
@@ -121,44 +124,74 @@ async function runFleetDoctorCommand(): Promise<
   };
 }
 
-async function runFleetRunCommand(
+export async function runFleetRunCommand(
   positionalPrompt: string | undefined,
   options: FleetRunOptions,
   command: Command,
 ): Promise<SingleResult<FleetRunResult>> {
   const config = loadFleetConfig();
-  const prompt = await resolveFleetRunPrompt(positionalPrompt, options);
   const pinnedHost = requireFleetHost(options.host, config.hosts);
   const idempotencyKey = options.idempotencyKey?.trim() || null;
   const callerId = idempotencyKey ? await getOrCreateCliClientId() : null;
   const existingAffinity =
     idempotencyKey && callerId ? await loadFleetAffinity({ callerId, idempotencyKey }) : null;
-  const workspaceId = options.workspace ?? process.env.PASEO_WORKSPACE_ID;
-  const cwd = options.cwd ?? process.cwd();
-  const sourceHost = findFleetHostForCwd(cwd, config.hosts);
-  const localHost = findFleetHostForHostname(os.hostname(), config.hosts);
   if (existingAffinity && pinnedHost && pinnedHost.id !== existingAffinity.host.id) {
     throw {
       code: "FLEET_KEY_HOST_CONFLICT",
       message: `Idempotency key is owned by ${existingAffinity.host.id}, not pinned host ${pinnedHost.id}`,
     } satisfies CommandError;
   }
-  let plan = existingAffinity
-    ? { ...existingAffinity, reason: "idempotency_key" as const }
-    : await resolveNewFleetRunPlan({
-        config,
-        workspaceId,
-        cwd,
-        sourceHost,
-        localHost,
-        pinnedHost,
-        idempotencyKey,
-      });
-  if (!existingAffinity && idempotencyKey && callerId) {
+  if (existingAffinity && idempotencyKey) {
+    const currentHost = findFleetHost(existingAffinity.host.id, config.hosts);
+    if (!currentHost) {
+      throw {
+        code: "FLEET_AFFINITY_HOST_MISSING",
+        message: `Idempotency key is owned by fleet host ${existingAffinity.host.id}, which is no longer configured`,
+      } satisfies CommandError;
+    }
+    const result = await runAgentRunIntent({
+      intent: existingAffinity.intent,
+      host: currentHost.endpoint,
+      expectedDaemonId: existingAffinity.daemonId,
+      idempotencyKey,
+    });
+    return buildFleetRunResult(result, {
+      hostId: currentHost.id,
+      reason: "idempotency_key",
+      intent: existingAffinity.intent,
+    });
+  }
+
+  const prompt = await resolveFleetRunPrompt(positionalPrompt, options);
+  const workspaceId = options.workspace ?? process.env.PASEO_WORKSPACE_ID;
+  const cwd = options.cwd ?? process.cwd();
+  const plan = await resolveNewFleetRunPlan({
+    config,
+    workspaceId,
+    cwd,
+    sourceHost: findFleetHostForCwd(cwd, config.hosts),
+    localHost: findFleetHostForHostname(os.hostname(), config.hosts),
+    pinnedHost,
+    idempotencyKey,
+  });
+  const model = resolveFleetProviderModelOptions(options, config.defaults);
+  const thinking = options.thinking ?? config.defaults.thinking;
+  const resolvedOptions = {
+    ...options,
+    host: plan.host.endpoint,
+    cwd: plan.cwd,
+    provider: model.provider,
+    model: model.model,
+    thinking,
+    base: resolveFleetWorktreeBase(options, cwd),
+  };
+
+  if (idempotencyKey && callerId) {
+    const prepared = await prepareAgentRunIntent(prompt, resolvedOptions);
     const affinity = await claimFleetAffinity({
       callerId,
       idempotencyKey,
-      affinity: { host: plan.host, cwd: plan.cwd },
+      affinity: { host: plan.host, daemonId: prepared.daemonId, intent: prepared.intent },
     });
     if (pinnedHost && pinnedHost.id !== affinity.host.id) {
       throw {
@@ -166,23 +199,27 @@ async function runFleetRunCommand(
         message: `Idempotency key is owned by ${affinity.host.id}, not pinned host ${pinnedHost.id}`,
       } satisfies CommandError;
     }
-    plan = { ...affinity, reason: "idempotency_key" };
+    const currentHost = findFleetHost(affinity.host.id, config.hosts);
+    if (!currentHost) {
+      throw {
+        code: "FLEET_AFFINITY_HOST_MISSING",
+        message: `Idempotency key is owned by fleet host ${affinity.host.id}, which is no longer configured`,
+      } satisfies CommandError;
+    }
+    const result = await runAgentRunIntent({
+      intent: affinity.intent,
+      host: currentHost.endpoint,
+      expectedDaemonId: affinity.daemonId,
+      idempotencyKey,
+    });
+    return buildFleetRunResult(result, {
+      hostId: currentHost.id,
+      reason: "idempotency_key",
+      intent: affinity.intent,
+    });
   }
-  const model = resolveFleetProviderModelOptions(options, config.defaults);
-  const thinking = options.thinking ?? config.defaults.thinking;
-  const result = await runRunCommand(
-    prompt,
-    {
-      ...options,
-      host: plan.host.endpoint,
-      cwd: plan.cwd,
-      provider: model.provider,
-      model: model.model,
-      thinking,
-      base: resolveFleetWorktreeBase(options, cwd),
-    },
-    command,
-  );
+
+  const result = await runRunCommand(prompt, resolvedOptions, command);
   return {
     type: "single",
     data: {
@@ -191,6 +228,23 @@ async function runFleetRunCommand(
       routeReason: plan.reason,
       effectiveModel: model.effectiveModel,
       effectiveThinking: thinking,
+    },
+    schema: fleetRunSchema,
+  };
+}
+
+function buildFleetRunResult(
+  result: SingleResult<AgentRunResult>,
+  input: { hostId: string; reason: FleetRouteReason; intent: AgentRunIntent },
+): SingleResult<FleetRunResult> {
+  return {
+    type: "single",
+    data: {
+      ...result.data,
+      fleetHost: input.hostId,
+      routeReason: input.reason,
+      effectiveModel: input.intent.create.config.model,
+      effectiveThinking: input.intent.create.config.thinkingOptionId,
     },
     schema: fleetRunSchema,
   };
