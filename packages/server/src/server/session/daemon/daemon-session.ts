@@ -157,7 +157,6 @@ export class DaemonSession {
   async handleGetStatusRequest(
     msg: Extract<SessionInboundMessage, { type: "daemon.get_status.request" }>,
   ): Promise<void> {
-    const runtimeCapacity = this.getAgentRuntimeCapacity();
     try {
       const pidInfo = await getPidLockInfo(this.paseoHome);
       const providers = (await this.listProviderAvailability()).map((p) => ({
@@ -177,7 +176,7 @@ export class DaemonSession {
           listen: this.daemonRuntimeConfig?.listen ?? null,
           relay: this.daemonRuntimeConfig?.relay ?? null,
           providers,
-          runtimeCapacity,
+          runtimeCapacity: this.getAgentRuntimeCapacity(),
         },
       });
     } catch (error) {
@@ -194,7 +193,7 @@ export class DaemonSession {
           listen: null,
           relay: null,
           providers: [],
-          runtimeCapacity,
+          runtimeCapacity: this.getAgentRuntimeCapacity(),
         },
       });
     }

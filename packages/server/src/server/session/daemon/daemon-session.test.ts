@@ -164,6 +164,48 @@ describe("DaemonSession", () => {
     ]);
   });
 
+  test("status snapshots runtime capacity after the provider probe completes", async () => {
+    let runtimeCapacity: AgentRuntimeCapacitySnapshot = {
+      limit: 12,
+      live: 9,
+      reserved: 0,
+      free: 3,
+    };
+    let resolveProviders!: (providers: ProviderAvailability[]) => void;
+    let markProviderProbeStarted!: () => void;
+    const providerProbeStarted = new Promise<void>((resolve) => {
+      markProviderProbeStarted = resolve;
+    });
+    const providers = new Promise<ProviderAvailability[]>((resolve) => {
+      resolveProviders = resolve;
+    });
+    const { subsystem, emitted } = makeSubsystem({
+      listProviderAvailability: () => {
+        markProviderProbeStarted();
+        return providers;
+      },
+      getAgentRuntimeCapacity: () => runtimeCapacity,
+    });
+
+    const response = subsystem.handleGetStatusRequest({
+      type: "daemon.get_status.request",
+      requestId: "s-fresh",
+    });
+    await providerProbeStarted;
+    runtimeCapacity = { limit: 12, live: 10, reserved: 1, free: 1 };
+    resolveProviders([]);
+    await response;
+
+    expect(emitted).toHaveLength(1);
+    expect(emitted[0]).toMatchObject({
+      type: "daemon.get_status.response",
+      payload: {
+        requestId: "s-fresh",
+        runtimeCapacity: { limit: 12, live: 10, reserved: 1, free: 1 },
+      },
+    });
+  });
+
   test("status falls back to null fields and an empty provider list when listing rejects", async () => {
     const { subsystem, emitted } = makeSubsystem({
       serverId: "srv-1",
