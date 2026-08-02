@@ -10,7 +10,7 @@ const { smokePackagedDesktopApp } = require("./smoke-packaged-desktop-app.js");
 const EXECUTABLE_NAME = "Paseo";
 
 exports.default = async function afterSign(context) {
-  if (context.electronPlatformName !== "darwin") {
+  if (context.electronPlatformName !== "darwin" && context.electronPlatformName !== "mas") {
     return;
   }
 

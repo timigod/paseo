@@ -3,8 +3,9 @@ const path = require("path");
 
 const {
   assertPackagedMacRuntime,
+  assertUnsignedMacSigningConfiguration,
   resolveElectronBuilderTargetArch,
-  shouldRunPackagedRuntimeGate,
+  resolveValidatedMacBuildMode,
 } = require("./packaged-runtime-gate.js");
 const { smokePackagedDesktopApp } = require("./smoke-packaged-desktop-app.js");
 
@@ -114,13 +115,16 @@ function fmtMB(bytes) {
 exports.default = async function afterPack(context) {
   const platform = context.electronPlatformName;
   const arch = resolveElectronBuilderTargetArch(context.arch);
+  const isMac = platform === "darwin" || platform === "mas";
+  const macBuildMode = isMac ? resolveValidatedMacBuildMode(process.env) : undefined;
 
   pruneNativeModules(context.appOutDir, platform, arch);
 
-  if (
-    platform === "darwin" &&
-    shouldRunPackagedRuntimeGate({ env: process.env, phase: "afterPack" })
-  ) {
+  if (isMac && macBuildMode === "unsigned") {
+    assertUnsignedMacSigningConfiguration({
+      commonConfig: context.packager?.config,
+      macConfig: context.packager?.platformSpecificBuildOptions,
+    });
     const appPath = path.join(context.appOutDir, `${EXECUTABLE_NAME}.app`);
     const receipt = assertPackagedMacRuntime({ appPath, targetArch: arch });
     if (process.env.PASEO_DESKTOP_SMOKE === "1" && receipt.helperExecution !== "skipped") {

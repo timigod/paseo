@@ -2,7 +2,11 @@ const { spawnSync } = require("node:child_process");
 const fs = require("node:fs");
 const path = require("node:path");
 
-const { isUnsignedMacBuildRequested } = require("./run-electron-builder.js");
+const {
+  INTERNAL_MAC_BUILD_MODE_ENV,
+  MAC_BUILD_MODE,
+  UNSIGNED_MAC_BUILD_ENV,
+} = require("./run-electron-builder.js");
 
 const RUNTIME_MARKER = "paseo-packaged-runtime-ok";
 const ARCH_MAP = { 0: "ia32", 1: "x64", 2: "armv7l", 3: "arm64", 4: "universal" };
@@ -12,9 +16,47 @@ function resolveElectronBuilderTargetArch(arch, hostArch = process.arch) {
   return ARCH_MAP[arch] || String(arch);
 }
 
+function resolveValidatedMacBuildMode(env) {
+  const publicOptInPresent = env[UNSIGNED_MAC_BUILD_ENV] !== undefined;
+  const mode = env[INTERNAL_MAC_BUILD_MODE_ENV];
+  if (publicOptInPresent && mode === undefined) {
+    throw new Error(
+      `${UNSIGNED_MAC_BUILD_ENV} reached an Electron Builder hook without wrapper validation. Run the repository's desktop build command instead of electron-builder directly.`,
+    );
+  }
+  if (mode !== MAC_BUILD_MODE.SIGNED && mode !== MAC_BUILD_MODE.UNSIGNED) {
+    throw new Error(
+      "macOS desktop builds must run through the Paseo desktop build wrapper so signing policy and runtime gates cannot be bypassed.",
+    );
+  }
+  if (publicOptInPresent) {
+    throw new Error(
+      `${UNSIGNED_MAC_BUILD_ENV} must be consumed by the build wrapper before hooks run.`,
+    );
+  }
+  return mode;
+}
+
 function shouldRunPackagedRuntimeGate({ env, phase }) {
-  const unsigned = isUnsignedMacBuildRequested(env);
-  return unsigned ? phase === "afterPack" : phase === "afterSign";
+  const mode = resolveValidatedMacBuildMode(env);
+  return mode === MAC_BUILD_MODE.UNSIGNED ? phase === "afterPack" : phase === "afterSign";
+}
+
+function assertUnsignedMacSigningConfiguration({ commonConfig, macConfig }) {
+  const conflicts = [];
+  if (commonConfig?.cscLink) conflicts.push("cscLink");
+  if (macConfig?.cscLink) conflicts.push("mac.cscLink");
+  if (macConfig?.identity !== undefined && macConfig.identity !== null) {
+    conflicts.push("mac.identity");
+  }
+  if (macConfig?.sign !== undefined && macConfig.sign !== null) conflicts.push("mac.sign");
+  if (conflicts.length > 0) {
+    throw new Error(
+      `Validated unsigned mac build conflicts with resolved signing configuration: ${conflicts.join(
+        ", ",
+      )}. Remove the signing configuration or build in signed mode.`,
+    );
+  }
 }
 
 // `codesign --verify --deep --strict` validates signatures without ever mapping
@@ -96,6 +138,8 @@ function assertPackagedMacRuntime({
 module.exports = {
   RUNTIME_MARKER,
   assertPackagedMacRuntime,
+  assertUnsignedMacSigningConfiguration,
   resolveElectronBuilderTargetArch,
+  resolveValidatedMacBuildMode,
   shouldRunPackagedRuntimeGate,
 };

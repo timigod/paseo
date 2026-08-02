@@ -7,13 +7,18 @@ import { describe, expect, it } from "vitest";
 const require = createRequire(import.meta.url);
 const {
   assertPackagedMacRuntime,
+  assertUnsignedMacSigningConfiguration,
   RUNTIME_MARKER,
   resolveElectronBuilderTargetArch,
+  resolveValidatedMacBuildMode,
   shouldRunPackagedRuntimeGate,
 } = require("../../scripts/packaged-runtime-gate.js");
 const {
+  INTERNAL_MAC_BUILD_MODE_ENV,
+  MAC_BUILD_MODE,
   resolveBuilderPlan,
   resolveExtraBuilderArgs,
+  SIGNED_MAC_BUILD_FAILURE_HINT,
   UNSIGNED_MAC_BUILD_ENV,
 } = require("../../scripts/run-electron-builder.js");
 
@@ -150,51 +155,131 @@ describe("packaged runtime gate", () => {
 });
 
 describe("explicit unsigned mac build contract", () => {
-  it("never weakens signed or partially configured CSC builds without the opt-in", () => {
-    expect(resolveExtraBuilderArgs({})).toEqual([]);
-    expect(resolveExtraBuilderArgs({ CSC_LINK: "identity.p12" })).toEqual([]);
-    expect(
-      resolveExtraBuilderArgs({ CSC_IDENTITY_AUTO_DISCOVERY: "false", CSC_NAME: "Developer ID" }),
-    ).toEqual([]);
-    expect(resolveExtraBuilderArgs({ CSC_IDENTITY_AUTO_DISCOVERY: "false" })).toEqual([]);
-    expect(resolveExtraBuilderArgs({}, ["-c.mac.identity=Developer ID Application"])).toEqual([]);
+  it("forces signing for default and x64 mac builds while preserving identity inputs", () => {
+    for (const env of [
+      {},
+      { CSC_LINK: "identity.p12" },
+      { CSC_IDENTITY_AUTO_DISCOVERY: "false", CSC_NAME: "Developer ID" },
+      { CSC_IDENTITY_AUTO_DISCOVERY: "false" },
+    ]) {
+      const plan = resolveBuilderPlan(env, ["--mac", "--x64"], "linux");
+      expect(plan.extraArgs).toEqual(["-c.mac.forceCodeSigning=true"]);
+      expect(plan.macBuildMode).toBe(MAC_BUILD_MODE.SIGNED);
+      expect(plan.childEnv[INTERNAL_MAC_BUILD_MODE_ENV]).toBe(MAC_BUILD_MODE.SIGNED);
+    }
+    expect(resolveExtraBuilderArgs({}, ["--linux"], "darwin")).toEqual([]);
+    expect(SIGNED_MAC_BUILD_FAILURE_HINT).toContain(`${UNSIGNED_MAC_BUILD_ENV}=1`);
   });
 
-  it("drops hardened runtime and disables discovery only for the explicit opt-in", () => {
-    const plan = resolveBuilderPlan({ [UNSIGNED_MAC_BUILD_ENV]: "1" });
-    expect(plan.extraArgs).toEqual(["-c.mac.hardenedRuntime=false", "-c.mac.notarize=false"]);
+  it("creates a private validated hook mode for the explicit unsigned opt-in", () => {
+    const plan = resolveBuilderPlan(
+      { [UNSIGNED_MAC_BUILD_ENV]: "1" },
+      ["--mac", "--arm64"],
+      "linux",
+    );
+    expect(plan.extraArgs).toEqual([
+      "-c.mac.forceCodeSigning=false",
+      "-c.mac.hardenedRuntime=false",
+      "-c.mac.notarize=false",
+    ]);
+    expect(plan.macBuildMode).toBe(MAC_BUILD_MODE.UNSIGNED);
     expect(plan.childEnv.CSC_IDENTITY_AUTO_DISCOVERY).toBe("false");
+    expect(plan.childEnv[UNSIGNED_MAC_BUILD_ENV]).toBeUndefined();
+    expect(plan.childEnv[INTERNAL_MAC_BUILD_MODE_ENV]).toBe(MAC_BUILD_MODE.UNSIGNED);
   });
 
-  it("fails closed when unsigned intent conflicts with a signing path", () => {
+  it("fails closed when unsigned intent conflicts with any declared signing path", () => {
     expect(() =>
-      resolveBuilderPlan({ [UNSIGNED_MAC_BUILD_ENV]: "1", CSC_LINK: "identity.p12" }),
+      resolveBuilderPlan(
+        { [UNSIGNED_MAC_BUILD_ENV]: "1", CSC_LINK: "identity.p12" },
+        ["--mac"],
+        "linux",
+      ),
     ).toThrow(/CSC_LINK/);
     expect(() =>
-      resolveBuilderPlan({ [UNSIGNED_MAC_BUILD_ENV]: "1", CSC_NAME: "Developer ID" }),
+      resolveBuilderPlan(
+        { [UNSIGNED_MAC_BUILD_ENV]: "1", CSC_NAME: "Developer ID" },
+        ["--mac"],
+        "linux",
+      ),
     ).toThrow(/CSC_NAME/);
     expect(() =>
-      resolveBuilderPlan({
-        [UNSIGNED_MAC_BUILD_ENV]: "1",
-        CSC_IDENTITY_AUTO_DISCOVERY: "true",
-      }),
+      resolveBuilderPlan(
+        {
+          [UNSIGNED_MAC_BUILD_ENV]: "1",
+          CSC_IDENTITY_AUTO_DISCOVERY: "true",
+        },
+        ["--mac"],
+        "linux",
+      ),
     ).toThrow(/CSC_IDENTITY_AUTO_DISCOVERY/);
+    for (const argument of [
+      "--config.mac.identity=Developer ID Application",
+      "-c.mac.sign=./custom-sign.js",
+      "-c.mac.cscLink=identity.p12",
+      "-c.forceCodeSigning=true",
+    ]) {
+      expect(() =>
+        resolveBuilderPlan({ [UNSIGNED_MAC_BUILD_ENV]: "1" }, ["--mac", argument], "linux"),
+      ).toThrow(/mac signing build argument/);
+    }
     expect(() =>
-      resolveBuilderPlan({ [UNSIGNED_MAC_BUILD_ENV]: "1" }, [
-        "--config.mac.identity=Developer ID Application",
-      ]),
+      resolveBuilderPlan(
+        { [UNSIGNED_MAC_BUILD_ENV]: "1" },
+        ["--mac", "--config", "alternate.yml"],
+        "linux",
+      ),
+    ).toThrow(/Alternate Electron Builder --config/);
+    expect(() =>
+      resolveBuilderPlan({ [UNSIGNED_MAC_BUILD_ENV]: "1" }, ["--mac", "mas"], "linux"),
+    ).toThrow(/Mac App Store target/);
+  });
+
+  it("rejects resolved custom signing configuration in validated unsigned mode", () => {
+    expect(() =>
+      assertUnsignedMacSigningConfiguration({ commonConfig: {}, macConfig: {} }),
+    ).not.toThrow();
+    expect(() =>
+      assertUnsignedMacSigningConfiguration({ commonConfig: {}, macConfig: { identity: null } }),
+    ).not.toThrow();
+    expect(() =>
+      assertUnsignedMacSigningConfiguration({
+        commonConfig: { cscLink: "identity.p12" },
+        macConfig: {},
+      }),
+    ).toThrow(/cscLink/);
+    expect(() =>
+      assertUnsignedMacSigningConfiguration({
+        commonConfig: {},
+        macConfig: { sign: "./custom-sign.js" },
+      }),
+    ).toThrow(/mac\.sign/);
+    expect(() =>
+      assertUnsignedMacSigningConfiguration({ commonConfig: {}, macConfig: { identity: "-" } }),
     ).toThrow(/mac\.identity/);
   });
 
-  it("runs the gate once after signing normally and once after packing when unsigned", () => {
-    expect(shouldRunPackagedRuntimeGate({ env: {}, phase: "afterPack" })).toBe(false);
-    expect(shouldRunPackagedRuntimeGate({ env: {}, phase: "afterSign" })).toBe(true);
-    expect(
-      shouldRunPackagedRuntimeGate({ env: { CSC_LINK: "identity.p12" }, phase: "afterSign" }),
-    ).toBe(true);
+  it("uses only the private wrapper marker to route signed and unsigned hooks", () => {
+    const signedEnv = { [INTERNAL_MAC_BUILD_MODE_ENV]: MAC_BUILD_MODE.SIGNED };
+    expect(shouldRunPackagedRuntimeGate({ env: signedEnv, phase: "afterPack" })).toBe(false);
+    expect(shouldRunPackagedRuntimeGate({ env: signedEnv, phase: "afterSign" })).toBe(true);
 
-    const unsignedEnv = { [UNSIGNED_MAC_BUILD_ENV]: "1" };
+    const unsignedEnv = { [INTERNAL_MAC_BUILD_MODE_ENV]: MAC_BUILD_MODE.UNSIGNED };
     expect(shouldRunPackagedRuntimeGate({ env: unsignedEnv, phase: "afterPack" })).toBe(true);
     expect(shouldRunPackagedRuntimeGate({ env: unsignedEnv, phase: "afterSign" })).toBe(false);
+    expect(resolveValidatedMacBuildMode(unsignedEnv)).toBe(MAC_BUILD_MODE.UNSIGNED);
+  });
+
+  it("rejects direct Electron Builder hooks without wrapper validation", () => {
+    expect(() => resolveValidatedMacBuildMode({})).toThrow(/must run through/);
+    expect(() => resolveValidatedMacBuildMode({ [UNSIGNED_MAC_BUILD_ENV]: "1" })).toThrow(
+      /without wrapper validation/,
+    );
+    expect(() =>
+      resolveValidatedMacBuildMode({
+        [INTERNAL_MAC_BUILD_MODE_ENV]: MAC_BUILD_MODE.UNSIGNED,
+        [UNSIGNED_MAC_BUILD_ENV]: "1",
+      }),
+    ).toThrow(/must be consumed/);
   });
 });

@@ -23,7 +23,11 @@ Root checkout dev is intentionally split across terminals:
 
 Signed macOS builds remain the default. The build wrapper preserves Electron
 Builder's normal Developer ID, `CSC_LINK`, `CSC_NAME`, and identity-discovery
-paths without modifying hardened runtime or notarization settings.
+paths without modifying hardened runtime or notarization settings. It also
+requires a real signing result, so a missing identity fails the build instead
+of silently skipping `afterSign`. Run macOS builds through `npm run
+build:desktop`; invoking Electron Builder directly is unsupported because it
+bypasses this signing and runtime-gate contract.
 
 For a local artifact that is intentionally unsigned, opt in explicitly:
 
@@ -33,7 +37,8 @@ PASEO_DESKTOP_UNSIGNED_MAC=1 npm run build:desktop -- --mac --arm64
 
 This mode disables signing identity auto-discovery, hardened runtime, and
 notarization so the ad-hoc bundle remains launchable. It fails closed when used
-with `CSC_LINK`, `CSC_NAME`, or a `mac.identity` build argument. Setting
+with `CSC_LINK`, `CSC_NAME`, `mac.identity`, `mac.sign`, `mac.cscLink`, or an
+alternate `--config`; Mac App Store targets are also signed-only. Setting
 `CSC_IDENTITY_AUTO_DISCOVERY=false` by itself is not an unsigned-build request.
 Every macOS build checks both packaged CLI launchers; native-architecture and
 universal builds also execute the packaged Electron helper. A cross-architecture
