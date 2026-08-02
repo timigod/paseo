@@ -404,6 +404,19 @@ type FetchAgentsResponsePageInfo = FetchAgentsResponsePayload["pageInfo"];
 type AgentUpdatesFilter = FetchAgentsRequestFilter;
 type CreateAgentRequestMessage = Extract<SessionInboundMessage, { type: "create_agent_request" }>;
 
+type RequestCreatedPlacement =
+  | { kind: "directory"; workspaceId: string }
+  | {
+      kind: "worktree";
+      workspaceId: string;
+      createdWorktree: CreatePaseoWorktreeWorkflowResult;
+    };
+
+interface PreparedAgentRequest {
+  request: CreateAgentRequestMessage;
+  createdPlacement: RequestCreatedPlacement | null;
+}
+
 interface ResolvedSessionCreateAgentIntent {
   config: AgentSessionConfig;
   intent: CreateAgentIntent;
@@ -3538,10 +3551,27 @@ export class Session {
       env,
     } = msg;
     let createdWorktreeForCleanup: CreatePaseoWorktreeWorkflowResult | null = null;
+    let createdPlacementForCleanup: RequestCreatedPlacement | null = null;
     let createdAgentId: string | null = null;
     let pendingCreationAgentId: string | undefined;
     try {
-      const placedRequest = await this.prepareAgentRequest(msg, requestContext);
+      // Reject configuration and ordinary host-capacity failures before a
+      // workspace record or managed worktree is created. Provider-specific
+      // source-managed capacity is checked authoritatively during launch and
+      // is covered by the request-owned placement rollback below.
+      await this.providerSnapshotManager.resolveCreateConfig({
+        cwd: expandTilde(config.cwd),
+        provider: config.provider,
+        requestedMode: config.modeId,
+        featureValues: config.featureValues,
+        parent: null,
+        unattended: false,
+      });
+      await this.agentManager.preflightAgentRegistration(config.provider);
+
+      const preparedRequest = await this.prepareAgentRequest(msg, requestContext);
+      const placedRequest = preparedRequest.request;
+      createdPlacementForCleanup = preparedRequest.createdPlacement;
       const trimmedPrompt = initialPrompt?.trim();
       const { provisionalTitle } = resolveCreateAgentTitles({
         configTitle: config.title,
@@ -3672,45 +3702,98 @@ export class Session {
         createdWorktree: requestContext ? null : createdWorktreeForCleanup,
         createdAgentId,
       });
+      await this.cleanupRequestCreatedPlacementAfterFailedAgentCreate({
+        createdPlacement: createdPlacementForCleanup,
+        preserveForRetry: Boolean(requestContext),
+        createdAgentId,
+      });
       await this.recoverPendingAgentCreation(pendingCreationAgentId);
       throw error;
+    }
+  }
+
+  private async cleanupRequestCreatedPlacementAfterFailedAgentCreate(input: {
+    createdPlacement: RequestCreatedPlacement | null;
+    preserveForRetry: boolean;
+    createdAgentId: string | null;
+  }): Promise<void> {
+    const { createdPlacement } = input;
+    if (!createdPlacement || input.preserveForRetry || input.createdAgentId) return;
+
+    if (createdPlacement.kind === "worktree") {
+      await this.createAgentLifecycleDispatch.cleanupCreatedWorktreeAfterFailedAgentCreate({
+        createdWorktree: createdPlacement.createdWorktree,
+        createdAgentId: null,
+      });
+      return;
+    }
+
+    try {
+      await this.archiveWorkspaceRecord(createdPlacement.workspaceId);
+    } catch (cleanupError) {
+      this.sessionLogger.warn(
+        { err: cleanupError, workspaceId: createdPlacement.workspaceId },
+        "Failed to archive request-owned workspace after agent creation failed",
+      );
     }
   }
 
   private async prepareAgentRequest(
     msg: CreateAgentRequestMessage,
     requestContext: CreateAgentRequestContext | undefined,
-  ): Promise<CreateAgentRequestMessage> {
+  ): Promise<PreparedAgentRequest> {
     let placement = requestContext?.placement;
+    let createdPlacement: RequestCreatedPlacement | null = null;
     if (msg.workspaceSource && !placement) {
-      placement = await this.createWorkspacePlacementForAgentRequest(msg, requestContext?.agentId);
-      await requestContext?.checkpoint("placement_created", placement);
-    }
-    if (requestContext?.phase === "placement_created" && !placement) {
-      throw new Error("Create receipt is missing its durable workspace placement");
+      const created = await this.createWorkspacePlacementForAgentRequest(
+        msg,
+        requestContext?.agentId,
+      );
+      placement = { workspaceId: created.workspaceId, cwd: created.cwd };
+      createdPlacement = created.createdPlacement;
     }
 
-    const placedRequest: CreateAgentRequestMessage = placement
-      ? {
-          ...msg,
-          config: { ...msg.config, cwd: placement.cwd },
-          workspaceId: placement.workspaceId,
-        }
-      : msg;
-    const requestedCwd = resolve(placedRequest.config.cwd);
-    const needsRequestedDirectory =
-      Boolean(msg.worktreeName || msg.git || msg.worktree) ||
-      (!msg.workspaceId && !msg.callerAgentId);
-    if (needsRequestedDirectory && !(await this.filesystem.isDirectory(requestedCwd))) {
-      throw new Error(`Working directory does not exist or is not a directory: ${requestedCwd}`);
+    try {
+      if (createdPlacement) {
+        await requestContext?.checkpoint("placement_created", placement);
+      }
+      if (requestContext?.phase === "placement_created" && !placement) {
+        throw new Error("Create receipt is missing its durable workspace placement");
+      }
+
+      const placedRequest: CreateAgentRequestMessage = placement
+        ? {
+            ...msg,
+            config: { ...msg.config, cwd: placement.cwd },
+            workspaceId: placement.workspaceId,
+          }
+        : msg;
+      const requestedCwd = resolve(placedRequest.config.cwd);
+      const needsRequestedDirectory =
+        Boolean(msg.worktreeName || msg.git || msg.worktree) ||
+        (!msg.workspaceId && !msg.callerAgentId);
+      if (needsRequestedDirectory && !(await this.filesystem.isDirectory(requestedCwd))) {
+        throw new Error(`Working directory does not exist or is not a directory: ${requestedCwd}`);
+      }
+      return { request: placedRequest, createdPlacement };
+    } catch (error) {
+      await this.cleanupRequestCreatedPlacementAfterFailedAgentCreate({
+        createdPlacement,
+        preserveForRetry: Boolean(requestContext),
+        createdAgentId: null,
+      });
+      throw error;
     }
-    return placedRequest;
   }
 
   private async createWorkspacePlacementForAgentRequest(
     request: CreateAgentRequestMessage,
     reservedAgentId?: string,
-  ): Promise<{ workspaceId: string; cwd: string }> {
+  ): Promise<{
+    workspaceId: string;
+    cwd: string;
+    createdPlacement: RequestCreatedPlacement;
+  }> {
     const source = request.workspaceSource;
     if (!source) {
       throw new Error("Create request is missing workspace source intent");
@@ -3740,7 +3823,11 @@ export class Session {
         },
       );
       await this.syncWorkspaceGitObserverForWorkspace(workspace);
-      return { workspaceId: workspace.workspaceId, cwd: workspace.cwd };
+      return {
+        workspaceId: workspace.workspaceId,
+        cwd: workspace.cwd,
+        createdPlacement: { kind: "directory", workspaceId: workspace.workspaceId },
+      };
     }
 
     if (!source.cwd && !source.projectId) {
@@ -3771,7 +3858,15 @@ export class Session {
         ? { resolveDefaultBranch: async () => source.baseBranch as string }
         : undefined,
     );
-    return { workspaceId: result.workspace.workspaceId, cwd: result.workspace.cwd };
+    return {
+      workspaceId: result.workspace.workspaceId,
+      cwd: result.workspace.cwd,
+      createdPlacement: {
+        kind: "worktree",
+        workspaceId: result.workspace.workspaceId,
+        createdWorktree: result,
+      },
+    };
   }
 
   private async buildCreatedAgentPayload(agentId: string): Promise<AgentSnapshotPayload> {

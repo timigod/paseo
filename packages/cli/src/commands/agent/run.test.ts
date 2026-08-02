@@ -1,10 +1,117 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  normalizeRunErrorWithWorkspaceReceipt,
   resolveExistingRunWorkspace,
   resolveRunCallerAgentId,
+  resolveRunWorkspace,
+  rollbackDefiniteLegacyRunWorkspace,
   runRunCommand,
   type AgentRunOptions,
 } from "./run";
+import { DaemonRpcError } from "@getpaseo/client/internal/daemon-client";
+
+describe("atomic run workspace resolution", () => {
+  it("defers new workspace creation to a modern daemon", async () => {
+    const createWorkspace = vi.fn();
+    const client = {
+      createWorkspace,
+      getLastServerInfoMessage: () => ({ features: { createAgentIdempotency: true } }),
+    };
+
+    await expect(resolveRunWorkspace(client as never, {}, "/tmp/project")).resolves.toEqual({
+      cwd: "/tmp/project",
+      source: { kind: "directory", path: "/tmp/project" },
+    });
+    expect(createWorkspace).not.toHaveBeenCalled();
+  });
+
+  it("keeps the two-step workspace path for an older daemon", async () => {
+    const createWorkspace = vi.fn(async () => ({
+      workspace: {
+        id: "workspace-legacy",
+        name: "project",
+        workspaceDirectory: "/tmp/project",
+      },
+      error: null,
+    }));
+    const client = {
+      createWorkspace,
+      getLastServerInfoMessage: () => ({ features: {} }),
+    };
+
+    await expect(resolveRunWorkspace(client as never, {}, "/tmp/project")).resolves.toEqual({
+      id: "workspace-legacy",
+      cwd: "/tmp/project",
+    });
+    expect(createWorkspace).toHaveBeenCalledOnce();
+  });
+});
+
+describe("failed run receipts", () => {
+  const atomicIntent = {
+    create: {
+      type: "create_agent_request" as const,
+      config: { provider: "opencode", cwd: "/tmp/project" },
+      workspaceSource: { kind: "directory" as const, path: "/tmp/project" },
+      initialPrompt: "implement",
+      labels: {},
+    },
+    prompt: "implement",
+    waitTimeoutMs: 0,
+    background: true,
+  };
+
+  it("reports an ambiguous atomic transport outcome without claiming failure", () => {
+    expect(
+      normalizeRunErrorWithWorkspaceReceipt(new Error("connection reset"), atomicIntent, {}),
+    ).toMatchObject({
+      code: "AGENT_CREATE_OUTCOME_UNKNOWN",
+      details: expect.stringContaining("Inspect the agent and workspace lists"),
+    });
+  });
+
+  it("keeps a definite daemon rejection distinct from an ambiguous transport failure", () => {
+    const rejection = new DaemonRpcError({
+      requestId: "request-1",
+      requestType: "create_agent_request",
+      error: "Invalid mode",
+      code: "agent_create_failed",
+    });
+    expect(normalizeRunErrorWithWorkspaceReceipt(rejection, atomicIntent, {})).toBe(rejection);
+  });
+
+  it("reports the exact legacy workspace preserved after an ambiguous failure", () => {
+    const legacyIntent = {
+      ...atomicIntent,
+      create: {
+        ...atomicIntent.create,
+        workspaceId: "workspace-legacy",
+        workspaceSource: undefined,
+      },
+    };
+    expect(
+      normalizeRunErrorWithWorkspaceReceipt(new Error("connection reset"), legacyIntent, {}),
+    ).toMatchObject({
+      code: "AGENT_CREATE_FAILED_WORKSPACE_PRESERVED",
+      details: expect.stringContaining("--workspace workspace-legacy"),
+    });
+  });
+
+  it("archives only the exact legacy workspace after a definite rejection", async () => {
+    const archiveWorkspace = vi.fn(async () => ({ workspace: null, error: null }));
+    await expect(
+      rollbackDefiniteLegacyRunWorkspace({ archiveWorkspace } as never, "workspace-legacy"),
+    ).resolves.toBe(true);
+    expect(archiveWorkspace).toHaveBeenCalledWith("workspace-legacy");
+  });
+
+  it("preserves the legacy workspace when cleanup itself is not confirmed", async () => {
+    const archiveWorkspace = vi.fn(async () => ({ workspace: null, error: "connection reset" }));
+    await expect(
+      rollbackDefiniteLegacyRunWorkspace({ archiveWorkspace } as never, "workspace-legacy"),
+    ).resolves.toBe(false);
+  });
+});
 
 describe("managed agent caller context", () => {
   it("propagates a trimmed PASEO_AGENT_ID", () => {

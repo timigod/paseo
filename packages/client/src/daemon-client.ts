@@ -2406,15 +2406,15 @@ export class DaemonClient {
       },
     });
     if (status.status === "agent_create_failed") {
-      if (status.errorCode) {
-        throw new DaemonRpcError({
-          requestId,
-          requestType: "create_agent_request",
-          error: status.error,
-          code: status.errorCode,
-        });
-      }
-      throw new Error(status.error);
+      // A correlated failure status is a definite daemon rejection even when
+      // an older daemon omitted its structured errorCode. Keep transport
+      // failures as ordinary errors so callers can preserve ambiguous state.
+      throw new DaemonRpcError({
+        requestId,
+        requestType: "create_agent_request",
+        error: status.error,
+        code: status.errorCode ?? "agent_create_failed",
+      });
     }
 
     return status.agent;

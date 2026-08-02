@@ -181,6 +181,24 @@ describe("OpenCode auto_accept feature", () => {
     ).toEqual({ modeId: "build", featureValues: { auto_accept: true } });
   });
 
+  test("treats the generic default mode as OpenCode's configured default agent", () => {
+    const client = new OpenCodeAgentClient(createTestLogger());
+
+    expect(
+      client.resolveCreateConfig({
+        provider: "opencode",
+        requestedMode: "default",
+        featureValues: undefined,
+        parent: null,
+        unattended: false,
+        availableModes: [
+          { id: "build", label: "Build" },
+          { id: "plan", label: "Plan" },
+        ],
+      }),
+    ).toEqual({ modeId: undefined, featureValues: undefined });
+  });
+
   test("inherits unattended callers as auto accept with OpenCode's default agent", () => {
     const client = new OpenCodeAgentClient(createTestLogger());
 

@@ -1416,6 +1416,26 @@ export class AgentManager {
     return validateAgentId(this.idFactory(), "allocateAgentId");
   }
 
+  /**
+   * Reject a create request at the earliest safe boundary when this manager
+   * would need to reserve a new host runtime and capacity is already full.
+   *
+   * Providers such as OpenCode reserve capacity at their process source and
+   * can reuse an existing runtime, so they must perform their authoritative
+   * admission during createAgent. The caller still rolls back any placement
+   * created between this preflight and that final admission check.
+   */
+  async preflightAgentRegistration(provider: AgentProvider): Promise<void> {
+    this.assertAcceptingAgentRegistrations();
+    await this.retryRetainedAgentRuntimeCleanups();
+    this.assertAcceptingAgentRegistrations();
+    if (this.clients.get(provider)?.managesRuntimeCapacityAtSource) {
+      return;
+    }
+    const reservation = this.runtimeCapacity.reserve();
+    reservation.release();
+  }
+
   private async createAgentInternal(
     config: AgentSessionConfig,
     agentId: string | undefined,

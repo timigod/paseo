@@ -910,6 +910,27 @@ test("reserves host runtime capacity before concurrent provider startup", async 
   });
 });
 
+test("preflights ordinary provider capacity before caller-owned placement work", async () => {
+  const manager = new AgentManager({
+    clients: { codex: new TestAgentClient() },
+    logger,
+    maxActiveAgentRuntimes: 1,
+  });
+  const live = await manager.createAgent(
+    { provider: "codex", cwd: process.cwd() },
+    "00000000-0000-4000-8000-000000000086",
+    {},
+  );
+
+  await expect(manager.preflightAgentRegistration("codex")).rejects.toMatchObject({
+    name: "AgentRuntimeCapacityError",
+    live: 1,
+    reserved: 0,
+  });
+  await manager.closeAgent(live.id);
+  await expect(manager.preflightAgentRegistration("codex")).resolves.toBeUndefined();
+});
+
 test("lets a source-managed provider admit normal agent creation without double charging", async () => {
   class SourceManagedClient extends TestAgentClient {
     readonly managesRuntimeCapacityAtSource = true as const;
@@ -944,6 +965,10 @@ test("lets a source-managed provider admit normal agent creation without double 
     "00000000-0000-4000-8000-000000000089",
     {},
   );
+
+  // The source knows whether it can reuse the existing provider process, so a
+  // generic preflight must not reserve a second slot or reject too early.
+  await expect(manager.preflightAgentRegistration("codex")).resolves.toBeUndefined();
 
   await expect(
     manager.createAgent(

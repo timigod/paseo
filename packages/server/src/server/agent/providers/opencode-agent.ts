@@ -167,16 +167,24 @@ function resolveOpenCodeCreateConfig(
   input: ResolveAgentCreateConfigInput,
 ): ResolveAgentCreateConfigResult {
   const legacyFullAccess = input.requestedMode === OPENCODE_LEGACY_FULL_ACCESS_MODE_ID;
+  // `default` is Paseo's historical generic spelling. OpenCode agent names
+  // are dynamic, so it must mean "use OpenCode's configured default" rather
+  // than assuming that a `default` (or even `build`) agent exists.
+  const genericDefault = input.requestedMode === "default";
   const parent = input.parent;
   const isUnattendedCreate = input.unattended || parent?.isUnattended === true;
-  const inheritsUnattended = input.requestedMode === undefined && isUnattendedCreate;
+  const inheritsUnattended =
+    (input.requestedMode === undefined || genericDefault) && isUnattendedCreate;
   const inheritedOpenCodeMode =
     inheritsUnattended && parent?.provider === input.provider
       ? (parent.modeId ?? undefined)
       : undefined;
-  const requestedMode = legacyFullAccess
-    ? OPENCODE_BUILD_MODE_ID
-    : (input.requestedMode ?? inheritedOpenCodeMode);
+  let requestedMode = input.requestedMode ?? inheritedOpenCodeMode;
+  if (legacyFullAccess) {
+    requestedMode = OPENCODE_BUILD_MODE_ID;
+  } else if (genericDefault) {
+    requestedMode = undefined;
+  }
   const featureValues =
     legacyFullAccess ||
     (isUnattendedCreate && input.featureValues?.[OPENCODE_AUTO_ACCEPT_FEATURE_ID] === undefined)

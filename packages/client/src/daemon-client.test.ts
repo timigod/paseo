@@ -2164,6 +2164,46 @@ test("sends create_agent_request with workspace and caller identity", async () =
   });
 });
 
+test("classifies an old daemon agent_create_failed status as a definite rejection", async () => {
+  const logger = createMockLogger();
+  const mock = createMockTransport();
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "clsk_unit_test",
+    logger,
+    reconnect: { enabled: false },
+    transportFactory: () => mock.transport,
+  });
+  clients.push(client);
+
+  const connectPromise = client.connect();
+  mock.triggerOpen();
+  await connectPromise;
+
+  const createPromise = client.createAgent({
+    provider: "claude",
+    cwd: "/tmp/project",
+  });
+  const request = parseSentFrame(mock.sent[0]);
+  mock.triggerMessage(
+    wrapSessionMessage({
+      type: "status",
+      payload: {
+        status: "agent_create_failed",
+        requestId: request.requestId,
+        error: "legacy rejection without an error code",
+      },
+    }),
+  );
+
+  await expect(createPromise).rejects.toMatchObject({
+    name: "DaemonRpcError",
+    requestId: request.requestId,
+    requestType: "create_agent_request",
+    code: "agent_create_failed",
+  });
+});
+
 test("rejects retry-safe agent creation when the daemon lacks support", async () => {
   const logger = createMockLogger();
   const mock = createMockTransport();

@@ -16,6 +16,7 @@ import { collectMultiple } from "../../utils/command-options.js";
 import { resolveProviderAndModel } from "../../utils/provider-model.js";
 import { buildWorkspaceSource } from "../workspace/create.js";
 import { parseAgentRunIntent, type AgentRunIntent } from "./run-intent.js";
+import { DaemonRpcError } from "@getpaseo/client/internal/daemon-client";
 
 export { resolveProviderAndModel } from "../../utils/provider-model.js";
 export { type AgentRunIntent } from "./run-intent.js";
@@ -514,9 +515,9 @@ async function connectToDaemonOrThrow(
   }
 }
 
-// A workspace is the explicit home of a run: it owns the directory the agent
-// runs in. The CLI resolves one before creating any agent, so no run leans on
-// createAgent's legacy cwd->workspace fallback.
+// A workspace is the explicit home of a run. Modern daemons receive its source
+// together with create-agent and own the operation atomically; the separate
+// create-workspace path remains only for compatibility with older daemons.
 interface RunWorkspace {
   id?: string;
   cwd: string;
@@ -555,7 +556,7 @@ export async function resolveExistingRunWorkspace(
 //   3. $PASEO_WORKSPACE_ID         -> exported by workspace terminals
 //   4. --new-workspace <kind>      -> mint a new workspace explicitly
 //   5. bare run                    -> mint a new local-backed workspace for cwd
-async function resolveRunWorkspace(
+export async function resolveRunWorkspace(
   client: ConnectedDaemonClient,
   options: AgentRunOptions,
   cwd: string,
@@ -580,7 +581,9 @@ async function resolveRunWorkspace(
   // TODO: thread the run `prompt` as firstAgentContext so workspace-level
   // title/branch generation picks up the task description (U8/U6 deferred).
   const source = buildRunWorkspaceSource(options, cwd);
-  if (options.idempotencyKey) {
+  const supportsAtomicWorkspaceAgentCreate =
+    client.getLastServerInfoMessage()?.features?.createAgentIdempotency === true;
+  if (options.idempotencyKey || supportsAtomicWorkspaceAgentCreate) {
     return { cwd, source };
   }
   const result = await client.createWorkspace({ source });
@@ -609,15 +612,93 @@ export async function runRunCommand(
   const inputs = resolveLocalRunInputs(prompt, options);
   const host = getDaemonHost({ host: options.host });
   const client = await connectToDaemonOrThrow(options.host, host);
+  let intent: AgentRunIntent | null = null;
 
   try {
-    const intent = await resolveAgentRunIntent(client, inputs, options);
+    intent = await resolveAgentRunIntent(client, inputs, options);
     return await executeAgentRunIntent(client, intent);
   } catch (err) {
-    throw normalizeRunError(err);
+    const legacyWorkspaceId = resolveLegacyRunCreatedWorkspaceId(intent, options);
+    if (legacyWorkspaceId && isDefiniteAgentCreateRejection(err)) {
+      if (await rollbackDefiniteLegacyRunWorkspace(client, legacyWorkspaceId)) {
+        throw normalizeRunError(err);
+      }
+    }
+    throw normalizeRunErrorWithWorkspaceReceipt(err, intent, options);
   } finally {
     await client.close().catch(() => {});
   }
+}
+
+export async function rollbackDefiniteLegacyRunWorkspace(
+  client: Pick<ConnectedDaemonClient, "archiveWorkspace">,
+  workspaceId: string,
+): Promise<boolean> {
+  try {
+    const archived = await client.archiveWorkspace(workspaceId);
+    if (!archived.error) return true;
+    console.error(`Warning: failed to clean up workspace ${workspaceId}: ${archived.error}`);
+  } catch (cleanupError) {
+    console.error(
+      `Warning: failed to clean up workspace ${workspaceId}: ${
+        cleanupError instanceof Error ? cleanupError.message : String(cleanupError)
+      }`,
+    );
+  }
+  return false;
+}
+
+function isDefiniteAgentCreateRejection(error: unknown): boolean {
+  return error instanceof DaemonRpcError && error.requestType === "create_agent_request";
+}
+
+function resolveLegacyRunCreatedWorkspaceId(
+  intent: AgentRunIntent | null,
+  options: AgentRunOptions,
+): string | null {
+  const workspaceId = intent?.create.workspaceId;
+  if (!workspaceId || intent?.create.workspaceSource) return null;
+  if (
+    options.idempotencyKey?.trim() ||
+    options.workspace?.trim() ||
+    process.env.PASEO_WORKSPACE_ID?.trim() ||
+    resolveRunCallerAgentId()
+  ) {
+    return null;
+  }
+  return workspaceId;
+}
+
+export function normalizeRunErrorWithWorkspaceReceipt(
+  error: unknown,
+  intent: AgentRunIntent | null,
+  options: AgentRunOptions,
+): unknown {
+  const normalized = normalizeRunError(error);
+  const workspaceId = resolveLegacyRunCreatedWorkspaceId(intent, options);
+  if (!workspaceId) {
+    if (intent?.create.workspaceSource && !isDefiniteAgentCreateRejection(error)) {
+      const commandError = normalized as CommandError;
+      const idempotencyKey = intent.create.idempotencyKey?.trim();
+      return {
+        ...commandError,
+        code: "AGENT_CREATE_OUTCOME_UNKNOWN",
+        details: idempotencyKey
+          ? `The daemon did not confirm the atomic create response. Retry with the same --idempotency-key ${idempotencyKey}; it will reuse the original placement and agent.`
+          : "The daemon did not confirm the atomic create response. Inspect the agent and workspace lists before retrying; the daemon may have completed the request.",
+      } satisfies CommandError;
+    }
+    return normalized;
+  }
+
+  const commandError = normalized as CommandError;
+  return {
+    ...commandError,
+    code: "AGENT_CREATE_FAILED_WORKSPACE_PRESERVED",
+    details:
+      `Workspace ${workspaceId} was preserved at ${intent?.create.config.cwd}. ` +
+      `Inspect it or retry with --workspace ${workspaceId}; do not create another workspace.`,
+  } satisfies CommandError;
 }
 
 interface LocalRunInputs {
