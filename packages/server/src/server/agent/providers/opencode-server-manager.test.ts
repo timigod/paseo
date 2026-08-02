@@ -345,6 +345,35 @@ describe("OpenCodeServerManager generations", () => {
     }
   });
 
+  test("a forced acquisition rotates when its prerequisite remains held", async () => {
+    const { manager, runtime } = createTestManager([5201, 5202], { autoAnnounce: false });
+    const current = manager.acquireCurrent();
+    const forced = manager.acquireNew();
+    const observeForced = forced.catch(() => undefined);
+
+    try {
+      await runtime.settle();
+      expect(runtime.launchedPorts).toEqual([5201]);
+
+      runtime.processForPort(5201).announceListening();
+      const currentAcquisition = await current;
+      await vi.waitFor(() => expect(runtime.launchedPorts).toEqual([5201, 5202]));
+
+      runtime.processForPort(5202).announceListening();
+      const forcedAcquisition = await forced;
+      expect(currentAcquisition.server.url).toBe("http://127.0.0.1:5201");
+      expect(forcedAcquisition.server.url).toBe("http://127.0.0.1:5202");
+
+      await forcedAcquisition.release();
+      await currentAcquisition.release();
+      expect(runtime.terminatedPorts).toEqual([5202, 5201]);
+      expect(await runtime.managedProcesses.list()).toEqual([]);
+    } finally {
+      await manager.shutdown();
+      await observeForced;
+    }
+  });
+
   test("a concurrent current acquisition joins the forced replacement during prerequisite cleanup", async () => {
     const { manager, runtime } = createTestManager([5101, 5102, 5103], {
       autoAnnounce: false,
