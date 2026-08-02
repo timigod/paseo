@@ -1949,7 +1949,8 @@ export const PaseoWorktreeArchiveRequestSchema = z.object({
   // retained for wire parse-compat, drop when floor >= v0.1.97.
   deleteWorktreeFromDisk: z.boolean().optional().default(false),
   // COMPAT(agentArchiveCaller): added after v0.2.5; remove after 2027-02-02.
-  // Optional so external and old clients retain coordinator archive behavior.
+  // Deprecated parse-only fields. The daemon ignores per-action identity and
+  // binds destructive authority to the physical connection hello instead.
   callerAgentId: z.string().optional(),
   callerAgentProof: z.string().optional(),
   requestId: z.string(),
@@ -2052,7 +2053,8 @@ export const ArchiveWorkspaceRequestSchema = z.object({
   type: z.literal("archive_workspace_request"),
   workspaceId: z.string(),
   // COMPAT(agentArchiveCaller): added after v0.2.5; remove after 2027-02-02.
-  // Optional so external and old clients retain coordinator archive behavior.
+  // Deprecated parse-only fields. The daemon ignores per-action identity and
+  // binds destructive authority to the physical connection hello instead.
   callerAgentId: z.string().optional(),
   callerAgentProof: z.string().optional(),
   requestId: z.string(),
@@ -5823,6 +5825,15 @@ export const WSHelloMessageSchema = z.object({
   clientType: z.enum(["mobile", "browser", "cli", "mcp"]),
   protocolVersion: z.number().int(),
   appVersion: z.string().optional(),
+  // COMPAT(agentCallerIncarnation): added after v0.2.5; remove after 2027-02-02.
+  // Optional so older clients continue to connect. A partial identity is kept
+  // structurally valid but is never sufficient for a destructive action.
+  callerAgent: z
+    .object({
+      agentId: z.string().optional(),
+      incarnation: z.string().optional(),
+    })
+    .optional(),
   capabilities: z
     .object({
       voice: z.boolean().optional(),

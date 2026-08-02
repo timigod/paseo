@@ -193,7 +193,9 @@ import { terminateWithTreeKill } from "../utils/tree-kill.js";
 import { isHostnameAllowed, type HostnamesConfig } from "./hostnames.js";
 import {
   createRequireBearerMiddleware,
+  extractHttpBearerToken,
   isAgentMcpRequestAuthorized,
+  isBearerTokenValidAsync,
   type DaemonAuthConfig,
 } from "./auth.js";
 import { createWebUiMiddleware } from "./web-ui.js";
@@ -207,6 +209,12 @@ import {
 } from "./agent/create-agent/create.js";
 import { archiveAgentCommand, cancelAgentRunCommand } from "./agent/lifecycle-command.js";
 import { ensureUnarchivedAgentLoaded } from "./agent/agent-loading.js";
+import {
+  createAgentDestructiveCaller,
+  createCoordinatorDestructiveCaller,
+  createUncertainDestructiveCaller,
+  type DestructiveCallerContext,
+} from "./agent/destructive-action-authority.js";
 import { CreateAgentLifecycleDispatch } from "./agent/create-agent-lifecycle-dispatch.js";
 import {
   HubRelationshipController,
@@ -538,6 +546,63 @@ function waitForShutdownStep(
   });
 }
 
+interface AgentMcpCallerContext {
+  callerAgentId?: string;
+  callerAgentIncarnation?: string;
+  destructiveCaller: DestructiveCallerContext;
+}
+
+function firstQueryString(value: unknown): string | undefined {
+  if (typeof value === "string") {
+    return value;
+  }
+  if (Array.isArray(value) && typeof value[0] === "string") {
+    return value[0];
+  }
+  return undefined;
+}
+
+async function resolveAgentMcpCallerContext(
+  req: express.Request,
+  daemonPassword: string | undefined,
+): Promise<AgentMcpCallerContext> {
+  const callerAgentId = firstQueryString(req.query.callerAgentId);
+  const callerAgentIncarnation = firstQueryString(req.query.callerAgentIncarnation);
+  const hasCallerClaim = callerAgentId !== undefined || callerAgentIncarnation !== undefined;
+
+  if (callerAgentId && callerAgentIncarnation) {
+    return {
+      callerAgentId,
+      callerAgentIncarnation,
+      destructiveCaller: createAgentDestructiveCaller({
+        agentId: callerAgentId,
+        incarnation: callerAgentIncarnation,
+      }),
+    };
+  }
+  if (hasCallerClaim) {
+    return {
+      callerAgentId,
+      callerAgentIncarnation,
+      destructiveCaller: createUncertainDestructiveCaller("MCP caller identity was incomplete"),
+    };
+  }
+  if (
+    daemonPassword &&
+    (await isBearerTokenValidAsync({
+      password: daemonPassword,
+      token: extractHttpBearerToken(req.header("authorization")),
+    }))
+  ) {
+    return { destructiveCaller: createCoordinatorDestructiveCaller() };
+  }
+  return {
+    destructiveCaller: createUncertainDestructiveCaller(
+      "MCP caller had no authenticated coordinator authority",
+    ),
+  };
+}
+
 function createBootstrapManagedProcessRegistry(
   config: Pick<PaseoDaemonConfig, "paseoHome" | "managedProcesses">,
   logger: Logger,
@@ -764,7 +829,6 @@ export async function createPaseoDaemon(
   // no plaintext available). Mirrors the /api/files/download capability-token
   // pattern.
   const agentMcpAuthToken = randomUUID();
-  const agentCallerIdentitySecret = randomUUID();
 
   const listenTarget = parseListenString(config.listen);
 
@@ -1018,7 +1082,6 @@ export async function createPaseoDaemon(
       workspaceGitService.onWorkspaceStateMayHaveChanged(cwd);
     },
     mcpAuthToken: agentMcpAuthToken,
-    callerIdentitySecret: agentCallerIdentitySecret,
     logger,
   });
 
@@ -1566,7 +1629,15 @@ export async function createPaseoDaemon(
     runLifecycleMutation: (operation) => lifecycleMutationIngress.run(operation),
     createAgentLifecycleDispatch: hubAgentLifecycle,
     callerAgentId: runtime.callerAgentId,
-    callerAgentVerified: runtime.callerAgentVerified,
+    callerAgentIncarnation: runtime.callerAgentIncarnation,
+    destructiveCaller:
+      runtime.destructiveCaller ??
+      (runtime.callerAgentId && runtime.callerAgentIncarnation
+        ? createAgentDestructiveCaller({
+            agentId: runtime.callerAgentId,
+            incarnation: runtime.callerAgentIncarnation,
+          })
+        : undefined),
     enableVoiceTools: runtime.enableVoiceTools,
     voiceOnly: runtime.voiceOnly,
     resolveSpeakHandler: (agentId) => wsServer?.resolveVoiceSpeakHandler(agentId) ?? null,
@@ -1652,27 +1723,9 @@ export async function createPaseoDaemon(
           });
           return;
         }
-        const callerAgentIdRaw = req.query.callerAgentId;
-        let callerAgentId: string | undefined;
-        const callerAgentProof = req.header("x-paseo-agent-proof");
-        if (typeof callerAgentIdRaw === "string") {
-          callerAgentId = callerAgentIdRaw;
-        } else if (Array.isArray(callerAgentIdRaw) && typeof callerAgentIdRaw[0] === "string") {
-          callerAgentId = callerAgentIdRaw[0];
-        }
-        if (!callerAgentId && callerAgentProof) {
-          callerAgentId = "missing-caller-agent-id";
-        }
+        const callerContext = await resolveAgentMcpCallerContext(req, config.auth?.password);
         const { server, transport } = await createAgentMcpSession({
-          callerAgentId,
-          ...(callerAgentId
-            ? {
-                callerAgentVerified: agentManager.verifyCallerAgentProof(
-                  callerAgentId,
-                  callerAgentProof,
-                ),
-              }
-            : {}),
+          ...callerContext,
         });
         res.on("close", () => {
           void transport.close();

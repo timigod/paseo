@@ -83,6 +83,12 @@ import {
   CLIENT_SHUTDOWN_RPC_REASON,
   normalizeClientRestartRpcReason,
 } from "./lifecycle-reasons.js";
+import {
+  createAgentDestructiveCaller,
+  createCoordinatorDestructiveCaller,
+  createUncertainDestructiveCaller,
+  type DestructiveCallerContext,
+} from "./agent/destructive-action-authority.js";
 import { CLIENT_CAPS } from "@getpaseo/protocol/client-capabilities";
 import type { BrowserAutomationExecuteResponse } from "@getpaseo/protocol/browser-automation/rpc-schemas";
 import {
@@ -120,6 +126,7 @@ interface WebSocketConnectionIdentity {
   transport: "direct" | "relay";
   peer: "loopback" | "local_ipc" | "external";
   browserOrigin: boolean;
+  authenticated: boolean;
   host?: string;
   origin?: string;
   userAgent?: string;
@@ -602,6 +609,7 @@ export class VoiceAssistantWebSocketServer {
     | null;
   private serverCapabilities: ServerCapabilities | undefined;
   private readonly runtimeMetrics = new WebSocketRuntimeMetricsWindow();
+  private readonly destructiveCallers = new WeakMap<object, DestructiveCallerContext>();
   private lastRuntimeMetricsSnapshot: WebSocketRuntimeDiagnosticPayload | null = null;
   private runtimeMetricsInterval: ReturnType<typeof setInterval> | null = null;
   private applicationSocketLeaseInterval: ReturnType<typeof setInterval> | null = null;
@@ -917,7 +925,7 @@ export class VoiceAssistantWebSocketServer {
       }
     }
 
-    await this.attachSocket(ws, request);
+    await this.attachSocket(ws, request, undefined, password !== undefined);
   }
 
   public broadcast(message: WSOutboundMessage): void {
@@ -963,7 +971,7 @@ export class VoiceAssistantWebSocketServer {
     if (metadata?.transport === "relay") {
       this.incrementRuntimeCounter("relayExternalSocketAttached");
     }
-    await this.attachSocket(ws, undefined, metadata);
+    await this.attachSocket(ws, undefined, metadata, metadata?.transport === "relay");
   }
 
   public async attachHubSocket(
@@ -999,6 +1007,7 @@ export class VoiceAssistantWebSocketServer {
       connectionLogger,
       socket: ws,
     };
+    this.destructiveCallers.set(ws, createCoordinatorDestructiveCaller());
     this.sessions.set(ws, connection);
     this.bindSocketHandlers(ws);
     connectionLogger.info("Hub session attached");
@@ -1232,6 +1241,7 @@ export class VoiceAssistantWebSocketServer {
     ws: WebSocketLike,
     request?: unknown,
     metadata?: ExternalSocketMetadata,
+    authenticated = false,
   ): Promise<void> {
     if (!this.acceptingConnections) {
       try {
@@ -1243,7 +1253,7 @@ export class VoiceAssistantWebSocketServer {
     }
 
     const requestMetadata = extractSocketRequestMetadata(request);
-    const identity = createWebSocketConnectionIdentity(requestMetadata, metadata);
+    const identity = createWebSocketConnectionIdentity(requestMetadata, metadata, authenticated);
     this.socketIdentities.set(ws, identity);
     const connectionLogger = this.logger.child(toConnectionLogFields(identity));
 
@@ -1372,6 +1382,9 @@ export class VoiceAssistantWebSocketServer {
       onBinaryMessageToSource: options.onBinaryMessageToSource,
       getTransportBufferedAmount: options.getTransportBufferedAmount,
       onLifecycleIntent: options.onLifecycleIntent,
+      resolveDestructiveCaller: (source) =>
+        this.destructiveCallers.get(source) ??
+        createUncertainDestructiveCaller("Physical connection has no destructive authority"),
       logger: options.connectionLogger.child({ module: "session" }),
       onWorkspaceRecovered: async (workspace) => {
         await Promise.all(
@@ -1497,6 +1510,7 @@ export class VoiceAssistantWebSocketServer {
     }
 
     this.clearPendingConnection(ws);
+    this.destructiveCallers.set(ws, resolveHelloDestructiveCaller(message, pending.identity));
     pending.identity.clientId = clientId;
     if (message.appVersion) {
       pending.identity.appVersion = message.appVersion;
@@ -2570,18 +2584,42 @@ interface SocketRequestMetadata {
 function createWebSocketConnectionIdentity(
   requestMetadata: SocketRequestMetadata,
   metadata: ExternalSocketMetadata | undefined,
+  authenticated: boolean,
 ): WebSocketConnectionIdentity {
   return {
     connectionId: `conn_${randomUUID().replaceAll("-", "")}`,
     transport: metadata?.transport === "relay" ? "relay" : "direct",
     peer: resolveConnectionPeer(requestMetadata, metadata),
     browserOrigin: requestMetadata.origin !== undefined,
+    authenticated,
     ...(requestMetadata.host ? { host: requestMetadata.host } : {}),
     ...(requestMetadata.origin ? { origin: requestMetadata.origin } : {}),
     ...(requestMetadata.userAgent ? { userAgent: requestMetadata.userAgent } : {}),
     ...(requestMetadata.remoteAddress ? { remoteAddress: requestMetadata.remoteAddress } : {}),
     ...(metadata?.relayConnectionId ? { relayConnectionId: metadata.relayConnectionId } : {}),
   };
+}
+
+function resolveHelloDestructiveCaller(
+  message: WSHelloMessage,
+  identity: WebSocketConnectionIdentity,
+): DestructiveCallerContext {
+  if (message.callerAgent) {
+    return message.callerAgent.agentId && message.callerAgent.incarnation
+      ? createAgentDestructiveCaller({
+          agentId: message.callerAgent.agentId,
+          incarnation: message.callerAgent.incarnation,
+        })
+      : createUncertainDestructiveCaller("Agent caller identity was incomplete");
+  }
+
+  if (identity.authenticated || identity.transport === "relay") {
+    return createCoordinatorDestructiveCaller();
+  }
+
+  return createUncertainDestructiveCaller(
+    `${message.clientType} connection omitted current agent identity and coordinator authentication`,
+  );
 }
 
 function toConnectionLogFields(identity: WebSocketConnectionIdentity): Record<string, string> {

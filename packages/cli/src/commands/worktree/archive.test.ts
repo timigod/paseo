@@ -109,17 +109,9 @@ describe("runArchiveCommand", () => {
       },
     });
 
-    await runArchiveCommandWithDeps(
-      "feature",
-      {},
-      { connectToDaemon: async () => fakeClient },
-      {
-        PASEO_AGENT_ID: " agent-1 ",
-        PASEO_AGENT_CALLER_PROOF: " proof-1 ",
-      },
-    );
+    await runArchiveCommandWithDeps("feature", {}, { connectToDaemon: async () => fakeClient });
 
-    expect(archiveCalls[0]?.caller).toEqual({ agentId: "agent-1", proof: "proof-1" });
+    expect(archiveCalls[0]).toEqual({ worktreePath, scope: "worktree" });
   });
 
   it("preserves the typed self-archive rejection code", async () => {

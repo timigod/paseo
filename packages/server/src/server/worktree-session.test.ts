@@ -39,6 +39,7 @@ import type { TerminalManager } from "../terminal/terminal-manager.js";
 import type { TerminalSession } from "../terminal/terminal.js";
 import type { AgentStorage, StoredAgentRecord } from "./agent/agent-storage.js";
 import type { ManagedAgent } from "./agent/agent-manager.js";
+import { createAgentDestructiveCaller } from "./agent/destructive-action-authority.js";
 import {
   createPersistedProjectRecord,
   type PersistedProjectRecord,
@@ -2277,8 +2278,8 @@ describe("handlePaseoWorktreeArchiveRequest worktree scope", () => {
           listAgents: () => [{ id: agentId, workspaceId } as ManagedAgent],
           archiveAgent: vi.fn(async () => ({ archivedAt: new Date().toISOString() })),
           archiveSnapshot: vi.fn(async () => ({})),
-          verifyCallerAgentProof: (candidateAgentId, proof) =>
-            candidateAgentId === agentId && proof === "caller-proof",
+          isCurrentAgentIncarnation: (candidateAgentId, incarnation) =>
+            candidateAgentId === agentId && incarnation === "incarnation-1",
         },
         agentStorage: createAgentStorageStub(),
         findWorkspaceIdForCwd: vi.fn(async () => workspaceId),
@@ -2297,9 +2298,11 @@ describe("handlePaseoWorktreeArchiveRequest worktree scope", () => {
         worktreePath: repoDir,
         workspaceId,
         scope: "workspace",
-        callerAgentId: agentId,
-        callerAgentProof: "caller-proof",
+        // Deprecated wire claims are ignored; the physical source context below wins.
+        callerAgentId: "forged-other-agent",
+        callerAgentProof: "replayed-proof",
       },
+      createAgentDestructiveCaller({ agentId, incarnation: "incarnation-1" }),
     );
 
     expect(markWorkspaceArchiving).not.toHaveBeenCalled();

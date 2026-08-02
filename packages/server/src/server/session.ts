@@ -87,12 +87,18 @@ import { createAgentCommand } from "./agent/create-agent/create.js";
 import { resolveCreateAgentIntent, type CreateAgentIntent } from "./agent/create-agent/intent.js";
 import {
   archiveAgentCommand,
+  assertAgentDestructiveActionAuthorized,
   cancelAgentRunCommand,
   closeAgentCommand,
   detachAgentCommand,
   setAgentModeCommand,
   updateAgentCommand,
 } from "./agent/lifecycle-command.js";
+import {
+  createCoordinatorDestructiveCaller,
+  DestructiveActionAuthorizationError,
+  type DestructiveCallerContext,
+} from "./agent/destructive-action-authority.js";
 import {
   buildStoredAgentPayload,
   resolveStoredAgentPayloadUpdatedAt,
@@ -239,7 +245,6 @@ import {
 } from "./worktree-session.js";
 import {
   archiveByScope,
-  resolveArchiveCallerContext,
   type ActiveWorkspaceRef,
   WorkspaceArchiveError,
 } from "./workspace-archive-service.js";
@@ -497,6 +502,17 @@ export interface SessionOptions {
   daemonVersion?: string;
   daemonRuntimeConfig?: DaemonRuntimeConfig;
   getWebSocketRuntimeMetrics?: () => DaemonWebSocketRuntimeDiagnosticSnapshot | null;
+  resolveDestructiveCaller?: (source: object) => DestructiveCallerContext;
+}
+
+function createDestructiveCallerResolver(
+  resolver: SessionOptions["resolveDestructiveCaller"],
+): (source: object) => DestructiveCallerContext {
+  if (resolver) {
+    return resolver;
+  }
+  const trustedInProcessCaller = createCoordinatorDestructiveCaller();
+  return () => trustedInProcessCaller;
 }
 
 export type SessionLifecycleIntent =
@@ -670,6 +686,7 @@ export class Session {
   private readonly hubExecutionController: HubExecutionController | null;
   private readonly workspaceScripts: WorkspaceScriptsService;
   private readonly createAgentLifecycleDispatch: CreateAgentLifecycleDispatch;
+  private readonly resolveDestructiveCaller: (source: object) => DestructiveCallerContext;
 
   constructor(options: SessionOptions) {
     const {
@@ -725,8 +742,10 @@ export class Session {
       daemonVersion,
       daemonRuntimeConfig,
       getWebSocketRuntimeMetrics,
+      resolveDestructiveCaller,
     } = options;
     this.clientId = clientId;
+    this.resolveDestructiveCaller = createDestructiveCallerResolver(resolveDestructiveCaller);
     this.scopes = [...scopes];
     this.appVersion = appVersion ?? null;
     this.clientCapabilities = parseClientCapabilities(clientCapabilities);
@@ -1810,7 +1829,11 @@ export class Session {
                 requestId,
                 requestType: msg.type,
                 error: `Request failed: ${err.message}`,
-                code: "handler_error",
+                code:
+                  err instanceof DestructiveActionAuthorizationError ||
+                  err instanceof WorkspaceArchiveError
+                    ? err.code
+                    : "handler_error",
               },
             });
           } catch (emitError) {
@@ -1849,11 +1872,11 @@ export class Session {
       this.dispatchAgentRelationshipMessage(msg) ??
       this.dispatchAgentTimelineMessage(msg, source) ??
       this.dispatchHubExecutionMessage(msg) ??
-      this.dispatchAgentLifecycleMessage(msg) ??
+      this.dispatchAgentLifecycleMessage(msg, source) ??
       this.dispatchAgentConfigMessage(msg) ??
       this.dispatchCheckoutMessage(msg) ??
       this.dispatchWorkspaceRecoveryMessage(msg) ??
-      this.dispatchWorkspaceAndProjectMessage(msg) ??
+      this.dispatchWorkspaceAndProjectMessage(msg, source) ??
       this.dispatchWorkspaceFileMessage(msg, source) ??
       this.dispatchProviderMessage(msg) ??
       this.dispatchTerminalMessage(msg) ??
@@ -1975,7 +1998,10 @@ export class Session {
     return undefined;
   }
 
-  private dispatchAgentLifecycleMessage(msg: SessionInboundMessage): Promise<void> | undefined {
+  private dispatchAgentLifecycleMessage(
+    msg: SessionInboundMessage,
+    source?: object,
+  ): Promise<void> | undefined {
     switch (msg.type) {
       case "fetch_agents_request":
         return this.handleFetchAgents(msg);
@@ -1986,11 +2012,11 @@ export class Session {
       case "fetch_agent_request":
         return this.handleFetchAgent(msg.agentId, msg.requestId);
       case "delete_agent_request":
-        return this.handleDeleteAgentRequest(msg.agentId, msg.requestId);
+        return this.handleDeleteAgentRequest(msg.agentId, msg.requestId, source);
       case "archive_agent_request":
-        return this.handleArchiveAgentRequest(msg.agentId, msg.requestId);
+        return this.handleArchiveAgentRequest(msg.agentId, msg.requestId, source);
       case "close_items_request":
-        return this.handleCloseItemsRequest(msg);
+        return this.handleCloseItemsRequest(msg, source);
       case "update_agent_request":
         return this.handleUpdateAgentRequest(msg.agentId, msg.name, msg.labels, msg.requestId);
       case "project.rename.request":
@@ -2130,6 +2156,7 @@ export class Session {
 
   private dispatchWorkspaceAndProjectMessage(
     msg: SessionInboundMessage,
+    source?: object,
   ): Promise<void> | undefined {
     switch (msg.type) {
       case "fetch_workspaces_request":
@@ -2139,7 +2166,7 @@ export class Session {
       case "paseo_worktree_list_request":
         return this.handlePaseoWorktreeListRequest(msg);
       case "paseo_worktree_archive_request":
-        return this.handlePaseoWorktreeArchiveRequest(msg);
+        return this.handlePaseoWorktreeArchiveRequest(msg, source);
       case "create_paseo_worktree_request":
         return this.handleCreatePaseoWorktreeRequest(msg);
       case "workspace_setup_status_request":
@@ -2160,7 +2187,7 @@ export class Session {
       case "project.github.clone.request":
         return this.handleProjectGithubCloneRequest(msg);
       case "archive_workspace_request":
-        return this.handleArchiveWorkspaceRequest(msg);
+        return this.handleArchiveWorkspaceRequest(msg, source);
       case "project.remove.request":
         return this.handleProjectRemoveRequest(msg);
       case "workspace.create.request":
@@ -2384,8 +2411,19 @@ export class Session {
     }
   }
 
-  private async handleDeleteAgentRequest(agentId: string, requestId: string): Promise<void> {
+  private async handleDeleteAgentRequest(
+    agentId: string,
+    requestId: string,
+    source?: object,
+  ): Promise<void> {
     this.sessionLogger.info({ agentId }, `Deleting agent ${agentId} from registry`);
+
+    assertAgentDestructiveActionAuthorized(
+      this.agentManager,
+      this.getDestructiveCaller(source),
+      agentId,
+      "agent.delete",
+    );
 
     const knownWorkspaceId =
       this.agentManager.getAgent(agentId)?.workspaceId ??
@@ -2430,10 +2468,18 @@ export class Session {
     }
   }
 
-  private async handleArchiveAgentRequest(agentId: string, requestId: string): Promise<void> {
+  private async handleArchiveAgentRequest(
+    agentId: string,
+    requestId: string,
+    source?: object,
+  ): Promise<void> {
     this.sessionLogger.info({ agentId }, `Archiving agent ${agentId}`);
 
-    const { archivedAt } = await this.archiveAgentForClose(agentId);
+    const { archivedAt } = await this.archiveAgentForClose(
+      agentId,
+      this.getDestructiveCaller(source),
+      "agent.archive",
+    );
 
     this.emit({
       type: "agent_archived",
@@ -2447,6 +2493,8 @@ export class Session {
 
   private async archiveAgentForClose(
     agentId: string,
+    caller?: DestructiveCallerContext,
+    action: "agent.archive" | "agent.finish" = "agent.archive",
   ): Promise<{ agentId: string; archivedAt: string }> {
     const { archivedAt, record: archivedRecord } = await archiveAgentCommand(
       {
@@ -2455,6 +2503,7 @@ export class Session {
         logger: this.sessionLogger,
       },
       agentId,
+      { caller, action },
     );
 
     if (this.agentUpdates.hasSubscription()) {
@@ -2518,9 +2567,10 @@ export class Session {
     }
   }
 
-  private async handleCloseItemsRequest(msg: CloseItemsRequest): Promise<void> {
+  private async handleCloseItemsRequest(msg: CloseItemsRequest, source?: object): Promise<void> {
+    const caller = this.getDestructiveCaller(source);
     const archiveResults = await Promise.allSettled(
-      msg.agentIds.map((agentId) => this.archiveAgentForClose(agentId)),
+      msg.agentIds.map((agentId) => this.archiveAgentForClose(agentId, caller, "agent.finish")),
     );
     const agents = [];
     for (let i = 0; i < archiveResults.length; i += 1) {
@@ -4020,6 +4070,7 @@ export class Session {
 
   private async handlePaseoWorktreeArchiveRequest(
     msg: Extract<SessionInboundMessage, { type: "paseo_worktree_archive_request" }>,
+    source?: object,
   ): Promise<void> {
     return handleWorktreeArchiveRequest(
       {
@@ -4044,6 +4095,7 @@ export class Session {
         sessionLogger: this.sessionLogger,
       },
       msg,
+      this.getDestructiveCaller(source),
     );
   }
 
@@ -6030,6 +6082,7 @@ export class Session {
 
   private async handleArchiveWorkspaceRequest(
     request: Extract<SessionInboundMessage, { type: "archive_workspace_request" }>,
+    source?: object,
   ): Promise<void> {
     try {
       const existing = await requireActiveWorkspaceForArchive(
@@ -6064,7 +6117,7 @@ export class Session {
         {
           scope: { kind: "workspace", workspaceId: existing.workspaceId },
           requestId: request.requestId,
-          caller: resolveArchiveCallerContext(this.agentManager, request),
+          caller: this.getDestructiveCaller(source),
         },
       );
       requireArchiveCleanupComplete(archiveResult, "Workspace archive");
@@ -6902,6 +6955,10 @@ export class Session {
   /**
    * Emit a message to the client
    */
+  private getDestructiveCaller(source?: object): DestructiveCallerContext {
+    return source ? this.resolveDestructiveCaller(source) : createCoordinatorDestructiveCaller();
+  }
+
   private emit(msg: SessionOutboundMessage): void {
     if (msg.type !== "rpc_error" && !isSessionRpcAllowed(this.scopes, msg.type)) {
       return;

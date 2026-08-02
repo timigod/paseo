@@ -12,6 +12,8 @@ import { createTestPaseoDaemon, type TestPaseoDaemon } from "../test-utils/paseo
 import { createTestAgentClients } from "../test-utils/fake-agent-client.js";
 import type { AgentClient, AgentProvider, AgentSessionConfig } from "./agent-sdk-types.js";
 import { PARENT_AGENT_ID_LABEL } from "@getpaseo/protocol/agent-labels";
+import { hashDaemonPassword } from "../auth.js";
+import type { AgentCallerIdentity } from "./destructive-action-authority.js";
 
 interface StructuredContent {
   [key: string]: unknown;
@@ -55,21 +57,27 @@ function formatHostForHttpUrl(host: string): string {
   return host.includes(":") && !host.startsWith("[") ? `[${host}]` : host;
 }
 
-function buildExpectedAgentMcpUrl(params: { host: string; port: number; agentId: string }): string {
+function buildExpectedAgentMcpUrl(params: {
+  host: string;
+  port: number;
+  agentId: string;
+  incarnation: string;
+}): string {
   const baseUrl = new URL(
     "/mcp/agents",
     `http://${formatHostForHttpUrl(params.host)}:${params.port}`,
   );
   baseUrl.searchParams.set("callerAgentId", params.agentId);
+  baseUrl.searchParams.set("callerAgentIncarnation", params.incarnation);
   return baseUrl.toString();
 }
 
-function getCallerAgentProof(agentId: string): string {
-  const proof = daemonHandle.daemon.agentManager.createCallerAgentProof(agentId);
-  if (!proof) {
-    throw new Error(`Expected caller proof for ${agentId}`);
+function getCallerAgentIdentity(agentId: string): AgentCallerIdentity {
+  const identity = daemonHandle.daemon.agentManager.getAgentCallerIdentity(agentId);
+  if (!identity) {
+    throw new Error(`Expected current caller identity for ${agentId}`);
   }
-  return proof;
+  return identity;
 }
 
 function getStructuredContent(result: McpToolResult): StructuredContent | null {
@@ -88,12 +96,10 @@ function getStructuredContent(result: McpToolResult): StructuredContent | null {
   return null;
 }
 
-async function createMcpClient(url: string, callerAgentProof?: string): Promise<McpClient> {
+async function createMcpClient(url: string, authToken?: string): Promise<McpClient> {
   const transport = new StreamableHTTPClientTransport(
     new URL(url),
-    callerAgentProof
-      ? { requestInit: { headers: { "X-Paseo-Agent-Proof": callerAgentProof } } }
-      : undefined,
+    authToken ? { requestInit: { headers: { Authorization: `Bearer ${authToken}` } } } : undefined,
   );
   const rawClient = await experimental_createMCPClient({ transport });
   const boundCallTool: McpClient["callTool"] = Reflect.get(rawClient, "callTool").bind(rawClient);
@@ -287,8 +293,14 @@ beforeAll(async () => {
   parentAgentCwd = await makeCwd("parent-agent-cwd");
   worktreeRepoCwd = await makeCwd("worktree-repo");
 
-  daemonHandle = await createTestPaseoDaemon({ agentClients: createRecordingAgentClients() });
-  topLevelClient = await createMcpClient(`http://127.0.0.1:${daemonHandle.port}/mcp/agents`);
+  daemonHandle = await createTestPaseoDaemon({
+    agentClients: createRecordingAgentClients(),
+    auth: { password: hashDaemonPassword("mcp-parity-password") },
+  });
+  topLevelClient = await createMcpClient(
+    `http://127.0.0.1:${daemonHandle.port}/mcp/agents`,
+    "mcp-parity-password",
+  );
 
   const parentPayload = await callToolStructured(topLevelClient, "create_agent", {
     relationship: { kind: "detached" },
@@ -300,15 +312,16 @@ beforeAll(async () => {
     background: true,
   });
   parentAgentId = str(parentPayload.agentId);
-  const parentCallerProof = getCallerAgentProof(parentAgentId);
+  const parentCallerIdentity = getCallerAgentIdentity(parentAgentId);
 
   agentScopedClient = await createMcpClient(
     buildExpectedAgentMcpUrl({
       host: "127.0.0.1",
       port: daemonHandle.port,
       agentId: parentAgentId,
+      incarnation: parentCallerIdentity.incarnation,
     }),
-    parentCallerProof,
+    daemonHandle.daemon.agentManager.getMcpAuthToken()!,
   );
 
   execSync("git init -b main", { cwd: worktreeRepoCwd, stdio: "pipe" });
@@ -382,8 +395,8 @@ describe("Suite A: Core Fixes", () => {
         host: listenTarget!.host,
         port: listenTarget!.port,
         agentId,
+        incarnation: getCallerAgentIdentity(agentId).incarnation,
       });
-      const callerAgentProof = getCallerAgentProof(agentId);
 
       const launchConfig = launchConfigsByProvider.claude
         ?.toReversed()
@@ -392,7 +405,9 @@ describe("Suite A: Core Fixes", () => {
         paseo: {
           type: "http",
           url: expectedUrl,
-          headers: { "X-Paseo-Agent-Proof": callerAgentProof },
+          headers: {
+            Authorization: `Bearer ${daemonHandle.daemon.agentManager.getMcpAuthToken()!}`,
+          },
         },
       });
       expect(snapshot.config.mcpServers?.paseo).toBeUndefined();
@@ -514,6 +529,73 @@ describe("Suite A: Core Fixes", () => {
       expect(agents.some((agent) => agent.id === archivedAgentId)).toBe(false);
     } finally {
       await archiveAgentIfPresent(agentId);
+    }
+  });
+
+  test("agent MCP blocks self aliases and stale incarnation replay", async () => {
+    let callerAgentId: string | null = null;
+    let crossTargetId: string | null = null;
+    let staleTargetId: string | null = null;
+    let scopedClient: McpClient | null = null;
+    let partialClaimClient: McpClient | null = null;
+    try {
+      callerAgentId = await createTopLevelAgent({ title: "Restricted MCP caller" });
+      crossTargetId = await createTopLevelAgent({ title: "Cross-agent target" });
+      staleTargetId = await createTopLevelAgent({ title: "Stale replay target" });
+      const identity = getCallerAgentIdentity(callerAgentId);
+      scopedClient = await createMcpClient(
+        buildExpectedAgentMcpUrl({
+          host: "127.0.0.1",
+          port: daemonHandle.port,
+          agentId: callerAgentId,
+          incarnation: identity.incarnation,
+        }),
+        daemonHandle.daemon.agentManager.getMcpAuthToken()!,
+      );
+
+      await expectToolError(
+        scopedClient,
+        "archive_agent",
+        { agentId: callerAgentId },
+        /cannot target itself with agent\.archive/,
+      );
+      await expectToolError(
+        scopedClient,
+        "kill_agent",
+        { agentId: callerAgentId },
+        /cannot target itself with agent\.kill/,
+      );
+      expect(daemonHandle.daemon.agentManager.getAgent(callerAgentId)).not.toBeNull();
+
+      await callToolStructured(scopedClient, "archive_agent", { agentId: crossTargetId });
+      expect(daemonHandle.daemon.agentManager.getAgent(crossTargetId)).toBeNull();
+      crossTargetId = null;
+
+      partialClaimClient = await createMcpClient(
+        `http://127.0.0.1:${daemonHandle.port}/mcp/agents?callerAgentId=${callerAgentId}`,
+        "mcp-parity-password",
+      );
+      await expectToolError(
+        partialClaimClient,
+        "archive_agent",
+        { agentId: staleTargetId },
+        /missing, stale, or does not match/,
+      );
+
+      await daemonHandle.daemon.agentManager.reloadAgentSession(callerAgentId);
+      await expectToolError(
+        scopedClient,
+        "archive_agent",
+        { agentId: staleTargetId },
+        /missing, stale, or does not match/,
+      );
+      expect(daemonHandle.daemon.agentManager.getAgent(staleTargetId)).not.toBeNull();
+    } finally {
+      await partialClaimClient?.close();
+      await scopedClient?.close();
+      await archiveAgentIfPresent(callerAgentId);
+      await archiveAgentIfPresent(crossTargetId);
+      await archiveAgentIfPresent(staleTargetId);
     }
   });
 
@@ -920,21 +1002,22 @@ describe("Suite E: Workspace Tools", () => {
         title: "Worktree scoped parity agent",
         workspace: { kind: "existing", workspaceId },
       });
-      const callerAgentProof = getCallerAgentProof(worktreeAgentId);
+      const callerAgentIdentity = getCallerAgentIdentity(worktreeAgentId);
       worktreeScopedClient = await createMcpClient(
         buildExpectedAgentMcpUrl({
           host: "127.0.0.1",
           port: daemonHandle.port,
           agentId: worktreeAgentId,
+          incarnation: callerAgentIdentity.incarnation,
         }),
-        callerAgentProof,
+        daemonHandle.daemon.agentManager.getMcpAuthToken()!,
       );
 
       await expectToolError(
         worktreeScopedClient,
         "archive_workspace",
         { workspaceId },
-        /cannot archive its own workspace/,
+        /cannot target itself with workspace\.archive/,
       );
 
       const listed = await callToolStructured(topLevelClient, "list_workspaces");

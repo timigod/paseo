@@ -1,4 +1,5 @@
 import type { z } from "zod";
+import type { DestructiveCallerContext } from "../destructive-action-authority.js";
 
 export interface PaseoToolExecutionContext {
   signal?: AbortSignal;
@@ -36,7 +37,8 @@ export interface PaseoToolCatalog {
 
 export interface PaseoToolRuntimeContext {
   callerAgentId?: string;
-  callerAgentVerified?: boolean;
+  callerAgentIncarnation?: string;
+  destructiveCaller?: DestructiveCallerContext;
   enableVoiceTools?: boolean;
   voiceOnly?: boolean;
 }

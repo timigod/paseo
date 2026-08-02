@@ -9,37 +9,37 @@ const BASE_CONFIG: AgentSessionConfig = {
 };
 
 describe("withRuntimePaseoMcpServer", () => {
-  test("injects the paseo MCP server with a bearer header when a token is provided", () => {
+  test("binds the paseo MCP server to the current incarnation without caller authority headers", () => {
     const result = withRuntimePaseoMcpServer({
       config: BASE_CONFIG,
       agentId: "agent-1",
+      agentIncarnation: "incarnation-1",
       mcpBaseUrl: "http://127.0.0.1:6767/mcp/agents",
       mcpAuthToken: "cap-token",
-      callerAgentProof: "caller-proof",
     });
 
     expect(result.mcpServers?.paseo).toEqual({
       type: "http",
-      url: "http://127.0.0.1:6767/mcp/agents?callerAgentId=agent-1",
+      url: "http://127.0.0.1:6767/mcp/agents?callerAgentId=agent-1&callerAgentIncarnation=incarnation-1",
       headers: {
         Authorization: "Bearer cap-token",
-        "X-Paseo-Agent-Proof": "caller-proof",
       },
     });
+    expect(JSON.stringify(result)).not.toContain("proof");
   });
 
   test("omits the header when no token is available", () => {
     const result = withRuntimePaseoMcpServer({
       config: BASE_CONFIG,
       agentId: "agent-1",
+      agentIncarnation: "incarnation-1",
       mcpBaseUrl: "http://127.0.0.1:6767/mcp/agents",
       mcpAuthToken: null,
-      callerAgentProof: null,
     });
 
     expect(result.mcpServers?.paseo).toEqual({
       type: "http",
-      url: "http://127.0.0.1:6767/mcp/agents?callerAgentId=agent-1",
+      url: "http://127.0.0.1:6767/mcp/agents?callerAgentId=agent-1&callerAgentIncarnation=incarnation-1",
     });
   });
 
@@ -47,9 +47,9 @@ describe("withRuntimePaseoMcpServer", () => {
     const result = withRuntimePaseoMcpServer({
       config: BASE_CONFIG,
       agentId: "agent-1",
+      agentIncarnation: "incarnation-1",
       mcpBaseUrl: null,
       mcpAuthToken: "cap-token",
-      callerAgentProof: "caller-proof",
     });
 
     expect(result.mcpServers).toBeUndefined();

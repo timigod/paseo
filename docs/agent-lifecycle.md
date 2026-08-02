@@ -78,12 +78,22 @@ archived workspace. History navigation must not infer workspace lifecycle from `
 or mutate either lifecycle. The workspace route asks the daemon for authoritative recovery state;
 only the route's explicit Unarchive or Restore action changes the archived workspace.
 
-An active provider agent cannot archive its own workspace. The shared workspace archive service
-checks the caller's persisted `workspaceId` against every resolved target workspace before marking
-anything as archiving or performing teardown. Native tools carry daemon-trusted caller context; the
-agent MCP endpoint and provider-launched CLI carry a per-agent proof issued by the daemon. A supplied
-agent identity with a missing or invalid proof is rejected. Requests without agent identity remain
-external coordinator actions and retain the ability to archive any workspace.
+An active provider agent cannot archive, delete, kill, or finish itself, and cannot archive its own
+workspace or worktree. All destructive aliases share one pre-mutation authorization check. The
+daemon gives each live agent a fresh incarnation when its provider session is created, resumed,
+imported, reloaded, or restored after daemon restart. Native tools retain the caller in process;
+agent MCP URLs and provider-launched CLI connection hellos carry only the agent id and current
+incarnation. Those values identify the restricted caller but do not grant coordinator authority.
+The daemon rejects missing, incomplete, mismatched, or stale agent identity whenever the resolved
+target is live. Deprecated per-action caller fields remain parseable but are ignored.
+
+External destructive authority is minted only inside the daemon after coordinator authentication
+(or an already authenticated relay/hub attachment). WebSocket authority is kept in a server-side map
+keyed by the physical connection, so a reconnect must establish it again; HTTP MCP authority is
+minted for the authenticated request and never returned to the caller. Neither form is serialized
+into provider environment variables, HTTP headers, or WebSocket messages. Unauthenticated CLI, MCP,
+browser, mobile, raw, and legacy connections therefore fail closed against live targets rather than
+being treated as coordinators.
 
 History navigation preserves the selected agent as an explicit recovery target. If both that agent
 and its workspace are archived, the workspace recovery action restores the workspace and unarchives

@@ -29,7 +29,6 @@ export async function runArchiveCommandWithDeps(
   workspaceId: string,
   options: { host?: string },
   deps: { connectToDaemon: typeof connectToDaemon },
-  env: NodeJS.ProcessEnv = process.env,
 ): Promise<SingleResult<WorkspaceArchiveResult>> {
   const host = getDaemonHost({ host: options.host });
   const client = await deps.connectToDaemon({ host: options.host }).catch((error: unknown) => {
@@ -40,11 +39,7 @@ export async function runArchiveCommandWithDeps(
     } satisfies CommandError;
   });
   try {
-    const payload = await client.archiveWorkspace(
-      workspaceId,
-      undefined,
-      resolveArchiveCaller(env),
-    );
+    const payload = await client.archiveWorkspace(workspaceId);
     if (payload.error) {
       throw {
         code: payload.errorCode ?? "WORKSPACE_ARCHIVE_FAILED",
@@ -68,15 +63,4 @@ export async function runArchiveCommandWithDeps(
   } finally {
     await client.close().catch(() => undefined);
   }
-}
-
-function resolveArchiveCaller(
-  env: NodeJS.ProcessEnv,
-): { agentId: string; proof?: string } | undefined {
-  const agentId = env.PASEO_AGENT_ID?.trim();
-  const proof = env.PASEO_AGENT_CALLER_PROOF?.trim();
-  if (!agentId && !proof) {
-    return undefined;
-  }
-  return { agentId: agentId ?? "", ...(proof ? { proof } : {}) };
 }

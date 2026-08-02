@@ -381,13 +381,12 @@ describe("agent MCP end-to-end (offline)", () => {
       const payload = getStructuredContent(result);
       agentId = typeof payload?.agentId === "string" ? payload.agentId : null;
       expect(agentId).toBeTruthy();
-      const callerProof = daemon.agentManager.createCallerAgentProof(agentId!);
-      expect(callerProof).toEqual(expect.any(String));
+      const callerIdentity = daemon.agentManager.getAgentCallerIdentity(agentId!);
+      expect(callerIdentity).toMatchObject({ agentId: agentId!, incarnation: expect.any(String) });
 
       expect(findRecordedPaseoMcpServer(recorder, agentId!)).toMatchObject({
         type: "http",
-        url: `http://127.0.0.1:${port}/mcp/agents?callerAgentId=${agentId!}`,
-        headers: { "X-Paseo-Agent-Proof": callerProof! },
+        url: `http://127.0.0.1:${port}/mcp/agents?callerAgentId=${agentId!}&callerAgentIncarnation=${callerIdentity!.incarnation}`,
       });
       const injectedAgent = daemon.agentManager.getAgent(agentId!);
       expect(injectedAgent?.config.mcpServers?.paseo).toBeUndefined();
@@ -471,13 +470,12 @@ describe("agent MCP end-to-end (offline)", () => {
       const payload = getStructuredContent(result);
       agentId = typeof payload?.agentId === "string" ? payload.agentId : null;
       expect(agentId).toBeTruthy();
-      const callerProof = daemon.agentManager.createCallerAgentProof(agentId!);
-      expect(callerProof).toEqual(expect.any(String));
+      const callerIdentity = daemon.agentManager.getAgentCallerIdentity(agentId!);
+      expect(callerIdentity).toMatchObject({ agentId: agentId!, incarnation: expect.any(String) });
 
       expect(findRecordedPaseoMcpServer(recorder, agentId!)).toMatchObject({
         type: "http",
-        url: `http://127.0.0.1:${port}/mcp/agents?callerAgentId=${agentId!}`,
-        headers: { "X-Paseo-Agent-Proof": callerProof! },
+        url: `http://127.0.0.1:${port}/mcp/agents?callerAgentId=${agentId!}&callerAgentIncarnation=${callerIdentity!.incarnation}`,
       });
       const injectedAgent = daemon.agentManager.getAgent(agentId!);
       expect(injectedAgent?.config.mcpServers?.paseo).toBeUndefined();

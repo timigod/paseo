@@ -29,6 +29,7 @@ export function stripInternalPaseoMcpServer(config: AgentSessionConfig): AgentSe
 export function withRuntimePaseoMcpServer(params: {
   config: AgentSessionConfig;
   agentId: string;
+  agentIncarnation: string;
   mcpBaseUrl: string | null;
   /**
    * Capability token authenticating the injected connection to the daemon's
@@ -36,7 +37,6 @@ export function withRuntimePaseoMcpServer(params: {
    * this header the agent's MCP requests are rejected when a password is set.
    */
   mcpAuthToken: string | null;
-  callerAgentProof: string | null;
 }): AgentSessionConfig {
   const storedConfig = stripInternalPaseoMcpServer(params.config);
   if (!params.mcpBaseUrl || storedConfig.mcpServers?.[PASEO_MCP_SERVER_NAME]) {
@@ -47,16 +47,12 @@ export function withRuntimePaseoMcpServer(params: {
   if (params.mcpAuthToken) {
     headers.Authorization = `Bearer ${params.mcpAuthToken}`;
   }
-  if (params.callerAgentProof) {
-    headers["X-Paseo-Agent-Proof"] = params.callerAgentProof;
-  }
-
   return {
     ...storedConfig,
     mcpServers: {
       [PASEO_MCP_SERVER_NAME]: {
         type: "http",
-        url: createAgentMcpUrl(params.mcpBaseUrl, params.agentId),
+        url: createAgentMcpUrl(params.mcpBaseUrl, params.agentId, params.agentIncarnation),
         ...(Object.keys(headers).length > 0 ? { headers } : {}),
       },
       ...storedConfig.mcpServers,
@@ -64,9 +60,10 @@ export function withRuntimePaseoMcpServer(params: {
   };
 }
 
-function createAgentMcpUrl(baseUrl: string, agentId: string): string {
+function createAgentMcpUrl(baseUrl: string, agentId: string, agentIncarnation: string): string {
   const url = new URL(baseUrl);
   url.searchParams.set("callerAgentId", agentId);
+  url.searchParams.set("callerAgentIncarnation", agentIncarnation);
   return url.toString();
 }
 

@@ -27,6 +27,20 @@ export interface ConnectOptions {
   timeout?: number;
 }
 
+export function resolveCliCallerIdentity(
+  env: NodeJS.ProcessEnv = process.env,
+): { agentId?: string; incarnation?: string } | undefined {
+  const agentId = env.PASEO_AGENT_ID?.trim();
+  const incarnation = env.PASEO_AGENT_INCARNATION?.trim();
+  if (!agentId && !incarnation) {
+    return undefined;
+  }
+  return {
+    ...(agentId ? { agentId } : {}),
+    ...(incarnation ? { incarnation } : {}),
+  };
+}
+
 export interface DaemonConnectionCommandError {
   code: "DAEMON_NOT_RUNNING";
   message: string;
@@ -347,6 +361,9 @@ async function tryConnectHost(
   const client = createCliDaemonClient({
     url: target.url,
     clientId,
+    clientType: "cli",
+    appVersion: resolveCliVersion(),
+    callerAgent: resolveCliCallerIdentity(),
     password,
     connectTimeoutMs: timeout,
     webSocketFactory: (
@@ -386,6 +403,9 @@ async function connectViaRelayOffer(
   const client = createCliDaemonClient({
     url,
     clientId,
+    clientType: "cli",
+    appVersion: resolveCliVersion(),
+    callerAgent: resolveCliCallerIdentity(),
     connectTimeoutMs: timeout,
     webSocketFactory: (
       target: string,

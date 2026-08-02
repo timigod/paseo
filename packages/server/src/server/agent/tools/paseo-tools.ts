@@ -87,6 +87,7 @@ import {
 } from "../../worktree/commands.js";
 import { registerBrowserTools } from "../../browser-tools/tools.js";
 import type { BrowserToolsBroker } from "../../browser-tools/broker.js";
+import type { DestructiveCallerContext } from "../destructive-action-authority.js";
 import type {
   PaseoToolCatalog,
   PaseoToolConfig,
@@ -146,7 +147,8 @@ export interface PaseoToolHostDependencies {
    * Used for cwd/mode inheritance when agents spawn child agents.
    */
   callerAgentId?: string;
-  callerAgentVerified?: boolean;
+  callerAgentIncarnation?: string;
+  destructiveCaller?: DestructiveCallerContext;
   /**
    * Optional resolver for session-bound speak handlers.
    * Used by hidden voice agents to narrate through daemon-managed TTS.
@@ -1441,14 +1443,7 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
         {
           requestId: "mcp:archive_workspace",
           scope: { kind: "workspace", workspaceId: workspace.workspaceId },
-          ...(callerAgentId
-            ? {
-                caller: {
-                  agentId: callerAgentId,
-                  verified: options.callerAgentVerified === true,
-                },
-              }
-            : {}),
+          caller: options.destructiveCaller,
         },
       );
       return {
@@ -2205,6 +2200,7 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
           logger: childLogger,
         },
         agentId,
+        { caller: options.destructiveCaller },
       );
       return {
         content: [],
@@ -2226,7 +2222,9 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
       },
     },
     async ({ agentId }) => {
-      await closeAgentCommand({ agentManager }, agentId);
+      await closeAgentCommand({ agentManager }, agentId, {
+        caller: options.destructiveCaller,
+      });
       return {
         content: [],
         structuredContent: ensureValidJson({ success: true }),

@@ -2522,6 +2522,7 @@ test("createAgent passes daemon launch env through the provider launch context",
     agentId: snapshot.id,
     env: {
       PASEO_AGENT_ID: snapshot.id,
+      PASEO_AGENT_INCARNATION: expect.any(String),
       PASEO_AGENT_CWD: workdir,
     },
   });
@@ -2648,10 +2649,12 @@ test("createAgent injects paseo MCP server only into provider launch config", as
       command: "custom-mcp",
     },
   });
+  const callerIdentity = manager.getAgentCallerIdentity(snapshot.id);
+  expect(callerIdentity).toMatchObject({ agentId: snapshot.id, incarnation: expect.any(String) });
   expect(client.lastConfig?.mcpServers).toEqual({
     paseo: {
       type: "http",
-      url: `http://127.0.0.1:6767/mcp/agents?callerAgentId=${snapshot.id}`,
+      url: `http://127.0.0.1:6767/mcp/agents?callerAgentId=${snapshot.id}&callerAgentIncarnation=${callerIdentity!.incarnation}`,
     },
     custom: {
       type: "stdio",
@@ -2786,9 +2789,10 @@ test("createAgent injects the MCP auth token as a bearer header into the launch 
   );
 
   expect(manager.getMcpAuthToken()).toBe("cap-token");
+  const callerIdentity = manager.getAgentCallerIdentity(snapshot.id);
   expect(client.lastConfig?.mcpServers?.paseo).toEqual({
     type: "http",
-    url: `http://127.0.0.1:6767/mcp/agents?callerAgentId=${snapshot.id}`,
+    url: `http://127.0.0.1:6767/mcp/agents?callerAgentId=${snapshot.id}&callerAgentIncarnation=${callerIdentity!.incarnation}`,
     headers: { Authorization: "Bearer cap-token" },
   });
 
@@ -2830,11 +2834,12 @@ test("resumeAgentFromPersistence replaces stored internal paseo MCP with current
       },
     },
   });
+  const callerIdentity = manager.getAgentCallerIdentity(snapshot.id);
 
   expect(client.resumeOverrides[0]?.mcpServers).toEqual({
     paseo: {
       type: "http",
-      url: `http://127.0.0.1:6768/mcp/agents?callerAgentId=${snapshot.id}`,
+      url: `http://127.0.0.1:6768/mcp/agents?callerAgentId=${snapshot.id}&callerAgentIncarnation=${callerIdentity!.incarnation}`,
     },
     custom: {
       type: "stdio",
@@ -3328,6 +3333,7 @@ test("resumeAgentFromPersistence keeps metadata config, applies overrides, and p
     agentId: resumed.id,
     env: {
       PASEO_AGENT_ID: resumed.id,
+      PASEO_AGENT_INCARNATION: expect.any(String),
       PASEO_AGENT_CWD: workdir,
     },
   });
@@ -3436,6 +3442,7 @@ test("importProviderSession imports the selected session without listing and pub
     agentId: imported.id,
     env: {
       PASEO_AGENT_ID: imported.id,
+      PASEO_AGENT_INCARNATION: expect.any(String),
       PASEO_AGENT_CWD: workdir,
     },
   });
@@ -3539,9 +3546,13 @@ test("reloadAgentSession passes daemon launch env through the provider launch co
     agentId: snapshot.id,
     env: {
       PASEO_AGENT_ID: snapshot.id,
+      PASEO_AGENT_INCARNATION: expect.any(String),
       PASEO_AGENT_CWD: workdir,
     },
   });
+  const initialIncarnation = client.lastCreateLaunchContext?.env?.PASEO_AGENT_INCARNATION;
+  expect(initialIncarnation).toBe(manager.getAgentCallerIdentity(snapshot.id)?.incarnation);
+  expect(client.lastCreateLaunchContext).not.toHaveProperty("env.PASEO_AGENT_CALLER_PROOF");
 
   await manager.reloadAgentSession(snapshot.id, {
     systemPrompt: "reloaded prompt",
@@ -3551,9 +3562,14 @@ test("reloadAgentSession passes daemon launch env through the provider launch co
     agentId: snapshot.id,
     env: {
       PASEO_AGENT_ID: snapshot.id,
+      PASEO_AGENT_INCARNATION: expect.any(String),
       PASEO_AGENT_CWD: workdir,
     },
   });
+  const reloadedIncarnation = client.lastResumeLaunchContext?.env?.PASEO_AGENT_INCARNATION;
+  expect(reloadedIncarnation).toBe(manager.getAgentCallerIdentity(snapshot.id)?.incarnation);
+  expect(reloadedIncarnation).not.toBe(initialIncarnation);
+  expect(client.lastResumeLaunchContext).not.toHaveProperty("env.PASEO_AGENT_CALLER_PROOF");
 });
 
 test("reloadAgentSession preserves timeline and does not force history replay", async () => {

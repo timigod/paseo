@@ -7,11 +7,17 @@ import {
 } from "./agent-manager.js";
 import type { StoredAgentRecord } from "./agent-storage.js";
 import type { AgentProviderNotice } from "./agent-sdk-types.js";
+import {
+  assertDestructiveActionAuthorized,
+  type DestructiveActionName,
+  type DestructiveCallerContext,
+} from "./destructive-action-authority.js";
 
-export type LifecycleAgentSnapshot = Pick<ManagedAgent, "id" | "cwd" | "lifecycle">;
+export type LifecycleAgentSnapshot = Pick<ManagedAgent, "id" | "cwd" | "workspaceId" | "lifecycle">;
 
 export interface LifecycleAgentManager {
   getAgent(agentId: string): LifecycleAgentSnapshot | null;
+  isCurrentAgentIncarnation?(agentId: string, incarnation: string): boolean;
   hasInFlightRun(agentId: string): boolean;
   cancelAgentRun(
     agentId: string,
@@ -173,8 +179,15 @@ export interface ArchiveAgentResult {
 export async function archiveAgentCommand(
   dependencies: AgentLifecycleCommandDependencies,
   agentId: string,
+  options?: { caller?: DestructiveCallerContext; action?: "agent.archive" | "agent.finish" },
 ): Promise<ArchiveAgentResult> {
   const liveAgent = dependencies.agentManager.getAgent(agentId);
+  assertAgentDestructiveActionAuthorized(
+    dependencies.agentManager,
+    options?.caller,
+    agentId,
+    options?.action ?? "agent.archive",
+  );
   let record: StoredAgentRecord | null;
   if (liveAgent) {
     await requestAgentRunCancellation(dependencies, agentId);
@@ -202,8 +215,44 @@ export async function archiveAgentCommand(
 export async function closeAgentCommand(
   dependencies: Pick<AgentLifecycleCommandDependencies, "agentManager">,
   agentId: string,
+  options?: { caller?: DestructiveCallerContext },
 ): Promise<void> {
+  assertAgentDestructiveActionAuthorized(
+    dependencies.agentManager,
+    options?.caller,
+    agentId,
+    "agent.kill",
+  );
   await dependencies.agentManager.closeAgent(agentId);
+}
+
+export function assertAgentDestructiveActionAuthorized(
+  agentManager: Pick<LifecycleAgentManager, "getAgent" | "isCurrentAgentIncarnation">,
+  caller: DestructiveCallerContext | undefined,
+  agentId: string,
+  action: Extract<
+    DestructiveActionName,
+    "agent.archive" | "agent.delete" | "agent.kill" | "agent.finish"
+  >,
+): void {
+  if (!caller) {
+    return;
+  }
+  const target = agentManager.getAgent(agentId);
+  assertDestructiveActionAuthorized(
+    {
+      getAgent: (id) => agentManager.getAgent(id),
+      isCurrentAgentIncarnation: (id, incarnation) =>
+        agentManager.isCurrentAgentIncarnation?.(id, incarnation) === true,
+    },
+    caller,
+    {
+      action,
+      targetAgentIds: [agentId],
+      targetWorkspaceIds: target?.workspaceId ? [target.workspaceId] : [],
+      hasLiveTarget: target !== null,
+    },
+  );
 }
 
 export interface UpdateAgentResult {

@@ -29,6 +29,10 @@ import {
 import { readPaseoWorktreeIncarnationId } from "../utils/worktree-metadata.js";
 import type { ManagedAgent } from "./agent/agent-manager.js";
 import type { AgentStorage, StoredAgentRecord } from "./agent/agent-storage.js";
+import {
+  createAgentDestructiveCaller,
+  createCoordinatorDestructiveCaller,
+} from "./agent/destructive-action-authority.js";
 import type { WorkspaceGitService } from "./workspace-git-service.js";
 import {
   archiveByScope,
@@ -166,6 +170,7 @@ interface ArchiveDepsInput {
   paseoWorktreesBaseRoot?: string;
   findWorkspaceIdForCwd?: (cwd: string) => Promise<string | null>;
   liveAgents?: Array<{ id: string; workspaceId?: string }>;
+  incarnations?: Record<string, string>;
 }
 
 interface ArchiveTestDependencies extends ArchiveDependencies {
@@ -197,6 +202,9 @@ function createArchiveDeps(input: ArchiveDepsInput): ArchiveTestDependencies {
         archivedSnapshotIds.push(agentId);
         return {};
       }),
+      isCurrentAgentIncarnation: (agentId: string, incarnation: string) =>
+        (input.incarnations?.[agentId] ?? `incarnation-${agentId}`) === incarnation &&
+        (input.liveAgents ?? []).some((agent) => agent.id === agentId),
     },
     agentStorage: {
       list: async (): Promise<StoredAgentRecord[]> => [],
@@ -546,7 +554,10 @@ describe("archiveByScope", () => {
     const archive = archiveByScope(deps, {
       scope: { kind: "workspace", workspaceId },
       requestId: "req-self-archive",
-      caller: { agentId, verified: true },
+      caller: createAgentDestructiveCaller({
+        agentId,
+        incarnation: `incarnation-${agentId}`,
+      }),
     });
 
     await expect(archive).rejects.toMatchObject({
@@ -576,7 +587,10 @@ describe("archiveByScope", () => {
     const result = await archiveByScope(deps, {
       scope: { kind: "workspace", workspaceId: targetWorkspaceId },
       requestId: "req-cross-workspace-archive",
-      caller: { agentId: "agent-caller", verified: true },
+      caller: createAgentDestructiveCaller({
+        agentId: "agent-caller",
+        incarnation: "incarnation-agent-caller",
+      }),
     });
 
     expect(result.archivedWorkspaceIds).toEqual([targetWorkspaceId]);
@@ -597,6 +611,7 @@ describe("archiveByScope", () => {
     const result = await archiveByScope(deps, {
       scope: { kind: "workspace", workspaceId },
       requestId: "req-external-archive",
+      caller: createCoordinatorDestructiveCaller(),
     });
 
     expect(result.archivedWorkspaceIds).toEqual([workspaceId]);
@@ -612,15 +627,15 @@ describe("archiveByScope", () => {
       liveAgents: [{ id: "real-agent", workspaceId }],
     });
 
-    for (const caller of [
-      { agentId: "real-agent", verified: false },
-      { agentId: "unknown-agent", verified: true },
+    for (const identity of [
+      { agentId: "real-agent", incarnation: "stale-incarnation" },
+      { agentId: "unknown-agent", incarnation: "incarnation-unknown-agent" },
     ]) {
       await expect(
         archiveByScope(deps, {
           scope: { kind: "workspace", workspaceId },
-          requestId: `req-${caller.agentId}`,
-          caller,
+          requestId: `req-${identity.agentId}`,
+          caller: createAgentDestructiveCaller(identity),
         }),
       ).rejects.toEqual(
         expect.objectContaining({
@@ -656,7 +671,10 @@ describe("archiveByScope", () => {
       archiveByScope(deps, {
         scope: { kind: "worktree", targetPath: symlinkPath },
         requestId: "req-symlink-self-archive",
-        caller: { agentId: "agent-symlink", verified: true },
+        caller: createAgentDestructiveCaller({
+          agentId: "agent-symlink",
+          incarnation: "incarnation-agent-symlink",
+        }),
       }),
     ).rejects.toBeInstanceOf(WorkspaceArchiveError);
     expect(deps.markWorkspaceArchiving).not.toHaveBeenCalled();

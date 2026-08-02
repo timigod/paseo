@@ -6,6 +6,7 @@ import type { StoredAgentRecord } from "./agent-storage.js";
 import {
   archiveAgentCommand,
   cancelAgentRunCommand,
+  closeAgentCommand,
   detachAgentCommand,
   setAgentModeCommand,
   updateAgentCommand,
@@ -13,6 +14,7 @@ import {
   type LifecycleAgentManager,
   type LifecycleAgentStorage,
 } from "./lifecycle-command.js";
+import { createAgentDestructiveCaller } from "./destructive-action-authority.js";
 
 class FakeLifecycleAgentStorage implements LifecycleAgentStorage {
   readonly records = new Map<string, StoredAgentRecord>();
@@ -46,11 +48,16 @@ class FakeLifecycleAgentManager implements LifecycleAgentManager {
   inFlightAgentIds = new Set<string>();
   readonly settledDuringCancellationAgentIds = new Set<string>();
   readonly rejectedCancellationAgentIds = new Set<string>();
+  readonly incarnations = new Map<string, string>();
 
   constructor(private readonly storage: FakeLifecycleAgentStorage) {}
 
   getAgent(agentId: string): LifecycleAgentSnapshot | null {
     return this.liveAgents.get(agentId) ?? null;
+  }
+
+  isCurrentAgentIncarnation(agentId: string, incarnation: string): boolean {
+    return this.incarnations.get(agentId) === incarnation;
   }
 
   hasInFlightRun(agentId: string): boolean {
@@ -348,6 +355,51 @@ describe("agent lifecycle commands", () => {
     expect(manager.cancelledAgentIds).toEqual(["agent-1"]);
     expect(manager.clearedAttentionAgentIds).toEqual(["agent-1"]);
     expect(manager.archivedAgentIds).toEqual(["agent-1"]);
+  });
+
+  test("blocks archive and kill aliases before mutating the caller agent", async () => {
+    const storage = new FakeLifecycleAgentStorage();
+    const manager = new FakeLifecycleAgentManager(storage);
+    manager.liveAgents.set("agent-1", managedAgent("agent-1", "running"));
+    manager.incarnations.set("agent-1", "incarnation-1");
+    storage.records.set("agent-1", storedAgent("agent-1"));
+    const caller = createAgentDestructiveCaller({
+      agentId: "agent-1",
+      incarnation: "incarnation-1",
+    });
+
+    await expect(
+      archiveAgentCommand({ agentManager: manager, agentStorage: storage, logger }, "agent-1", {
+        caller,
+      }),
+    ).rejects.toMatchObject({ code: "SELF_ARCHIVE_BLOCKED" });
+    await expect(
+      closeAgentCommand({ agentManager: manager }, "agent-1", { caller }),
+    ).rejects.toMatchObject({ code: "SELF_ARCHIVE_BLOCKED" });
+
+    expect(manager.cancelledAgentIds).toEqual([]);
+    expect(manager.clearedAttentionAgentIds).toEqual([]);
+    expect(manager.archivedAgentIds).toEqual([]);
+    expect(manager.closedAgentIds).toEqual([]);
+  });
+
+  test("rejects a stale incarnation before archiving another live agent", async () => {
+    const storage = new FakeLifecycleAgentStorage();
+    const manager = new FakeLifecycleAgentManager(storage);
+    manager.liveAgents.set("agent-1", managedAgent("agent-1", "idle"));
+    manager.liveAgents.set("agent-2", managedAgent("agent-2", "idle"));
+    manager.incarnations.set("agent-1", "incarnation-after-restart");
+    storage.records.set("agent-2", storedAgent("agent-2"));
+
+    await expect(
+      archiveAgentCommand({ agentManager: manager, agentStorage: storage, logger }, "agent-2", {
+        caller: createAgentDestructiveCaller({
+          agentId: "agent-1",
+          incarnation: "incarnation-before-restart",
+        }),
+      }),
+    ).rejects.toMatchObject({ code: "INVALID_CALLER_IDENTITY" });
+    expect(manager.archivedAgentIds).toEqual([]);
   });
 
   test("archives a live agent when its graceful cancellation is rejected", async () => {

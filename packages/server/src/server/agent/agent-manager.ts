@@ -1,4 +1,4 @@
-import { createHmac, randomUUID, timingSafeEqual } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { resolve } from "node:path";
 import { stat } from "node:fs/promises";
 import {
@@ -77,6 +77,7 @@ import { isSystemInjectedEnvelope } from "./agent-prompt.js";
 import { stripInternalPaseoMcpServer, withRuntimePaseoMcpServer } from "./runtime-mcp-config.js";
 import { resolveCreateAgentTitles } from "./create-agent-title.js";
 import type { PaseoToolCatalogFactory } from "./tools/types.js";
+import type { AgentCallerIdentity } from "./destructive-action-authority.js";
 import {
   ProviderSubagentStore,
   type ProviderSubagentDescriptor,
@@ -96,10 +97,6 @@ const STORED_AGENT_CAPABILITIES: AgentCapabilityFlags = {
   supportsRewindFiles: false,
   supportsRewindBoth: false,
 };
-
-function nullableCallerIdentitySecret(secret: string | undefined): string | null {
-  return secret ?? null;
-}
 
 type TimeoutResult = "completed" | "timed_out";
 
@@ -314,7 +311,6 @@ export interface AgentManagerOptions {
   terminalManager?: TerminalManager | null;
   mcpBaseUrl?: string;
   mcpAuthToken?: string;
-  callerIdentitySecret?: string;
   paseoToolsEnabled?: boolean;
   paseoToolCatalogFactory?: PaseoToolCatalogFactory;
   appendSystemPrompt?: string;
@@ -626,6 +622,7 @@ export class AgentManager {
   private readonly clients = new Map<AgentProvider, AgentClient>();
   private readonly providerEnabled = new Map<AgentProvider, boolean>();
   private readonly agents = new Map<string, LiveManagedAgent>();
+  private readonly agentIncarnations = new Map<string, string>();
   private readonly timelineStore = new InMemoryAgentTimelineStore();
   private readonly providerSubagents = new ProviderSubagentStore();
   private readonly agentsAwaitingInitialSnapshotPersist = new Set<string>();
@@ -650,7 +647,6 @@ export class AgentManager {
   private readonly agentStreamCoalescer: AgentStreamCoalescer;
   private mcpBaseUrl: string | null;
   private readonly mcpAuthToken: string | null;
-  private readonly callerIdentitySecret: string | null;
   private paseoToolsEnabled = true;
   private paseoToolCatalogFactory: PaseoToolCatalogFactory | null = null;
   private appendSystemPrompt: string;
@@ -671,7 +667,6 @@ export class AgentManager {
     this.onWorkspaceStateMayHaveChanged = options?.onWorkspaceStateMayHaveChanged;
     this.mcpBaseUrl = options?.mcpBaseUrl ?? null;
     this.mcpAuthToken = options?.mcpAuthToken ?? null;
-    this.callerIdentitySecret = nullableCallerIdentitySecret(options.callerIdentitySecret);
     this.configurePaseoTools(options);
     this.appendSystemPrompt = options.appendSystemPrompt ?? "";
     this.logger = options.logger.child({ module: "agent", component: "agent-manager" });
@@ -789,22 +784,19 @@ export class AgentManager {
     return this.mcpAuthToken;
   }
 
-  createCallerAgentProof(agentId: string): string | null {
-    if (!this.callerIdentitySecret) {
+  getAgentCallerIdentity(agentId: string): AgentCallerIdentity | null {
+    const incarnation = this.agentIncarnations.get(agentId);
+    if (!incarnation || !this.agents.has(agentId)) {
       return null;
     }
-    return createHmac("sha256", this.callerIdentitySecret).update(agentId).digest("base64url");
+    return { agentId, incarnation };
   }
 
-  verifyCallerAgentProof(agentId: string, proof: string | undefined): boolean {
-    const expected = this.createCallerAgentProof(agentId);
-    if (!expected || !proof) {
-      return false;
-    }
-    const actualBuffer = Buffer.from(proof);
-    const expectedBuffer = Buffer.from(expected);
+  isCurrentAgentIncarnation(agentId: string, incarnation: string): boolean {
     return (
-      actualBuffer.length === expectedBuffer.length && timingSafeEqual(actualBuffer, expectedBuffer)
+      incarnation.length > 0 &&
+      this.agents.has(agentId) &&
+      this.agentIncarnations.get(agentId) === incarnation
     );
   }
 
@@ -1166,9 +1158,11 @@ export class AgentManager {
   ): Promise<ManagedAgent> {
     this.assertAcceptingAgentRegistrations();
     const resolvedAgentId = validateAgentId(agentId ?? this.idFactory(), "createAgent");
+    const agentIncarnation = randomUUID();
     const { storedConfig, launchConfig } = await this.prepareSessionConfig(
       config,
       resolvedAgentId,
+      agentIncarnation,
       options?.env,
     );
     this.requireEnabledProvider(storedConfig.provider);
@@ -1179,6 +1173,7 @@ export class AgentManager {
       resolvedAgentId,
       client,
       storedConfig.cwd,
+      agentIncarnation,
       options?.env,
     );
     const providerLaunchConfig = this.resolveProviderLaunchConfig(launchConfig, launchContext);
@@ -1203,6 +1198,7 @@ export class AgentManager {
           workspaceId: options.workspaceId,
           owner: options.owner,
           autoArchiveObligation: options.autoArchiveObligation,
+          incarnation: agentIncarnation,
         });
       },
     );
@@ -1428,6 +1424,7 @@ export class AgentManager {
       agentId ?? this.idFactory(),
       "resumeAgentFromPersistence",
     );
+    const agentIncarnation = randomUUID();
     const metadata = (handle.metadata ?? {}) as Partial<AgentSessionConfig>;
     const mergedConfig = {
       ...metadata,
@@ -1437,6 +1434,7 @@ export class AgentManager {
     const { storedConfig, launchConfig } = await this.prepareSessionConfig(
       mergedConfig,
       resolvedAgentId,
+      agentIncarnation,
     );
 
     const client = this.requireClient(handle.provider);
@@ -1446,7 +1444,12 @@ export class AgentManager {
         `Provider '${handle.provider}' is not available. Please ensure the CLI is installed.`,
       );
     }
-    const launchContext = await this.buildLaunchContext(resolvedAgentId, client, storedConfig.cwd);
+    const launchContext = await this.buildLaunchContext(
+      resolvedAgentId,
+      client,
+      storedConfig.cwd,
+      agentIncarnation,
+    );
     const providerLaunchConfig = this.resolveProviderLaunchConfig(launchConfig, launchContext);
     if (resumeOptions?.purpose === "history") {
       const session = await client.resumeSession(
@@ -1459,6 +1462,7 @@ export class AgentManager {
       return this.registerSession(session, storedConfig, resolvedAgentId, {
         ...options,
         persistence: handle,
+        incarnation: agentIncarnation,
       });
     }
     return this.withManagedWorktreeWriter(
@@ -1479,6 +1483,7 @@ export class AgentManager {
         return this.registerSession(session, storedConfig, resolvedAgentId, {
           ...options,
           persistence: handle,
+          incarnation: agentIncarnation,
         });
       },
     );
@@ -1509,6 +1514,7 @@ export class AgentManager {
   ): Promise<ManagedAgent> {
     this.assertAcceptingAgentRegistrations();
     const resolvedAgentId = validateAgentId(this.idFactory(), "importProviderSession");
+    const agentIncarnation = randomUUID();
     this.requireEnabledProvider(input.provider);
 
     const client = await this.requireAvailableClient({ provider: input.provider });
@@ -1522,8 +1528,14 @@ export class AgentManager {
         cwd: input.cwd,
       },
       resolvedAgentId,
+      agentIncarnation,
     );
-    const launchContext = await this.buildLaunchContext(resolvedAgentId, client, storedConfig.cwd);
+    const launchContext = await this.buildLaunchContext(
+      resolvedAgentId,
+      client,
+      storedConfig.cwd,
+      agentIncarnation,
+    );
     const providerLaunchConfig = this.resolveProviderLaunchConfig(launchConfig, launchContext);
     return this.withManagedWorktreeWriter(
       {
@@ -1562,6 +1574,7 @@ export class AgentManager {
               historyPrimed: true,
               initialTitle,
               publishWhenReady: true,
+              incarnation: agentIncarnation,
             },
           );
           for (const event of imported.providerSubagentEvents ?? []) {
@@ -1616,13 +1629,23 @@ export class AgentManager {
     const handle = existing.persistence;
     const provider = handle?.provider ?? existing.provider;
     const client = this.requireClient(provider);
+    const agentIncarnation = randomUUID();
     const refreshConfig = {
       ...existing.config,
       ...overrides,
       provider,
     } as AgentSessionConfig;
-    const { storedConfig, launchConfig } = await this.prepareSessionConfig(refreshConfig, agentId);
-    const launchContext = await this.buildLaunchContext(agentId, client, storedConfig.cwd);
+    const { storedConfig, launchConfig } = await this.prepareSessionConfig(
+      refreshConfig,
+      agentId,
+      agentIncarnation,
+    );
+    const launchContext = await this.buildLaunchContext(
+      agentId,
+      client,
+      storedConfig.cwd,
+      agentIncarnation,
+    );
     const providerLaunchConfig = this.resolveProviderLaunchConfig(launchConfig, launchContext);
 
     return this.withManagedWorktreeWriter(
@@ -1673,6 +1696,7 @@ export class AgentManager {
             lastUsage: preservedLastUsage,
             lastError: preservedLastError,
             attention: preservedAttention,
+            incarnation: agentIncarnation,
           });
         } finally {
           if (!handedToRegistration) {
@@ -2212,14 +2236,15 @@ export class AgentManager {
       labels?: Record<string, string>;
     },
   ): Promise<void> {
-    const liveAgent = this.getAgent(agentId);
+    const liveAgent = this.agents.get(agentId);
     if (liveAgent) {
-      if (updates.title) {
-        await this.setTitle(agentId, updates.title);
-      }
       if (updates.labels) {
-        await this.writeLabels(agentId, updates.labels);
+        liveAgent.labels = applyLabelPatch(liveAgent.labels, updates.labels);
       }
+      const title = updates.title?.trim();
+      this.touchUpdatedAt(liveAgent);
+      await this.persistSnapshot(liveAgent, title ? { title } : undefined);
+      this.emitState(liveAgent, { persist: false });
       return;
     }
 
@@ -3087,28 +3112,27 @@ export class AgentManager {
     session: AgentSession,
     config: AgentSessionConfig,
     agentId: string,
-    options:
-      | {
-          createdAt?: Date;
-          updatedAt?: Date;
-          lastUserMessageAt?: Date | null;
-          labels?: Record<string, string>;
-          timeline?: AgentTimelineItem[];
-          timelineRows?: AgentTimelineRow[];
-          timelineNextSeq?: number;
-          persistence?: AgentPersistenceHandle;
-          historyPrimed?: boolean;
-          lastUsage?: AgentUsage;
-          lastError?: string;
-          attention?: AttentionState;
-          initialTitle?: string | null;
-          publishWhenReady?: boolean;
-          workspaceId?: string;
-          owner?: AgentOwner;
-          autoArchiveObligation?: AutoArchiveObligation;
-          resumeRunning?: boolean;
-        }
-      | undefined,
+    options: {
+      createdAt?: Date;
+      updatedAt?: Date;
+      lastUserMessageAt?: Date | null;
+      labels?: Record<string, string>;
+      timeline?: AgentTimelineItem[];
+      timelineRows?: AgentTimelineRow[];
+      timelineNextSeq?: number;
+      persistence?: AgentPersistenceHandle;
+      historyPrimed?: boolean;
+      lastUsage?: AgentUsage;
+      lastError?: string;
+      attention?: AttentionState;
+      initialTitle?: string | null;
+      publishWhenReady?: boolean;
+      workspaceId?: string;
+      owner?: AgentOwner;
+      autoArchiveObligation?: AutoArchiveObligation;
+      resumeRunning?: boolean;
+      incarnation: string;
+    },
   ): Promise<ManagedAgent> {
     let registered = false;
     let resolvedAgentId = agentId;
@@ -3121,7 +3145,7 @@ export class AgentManager {
       const initialPersistedTitle = await this.resolveInitialPersistedTitle(
         resolvedAgentId,
         config,
-        options?.initialTitle ?? null,
+        options.initialTitle ?? null,
       );
 
       const now = new Date();
@@ -3142,6 +3166,7 @@ export class AgentManager {
 
       this.assertAcceptingAgentRegistrations();
       this.agents.set(resolvedAgentId, managed);
+      this.agentIncarnations.set(resolvedAgentId, options.incarnation);
       registered = true;
       if (options?.resumeRunning) {
         managed.lifecycle = "running";
@@ -3328,6 +3353,7 @@ export class AgentManager {
   ): ManagedAgentClosed {
     this.agentStreamCoalescer.flushAndDiscard(agent.id);
     this.agents.delete(agent.id);
+    this.agentIncarnations.delete(agent.id);
     this.previousStatuses.delete(agent.id);
     if (agent.unsubscribeSession) {
       agent.unsubscribeSession();
@@ -4674,6 +4700,7 @@ export class AgentManager {
   private async prepareSessionConfig(
     config: AgentSessionConfig,
     agentId: string,
+    agentIncarnation: string,
     env?: Record<string, string>,
   ): Promise<PreparedSessionConfig> {
     const storedConfig = await this.normalizeConfig(stripInternalPaseoMcpServer(config), { env });
@@ -4681,9 +4708,9 @@ export class AgentManager {
       withRuntimePaseoMcpServer({
         config: storedConfig,
         agentId,
+        agentIncarnation,
         mcpBaseUrl: this.mcpBaseUrl,
         mcpAuthToken: this.mcpAuthToken,
-        callerAgentProof: this.createCallerAgentProof(agentId),
       }),
     );
     return { storedConfig, launchConfig };
@@ -4706,16 +4733,16 @@ export class AgentManager {
     agentId: string,
     client: AgentClient,
     cwd: string,
+    agentIncarnation: string,
     env?: Record<string, string>,
   ): Promise<AgentLaunchContext> {
-    const callerAgentProof = this.createCallerAgentProof(agentId);
     const context: AgentLaunchContext = {
       agentId,
       env: {
         ...env,
         PASEO_AGENT_ID: agentId,
+        PASEO_AGENT_INCARNATION: agentIncarnation,
         PASEO_AGENT_CWD: cwd,
-        ...(callerAgentProof ? { PASEO_AGENT_CALLER_PROOF: callerAgentProof } : {}),
       },
     };
     if (
@@ -4725,7 +4752,7 @@ export class AgentManager {
     ) {
       context.paseoTools = await this.paseoToolCatalogFactory({
         callerAgentId: agentId,
-        callerAgentVerified: true,
+        callerAgentIncarnation: agentIncarnation,
       });
     }
     return context;

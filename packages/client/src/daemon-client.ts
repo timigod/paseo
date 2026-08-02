@@ -297,6 +297,7 @@ export interface DaemonClientConfig {
   clientId: string;
   clientType?: "mobile" | "browser" | "cli" | "mcp";
   appVersion?: string;
+  callerAgent?: { agentId?: string; incarnation?: string };
   runtimeGeneration?: number | null;
   password?: string;
   authHeader?: string;
@@ -2249,17 +2250,12 @@ export class DaemonClient {
   async archiveWorkspace(
     workspaceId: string,
     requestId?: string,
-    caller?: { agentId: string; proof?: string },
   ): Promise<ArchiveWorkspacePayload> {
-    if (caller) {
-      this.requireAgentArchiveCallerSupport();
-    }
     return this.sendCorrelatedSessionRequest({
       requestId,
       message: {
         type: "archive_workspace_request",
         workspaceId,
-        ...(caller ? { callerAgentId: caller.agentId, callerAgentProof: caller.proof } : {}),
       },
       responseType: "archive_workspace_response",
     });
@@ -3977,13 +3973,9 @@ export class DaemonClient {
       branchName?: string;
       workspaceId?: string;
       scope?: "workspace" | "worktree";
-      caller?: { agentId: string; proof?: string };
     },
     requestId?: string,
   ): Promise<PaseoWorktreeArchivePayload> {
-    if (input.caller) {
-      this.requireAgentArchiveCallerSupport();
-    }
     return this.sendCorrelatedSessionRequest({
       requestId,
       message: {
@@ -3993,9 +3985,6 @@ export class DaemonClient {
         branchName: input.branchName,
         ...(input.workspaceId !== undefined ? { workspaceId: input.workspaceId } : {}),
         ...(input.scope !== undefined ? { scope: input.scope } : {}),
-        ...(input.caller
-          ? { callerAgentId: input.caller.agentId, callerAgentProof: input.caller.proof }
-          : {}),
       },
       responseType: "paseo_worktree_archive_response",
     });
@@ -5291,13 +5280,6 @@ export class DaemonClient {
     }
   }
 
-  private requireAgentArchiveCallerSupport(): void {
-    // COMPAT(agentArchiveCaller): added after v0.2.5; remove after 2027-02-02.
-    if (this.lastServerInfoMessage?.features?.agentArchiveCaller !== true) {
-      throw new Error("Update the host to archive workspaces from a managed agent.");
-    }
-  }
-
   private resolveTransportUrlForAttempt(): string {
     return this.config.url;
   }
@@ -5319,6 +5301,7 @@ export class DaemonClient {
           clientId: this.config.clientId,
           clientType: this.config.clientType ?? "cli",
           protocolVersion: 1,
+          ...(this.config.callerAgent ? { callerAgent: this.config.callerAgent } : {}),
           capabilities: {
             [CLIENT_CAPS.customModeIcons]: true,
             [CLIENT_CAPS.reasoningMergeEnum]: true,

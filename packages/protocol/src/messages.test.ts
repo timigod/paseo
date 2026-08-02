@@ -9,6 +9,7 @@ import {
   parseServerInfoStatusPayload,
   SessionInboundMessageSchema,
   SessionOutboundMessageSchema,
+  WSHelloMessageSchema,
 } from "./messages.js";
 
 describe("managed-worktree writer conflict compatibility", () => {
@@ -484,7 +485,7 @@ describe("paseo worktree archive request compatibility", () => {
     expect(parsed.scope).toBe("workspace");
   });
 
-  test("optional caller identity parses without changing old requests", () => {
+  test("deprecated per-action caller fields remain parse compatible", () => {
     expect(
       PaseoWorktreeArchiveRequestSchema.parse({
         type: "paseo_worktree_archive_request",
@@ -516,7 +517,7 @@ describe("archive caller protocol compatibility", () => {
     expect(parsed?.features?.agentArchiveCaller).toBe(true);
   });
 
-  test("workspace archive accepts old and caller-scoped requests", () => {
+  test("workspace archive accepts old and deprecated per-action fields", () => {
     expect(
       ArchiveWorkspaceRequestSchema.parse({
         type: "archive_workspace_request",
@@ -582,6 +583,33 @@ describe("archive caller protocol compatibility", () => {
         },
       }).payload.errorCode,
     ).toBe("SELF_ARCHIVE_BLOCKED");
+  });
+});
+
+describe("destructive caller hello compatibility", () => {
+  const baseHello = {
+    type: "hello" as const,
+    clientId: "client-1",
+    clientType: "cli" as const,
+    protocolVersion: 1,
+  };
+
+  test("accepts a complete current agent incarnation", () => {
+    expect(
+      WSHelloMessageSchema.parse({
+        ...baseHello,
+        callerAgent: { agentId: "agent-1", incarnation: "incarnation-1" },
+      }),
+    ).toMatchObject({
+      callerAgent: { agentId: "agent-1", incarnation: "incarnation-1" },
+    });
+  });
+
+  test("keeps missing and partial legacy identities parseable for fail-closed handling", () => {
+    expect(WSHelloMessageSchema.parse(baseHello)).not.toHaveProperty("callerAgent");
+    expect(
+      WSHelloMessageSchema.parse({ ...baseHello, callerAgent: { agentId: "agent-1" } }),
+    ).toMatchObject({ callerAgent: { agentId: "agent-1" } });
   });
 });
 
