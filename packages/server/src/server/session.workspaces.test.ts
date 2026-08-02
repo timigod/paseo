@@ -7296,6 +7296,60 @@ test("fetch_workspaces_response emits before cold registration-triggered git wor
   expect(events[0]).toBe("response");
 });
 
+test("paginated one-shot workspace inventory never installs live git observers", async () => {
+  const emitted: SessionOutboundMessage[] = [];
+  const workspaceGitService = createNoopWorkspaceGitService({
+    peekSnapshot: (cwd) => createWorkspaceRuntimeSnapshot(cwd),
+  });
+  workspaceGitService.registerWorkspace = vi.fn(() => ({ unsubscribe: () => {} }));
+  const session = asTestSession(createSessionForWorkspaceTests({ workspaceGitService }));
+  const project = createPersistedProjectRecord({
+    projectId: "proj-one-shot-inventory",
+    rootPath: "/tmp/one-shot-inventory",
+    kind: "git",
+    displayName: "one-shot-inventory",
+    createdAt: "2026-08-01T00:00:00.000Z",
+    updatedAt: "2026-08-01T00:00:00.000Z",
+  });
+  const workspaces = Array.from({ length: 120 }, (_, index) =>
+    createPersistedWorkspaceRecord({
+      workspaceId: `ws-one-shot-inventory-${String(index).padStart(3, "0")}`,
+      projectId: project.projectId,
+      cwd: `/tmp/one-shot-inventory/worktree-${index}`,
+      kind: "worktree",
+      displayName: `worktree-${index}`,
+      createdAt: "2026-08-01T00:00:00.000Z",
+      updatedAt: "2026-08-01T00:00:00.000Z",
+    }),
+  );
+
+  session.emit = (message) => {
+    if (isSessionOutboundMessage(message)) emitted.push(message);
+  };
+  session.listAgentPayloads = async () => [];
+  session.projectRegistry.list = async () => [project];
+  session.workspaceRegistry.list = async () => workspaces;
+
+  const pageSizes: number[] = [];
+  let cursor: string | undefined;
+  for (let pageIndex = 0; pageIndex < 3; pageIndex += 1) {
+    emitted.length = 0;
+    await session.handleMessage({
+      type: "fetch_workspaces_request",
+      requestId: `req-one-shot-inventory-${pageIndex}`,
+      page: { limit: 50, ...(cursor ? { cursor } : {}) },
+    });
+    const response = findByType(emitted, "fetch_workspaces_response");
+    expect(response).toBeDefined();
+    pageSizes.push(response!.payload.entries.length);
+    cursor = response!.payload.pageInfo.nextCursor ?? undefined;
+  }
+
+  expect(pageSizes).toEqual([50, 50, 20]);
+  expect(cursor).toBeUndefined();
+  expect(workspaceGitService.registerWorkspace).not.toHaveBeenCalled();
+});
+
 test("fetch_workspaces_response serves 120 cached snapshots while git refreshes are blocked", async () => {
   const emitted: SessionOutboundMessage[] = [];
   const blockedRefresh = deferred<WorkspaceGitRuntimeSnapshot>();
