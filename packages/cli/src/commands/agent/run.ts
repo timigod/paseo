@@ -26,6 +26,7 @@ export function addRunOptions(cmd: Command, options: { optionalPrompt?: boolean 
       .description("Create and start an agent with a task")
       .argument(options.optionalPrompt ? "[prompt]" : "<prompt>", "The task/prompt for the agent")
       .option("-d, --background", "Run in background")
+      .option("--auto-archive", "Archive the agent after its first terminal turn")
       // COMPAT(detachRunFlag): --detach used to mean background execution, not
       // ownership transfer. Added in v0.2.0; remove after 2027-01-17.
       .addOption(new Option("--detach", "Legacy alias for --background").hideHelp())
@@ -111,6 +112,7 @@ export const agentRunSchema: OutputSchema<AgentRunResult> = {
 
 export interface AgentRunOptions extends CommandOptions {
   background?: boolean;
+  autoArchive?: boolean;
   detach?: boolean;
   title?: string;
   idempotencyKey?: string;
@@ -711,6 +713,7 @@ async function resolveAgentRunIntent(
     workspaceSource: workspace.source,
     callerAgentId: resolveRunCallerAgentId(),
     initialPrompt: inputs.prompt,
+    autoArchive: options.autoArchive,
     idempotencyKey: options.idempotencyKey?.trim(),
     outputSchema: inputs.outputSchema,
     images: inputs.images,

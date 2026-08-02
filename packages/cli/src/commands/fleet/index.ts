@@ -22,7 +22,23 @@ import {
   type AgentFinishOptions,
   type AgentFinishResult,
 } from "../agent/finish.js";
-import { findFleetAgentMatches, selectFleetAgentLocation } from "./lifecycle.js";
+import {
+  addReloadOptions,
+  runReloadCommand,
+  type AgentReloadCommandResult,
+  type AgentReloadOptions,
+} from "../agent/reload.js";
+import {
+  addSendOptions,
+  runSendCommand,
+  type AgentSendOptions,
+  type AgentSendResult,
+} from "../agent/send.js";
+import {
+  findFleetAgentMatches,
+  selectFleetAgentLocation,
+  type FleetAgentMatch,
+} from "./lifecycle.js";
 import { selectFleetHost, selectFleetWorkspaceHost, type FleetRouteReason } from "./routing.js";
 import {
   buildFleetDoctorResult,
@@ -357,13 +373,8 @@ async function resolvePreparedNewFleetRunPlan(input: Parameters<typeof resolveNe
   return { ...plan, cwd: prepared.cwd };
 }
 
-export async function runFleetFinishCommand(
-  query: string,
-  options: AgentFinishOptions & { host?: string },
-  command: Command,
-): Promise<SingleResult<AgentFinishResult>> {
+async function locateFleetAgent(query: string): Promise<FleetAgentMatch> {
   const config = loadFleetConfig();
-  const pinnedHost = requireFleetHost(options.host, config.hosts);
   const results = await Promise.all(
     config.hosts.map(async (host) => {
       let client: Awaited<ReturnType<typeof connectToDaemon>> | null = null;
@@ -378,11 +389,20 @@ export async function runFleetFinishCommand(
       }
     }),
   );
-  const location = selectFleetAgentLocation(
+  return selectFleetAgentLocation(
     query,
     results.flatMap((result) => result.matches ?? []),
     results.flatMap((result) => (result.failure ? [result.failure] : [])),
   );
+}
+
+export async function runFleetFinishCommand(
+  query: string,
+  options: AgentFinishOptions & { host?: string },
+  command: Command,
+): Promise<SingleResult<AgentFinishResult>> {
+  const pinnedHost = requireFleetHost(options.host, loadFleetConfig().hosts);
+  const location = await locateFleetAgent(query);
   if (pinnedHost && pinnedHost.id !== location.host.id) {
     throw {
       code: "FLEET_AGENT_ON_OTHER_HOST",
@@ -390,6 +410,43 @@ export async function runFleetFinishCommand(
     } satisfies CommandError;
   }
   return runFinishCommand(location.agentId, { ...options, host: location.host.endpoint }, command);
+}
+
+export async function runFleetRecoverCommand(
+  query: string,
+  options: AgentReloadOptions & { host?: string },
+  command: Command,
+): Promise<AgentReloadCommandResult> {
+  const pinnedHost = requireFleetHost(options.host, loadFleetConfig().hosts);
+  const location = await locateFleetAgent(query);
+  if (pinnedHost && pinnedHost.id !== location.host.id) {
+    throw {
+      code: "FLEET_AGENT_ON_OTHER_HOST",
+      message: `Agent ${location.agentId} is owned by ${location.host.id}, not pinned host ${pinnedHost.id}`,
+    } satisfies CommandError;
+  }
+  return runReloadCommand(location.agentId, { ...options, host: location.host.endpoint }, command);
+}
+
+export async function runFleetContinueCommand(
+  query: string,
+  prompt: string | undefined,
+  options: AgentSendOptions & { host?: string },
+  command: Command,
+): Promise<SingleResult<AgentSendResult>> {
+  const pinnedHost = requireFleetHost(options.host, loadFleetConfig().hosts);
+  const location = await locateFleetAgent(query);
+  if (pinnedHost && pinnedHost.id !== location.host.id) {
+    throw {
+      code: "FLEET_AGENT_ON_OTHER_HOST",
+      message: `Agent ${location.agentId} is owned by ${location.host.id}, not pinned host ${pinnedHost.id}`,
+    } satisfies CommandError;
+  }
+  const host = location.host.endpoint;
+  if (location.archived) {
+    await runReloadCommand(location.agentId, { host }, command);
+  }
+  return runSendCommand(location.agentId, prompt, { ...options, host }, command);
 }
 
 export function createFleetCommand(): Command {
@@ -414,5 +471,15 @@ export function createFleetCommand(): Command {
       "Pin a configured fleet host",
     ),
   ).action(withOutput(runFleetFinishCommand));
+  addJsonOption(
+    addReloadOptions(fleet.command("recover"))
+      .description("Recover an agent on its owning fleet host")
+      .option("--host <host>", "Pin a configured fleet host"),
+  ).action(withOutput(runFleetRecoverCommand));
+  addJsonOption(
+    addSendOptions(fleet.command("continue"))
+      .description("Continue an agent on its owning fleet host")
+      .option("--host <host>", "Pin a configured fleet host"),
+  ).action(withOutput(runFleetContinueCommand));
   return fleet;
 }

@@ -9,9 +9,12 @@ it("exposes the focused fleet control surface", () => {
     "doctor",
     "run",
     "finish",
+    "recover",
+    "continue",
   ]);
   const runHelp = fleet?.commands.find((command) => command.name() === "run")?.helpInformation();
   expect(runHelp).toContain("--prompt-file <path>");
   expect(runHelp).toContain("--host <host>");
   expect(runHelp).toContain("--idempotency-key <key>");
+  expect(runHelp).toContain("--auto-archive");
 });
