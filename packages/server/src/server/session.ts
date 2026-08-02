@@ -5915,6 +5915,7 @@ export class Session {
       }
     } catch (error) {
       if (subscriptionId && this.workspaceUpdatesSubscription?.subscriptionId === subscriptionId) {
+        this.workspaceGitObserver.reset();
         this.workspaceUpdatesSubscription = null;
       }
       const code = error instanceof SessionRequestError ? error.code : "fetch_workspaces_failed";

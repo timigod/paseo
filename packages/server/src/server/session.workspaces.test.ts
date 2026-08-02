@@ -152,6 +152,13 @@ interface SessionTestAccess {
   };
   agentUpdates: AgentUpdatesService;
   workspaceUpdatesSubscription: unknown;
+  workspaceGitObserver: {
+    getMetrics(): {
+      watchedDirectoryCount: number;
+      workspaceRecordCount: number;
+      subscriptionCount: number;
+    };
+  };
   interruptAgentIfRunning(agentId: string): unknown;
   reconcileWorkspaceRecord(workspaceId: string): Promise<{
     changed: boolean;
@@ -7516,6 +7523,66 @@ test("reusing the same workspace subscription preserves its warm observer set", 
 
   expect(registerCalls).toEqual([path.resolve("/tmp/subscription-warm")]);
   expect(unsubscribeCalls).toEqual([]);
+});
+
+test("a failed stable workspace resubscription releases its preserved observer set", async () => {
+  const unsubscribeCalls: string[] = [];
+  const workspaceGitService = createNoopWorkspaceGitService({
+    registerWorkspace: ({ cwd }) => {
+      const normalizedCwd = path.resolve(cwd);
+      return { unsubscribe: () => unsubscribeCalls.push(normalizedCwd) };
+    },
+  });
+  const session = asTestSession(createSessionForWorkspaceTests({ workspaceGitService }));
+  const descriptor = {
+    id: "workspace-failed-reconnect",
+    projectId: "project-failed-reconnect",
+    projectDisplayName: "failed-reconnect",
+    projectRootPath: "/tmp/subscription-failed-reconnect",
+    workspaceDirectory: "/tmp/subscription-failed-reconnect",
+    projectKind: "git",
+    workspaceKind: "local_checkout",
+    name: "failed-reconnect",
+    status: "done",
+    activityAt: null,
+    diffStat: null,
+  } as WorkspaceDescriptorPayload;
+  let listingAttempt = 0;
+  session.listFetchWorkspacesEntries = async () => {
+    listingAttempt += 1;
+    if (listingAttempt === 2) {
+      throw new Error("injected reconnect listing failure");
+    }
+    return {
+      entries: [descriptor],
+      emptyProjects: [],
+      pageInfo: { nextCursor: null, prevCursor: null, hasMore: false },
+    };
+  };
+
+  await session.handleMessage({
+    type: "fetch_workspaces_request",
+    requestId: "req-failed-reconnect-first",
+    subscribe: { subscriptionId: "stable-failed-reconnect" },
+  });
+  expect(session.workspaceGitObserver.getMetrics()).toEqual({
+    watchedDirectoryCount: 1,
+    workspaceRecordCount: 1,
+    subscriptionCount: 1,
+  });
+
+  await session.handleMessage({
+    type: "fetch_workspaces_request",
+    requestId: "req-failed-reconnect-second",
+    subscribe: { subscriptionId: "stable-failed-reconnect" },
+  });
+
+  expect(unsubscribeCalls).toEqual([path.resolve("/tmp/subscription-failed-reconnect")]);
+  expect(session.workspaceGitObserver.getMetrics()).toEqual({
+    watchedDirectoryCount: 0,
+    workspaceRecordCount: 0,
+    subscriptionCount: 0,
+  });
 });
 
 test("a superseded workspace subscription response cannot install stale observers", async () => {
