@@ -14,7 +14,11 @@ import {
   type LifecycleAgentManager,
   type LifecycleAgentStorage,
 } from "./lifecycle-command.js";
-import { createAgentDestructiveCaller } from "./destructive-action-authority.js";
+import {
+  createAgentDestructiveCaller,
+  createCoordinatorDestructiveCaller,
+  revokeDestructiveCaller,
+} from "./destructive-action-authority.js";
 
 class FakeLifecycleAgentStorage implements LifecycleAgentStorage {
   readonly records = new Map<string, StoredAgentRecord>();
@@ -400,6 +404,39 @@ describe("agent lifecycle commands", () => {
       }),
     ).rejects.toMatchObject({ code: "INVALID_CALLER_IDENTITY" });
     expect(manager.archivedAgentIds).toEqual([]);
+  });
+
+  test("rechecks a caller after awaited cleanup and before archiving", async () => {
+    const storage = new FakeLifecycleAgentStorage();
+    const manager = new FakeLifecycleAgentManager(storage);
+    manager.liveAgents.set("agent-1", managedAgent("agent-1", "idle"));
+    storage.records.set("agent-1", storedAgent("agent-1"));
+    const caller = createCoordinatorDestructiveCaller();
+    let releaseAttention = () => {};
+    let attentionStarted = () => {};
+    const attentionReached = new Promise<void>((resolve) => {
+      attentionStarted = resolve;
+    });
+    vi.spyOn(manager, "clearAgentAttention").mockImplementation(async (agentId) => {
+      manager.clearedAttentionAgentIds.push(agentId);
+      attentionStarted();
+      await new Promise<void>((resolve) => {
+        releaseAttention = resolve;
+      });
+    });
+
+    const archive = archiveAgentCommand(
+      { agentManager: manager, agentStorage: storage, logger },
+      "agent-1",
+      { caller },
+    );
+    await attentionReached;
+    revokeDestructiveCaller(caller);
+    releaseAttention();
+
+    await expect(archive).rejects.toMatchObject({ code: "INVALID_CALLER_IDENTITY" });
+    expect(manager.archivedAgentIds).toEqual([]);
+    expect(manager.liveAgents.has("agent-1")).toBe(true);
   });
 
   test("archives a live agent when its graceful cancellation is rejected", async () => {

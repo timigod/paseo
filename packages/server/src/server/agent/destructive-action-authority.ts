@@ -105,14 +105,22 @@ export function revokeDestructiveCaller(caller: DestructiveCallerContext): void 
   }
 }
 
+export function assertDestructiveCallerActive(
+  caller: DestructiveCallerContext | undefined,
+  signal?: AbortSignal,
+): void {
+  if (signal?.aborted || (caller && callerAuthorities.get(caller)?.active !== true)) {
+    throw invalidCaller();
+  }
+}
+
 export function assertDestructiveActionAuthorized(
   authority: LiveAgentAuthority,
   caller: DestructiveCallerContext,
   target: DestructiveActionTarget,
+  signal?: AbortSignal,
 ): void {
-  if (callerAuthorities.get(caller)?.active !== true) {
-    throw invalidCaller();
-  }
+  assertDestructiveCallerActive(caller, signal);
 
   if (caller.kind === "coordinator") {
     return;
@@ -141,12 +149,12 @@ export function assertDestructiveActionAuthorized(
   if (liveCaller.workspaceId && target.targetWorkspaceIds.includes(liveCaller.workspaceId)) {
     throw selfActionBlocked(target.action);
   }
-  if (target.targetPaths && callerCheckoutIsWithinTarget(liveCaller, target.targetPaths)) {
+  if (target.targetPaths && agentCheckoutIsWithinTarget(liveCaller, target.targetPaths)) {
     throw selfActionBlocked(target.action);
   }
 }
 
-function callerCheckoutIsWithinTarget(
+export function agentCheckoutIsWithinTarget(
   caller: { cwd?: string; containmentPaths?: readonly string[] },
   targetPaths: readonly string[],
 ): boolean {

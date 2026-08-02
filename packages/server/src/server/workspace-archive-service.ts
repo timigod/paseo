@@ -38,6 +38,8 @@ import {
   type WorkspaceLifecycleCoordinator,
 } from "./workspace-lifecycle-coordinator.js";
 import {
+  agentCheckoutIsWithinTarget,
+  assertDestructiveCallerActive,
   assertDestructiveActionAuthorized,
   DESTRUCTIVE_ACTION_ERROR_CODES,
   DestructiveActionAuthorizationError,
@@ -397,13 +399,16 @@ async function archiveResolvedTarget(
   target: ArchiveTarget,
 ): Promise<ArchiveResult> {
   const targetWorkspaceIds = target.workspaceIds;
+  const authorizeCaller = () =>
+    assertCallerCanArchive(
+      dependencies,
+      request.caller,
+      target,
+      request.scope.kind === "worktree" ? "worktree.archive" : "workspace.archive",
+      request.signal,
+    );
 
-  await assertCallerCanArchive(
-    dependencies,
-    request.caller,
-    target,
-    request.scope.kind === "worktree" ? "worktree.archive" : "workspace.archive",
-  );
+  await authorizeCaller();
 
   if (targetWorkspaceIds.length > 0) {
     dependencies.markWorkspaceArchiving(targetWorkspaceIds, new Date().toISOString());
@@ -416,15 +421,23 @@ async function archiveResolvedTarget(
       await dependencies.emitWorkspaceUpdatesForWorkspaceIds(targetWorkspaceIds);
     }
 
+    await authorizeCaller();
     await persistTargetCleanupPending(dependencies, target);
 
     const { archivedAgents, archivedWorkspaceIds, failures } = await archiveTargetRecords(
       dependencies,
       targetWorkspaceIds,
       request.requestId,
+      authorizeCaller,
     );
     await clearCleanupPendingForUnarchivedTargets(dependencies, target, archivedWorkspaceIds);
     if (failures.length > 0) {
+      const authorityFailure = failures.find(
+        (failure): failure is WorkspaceArchiveError => failure instanceof WorkspaceArchiveError,
+      );
+      if (authorityFailure) {
+        throw authorityFailure;
+      }
       throw new AggregateError(failures, "Failed to archive one or more workspaces");
     }
 
@@ -443,12 +456,15 @@ async function archiveResolvedTarget(
     }
 
     if (target.backing !== null) {
+      await authorizeCaller();
       removedDirectory = await maybeRemoveDirectory(
         dependencies,
         lifecycleCoordinator,
         request,
         target,
         archivedWorkspaceIds,
+        request.signal,
+        authorizeCaller,
       );
     }
 
@@ -473,30 +489,45 @@ async function assertCallerCanArchive(
   caller: ArchiveCallerContext | undefined,
   target: ArchiveTarget,
   action: "workspace.archive" | "worktree.archive",
+  signal?: AbortSignal,
 ): Promise<void> {
-  if (!caller) {
-    return;
-  }
-  const liveAgents = dependencies.agentManager.listAgents();
-  const targetWorkspaceIds = target.workspaceIds;
-  const callerAgent =
-    caller.kind === "agent"
-      ? (liveAgents.find((agent) => agent.id === caller.identity.agentId) ?? null)
-      : null;
-  const callerContainmentPaths = callerAgent
-    ? await resolveGitCheckoutContainmentPaths(dependencies.workspaceGitService, [callerAgent.cwd])
-    : [];
-  const targetPaths = callerAgent
-    ? [
-        ...(target.backing ? [target.backing.path] : []),
-        ...target.teardownTargets.map((teardownTarget) => teardownTarget.cwd),
-        ...(await resolveGitCheckoutContainmentPaths(
-          dependencies.workspaceGitService,
-          target.teardownTargets.map((teardownTarget) => teardownTarget.cwd),
-        )),
-      ]
-    : [];
   try {
+    assertDestructiveCallerActive(caller, signal);
+    if (!caller) {
+      return;
+    }
+
+    const liveAgents = dependencies.agentManager.listAgents();
+    const targetWorkspaceIds = target.workspaceIds;
+    const containmentPathsByAgentId =
+      caller.kind === "coordinator"
+        ? new Map<string, string[]>()
+        : await resolveLiveAgentContainmentPaths(dependencies.workspaceGitService, liveAgents);
+    const targetPaths =
+      caller.kind === "coordinator"
+        ? []
+        : [
+            ...(target.backing ? [target.backing.path] : []),
+            ...target.teardownTargets.map((teardownTarget) => teardownTarget.cwd),
+            ...(await resolveGitCheckoutContainmentPaths(
+              dependencies.workspaceGitService,
+              target.teardownTargets.map((teardownTarget) => teardownTarget.cwd),
+            )),
+          ];
+    const targetAgentIds = liveAgents
+      .filter(
+        (agent) =>
+          (agent.workspaceId && targetWorkspaceIds.includes(agent.workspaceId)) ||
+          agentCheckoutIsWithinTarget(
+            {
+              cwd: agent.cwd,
+              containmentPaths: containmentPathsByAgentId.get(agent.id) ?? [],
+            },
+            targetPaths,
+          ),
+      )
+      .map((agent) => agent.id);
+
     assertDestructiveActionAuthorized(
       {
         getAgent: (agentId) => {
@@ -506,7 +537,7 @@ async function assertCallerCanArchive(
                 id: agent.id,
                 workspaceId: agent.workspaceId,
                 cwd: agent.cwd,
-                containmentPaths: agent.id === callerAgent?.id ? callerContainmentPaths : [],
+                containmentPaths: containmentPathsByAgentId.get(agent.id) ?? [],
               }
             : null;
         },
@@ -516,13 +547,12 @@ async function assertCallerCanArchive(
       caller,
       {
         action,
-        targetAgentIds: liveAgents
-          .filter((agent) => agent.workspaceId && targetWorkspaceIds.includes(agent.workspaceId))
-          .map((agent) => agent.id),
+        targetAgentIds,
         targetWorkspaceIds,
         targetPaths,
-        hasLiveTarget: targetWorkspaceIds.length > 0,
+        hasLiveTarget: targetWorkspaceIds.length > 0 || targetAgentIds.length > 0,
       },
+      signal,
     );
   } catch (error) {
     if (error instanceof DestructiveActionAuthorizationError) {
@@ -530,6 +560,22 @@ async function assertCallerCanArchive(
     }
     throw error;
   }
+}
+
+async function resolveLiveAgentContainmentPaths(
+  workspaceGitService: Pick<WorkspaceGitService, "getCheckout">,
+  liveAgents: ReturnType<ArchiveDependencies["agentManager"]["listAgents"]>,
+): Promise<Map<string, string[]>> {
+  const entries = await Promise.all(
+    liveAgents.map(
+      async (agent) =>
+        [
+          agent.id,
+          await resolveGitCheckoutContainmentPaths(workspaceGitService, [agent.cwd]),
+        ] as const,
+    ),
+  );
+  return new Map(entries);
 }
 
 async function resolveGitCheckoutContainmentPaths(
@@ -697,6 +743,7 @@ async function archiveTargetRecords(
   dependencies: ArchiveDependencies,
   targetWorkspaceIds: string[],
   requestId: string,
+  authorizeCaller: () => Promise<void>,
 ): Promise<{
   archivedAgents: Set<string>;
   archivedWorkspaceIds: string[];
@@ -707,7 +754,8 @@ async function archiveTargetRecords(
 
   const results = await Promise.allSettled(
     targetWorkspaceIds.map(async (workspaceId) => {
-      const agents = await archiveWorkspaceContents(dependencies, workspaceId);
+      const agents = await archiveWorkspaceContents(dependencies, workspaceId, authorizeCaller);
+      await authorizeCaller();
       await dependencies.archiveWorkspaceRecord(workspaceId);
       return { workspaceId, agents };
     }),
@@ -740,6 +788,7 @@ async function maybeRemoveDirectory(
   target: ArchiveTarget,
   archivedWorkspaceIds: string[],
   signal?: AbortSignal,
+  authorizeCaller?: () => Promise<void>,
 ): Promise<boolean> {
   const backing = target.backing;
   if (!backing?.isPaseoOwnedWorktree) {
@@ -749,12 +798,14 @@ async function maybeRemoveDirectory(
   return lifecycleCoordinator.runDirectoryExclusive(
     backing.path,
     async () => {
+      await authorizeCaller?.();
       return maybeRemoveDirectoryExclusive(
         dependencies,
         request,
         target,
         archivedWorkspaceIds,
         signal,
+        authorizeCaller,
       );
     },
     signal,
@@ -767,6 +818,7 @@ async function maybeRemoveDirectoryExclusive(
   target: ArchiveTarget,
   archivedWorkspaceIds: string[],
   signal?: AbortSignal,
+  authorizeCaller?: () => Promise<void>,
 ): Promise<boolean> {
   const backing = target.backing;
   if (!backing) return false;
@@ -826,7 +878,14 @@ async function maybeRemoveDirectoryExclusive(
   }
 
   if (!cleanupAlreadyQuarantined) {
-    await runPendingCleanupTeardown(dependencies, request, backing, pendingCleanupTargets, signal);
+    await runPendingCleanupTeardown(
+      dependencies,
+      request,
+      backing,
+      pendingCleanupTargets,
+      signal,
+      authorizeCaller,
+    );
   }
 
   const finalIncarnationState = await compareCleanupIncarnation(
@@ -860,6 +919,7 @@ async function maybeRemoveDirectoryExclusive(
     backing,
     pendingCleanupTargets,
     signal,
+    authorizeCaller,
   );
 }
 
@@ -869,12 +929,14 @@ async function runPendingCleanupTeardown(
   backing: BackingDirectory,
   pendingCleanupTargets: PendingCleanupTarget[],
   signal?: AbortSignal,
+  authorizeCaller?: () => Promise<void>,
 ): Promise<void> {
   const teardownCwds = uniqueFilesystemPaths(
     pendingCleanupTargets.map((pendingCleanupTarget) => pendingCleanupTarget.teardownCwd),
   );
   try {
     for (const teardownCwd of teardownCwds) {
+      await authorizeCaller?.();
       await runWorktreeTeardownCommands({
         worktreePath: backing.path,
         teardownCwd,
@@ -899,10 +961,12 @@ async function removePendingCleanupDirectory(
   backing: BackingDirectory,
   pendingCleanupTargets: PendingCleanupTarget[],
   signal?: AbortSignal,
+  authorizeCaller?: () => Promise<void>,
 ): Promise<boolean> {
   try {
     const expectedWorktreeIncarnationId = pendingCleanupTargets[0]!.worktreeIncarnationId;
     const expectedQuarantineMarker = pendingCleanupTargets[0]!.quarantineMarker;
+    await authorizeCaller?.();
     await deletePaseoWorktree({
       cwd: backing.mainRepoRoot,
       worktreePath: backing.path,
@@ -918,6 +982,9 @@ async function removePendingCleanupDirectory(
     await clearPendingCleanup(dependencies, pendingCleanupTargets);
     return true;
   } catch (error) {
+    if (error instanceof WorkspaceArchiveError) {
+      throw error;
+    }
     if (error instanceof WorktreeCleanupRelocatedError) {
       await updatePendingCleanupAfterRelocation(dependencies, pendingCleanupTargets, error);
       backing.path = error.remainingPath;
@@ -1293,6 +1360,7 @@ export type ArchiveWorkspaceContentsDependencies = Pick<
 export async function archiveWorkspaceContents(
   dependencies: ArchiveWorkspaceContentsDependencies,
   workspaceId: string,
+  authorizeCaller?: () => Promise<void>,
 ): Promise<Set<string>> {
   const archivedAgents = new Set<string>();
 
@@ -1312,6 +1380,7 @@ export async function archiveWorkspaceContents(
     archivedAgents.add(record.id);
   }
 
+  await authorizeCaller?.();
   const archivedAt = new Date().toISOString();
   await Promise.all([
     ...liveAgents.map((agent) => dependencies.agentManager.archiveAgent(agent.id)),

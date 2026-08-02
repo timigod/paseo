@@ -231,4 +231,25 @@ describe("destructive action authority", () => {
     await expect(operation).rejects.toThrowError(DestructiveActionAuthorizationError);
     expect(mutated).toBe(false);
   });
+
+  test("rejects an aborted request even while its captured caller remains active", () => {
+    const authority = liveAuthority();
+    const caller = createCoordinatorDestructiveCaller();
+    const controller = new AbortController();
+    controller.abort();
+
+    expect(() =>
+      assertDestructiveActionAuthorized(
+        authority,
+        caller,
+        {
+          action: "agent.archive",
+          targetAgentIds: ["agent-b"],
+          targetWorkspaceIds: ["workspace-b"],
+          hasLiveTarget: true,
+        },
+        controller.signal,
+      ),
+    ).toThrowError(DestructiveActionAuthorizationError);
+  });
 });

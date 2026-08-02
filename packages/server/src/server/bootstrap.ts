@@ -213,6 +213,7 @@ import {
   createAgentDestructiveCaller,
   createCoordinatorDestructiveCaller,
   createUncertainDestructiveCaller,
+  revokeDestructiveCaller,
   type DestructiveCallerContext,
 } from "./agent/destructive-action-authority.js";
 import { CreateAgentLifecycleDispatch } from "./agent/create-agent-lifecycle-dispatch.js";
@@ -1726,15 +1727,41 @@ export async function createPaseoDaemon(
           return;
         }
         const callerContext = await resolveAgentMcpCallerContext(req, config.auth?.password);
-        const { server, transport } = await createAgentMcpSession({
+        let mcpSession: Awaited<ReturnType<typeof createAgentMcpSession>> | null = null;
+        let requestClosed = false;
+        let callerRevoked = false;
+        const closeMcpSession = () => {
+          const currentSession = mcpSession;
+          mcpSession = null;
+          if (!currentSession) {
+            return;
+          }
+          void currentSession.transport.close();
+          void currentSession.server.close();
+        };
+        const closeRequestAuthority = () => {
+          requestClosed = true;
+          if (!callerRevoked) {
+            callerRevoked = true;
+            revokeDestructiveCaller(callerContext.destructiveCaller);
+          }
+          closeMcpSession();
+        };
+        req.once("aborted", closeRequestAuthority);
+        res.once("close", closeRequestAuthority);
+        if (req.aborted || res.destroyed) {
+          closeRequestAuthority();
+        }
+
+        mcpSession = await createAgentMcpSession({
           ...callerContext,
         });
-        res.on("close", () => {
-          void transport.close();
-          void server.close();
-        });
+        if (requestClosed) {
+          closeMcpSession();
+          return;
+        }
 
-        await transport.handleRequest(
+        await mcpSession.transport.handleRequest(
           req as unknown as IncomingMessage,
           res as unknown as ServerResponse,
           req.body,

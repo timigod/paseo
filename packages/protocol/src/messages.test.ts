@@ -2,6 +2,7 @@ import { describe, expect, test } from "vitest";
 import {
   ArchiveWorkspaceRequestSchema,
   ArchiveWorkspaceResponseMessageSchema,
+  DESTRUCTIVE_CALLER_WIRE_STRING_MAX_LENGTH,
   FileExplorerRequestSchema,
   MANAGED_WORKTREE_WRITER_CONFLICT_ERROR_CODE,
   PaseoWorktreeArchiveRequestSchema,
@@ -537,6 +538,60 @@ describe("archive caller protocol compatibility", () => {
     ).toMatchObject({ callerAgentId: "agent-1", callerAgentProof: "proof-1" });
   });
 
+  test("bounds deprecated per-action caller strings", () => {
+    const bounded = "x".repeat(DESTRUCTIVE_CALLER_WIRE_STRING_MAX_LENGTH);
+    const oversized = `${bounded}x`;
+    const worktreeBase = {
+      type: "paseo_worktree_archive_request" as const,
+      worktreePath: "/repo/app",
+      requestId: "req-bounded",
+    };
+    const workspaceBase = {
+      type: "archive_workspace_request" as const,
+      workspaceId: "workspace-1",
+      requestId: "req-bounded",
+    };
+
+    expect(
+      PaseoWorktreeArchiveRequestSchema.safeParse({
+        ...worktreeBase,
+        callerAgentId: bounded,
+        callerAgentProof: bounded,
+      }).success,
+    ).toBe(true);
+    expect(
+      PaseoWorktreeArchiveRequestSchema.safeParse({
+        ...worktreeBase,
+        callerAgentId: oversized,
+      }).success,
+    ).toBe(false);
+    expect(
+      PaseoWorktreeArchiveRequestSchema.safeParse({
+        ...worktreeBase,
+        callerAgentProof: oversized,
+      }).success,
+    ).toBe(false);
+    expect(
+      ArchiveWorkspaceRequestSchema.safeParse({
+        ...workspaceBase,
+        callerAgentId: bounded,
+        callerAgentProof: bounded,
+      }).success,
+    ).toBe(true);
+    expect(
+      ArchiveWorkspaceRequestSchema.safeParse({
+        ...workspaceBase,
+        callerAgentId: oversized,
+      }).success,
+    ).toBe(false);
+    expect(
+      ArchiveWorkspaceRequestSchema.safeParse({
+        ...workspaceBase,
+        callerAgentProof: oversized,
+      }).success,
+    ).toBe(false);
+  });
+
   test("archive responses accept old payloads and preserve typed error codes", () => {
     expect(
       ArchiveWorkspaceResponseMessageSchema.parse({
@@ -610,6 +665,30 @@ describe("destructive caller hello compatibility", () => {
     expect(
       WSHelloMessageSchema.parse({ ...baseHello, callerAgent: { agentId: "agent-1" } }),
     ).toMatchObject({ callerAgent: { agentId: "agent-1" } });
+  });
+
+  test("bounds complete and partial caller identities", () => {
+    const bounded = "x".repeat(DESTRUCTIVE_CALLER_WIRE_STRING_MAX_LENGTH);
+    const oversized = `${bounded}x`;
+
+    expect(
+      WSHelloMessageSchema.safeParse({
+        ...baseHello,
+        callerAgent: { agentId: bounded, incarnation: bounded },
+      }).success,
+    ).toBe(true);
+    expect(
+      WSHelloMessageSchema.safeParse({
+        ...baseHello,
+        callerAgent: { agentId: oversized },
+      }).success,
+    ).toBe(false);
+    expect(
+      WSHelloMessageSchema.safeParse({
+        ...baseHello,
+        callerAgent: { incarnation: oversized },
+      }).success,
+    ).toBe(false);
   });
 });
 

@@ -32,6 +32,8 @@ import type { AgentStorage, StoredAgentRecord } from "./agent/agent-storage.js";
 import {
   createAgentDestructiveCaller,
   createCoordinatorDestructiveCaller,
+  createUncertainDestructiveCaller,
+  revokeDestructiveCaller,
 } from "./agent/destructive-action-authority.js";
 import type { WorkspaceGitService } from "./workspace-git-service.js";
 import {
@@ -745,6 +747,72 @@ describe("archiveByScope", () => {
     ).rejects.toMatchObject({ code: WORKSPACE_ARCHIVE_ERROR_CODES.selfArchiveBlocked });
     expect(deps.markWorkspaceArchiving).not.toHaveBeenCalled();
     expect(existsSync(worktree.worktreePath)).toBe(true);
+  });
+
+  test("fails closed for an uncertain caller when a zero-record worktree contains a live restored agent", async () => {
+    const { tempDir, repoDir } = createGitRepo();
+    const paseoHome = path.join(tempDir, ".paseo");
+    const worktree = await createPaseoOwnedWorktree(repoDir, paseoHome, "zero-record-live-agent");
+    const agentCwd = path.join(worktree.worktreePath, "packages", "server");
+    mkdirSync(agentCwd, { recursive: true });
+    const deps = createArchiveDeps({
+      paseoHome,
+      activeWorkspaces: [],
+      liveAgents: [{ id: "restored-agent", cwd: agentCwd }],
+      checkoutRootForCwd: () => worktree.worktreePath,
+    });
+
+    await expect(
+      archiveByScope(deps, {
+        scope: { kind: "worktree", targetPath: worktree.worktreePath },
+        requestId: "req-zero-record-live-agent",
+        caller: createUncertainDestructiveCaller("partial legacy identity"),
+      }),
+    ).rejects.toMatchObject({ code: WORKSPACE_ARCHIVE_ERROR_CODES.invalidCallerIdentity });
+    expect(deps.archivedAgentIds).toEqual([]);
+    expect(existsSync(worktree.worktreePath)).toBe(true);
+  });
+
+  test("rechecks a captured caller after emitting state and before archive mutation", async () => {
+    const { tempDir } = createGitRepo();
+    const workspaceId = "ws-revoked-after-authorize";
+    const deps = createArchiveDeps({
+      paseoHome: path.join(tempDir, ".paseo"),
+      activeWorkspaces: [{ workspaceId, cwd: tempDir, kind: "local_checkout" }],
+    });
+    deps.archiveWorkspaceRecord = vi.fn(deps.archiveWorkspaceRecord);
+    const caller = createCoordinatorDestructiveCaller();
+    let releaseEmit = () => {};
+    let emitStarted = () => {};
+    let deferNextEmit = true;
+    const emitReached = new Promise<void>((resolve) => {
+      emitStarted = resolve;
+    });
+    deps.emitWorkspaceUpdatesForWorkspaceIds = vi.fn(async () => {
+      if (!deferNextEmit) {
+        return;
+      }
+      deferNextEmit = false;
+      emitStarted();
+      await new Promise<void>((resolve) => {
+        releaseEmit = resolve;
+      });
+    });
+
+    const archive = archiveByScope(deps, {
+      scope: { kind: "workspace", workspaceId },
+      requestId: "req-revoked-after-authorize",
+      caller,
+    });
+    await emitReached;
+    revokeDestructiveCaller(caller);
+    releaseEmit();
+
+    await expect(archive).rejects.toMatchObject({
+      code: WORKSPACE_ARCHIVE_ERROR_CODES.invalidCallerIdentity,
+    });
+    expect(deps.archiveWorkspaceRecord).not.toHaveBeenCalled();
+    expect(deps.activeWorkspaces).toHaveLength(1);
   });
 
   test("blocks sibling workspace deletion when the caller shares its git checkout root", async () => {

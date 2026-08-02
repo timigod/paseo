@@ -2418,12 +2418,10 @@ export class Session {
   ): Promise<void> {
     this.sessionLogger.info({ agentId }, `Deleting agent ${agentId} from registry`);
 
-    assertAgentDestructiveActionAuthorized(
-      this.agentManager,
-      this.getDestructiveCaller(source),
-      agentId,
-      "agent.delete",
-    );
+    const caller = this.getDestructiveCaller(source);
+    const authorize = () =>
+      assertAgentDestructiveActionAuthorized(this.agentManager, caller, agentId, "agent.delete");
+    authorize();
 
     const knownWorkspaceId =
       this.agentManager.getAgent(agentId)?.workspaceId ??
@@ -2431,6 +2429,7 @@ export class Session {
       null;
 
     // File-backed storage still needs an early delete fence before closeAgent().
+    authorize();
     beginAgentDeleteIfSupported(this.agentStorage, agentId);
 
     try {

@@ -1422,7 +1422,7 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
         cleanupPending: z.boolean(),
       },
     },
-    async ({ workspaceId }) => {
+    async ({ workspaceId }, context) => {
       if (!options.listActiveWorkspaces) {
         throw new Error("Active workspace lister is required to archive workspaces");
       }
@@ -1444,6 +1444,7 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
           requestId: "mcp:archive_workspace",
           scope: { kind: "workspace", workspaceId: workspace.workspaceId },
           caller: options.destructiveCaller,
+          signal: context.signal,
         },
       );
       return {
@@ -2192,7 +2193,7 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
         success: z.boolean(),
       },
     },
-    async ({ agentId }) => {
+    async ({ agentId }, context) => {
       await archiveAgentCommand(
         {
           agentManager,
@@ -2200,7 +2201,7 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
           logger: childLogger,
         },
         agentId,
-        { caller: options.destructiveCaller },
+        { caller: options.destructiveCaller, signal: context.signal },
       );
       return {
         content: [],
@@ -2221,9 +2222,10 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
         success: z.boolean(),
       },
     },
-    async ({ agentId }) => {
+    async ({ agentId }, context) => {
       await closeAgentCommand({ agentManager }, agentId, {
         caller: options.destructiveCaller,
+        signal: context.signal,
       });
       return {
         content: [],

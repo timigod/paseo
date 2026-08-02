@@ -6,6 +6,7 @@ import { afterEach, describe, expect, test, vi } from "vitest";
 
 import { DaemonClient, createTestPaseoDaemon } from "./test-utils/index.js";
 import { AgentManager } from "./agent/agent-manager.js";
+import { AgentStorage } from "./agent/agent-storage.js";
 import { FileBackedWorkspaceRegistry } from "./workspace-registry.js";
 import { VoiceAssistantWebSocketServer } from "./websocket-server.js";
 
@@ -275,6 +276,74 @@ describe("destructive authority over real WebSocket execution paths", () => {
       listAgentsSpy.mockRestore();
       archiveSpy.mockRestore();
       listSpy.mockRestore();
+    }
+  }, 30_000);
+
+  test("disconnect after delete authorization but before storage lookup completes fences mutation", async () => {
+    const originalGet = AgentStorage.prototype.get;
+    const originalBeginDelete = AgentStorage.prototype.beginDelete;
+    let targetAgentId: string | null = null;
+    let releaseLookup = () => {};
+    let markLookupStarted = () => {};
+    const lookupGate = new Promise<void>((resolve) => {
+      releaseLookup = resolve;
+    });
+    const lookupStarted = new Promise<void>((resolve) => {
+      markLookupStarted = resolve;
+    });
+    const getSpy = vi.spyOn(AgentStorage.prototype, "get").mockImplementation(async function (id) {
+      const stack = new Error().stack ?? "";
+      if (id === targetAgentId && stack.includes("handleDeleteAgentRequest")) {
+        markLookupStarted();
+        await lookupGate;
+      }
+      return originalGet.call(this, id);
+    });
+    const beginDeleteSpy = vi
+      .spyOn(AgentStorage.prototype, "beginDelete")
+      .mockImplementation(function (id) {
+        return originalBeginDelete.call(this, id);
+      });
+    const webSocketServerPrototype = VoiceAssistantWebSocketServer.prototype as unknown as {
+      revokeSocketDestructiveCaller(socket: unknown): void;
+    };
+    const originalRevokeSocketDestructiveCaller =
+      webSocketServerPrototype.revokeSocketDestructiveCaller;
+    const revokeSocketSpy = vi
+      .spyOn(webSocketServerPrototype, "revokeSocketDestructiveCaller")
+      .mockImplementation(function (socket) {
+        return originalRevokeSocketDestructiveCaller.call(this, socket);
+      });
+    const daemon = await createTestPaseoDaemon();
+    const cwd = createCwd();
+    const target = await createManagedAgent(daemon, cwd);
+    targetAgentId = target.id;
+    const client = new DaemonClient({
+      url: `ws://127.0.0.1:${daemon.port}/ws`,
+      clientId: "disconnect-after-delete-authorization",
+      reconnect: { enabled: false },
+    });
+
+    try {
+      await client.connect();
+      beginDeleteSpy.mockClear();
+      const deleteResult = client.deleteAgent(target.id).catch((error) => error as Error);
+      await lookupStarted;
+      await client.close();
+      await expect.poll(() => revokeSocketSpy.mock.calls.length).toBeGreaterThan(0);
+      releaseLookup();
+
+      await expect(deleteResult).resolves.toBeInstanceOf(Error);
+      expect(beginDeleteSpy).not.toHaveBeenCalled();
+      expect(daemon.daemon.agentManager.getAgent(target.id)).not.toBeNull();
+      await expect(daemon.daemon.agentStorage.get(target.id)).resolves.not.toBeNull();
+    } finally {
+      releaseLookup();
+      await client.close();
+      await daemon.close();
+      revokeSocketSpy.mockRestore();
+      beginDeleteSpy.mockRestore();
+      getSpy.mockRestore();
     }
   }, 30_000);
 });

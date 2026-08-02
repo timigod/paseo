@@ -74,6 +74,8 @@ import {
   type PaseoScriptEntryRaw,
   type ProjectConfigRpcError,
 } from "./paseo-config-schema.js";
+
+export const DESTRUCTIVE_CALLER_WIRE_STRING_MAX_LENGTH = 4096;
 export {
   PaseoConfigRawSchema,
   PaseoLifecycleCommandRawSchema,
@@ -1951,8 +1953,8 @@ export const PaseoWorktreeArchiveRequestSchema = z.object({
   // COMPAT(agentArchiveCaller): added after v0.2.5; remove after 2027-02-02.
   // Deprecated parse-only fields. The daemon ignores per-action identity and
   // binds destructive authority to the physical connection hello instead.
-  callerAgentId: z.string().optional(),
-  callerAgentProof: z.string().optional(),
+  callerAgentId: z.string().max(DESTRUCTIVE_CALLER_WIRE_STRING_MAX_LENGTH).optional(),
+  callerAgentProof: z.string().max(DESTRUCTIVE_CALLER_WIRE_STRING_MAX_LENGTH).optional(),
   requestId: z.string(),
 });
 
@@ -2055,8 +2057,8 @@ export const ArchiveWorkspaceRequestSchema = z.object({
   // COMPAT(agentArchiveCaller): added after v0.2.5; remove after 2027-02-02.
   // Deprecated parse-only fields. The daemon ignores per-action identity and
   // binds destructive authority to the physical connection hello instead.
-  callerAgentId: z.string().optional(),
-  callerAgentProof: z.string().optional(),
+  callerAgentId: z.string().max(DESTRUCTIVE_CALLER_WIRE_STRING_MAX_LENGTH).optional(),
+  callerAgentProof: z.string().max(DESTRUCTIVE_CALLER_WIRE_STRING_MAX_LENGTH).optional(),
   requestId: z.string(),
 });
 
@@ -5830,8 +5832,8 @@ export const WSHelloMessageSchema = z.object({
   // structurally valid but is never sufficient for a destructive action.
   callerAgent: z
     .object({
-      agentId: z.string().optional(),
-      incarnation: z.string().optional(),
+      agentId: z.string().max(DESTRUCTIVE_CALLER_WIRE_STRING_MAX_LENGTH).optional(),
+      incarnation: z.string().max(DESTRUCTIVE_CALLER_WIRE_STRING_MAX_LENGTH).optional(),
     })
     .optional(),
   capabilities: z

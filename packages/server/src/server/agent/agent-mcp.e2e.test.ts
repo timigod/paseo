@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { existsSync } from "node:fs";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { describe, expect, test } from "vitest";
+import { describe, expect, test, vi } from "vitest";
 import { experimental_createMCPClient } from "ai";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import pino from "pino";
@@ -12,6 +12,8 @@ import { withTimeout } from "../../utils/promise-timeout.js";
 import { hashDaemonPassword } from "../auth.js";
 import { createPaseoDaemon, type PaseoDaemonConfig } from "../bootstrap.js";
 import { createTestAgentClients } from "../test-utils/fake-agent-client.js";
+import { AgentManager } from "./agent-manager.js";
+import * as destructiveAuthority from "./destructive-action-authority.js";
 import type {
   AgentClient,
   AgentPersistenceHandle,
@@ -79,10 +81,37 @@ function getStructuredContent(result: McpToolResult): StructuredContent | null {
   return null;
 }
 
-async function createMcpClient(url: string, authToken?: string): Promise<McpClient> {
+async function createMcpClient(
+  url: string,
+  authToken?: string,
+  signal?: AbortSignal,
+): Promise<McpClient> {
+  const requestInit = authToken ? { headers: { Authorization: `Bearer ${authToken}` } } : undefined;
+  const abortableFetch = signal
+    ? async (input: string | URL, init?: RequestInit): Promise<Response> => {
+        const controller = new AbortController();
+        const abort = () => controller.abort();
+        signal.addEventListener("abort", abort, { once: true });
+        init?.signal?.addEventListener("abort", abort, { once: true });
+        if (signal.aborted || init?.signal?.aborted) {
+          abort();
+        }
+        try {
+          return await fetch(input, { ...init, signal: controller.signal });
+        } finally {
+          signal.removeEventListener("abort", abort);
+          init?.signal?.removeEventListener("abort", abort);
+        }
+      }
+    : undefined;
   const transport = new StreamableHTTPClientTransport(
     new URL(url),
-    authToken ? { requestInit: { headers: { Authorization: `Bearer ${authToken}` } } } : undefined,
+    requestInit || abortableFetch
+      ? {
+          ...(requestInit ? { requestInit } : {}),
+          ...(abortableFetch ? { fetch: abortableFetch } : {}),
+        }
+      : undefined,
   );
   const rawClient = await experimental_createMCPClient({ transport });
   const boundCallTool: McpClient["callTool"] = Reflect.get(rawClient, "callTool").bind(rawClient);
@@ -352,6 +381,96 @@ describe("agent MCP end-to-end (offline)", () => {
       await Promise.all(
         [paseoHome, staticDir, archiveAgentCwd, killAgentCwd, workspaceCwd].map((target) =>
           rm(target, { recursive: true, force: true }),
+        ),
+      );
+    }
+  }, 30_000);
+
+  test("HTTP disconnect after archive authorization revokes authority before mutation", async () => {
+    const paseoHome = await mkdtemp(path.join(os.tmpdir(), "paseo-home-"));
+    const staticDir = await mkdtemp(path.join(os.tmpdir(), "paseo-static-"));
+    const agentCwd = await mkdtemp(path.join(os.tmpdir(), "paseo-agent-cwd-"));
+    const port = await getAvailablePort();
+    const daemon = await createPaseoDaemon(
+      {
+        listen: `127.0.0.1:${port}`,
+        paseoHome,
+        corsAllowedOrigins: [],
+        hostnames: true,
+        mcpEnabled: true,
+        staticDir,
+        mcpDebug: false,
+        agentClients: createTestAgentClients(),
+        agentStoragePath: path.join(paseoHome, "agents"),
+      },
+      pino({ level: "silent" }),
+    );
+    await daemon.start();
+    const target = await daemon.agentManager.createAgent(
+      {
+        provider: "codex",
+        model: "gpt-5.4-mini",
+        modeId: "full-access",
+        cwd: agentCwd,
+      },
+      undefined,
+      { workspaceId: undefined },
+    );
+    let releaseAttention = () => {};
+    let markAttentionStarted = () => {};
+    const attentionGate = new Promise<void>((resolve) => {
+      releaseAttention = resolve;
+    });
+    const attentionStarted = new Promise<void>((resolve) => {
+      markAttentionStarted = resolve;
+    });
+    const originalClearAttention = AgentManager.prototype.clearAgentAttention;
+    const clearAttentionSpy = vi
+      .spyOn(AgentManager.prototype, "clearAgentAttention")
+      .mockImplementation(async function (agentId) {
+        if (agentId === target.id) {
+          markAttentionStarted();
+          await attentionGate;
+        }
+        return originalClearAttention.call(this, agentId);
+      });
+    const archiveSpy = vi.spyOn(AgentManager.prototype, "archiveAgent");
+    const requestController = new AbortController();
+    const client = await createMcpClient(
+      `http://127.0.0.1:${port}/mcp/agents`,
+      undefined,
+      requestController.signal,
+    );
+    const revokeCallerSpy = vi.spyOn(destructiveAuthority, "revokeDestructiveCaller");
+
+    try {
+      archiveSpy.mockClear();
+      const archiveResult = client
+        .callTool({ name: "archive_agent", args: { agentId: target.id } })
+        .catch((error) => error as Error);
+      await attentionStarted;
+      requestController.abort();
+      await expect.poll(() => revokeCallerSpy.mock.calls.length).toBeGreaterThan(0);
+      releaseAttention();
+
+      const abortedResult = await withTimeout({
+        promise: archiveResult,
+        timeoutMs: 5000,
+        label: "aborted MCP archive request",
+      });
+      expect(archiveSpy, JSON.stringify(abortedResult)).not.toHaveBeenCalled();
+      expect(daemon.agentManager.getAgent(target.id)).not.toBeNull();
+      expect(abortedResult instanceof Error || abortedResult.isError === true).toBe(true);
+    } finally {
+      releaseAttention();
+      await client.close();
+      clearAttentionSpy.mockRestore();
+      archiveSpy.mockRestore();
+      revokeCallerSpy.mockRestore();
+      await daemon.stop();
+      await Promise.all(
+        [paseoHome, staticDir, agentCwd].map((targetPath) =>
+          rm(targetPath, { recursive: true, force: true }),
         ),
       );
     }

@@ -179,23 +179,31 @@ export interface ArchiveAgentResult {
 export async function archiveAgentCommand(
   dependencies: AgentLifecycleCommandDependencies,
   agentId: string,
-  options?: { caller?: DestructiveCallerContext; action?: "agent.archive" | "agent.finish" },
+  options?: {
+    caller?: DestructiveCallerContext;
+    action?: "agent.archive" | "agent.finish";
+    signal?: AbortSignal;
+  },
 ): Promise<ArchiveAgentResult> {
   const liveAgent = dependencies.agentManager.getAgent(agentId);
-  assertAgentDestructiveActionAuthorized(
-    dependencies.agentManager,
-    options?.caller,
-    agentId,
-    options?.action ?? "agent.archive",
-  );
+  const authorize = () =>
+    assertAgentDestructiveActionAuthorized(
+      dependencies.agentManager,
+      options?.caller,
+      agentId,
+      options?.action ?? "agent.archive",
+      options?.signal,
+    );
+  authorize();
   let record: StoredAgentRecord | null;
   if (liveAgent) {
     await requestAgentRunCancellation(dependencies, agentId);
     await dependencies.agentManager.clearAgentAttention(agentId).catch(() => undefined);
+    authorize();
     await dependencies.agentManager.archiveAgent(agentId);
     record = await dependencies.agentStorage.get(agentId);
   } else {
-    record = await archiveStoredAgent(dependencies, agentId);
+    record = await archiveStoredAgent(dependencies, agentId, authorize);
   }
 
   if (!record) {
@@ -215,13 +223,14 @@ export async function archiveAgentCommand(
 export async function closeAgentCommand(
   dependencies: Pick<AgentLifecycleCommandDependencies, "agentManager">,
   agentId: string,
-  options?: { caller?: DestructiveCallerContext },
+  options?: { caller?: DestructiveCallerContext; signal?: AbortSignal },
 ): Promise<void> {
   assertAgentDestructiveActionAuthorized(
     dependencies.agentManager,
     options?.caller,
     agentId,
     "agent.kill",
+    options?.signal,
   );
   await dependencies.agentManager.closeAgent(agentId);
 }
@@ -234,6 +243,7 @@ export function assertAgentDestructiveActionAuthorized(
     DestructiveActionName,
     "agent.archive" | "agent.delete" | "agent.kill" | "agent.finish"
   >,
+  signal?: AbortSignal,
 ): void {
   if (!caller) {
     return;
@@ -252,6 +262,7 @@ export function assertAgentDestructiveActionAuthorized(
       targetWorkspaceIds: target?.workspaceId ? [target.workspaceId] : [],
       hasLiveTarget: target !== null,
     },
+    signal,
   );
 }
 
@@ -321,6 +332,7 @@ export async function setAgentModeCommand(
 async function archiveStoredAgent(
   dependencies: Pick<AgentLifecycleCommandDependencies, "agentManager" | "agentStorage">,
   agentId: string,
+  authorize: () => void,
 ): Promise<StoredAgentRecord> {
   const existing = await dependencies.agentStorage.get(agentId);
   if (!existing) {
@@ -331,6 +343,7 @@ async function archiveStoredAgent(
     return existing;
   }
 
+  authorize();
   const archivedAt = new Date().toISOString();
   return dependencies.agentManager.archiveSnapshot(agentId, archivedAt);
 }
