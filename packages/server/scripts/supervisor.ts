@@ -143,6 +143,7 @@ export function runSupervisor(options: SupervisorOptions): SupervisorController 
   const workerExecArgv = options.workerExecArgv ?? ["--import", "tsx"];
   const resolveWorkerSpawnSpec = options.resolveWorkerSpawnSpec;
   const platform = options.platform ?? process.platform;
+  const shutdownTermination = platform === "win32" ? "forceful" : "graceful";
   const workerStopTimeoutMs = options.workerStopTimeoutMs ?? 12_000;
 
   let child: ChildProcess | null = null;
@@ -313,7 +314,10 @@ export function runSupervisor(options: SupervisorOptions): SupervisorController 
             return true;
           }
           writeLifecycleLog("Worker ownership committed", { workerPid });
-          currentChild.send({ type: SUPERVISOR_OWNERSHIP_COMMITTED_MESSAGE });
+          currentChild.send({
+            type: SUPERVISOR_OWNERSHIP_COMMITTED_MESSAGE,
+            shutdownTermination,
+          });
           return true;
         })
         .catch(async (error) => {
@@ -510,7 +514,7 @@ export function runSupervisor(options: SupervisorOptions): SupervisorController 
     restarting = false;
     writeLifecycleLog("Supervisor shutdown requested", { reason });
     log(
-      platform === "win32"
+      shutdownTermination === "forceful"
         ? `${reason}. Forcing worker termination on Windows...`
         : `${reason}. Stopping worker...`,
     );
@@ -518,7 +522,7 @@ export function runSupervisor(options: SupervisorOptions): SupervisorController 
       exitSupervisor(0);
       return;
     }
-    signalWorker(platform === "win32" ? "SIGKILL" : "SIGTERM", reason);
+    signalWorker(shutdownTermination === "forceful" ? "SIGKILL" : "SIGTERM", reason);
   };
 
   const forwardSignal = (signal: NodeJS.Signals) => {

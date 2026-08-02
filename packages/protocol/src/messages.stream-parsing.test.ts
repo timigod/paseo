@@ -402,4 +402,27 @@ describe("shared messages stream parsing", () => {
     });
     expect(highlightedParsed.success).toBe(false);
   });
+
+  it("parses shutdown acknowledgements across termination metadata versions", () => {
+    const legacy = SessionOutboundMessageSchema.parse({
+      type: "status",
+      payload: {
+        status: "shutdown_requested",
+        clientId: "client-legacy",
+        requestId: "shutdown-legacy",
+      },
+    });
+    const current = SessionOutboundMessageSchema.parse({
+      type: "status",
+      payload: {
+        status: "shutdown_requested",
+        clientId: "client-current",
+        requestId: "shutdown-current",
+        termination: "forceful",
+      },
+    });
+
+    expect(legacy).not.toHaveProperty("payload.termination");
+    expect(current).toHaveProperty("payload.termination", "forceful");
+  });
 });

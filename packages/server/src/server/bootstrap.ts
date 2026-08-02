@@ -390,6 +390,8 @@ export type DaemonLifecycleIntent =
       reason: string;
     };
 
+export type DaemonShutdownTermination = "graceful" | "forceful";
+
 export interface PaseoDaemonConfig {
   listen: string;
   paseoHome: string;
@@ -445,6 +447,7 @@ export interface PaseoDaemonConfig {
   };
   providerOverrides?: Record<string, ProviderOverride>;
   log?: PersistedConfig["log"];
+  shutdownTermination?: DaemonShutdownTermination;
   onLifecycleIntent?: (intent: DaemonLifecycleIntent) => void;
   pushNotificationSender?: PushNotificationSender;
   managedProcesses?: ManagedProcessRegistry;
@@ -1922,6 +1925,7 @@ export async function createPaseoDaemon(
                 worktreesRoot: config.worktreesRoot,
                 appBaseUrl: config.appBaseUrl,
                 desktopManaged: config.desktopManaged === true,
+                shutdownTermination: config.shutdownTermination ?? "graceful",
                 relay: {
                   enabled: relayEnabled,
                   endpoint: relayEndpoint,

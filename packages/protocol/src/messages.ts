@@ -2944,6 +2944,8 @@ export const ShutdownRequestedStatusPayloadSchema = z.object({
   status: z.literal("shutdown_requested"),
   clientId: z.string(),
   requestId: z.string(),
+  // Added in v0.2.5; remains optional so newer clients accept older daemon acknowledgements.
+  termination: z.enum(["graceful", "forceful"]).optional(),
 });
 
 export const DaemonConfigChangedStatusPayloadSchema = z

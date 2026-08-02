@@ -685,6 +685,7 @@ export class Session {
     | null;
   private readonly getTransportBufferedAmount: () => number | null;
   private readonly onLifecycleIntent: ((intent: SessionLifecycleIntent) => void) | null;
+  private readonly daemonRuntimeConfig: DaemonRuntimeConfig | undefined;
   private readonly onWorkspaceRecovered:
     | ((workspace: PersistedWorkspaceRecord) => Promise<void>)
     | null;
@@ -826,6 +827,7 @@ export class Session {
     this.onBinaryMessageToSource = onBinaryMessageToSource ?? null;
     this.getTransportBufferedAmount = getTransportBufferedAmount ?? (() => 0);
     this.onLifecycleIntent = onLifecycleIntent ?? null;
+    this.daemonRuntimeConfig = daemonRuntimeConfig;
     this.onWorkspaceRecovered = onWorkspaceRecovered ?? null;
     this.pushTokenStore = pushTokenStore;
     this.paseoHome = paseoHome;
@@ -2460,6 +2462,7 @@ export class Session {
         status: "shutdown_requested",
         clientId: this.clientId,
         requestId,
+        termination: this.daemonRuntimeConfig?.shutdownTermination ?? "graceful",
       },
     });
 

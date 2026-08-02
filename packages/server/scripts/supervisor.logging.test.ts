@@ -14,7 +14,7 @@ interface SupervisorFixtureOptions {
   workerSource: string | ((tempDir: string) => string);
   restartOnCrash?: boolean;
   ownershipCommitFailure?: boolean;
-  ownershipMode?: "delayed-first-commit" | "verify-escalation";
+  ownershipMode?: "commit" | "delayed-first-commit" | "verify-escalation";
   workerStopTimeoutMs?: number;
   platform?: NodeJS.Platform;
 }
@@ -72,6 +72,20 @@ function createWorkerOwnershipSource(options: SupervisorFixtureOptions): string 
               recordOwnershipEvent("clear-" + generation);
             }
           },
+        };
+      },
+    }`;
+  }
+  if (options.ownershipMode === "commit") {
+    return `{
+      createClaim(env) {
+        let workerPid = null;
+        return {
+          env,
+          get workerPid() { return workerPid; },
+          async commit(pid) { workerPid = pid; },
+          async verify() { return true; },
+          async clear() {},
         };
       },
     }`;
@@ -328,17 +342,22 @@ describe("supervisor durable logging", () => {
   test("uses and reports forced worker termination on Windows", async () => {
     const result = await runSupervisorFixture({
       workerSource: `
-        process.send?.({ type: "paseo:shutdown", reason: "windows_shutdown" });
-        setInterval(() => {}, 1000);
-      `,
+          process.once("message", (message) => {
+            process.stdout.write(JSON.stringify(message) + "\\n");
+            process.send?.({ type: "paseo:shutdown", reason: "windows_shutdown" });
+          });
+          setInterval(() => {}, 1000);
+        `,
+      ownershipMode: "commit",
       platform: "win32",
     });
 
     expect(result.code).toBe(0);
     expect(result.log).toContain('"signal":"SIGKILL"');
     expect(result.log).toContain('"termination":"forceful"');
+    expect(result.stdout).toContain('"shutdownTermination":"forceful"');
     expect(result.stderr).toContain("Forcing worker termination on Windows");
-  });
+  }, 10_000);
 
   test("logs the worker shutdown reason before signaling the worker", async () => {
     const result = await runSupervisorFixture({

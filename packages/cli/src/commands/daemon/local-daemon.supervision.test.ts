@@ -1,8 +1,10 @@
-import { EventEmitter } from "node:events";
+import { spawn } from "node:child_process";
+import { EventEmitter, once } from "node:events";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
+import { tryConnectToDaemon } from "../../utils/client.js";
 
 import {
   type DaemonLaunchRuntime,
@@ -10,7 +12,12 @@ import {
   resolveLocalDaemonState,
   startLocalDaemonDetached,
   startLocalDaemonForeground,
+  stopLocalDaemon,
 } from "./local-daemon.js";
+
+vi.mock("../../utils/client.js", () => ({
+  tryConnectToDaemon: vi.fn(),
+}));
 
 type RecordedDaemonLaunch =
   | {
@@ -91,6 +98,7 @@ function expectSupervisorLaunch(argv: string[]): void {
 describe("local daemon launch supervision", () => {
   beforeEach(() => {
     vi.useRealTimers();
+    vi.clearAllMocks();
   });
 
   afterEach(async () => {
@@ -210,5 +218,53 @@ describe("local daemon launch supervision", () => {
     expect(state.relayEndpoint).toBe("paseo.example.com");
     expect(state.relayUseTls).toBe(false);
     expect(state.relayPublicUseTls).toBe(true);
+  });
+
+  test("reports successful Windows lifecycle shutdown as forceful", async () => {
+    const home = await createPaseoHome({ version: 1 });
+    const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+      stdio: "ignore",
+    });
+    const childClosed = once(child, "close");
+    await once(child, "spawn");
+    const pid = child.pid;
+    if (!pid) {
+      throw new Error("fixture process did not expose a PID");
+    }
+    await writeFile(
+      path.join(home, "paseo.pid"),
+      JSON.stringify({ pid, listen: "127.0.0.1:6767" }),
+    );
+
+    const shutdownServer = vi.fn(async () => {
+      child.kill("SIGKILL");
+      return {
+        status: "shutdown_requested" as const,
+        clientId: "cli-test",
+        requestId: "shutdown-windows",
+        termination: "forceful" as const,
+      };
+    });
+    const close = vi.fn(async () => undefined);
+    vi.mocked(tryConnectToDaemon).mockResolvedValue({ shutdownServer, close } as never);
+
+    try {
+      await expect(stopLocalDaemon({ home, timeoutMs: 2_000 })).resolves.toEqual({
+        action: "stopped",
+        home,
+        pid,
+        forced: true,
+        usedLifecycleRpc: true,
+        reason: "lifecycle_shutdown_rpc",
+        message: "Daemon stopped via forceful lifecycle shutdown",
+      });
+      expect(shutdownServer).toHaveBeenCalledOnce();
+      expect(close).toHaveBeenCalledOnce();
+    } finally {
+      if (child.exitCode === null && child.signalCode === null) {
+        child.kill("SIGKILL");
+      }
+      await childClosed;
+    }
   });
 });

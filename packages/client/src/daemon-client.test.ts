@@ -2914,6 +2914,7 @@ test("sends explicit shutdown_server_request via shutdownServer", async () => {
         status: "shutdown_requested",
         clientId: "clsk_unit_test",
         requestId: "req-shutdown-1",
+        termination: "forceful",
       },
     }),
   );
@@ -2922,6 +2923,7 @@ test("sends explicit shutdown_server_request via shutdownServer", async () => {
     status: "shutdown_requested",
     clientId: "clsk_unit_test",
     requestId: "req-shutdown-1",
+    termination: "forceful",
   });
 });
 

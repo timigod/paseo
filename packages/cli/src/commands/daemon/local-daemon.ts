@@ -223,20 +223,22 @@ function resolveListenField(listen: unknown, sockPath: unknown): string | undefi
 }
 
 function resolveStopMessage(
-  forced: boolean,
+  ownerForced: boolean,
   lifecycleRequested: boolean,
+  lifecycleForced: boolean,
   fallbackMessage: string | null | undefined,
 ): string {
-  if (forced) return "Daemon owner process was force-stopped";
+  if (ownerForced) return "Daemon owner process was force-stopped";
+  if (lifecycleForced) return "Daemon stopped via forceful lifecycle shutdown";
   if (lifecycleRequested) return "Daemon stopped gracefully";
   return fallbackMessage ?? "Daemon stopped via owner PID signal";
 }
 
 function resolveStopReason(
-  forced: boolean,
+  ownerForced: boolean,
   lifecycleRequested: boolean,
 ): StopLocalDaemonResult["reason"] {
-  if (forced) return "owner_pid_sigkill";
+  if (ownerForced) return "owner_pid_sigkill";
   if (lifecycleRequested) return "lifecycle_shutdown_rpc";
   return "owner_pid_signal";
 }
@@ -494,7 +496,9 @@ async function waitForStopAfterRequest(args: {
   return { stopped, forced: false };
 }
 
-type LifecycleShutdownAttempt = { requested: true } | { requested: false; reason: string };
+type LifecycleShutdownAttempt =
+  | { requested: true; termination: "graceful" | "forceful" }
+  | { requested: false; reason: string };
 
 function getErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
@@ -691,8 +695,9 @@ async function requestLifecycleShutdown(
   }
 
   try {
-    await client.shutdownServer({ timeout: Math.min(remainingTimeoutMs(), 5000) });
-    return { requested: true };
+    const response = await client.shutdownServer({ timeout: Math.min(remainingTimeoutMs(), 5000) });
+    // COMPAT(shutdownTermination): added in v0.2.5, remove fallback after 2027-02-02.
+    return { requested: true, termination: response.termination ?? "graceful" };
   } catch (error) {
     return {
       requested: false,
@@ -716,6 +721,7 @@ export async function stopLocalDaemon(
 
   const shutdownAttempt = await requestLifecycleShutdown(state, remainingTimeoutMs());
   const lifecycleRequested = shutdownAttempt.requested;
+  const lifecycleForced = shutdownAttempt.requested && shutdownAttempt.termination === "forceful";
 
   if (!state.pidInfo || (!state.running && !lifecycleRequested)) {
     const staleSuffix =
@@ -734,7 +740,7 @@ export async function stopLocalDaemon(
     if (notRunningResult) return notRunningResult;
   }
 
-  const { stopped, forced } = await waitForStopAfterRequest({
+  const { stopped, forced: ownerForced } = await waitForStopAfterRequest({
     state,
     pid,
     timeoutMs: remainingTimeoutMs(),
@@ -749,13 +755,15 @@ export async function stopLocalDaemon(
     removeStalePidFile(state);
   }
 
+  const forced = ownerForced || lifecycleForced;
+
   return {
     action: "stopped",
     home: state.home,
     pid,
     forced,
     usedLifecycleRpc: lifecycleRequested,
-    reason: resolveStopReason(forced, lifecycleRequested),
-    message: resolveStopMessage(forced, lifecycleRequested, fallbackMessage),
+    reason: resolveStopReason(ownerForced, lifecycleRequested),
+    message: resolveStopMessage(ownerForced, lifecycleRequested, lifecycleForced, fallbackMessage),
   };
 }

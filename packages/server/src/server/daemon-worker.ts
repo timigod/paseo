@@ -35,6 +35,8 @@ interface SupervisorHeartbeatMessage {
   type: "paseo:supervisor-heartbeat";
 }
 
+type ShutdownTermination = "graceful" | "forceful";
+
 interface BootstrapResult {
   paseoHome: string;
   logger: ReturnType<typeof createRootLogger>;
@@ -81,15 +83,15 @@ function writeWorkerLifecycleLog(
   }
 }
 
-async function waitForOwnershipCommit(): Promise<void> {
+async function waitForOwnershipCommit(): Promise<ShutdownTermination> {
   if (!process.env[SUPERVISOR_WORKER_TOKEN_ENV]) {
-    return;
+    return "graceful";
   }
   if (typeof process.send !== "function") {
     throw new Error("Supervised daemon worker started without an IPC channel");
   }
 
-  await new Promise<void>((resolve, reject) => {
+  return new Promise<ShutdownTermination>((resolve, reject) => {
     const timeout = setTimeout(() => {
       cleanup();
       reject(new Error("Supervisor did not commit worker ownership before startup timeout"));
@@ -101,8 +103,16 @@ async function waitForOwnershipCommit(): Promise<void> {
         "type" in message &&
         (message as { type?: unknown }).type === SUPERVISOR_OWNERSHIP_COMMITTED_MESSAGE
       ) {
+        const shutdownTermination = (message as { shutdownTermination?: unknown })
+          .shutdownTermination;
         cleanup();
-        resolve();
+        if (shutdownTermination === "graceful" || shutdownTermination === "forceful") {
+          resolve(shutdownTermination);
+          return;
+        }
+        // COMPAT(shutdownTermination): added in v0.2.5, remove fallback after 2027-02-02.
+        // Workers can outlive and restart under an older supervisor without this policy.
+        resolve(process.platform === "win32" ? "forceful" : "graceful");
       }
     };
     const onDisconnect = () => {
@@ -167,7 +177,7 @@ function applyCliFlagOverrides(config: ReturnType<typeof loadConfig>): void {
   }
 }
 
-async function main() {
+async function main(shutdownTermination: ShutdownTermination) {
   const { paseoHome, logger, config } = bootstrapFromEnvironment();
   let daemon: Awaited<ReturnType<typeof createPaseoDaemon>> | null = null;
   let shutdownPromise: Promise<number> | null = null;
@@ -346,6 +356,7 @@ async function main() {
     daemon = await createPaseoDaemon(
       {
         ...config,
+        shutdownTermination,
         onLifecycleIntent: handleLifecycleIntent,
       },
       logger,

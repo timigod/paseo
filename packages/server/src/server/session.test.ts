@@ -350,8 +350,10 @@ interface SessionForTestOptions {
   serverId?: SessionOptions["serverId"];
   daemonVersion?: SessionOptions["daemonVersion"];
   daemonRuntimeConfig?: SessionOptions["daemonRuntimeConfig"];
+  onLifecycleIntent?: SessionOptions["onLifecycleIntent"];
   downloadTokenStore?: SessionOptions["downloadTokenStore"];
   messages?: unknown[];
+  onMessage?: SessionOptions["onMessage"];
   targetedMessages?: Array<{ source: object; message: SessionOutboundMessage }>;
   binaryMessages?: Uint8Array[];
 }
@@ -392,7 +394,7 @@ function createSessionForTest(options: SessionForTestOptions = {}): Session {
 
   const sessionOptions: SessionOptions = {
     clientId: "test-client",
-    onMessage: (message) => messages.push(message),
+    onMessage: options.onMessage ?? ((message) => messages.push(message)),
     ...(options.targetedMessages
       ? {
           onMessageToSource: (source: object, message: SessionOutboundMessage) =>
@@ -456,10 +458,55 @@ function createSessionForTest(options: SessionForTestOptions = {}): Session {
     serverId: options.serverId,
     daemonVersion: options.daemonVersion,
     daemonRuntimeConfig: options.daemonRuntimeConfig,
+    onLifecycleIntent: options.onLifecycleIntent,
     scopes: options.scopes ?? ["*"],
   };
   return new Session(sessionOptions);
 }
+
+describe("session daemon lifecycle", () => {
+  test("acknowledges forceful shutdown before emitting the lifecycle intent", async () => {
+    const events: Array<{ kind: "message" | "intent"; value: unknown }> = [];
+    const session = createSessionForTest({
+      onMessage: (message) => events.push({ kind: "message", value: message }),
+      daemonRuntimeConfig: {
+        listen: "127.0.0.1:6767",
+        relay: null,
+        shutdownTermination: "forceful",
+      },
+      onLifecycleIntent: (intent) => events.push({ kind: "intent", value: intent }),
+    });
+
+    await session.handleMessage({
+      type: "shutdown_server_request",
+      requestId: "shutdown-forceful",
+    });
+
+    expect(events).toEqual([
+      {
+        kind: "message",
+        value: {
+          type: "status",
+          payload: {
+            status: "shutdown_requested",
+            clientId: "test-client",
+            requestId: "shutdown-forceful",
+            termination: "forceful",
+          },
+        },
+      },
+      {
+        kind: "intent",
+        value: {
+          type: "shutdown",
+          clientId: "test-client",
+          requestId: "shutdown-forceful",
+          reason: "client_shutdown_rpc",
+        },
+      },
+    ]);
+  });
+});
 
 describe("session authorization scopes", () => {
   test("rejects an RPC outside an exact grant with the generic RPC error", async () => {

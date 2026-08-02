@@ -17,6 +17,7 @@ export interface DaemonRuntimeConfig {
   worktreesRoot?: string;
   appBaseUrl?: string;
   desktopManaged?: boolean;
+  shutdownTermination?: "graceful" | "forceful";
   relay: {
     enabled: boolean;
     endpoint: string;
