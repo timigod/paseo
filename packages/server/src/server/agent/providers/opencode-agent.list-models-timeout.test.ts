@@ -6,6 +6,18 @@ import {
   TestOpenCodeClient,
   TestOpenCodeHarness,
 } from "./opencode/test-utils/test-opencode-harness.js";
+import type { OpenCodeServerAcquisition } from "./opencode/server-manager.js";
+
+function createDeferred<T>(): {
+  promise: Promise<T>;
+  resolve: (value: T) => void;
+} {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((finish) => {
+    resolve = finish;
+  });
+  return { promise, resolve };
+}
 
 afterEach(() => {
   vi.useRealTimers();
@@ -114,6 +126,77 @@ test("uses the supplied catalog budget for mode discovery and releases the runti
   });
   expect(modeDiscoverySignal?.aborted).toBe(true);
   expect(runtime.acquisitions).toEqual([{ kind: "current", releaseCount: 1 }]);
+});
+
+test("times out a pending server acquisition and releases a late handle exactly once", async () => {
+  vi.useFakeTimers();
+  vi.setSystemTime(0);
+
+  const runtime = new TestOpenCodeHarness();
+  const acquireCurrent = runtime.acquireCurrent.bind(runtime);
+  const deferredAcquisition = createDeferred<OpenCodeServerAcquisition>();
+  vi.spyOn(runtime, "acquireCurrent").mockReturnValue(deferredAcquisition.promise);
+  const client = new OpenCodeAgentClient(createTestLogger(), undefined, {
+    serverManager: runtime,
+    createClient: runtime.createClient,
+  });
+  const catalogPromise = client.fetchCatalog({
+    scope: "workspace",
+    cwd: "/tmp/opencode-models",
+    force: false,
+    timeoutMs: 250,
+  });
+  const rejection = expect(catalogPromise).rejects.toThrow(
+    "OpenCode server acquisition timed out within the 250ms catalog budget",
+  );
+
+  await vi.advanceTimersByTimeAsync(250);
+  await rejection;
+  expect(runtime.clientCreations).toEqual([]);
+  expect(runtime.acquisitions).toEqual([]);
+
+  deferredAcquisition.resolve(await acquireCurrent());
+  await vi.waitFor(() => {
+    expect(runtime.acquisitions).toEqual([{ kind: "current", releaseCount: 1 }]);
+  });
+  await vi.runAllTimersAsync();
+  expect(runtime.acquisitions).toEqual([{ kind: "current", releaseCount: 1 }]);
+  expect(runtime.clientCreations).toEqual([]);
+});
+
+test("aborts a pending server acquisition and releases a late handle exactly once", async () => {
+  const runtime = new TestOpenCodeHarness();
+  const acquireCurrent = runtime.acquireCurrent.bind(runtime);
+  const deferredAcquisition = createDeferred<OpenCodeServerAcquisition>();
+  vi.spyOn(runtime, "acquireCurrent").mockReturnValue(deferredAcquisition.promise);
+  const client = new OpenCodeAgentClient(createTestLogger(), undefined, {
+    serverManager: runtime,
+    createClient: runtime.createClient,
+  });
+  const controller = new AbortController();
+  const catalogPromise = client.fetchCatalog({
+    scope: "workspace",
+    cwd: "/tmp/opencode-models",
+    force: false,
+    timeoutMs: 30_000,
+    signal: controller.signal,
+  });
+  const rejection = expect(catalogPromise).rejects.toThrow(
+    "OpenCode server acquisition aborted by caller",
+  );
+
+  controller.abort();
+  await rejection;
+  expect(runtime.clientCreations).toEqual([]);
+  expect(runtime.acquisitions).toEqual([]);
+
+  deferredAcquisition.resolve(await acquireCurrent());
+  await vi.waitFor(() => {
+    expect(runtime.acquisitions).toEqual([{ kind: "current", releaseCount: 1 }]);
+  });
+  await Promise.resolve();
+  expect(runtime.acquisitions).toEqual([{ kind: "current", releaseCount: 1 }]);
+  expect(runtime.clientCreations).toEqual([]);
 });
 
 test("keeps models usable and reports degraded mode discovery when app.agents errors", async () => {

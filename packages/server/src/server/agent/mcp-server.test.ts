@@ -5032,6 +5032,40 @@ describe("provider listing MCP tool", () => {
     ]);
   });
 
+  it("preserves unknown provider modes and their degradation diagnostic", async () => {
+    const { agentManager, agentStorage } = createTestDeps();
+    const provStub = createProviderSnapshotManagerStub();
+    const degradedEntry: ProviderSnapshotEntry = {
+      provider: "opencode",
+      label: "OpenCode",
+      status: "ready",
+      enabled: true,
+      error: "OpenCode app.agents timed out within the catalog budget",
+    };
+    provStub.listProviders.mockResolvedValue([degradedEntry]);
+    const server = await createAgentMcpServer({
+      agentManager,
+      agentStorage,
+      providerSnapshotManager: provStub.manager,
+      logger,
+    });
+    const response = await registeredTool(server, "list_providers").handler({});
+
+    expect(response.structuredContent).toEqual({
+      providers: [
+        {
+          id: "opencode",
+          label: "OpenCode",
+          description: "",
+          enabled: true,
+          status: "available",
+          error: "OpenCode app.agents timed out within the catalog budget",
+        },
+      ],
+    });
+    expect(response.structuredContent.providers[0]).not.toHaveProperty("modes");
+  });
+
   it("returns disabled providers with metadata without checking availability", async () => {
     const { agentManager, agentStorage } = createTestDeps();
     const provStub = createProviderSnapshotManagerStub();
@@ -5151,6 +5185,43 @@ describe("provider MCP tools", () => {
         },
       ],
     });
+  });
+
+  it("inspects a usable provider without fabricating unknown modes or dropping its error", async () => {
+    const { agentManager, agentStorage, spies } = createTestDeps();
+    spies.agentManager.listDraftFeatures.mockResolvedValue([]);
+    const provStub = createProviderSnapshotManagerStub();
+    const degradedEntry: ProviderSnapshotEntry = {
+      provider: "opencode",
+      label: "OpenCode",
+      description: "OpenCode coding agent",
+      status: "ready",
+      enabled: true,
+      error: "OpenCode app.agents timed out within the catalog budget",
+    };
+    provStub.getProvider.mockResolvedValue(degradedEntry);
+    const server = await createAgentMcpServer({
+      agentManager,
+      agentStorage,
+      providerSnapshotManager: provStub.manager,
+      logger,
+    });
+    const response = await registeredTool(server, "inspect_provider").handler({
+      provider: "opencode",
+      cwd: "~/repo",
+    });
+
+    expect(response.structuredContent).toEqual({
+      provider: "opencode",
+      label: "OpenCode",
+      description: "OpenCode coding agent",
+      enabled: true,
+      status: "available",
+      error: "OpenCode app.agents timed out within the catalog budget",
+      selectedModel: null,
+      features: [],
+    });
+    expect(response.structuredContent).not.toHaveProperty("modes");
   });
 
   it("rejects disabled providers without fetching models", async () => {

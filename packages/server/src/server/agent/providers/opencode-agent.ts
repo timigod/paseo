@@ -69,6 +69,7 @@ import { execCommand } from "../../../utils/spawn.js";
 import { mapOpencodeToolCall } from "./opencode/tool-call-mapper.js";
 import {
   OpenCodeServerManager,
+  type OpenCodeServerAcquisition,
   type OpenCodeServerManagerLike,
 } from "./opencode/server-manager.js";
 import { resolveOpenCodeHomeDir } from "./opencode/paths.js";
@@ -346,6 +347,78 @@ async function runOpenCodeCatalogRequest<T>(
   } finally {
     parentSignal?.removeEventListener("abort", abortFromParent);
     controller.abort();
+  }
+}
+
+async function acquireOpenCodeCatalogServer(
+  acquire: () => Promise<OpenCodeServerAcquisition>,
+  budget: OpenCodeCatalogBudget,
+  logger: Logger,
+): Promise<OpenCodeServerAcquisition> {
+  if (budget.signal?.aborted) {
+    throw new Error("OpenCode server acquisition aborted by caller");
+  }
+  const remainingMs = budget.deadlineAtMs - Date.now();
+  if (remainingMs <= 0) {
+    throw new Error(
+      `OpenCode server acquisition timed out within the ${budget.timeoutMs}ms catalog budget`,
+    );
+  }
+
+  const acquisitionPromise = acquire();
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  let cancelled = false;
+  const cancel = (reject: (error: Error) => void, error: Error) => {
+    if (cancelled) {
+      return;
+    }
+    cancelled = true;
+    reject(error);
+  };
+  let abortFromParent: (() => void) | undefined;
+  const cancellationPromise = new Promise<never>((_resolve, reject) => {
+    abortFromParent = () =>
+      cancel(reject, new Error("OpenCode server acquisition aborted by caller"));
+    budget.signal?.addEventListener("abort", abortFromParent, { once: true });
+    timeout = setTimeout(
+      () =>
+        cancel(
+          reject,
+          new Error(
+            `OpenCode server acquisition timed out within the ${budget.timeoutMs}ms catalog budget`,
+          ),
+        ),
+      remainingMs,
+    );
+  });
+
+  try {
+    return await Promise.race([acquisitionPromise, cancellationPromise]);
+  } catch (error) {
+    if (cancelled) {
+      void acquisitionPromise.then(
+        async (lateAcquisition) => {
+          try {
+            await lateAcquisition.release();
+          } catch (releaseError) {
+            logger.warn(
+              { err: releaseError },
+              "Failed to release OpenCode server acquired after catalog cancellation",
+            );
+          }
+          return undefined;
+        },
+        () => undefined,
+      );
+    }
+    throw error;
+  } finally {
+    if (timeout) {
+      clearTimeout(timeout);
+    }
+    if (abortFromParent) {
+      budget.signal?.removeEventListener("abort", abortFromParent);
+    }
   }
 }
 
@@ -1464,9 +1537,13 @@ export class OpenCodeAgentClient implements AgentClient {
     if (catalogBudget.signal?.aborted) {
       throw new Error("OpenCode catalog refresh aborted by caller");
     }
-    const acquisition = options.force
-      ? await this.serverManager.acquireNew()
-      : await this.serverManager.acquireCurrent();
+    const acquisition = await acquireOpenCodeCatalogServer(
+      options.force
+        ? () => this.serverManager.acquireNew()
+        : () => this.serverManager.acquireCurrent(),
+      catalogBudget,
+      this.logger,
+    );
     const { url } = acquisition.server;
     const isGlobalCatalog = options.scope === "global";
 

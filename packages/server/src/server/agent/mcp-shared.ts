@@ -30,7 +30,9 @@ export const ProviderSummarySchema = z
     label: z.string().nullish(),
     description: z.string().nullish(),
     enabled: z.boolean().optional().default(true),
+    status: z.string().optional(),
     modes: z.array(ProviderModeSchema).nullish(),
+    error: z.string().nullish(),
   })
   .passthrough();
 

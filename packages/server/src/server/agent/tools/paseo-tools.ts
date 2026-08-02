@@ -225,7 +225,7 @@ interface ProviderSummary {
   label: string;
   description: string;
   enabled: boolean;
-  modes: AgentMode[];
+  modes?: AgentMode[];
   status: string;
   error?: string;
 }
@@ -343,7 +343,7 @@ function toProviderSummary(entry: {
     label: entry.label ?? entry.provider,
     description: entry.description ?? "",
     enabled: entry.enabled,
-    modes: entry.modes ?? [],
+    ...(entry.modes !== undefined ? { modes: entry.modes } : {}),
     status: entry.status === "ready" ? "available" : entry.status,
     ...(entry.error ? { error: entry.error } : {}),
   };
@@ -3045,6 +3045,7 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
         enabled: z.boolean(),
         status: z.string(),
         modes: z.array(ProviderModeSchema).nullish(),
+        error: z.string().nullish(),
         selectedModel: z.string().nullable(),
         features: z.array(AgentFeatureSchema),
       },
@@ -3085,7 +3086,8 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
           description: summary.description,
           enabled: summary.enabled,
           status: summary.status,
-          modes: summary.modes,
+          ...(summary.modes !== undefined ? { modes: summary.modes } : {}),
+          ...(summary.error !== undefined ? { error: summary.error } : {}),
           selectedModel: selectedModel ?? null,
           features,
         }),

@@ -22,6 +22,7 @@ import {
   TestOpenCodeClient,
   TestOpenCodeHarness,
 } from "./providers/opencode/test-utils/test-opencode-harness.js";
+import type { OpenCodeServerAcquisition } from "./providers/opencode/server-manager.js";
 
 const TEST_CAPABILITIES = {
   supportsStreaming: false,
@@ -1031,6 +1032,64 @@ describe("ProviderSnapshotManager public surface", () => {
       });
       expect("modes" in earlyResult ? earlyResult.modes : undefined).toBeUndefined();
       expect(runtime.acquisitions).toEqual([{ kind: "current", releaseCount: 1 }]);
+    } finally {
+      manager.destroy();
+      vi.useRealTimers();
+    }
+  });
+
+  test("does not publish a late catalog after timing out during real OpenCode acquisition", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    const runtime = new TestOpenCodeHarness();
+    const acquireCurrent = runtime.acquireCurrent.bind(runtime);
+    let resolveAcquisition!: (acquisition: OpenCodeServerAcquisition) => void;
+    const pendingAcquisition = new Promise<OpenCodeServerAcquisition>((finish) => {
+      resolveAcquisition = finish;
+    });
+    vi.spyOn(runtime, "acquireCurrent").mockReturnValue(pendingAcquisition);
+    const openCodeAgentClient = new OpenCodeAgentClient(createTestLogger(), undefined, {
+      serverManager: runtime,
+      createClient: runtime.createClient,
+    });
+    vi.spyOn(openCodeAgentClient, "isAvailable").mockResolvedValue(true);
+    const manager = new ProviderSnapshotManager({
+      logger: createTestLogger(),
+      refreshTimeoutMs: 250,
+      extraClients: {
+        opencode: openCodeAgentClient,
+      },
+    });
+    const entryPromise = manager.getProvider({
+      cwd: "/tmp/project",
+      provider: "opencode",
+      wait: true,
+    });
+
+    try {
+      await vi.waitFor(() => expect(runtime.acquireCurrent).toHaveBeenCalledTimes(1));
+      await vi.advanceTimersByTimeAsync(250);
+      const timedOutEntry = await entryPromise;
+
+      expect(timedOutEntry).toMatchObject({
+        provider: "opencode",
+        status: "error",
+        error: "OpenCode server acquisition timed out within the 250ms catalog budget",
+      });
+      expect(timedOutEntry.modes).toBeUndefined();
+      expect(runtime.clientCreations).toEqual([]);
+
+      resolveAcquisition(await acquireCurrent());
+      await vi.waitFor(() => {
+        expect(runtime.acquisitions).toEqual([{ kind: "current", releaseCount: 1 }]);
+      });
+      const settledEntry = await manager.getProvider({
+        cwd: "/tmp/project",
+        provider: "opencode",
+        wait: false,
+      });
+      expect(settledEntry).toEqual(timedOutEntry);
+      expect(runtime.clientCreations).toEqual([]);
     } finally {
       manager.destroy();
       vi.useRealTimers();
