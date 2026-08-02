@@ -90,6 +90,10 @@ import {
   buildAgentArchiveCascadePlan,
   type AgentArchiveCascadePlan,
 } from "./agent-archive-cascade.js";
+import {
+  DestructiveMembershipGate,
+  type MembershipMutationLease,
+} from "../destructive-membership-gate.js";
 
 const RELOAD_SESSION_CLOSE_TIMEOUT_MS = 3_000;
 const INTERRUPT_SESSION_TIMEOUT_MS = 2_000;
@@ -318,6 +322,7 @@ export interface AgentManagerOptions {
   terminalManager?: TerminalManager | null;
   mcpBaseUrl?: string;
   issueAgentAuthToken?: (identity: AgentCallerIdentity) => string;
+  membershipGate?: DestructiveMembershipGate;
   paseoToolsEnabled?: boolean;
   paseoToolCatalogFactory?: PaseoToolCatalogFactory;
   appendSystemPrompt?: string;
@@ -655,6 +660,7 @@ export class AgentManager {
   private readonly agentStreamCoalescer: AgentStreamCoalescer;
   private mcpBaseUrl: string | null;
   private readonly issueAgentAuthToken: ((identity: AgentCallerIdentity) => string) | null;
+  private readonly membershipGate: DestructiveMembershipGate | null;
   private paseoToolsEnabled = true;
   private paseoToolCatalogFactory: PaseoToolCatalogFactory | null = null;
   private appendSystemPrompt: string;
@@ -667,14 +673,15 @@ export class AgentManager {
   private acceptingAgentRegistrations = true;
 
   constructor(options: AgentManagerOptions) {
-    this.idFactory = options?.idFactory ?? (() => randomUUID());
-    this.registry = options?.registry;
-    this.workspaceRegistry = options?.workspaceRegistry;
-    this.durableTimelineStore = options?.durableTimelineStore;
-    this.onAgentAttention = options?.onAgentAttention;
-    this.onWorkspaceStateMayHaveChanged = options?.onWorkspaceStateMayHaveChanged;
-    this.mcpBaseUrl = options?.mcpBaseUrl ?? null;
-    this.issueAgentAuthToken = options?.issueAgentAuthToken ?? null;
+    this.idFactory = options.idFactory ?? (() => randomUUID());
+    this.registry = options.registry;
+    this.workspaceRegistry = options.workspaceRegistry;
+    this.durableTimelineStore = options.durableTimelineStore;
+    this.onAgentAttention = options.onAgentAttention;
+    this.onWorkspaceStateMayHaveChanged = options.onWorkspaceStateMayHaveChanged;
+    this.mcpBaseUrl = options.mcpBaseUrl ?? null;
+    this.issueAgentAuthToken = options.issueAgentAuthToken ?? null;
+    this.membershipGate = options.membershipGate ?? null;
     this.configurePaseoTools(options);
     this.appendSystemPrompt = options.appendSystemPrompt ?? "";
     this.logger = options.logger.child({ module: "agent", component: "agent-manager" });
@@ -790,6 +797,55 @@ export class AgentManager {
 
   getMembershipVersion(): number {
     return this.membershipVersion;
+  }
+
+  getMembershipGate(): DestructiveMembershipGate | null {
+    return this.membershipGate;
+  }
+
+  private async beginAgentMembershipMutation(input: {
+    agentId: string;
+    cwd: string;
+    workspaceId?: string;
+    labels?: Readonly<Record<string, string>>;
+    additionalParentAgentIds?: readonly string[];
+  }): Promise<MembershipMutationLease | null> {
+    if (!this.membershipGate) {
+      return null;
+    }
+
+    const parentAgentIdById = new Map<string, string | undefined>();
+    if (this.registry) {
+      for (const record of await this.registry.list()) {
+        if (!record.archivedAt) {
+          parentAgentIdById.set(record.id, getParentAgentIdFromLabels(record.labels) ?? undefined);
+        }
+      }
+    }
+    for (const agent of this.agents.values()) {
+      if (!agent.internal) {
+        parentAgentIdById.set(agent.id, getParentAgentIdFromLabels(agent.labels) ?? undefined);
+      }
+    }
+
+    const agentIds = new Set<string>([input.agentId]);
+    const pendingParents = [
+      getParentAgentIdFromLabels(input.labels),
+      ...(input.additionalParentAgentIds ?? []),
+    ].filter((candidate): candidate is string => typeof candidate === "string");
+    for (const firstParentAgentId of pendingParents) {
+      let parentAgentId: string | undefined = firstParentAgentId;
+      while (parentAgentId && !agentIds.has(parentAgentId)) {
+        agentIds.add(parentAgentId);
+        parentAgentId = parentAgentIdById.get(parentAgentId);
+      }
+    }
+
+    return this.membershipGate.beginMembershipMutation({
+      agentIds: Array.from(agentIds),
+      ...(input.workspaceId ? { workspaceIds: [input.workspaceId] } : {}),
+      paths: [input.cwd],
+    });
   }
 
   getAgentCallerIdentity(agentId: string): AgentCallerIdentity | null {
@@ -1166,50 +1222,60 @@ export class AgentManager {
   ): Promise<ManagedAgent> {
     this.assertAcceptingAgentRegistrations();
     const resolvedAgentId = validateAgentId(agentId ?? this.idFactory(), "createAgent");
-    const agentIncarnation = randomUUID();
-    const { storedConfig, launchConfig } = await this.prepareSessionConfig(
-      config,
-      resolvedAgentId,
-      agentIncarnation,
-      options?.env,
-    );
-    this.requireEnabledProvider(storedConfig.provider);
-    const client = await this.requireAvailableClient({
-      provider: storedConfig.provider,
+    const membershipLease = await this.beginAgentMembershipMutation({
+      agentId: resolvedAgentId,
+      cwd: config.cwd,
+      workspaceId: options.workspaceId,
+      labels: options.labels,
     });
-    const launchContext = await this.buildLaunchContext(
-      resolvedAgentId,
-      client,
-      storedConfig.cwd,
-      agentIncarnation,
-      options?.env,
-    );
-    const providerLaunchConfig = this.resolveProviderLaunchConfig(launchConfig, launchContext);
-    const createOptions = this.buildCreateSessionOptions(options);
-    return this.withManagedWorktreeWriter(
-      {
-        agentId: resolvedAgentId,
-        cwd: storedConfig.cwd,
-        workspaceId: options.workspaceId,
-      },
-      async () => {
-        await this.deleteAgentState(resolvedAgentId);
-        const session = await client.createSession(
-          providerLaunchConfig,
-          launchContext,
-          createOptions,
-        );
-        this.trackStartedAgentRuntime(session, reservation);
-        return this.registerSession(session, storedConfig, resolvedAgentId, {
-          labels: options.labels,
-          initialTitle: options.initialTitle,
+    try {
+      const agentIncarnation = randomUUID();
+      const { storedConfig, launchConfig } = await this.prepareSessionConfig(
+        config,
+        resolvedAgentId,
+        agentIncarnation,
+        options?.env,
+      );
+      this.requireEnabledProvider(storedConfig.provider);
+      const client = await this.requireAvailableClient({
+        provider: storedConfig.provider,
+      });
+      const launchContext = await this.buildLaunchContext(
+        resolvedAgentId,
+        client,
+        storedConfig.cwd,
+        agentIncarnation,
+        options?.env,
+      );
+      const providerLaunchConfig = this.resolveProviderLaunchConfig(launchConfig, launchContext);
+      const createOptions = this.buildCreateSessionOptions(options);
+      return this.withManagedWorktreeWriter(
+        {
+          agentId: resolvedAgentId,
+          cwd: storedConfig.cwd,
           workspaceId: options.workspaceId,
-          owner: options.owner,
-          autoArchiveObligation: options.autoArchiveObligation,
-          incarnation: agentIncarnation,
-        });
-      },
-    );
+        },
+        async () => {
+          await this.deleteAgentState(resolvedAgentId);
+          const session = await client.createSession(
+            providerLaunchConfig,
+            launchContext,
+            createOptions,
+          );
+          this.trackStartedAgentRuntime(session, reservation);
+          return this.registerSession(session, storedConfig, resolvedAgentId, {
+            labels: options.labels,
+            initialTitle: options.initialTitle,
+            workspaceId: options.workspaceId,
+            owner: options.owner,
+            autoArchiveObligation: options.autoArchiveObligation,
+            incarnation: agentIncarnation,
+          });
+        },
+      );
+    } finally {
+      membershipLease?.release();
+    }
   }
 
   private async withManagedWorktreeWriter<T>(
@@ -1439,48 +1505,34 @@ export class AgentManager {
       ...overrides,
       provider: handle.provider,
     } as AgentSessionConfig;
-    const { storedConfig, launchConfig } = await this.prepareSessionConfig(
-      mergedConfig,
-      resolvedAgentId,
-      agentIncarnation,
-    );
+    const membershipLease = await this.beginAgentMembershipMutation({
+      agentId: resolvedAgentId,
+      cwd: mergedConfig.cwd,
+      workspaceId: options?.workspaceId,
+      labels: options?.labels,
+    });
+    try {
+      const { storedConfig, launchConfig } = await this.prepareSessionConfig(
+        mergedConfig,
+        resolvedAgentId,
+        agentIncarnation,
+      );
 
-    const client = this.requireClient(handle.provider);
-    const available = await client.isAvailable();
-    if (!available) {
-      throw new Error(
-        `Provider '${handle.provider}' is not available. Please ensure the CLI is installed.`,
+      const client = this.requireClient(handle.provider);
+      const available = await client.isAvailable();
+      if (!available) {
+        throw new Error(
+          `Provider '${handle.provider}' is not available. Please ensure the CLI is installed.`,
+        );
+      }
+      const launchContext = await this.buildLaunchContext(
+        resolvedAgentId,
+        client,
+        storedConfig.cwd,
+        agentIncarnation,
       );
-    }
-    const launchContext = await this.buildLaunchContext(
-      resolvedAgentId,
-      client,
-      storedConfig.cwd,
-      agentIncarnation,
-    );
-    const providerLaunchConfig = this.resolveProviderLaunchConfig(launchConfig, launchContext);
-    if (resumeOptions?.purpose === "history") {
-      const session = await client.resumeSession(
-        handle,
-        providerLaunchConfig,
-        launchContext,
-        resumeOptions,
-      );
-      this.trackStartedAgentRuntime(session, reservation);
-      return this.registerSession(session, storedConfig, resolvedAgentId, {
-        ...options,
-        persistence: handle,
-        incarnation: agentIncarnation,
-      });
-    }
-    return this.withManagedWorktreeWriter(
-      this.buildManagedWorktreeWriterCandidate({
-        agentId: resolvedAgentId,
-        cwd: storedConfig.cwd,
-        workspaceId: options?.workspaceId,
-        persistence: handle,
-      }),
-      async () => {
+      const providerLaunchConfig = this.resolveProviderLaunchConfig(launchConfig, launchContext);
+      if (resumeOptions?.purpose === "history") {
         const session = await client.resumeSession(
           handle,
           providerLaunchConfig,
@@ -1493,8 +1545,32 @@ export class AgentManager {
           persistence: handle,
           incarnation: agentIncarnation,
         });
-      },
-    );
+      }
+      return this.withManagedWorktreeWriter(
+        this.buildManagedWorktreeWriterCandidate({
+          agentId: resolvedAgentId,
+          cwd: storedConfig.cwd,
+          workspaceId: options?.workspaceId,
+          persistence: handle,
+        }),
+        async () => {
+          const session = await client.resumeSession(
+            handle,
+            providerLaunchConfig,
+            launchContext,
+            resumeOptions,
+          );
+          this.trackStartedAgentRuntime(session, reservation);
+          return this.registerSession(session, storedConfig, resolvedAgentId, {
+            ...options,
+            persistence: handle,
+            incarnation: agentIncarnation,
+          });
+        },
+      );
+    } finally {
+      membershipLease?.release();
+    }
   }
 
   importProviderSession(input: {
@@ -1523,80 +1599,90 @@ export class AgentManager {
     this.assertAcceptingAgentRegistrations();
     const resolvedAgentId = validateAgentId(this.idFactory(), "importProviderSession");
     const agentIncarnation = randomUUID();
-    this.requireEnabledProvider(input.provider);
+    const membershipLease = await this.beginAgentMembershipMutation({
+      agentId: resolvedAgentId,
+      cwd: input.cwd,
+      workspaceId: input.workspaceId,
+      labels: input.labels,
+    });
+    try {
+      this.requireEnabledProvider(input.provider);
 
-    const client = await this.requireAvailableClient({ provider: input.provider });
-    if (!client.importSession) {
-      throw new Error(`Provider '${input.provider}' does not support importing sessions`);
-    }
+      const client = await this.requireAvailableClient({ provider: input.provider });
+      if (!client.importSession) {
+        throw new Error(`Provider '${input.provider}' does not support importing sessions`);
+      }
 
-    const { storedConfig, launchConfig } = await this.prepareSessionConfig(
-      {
-        provider: input.provider,
-        cwd: input.cwd,
-      },
-      resolvedAgentId,
-      agentIncarnation,
-    );
-    const launchContext = await this.buildLaunchContext(
-      resolvedAgentId,
-      client,
-      storedConfig.cwd,
-      agentIncarnation,
-    );
-    const providerLaunchConfig = this.resolveProviderLaunchConfig(launchConfig, launchContext);
-    return this.withManagedWorktreeWriter(
-      {
-        agentId: resolvedAgentId,
-        cwd: storedConfig.cwd,
-        workspaceId: input.workspaceId,
-      },
-      async () => {
-        const imported = await client.importSession!(
-          {
-            providerHandleId: input.providerHandleId,
-            cwd: input.cwd,
-          },
-          { config: providerLaunchConfig, storedConfig, launchContext },
-        );
-        this.trackStartedAgentRuntime(imported.session, reservation);
-        let handedToRegistration = false;
-        try {
-          const importedConfig = await this.normalizeConfig(
-            stripInternalPaseoMcpServer(imported.config),
-          );
-          const timelineRows = buildImportedTimelineRows(imported.timeline);
-          const initialTitle = resolveImportedAgentTitle(importedConfig, timelineRows);
-
-          handedToRegistration = true;
-          const agent = await this.registerSession(
-            imported.session,
-            importedConfig,
-            resolvedAgentId,
+      const { storedConfig, launchConfig } = await this.prepareSessionConfig(
+        {
+          provider: input.provider,
+          cwd: input.cwd,
+        },
+        resolvedAgentId,
+        agentIncarnation,
+      );
+      const launchContext = await this.buildLaunchContext(
+        resolvedAgentId,
+        client,
+        storedConfig.cwd,
+        agentIncarnation,
+      );
+      const providerLaunchConfig = this.resolveProviderLaunchConfig(launchConfig, launchContext);
+      return this.withManagedWorktreeWriter(
+        {
+          agentId: resolvedAgentId,
+          cwd: storedConfig.cwd,
+          workspaceId: input.workspaceId,
+        },
+        async () => {
+          const imported = await client.importSession!(
             {
-              labels: input.labels,
-              workspaceId: input.workspaceId,
-              timelineRows,
-              timelineNextSeq: timelineRows.length + 1,
-              persistence: imported.persistence,
-              historyPrimed: true,
-              initialTitle,
-              publishWhenReady: true,
-              incarnation: agentIncarnation,
+              providerHandleId: input.providerHandleId,
+              cwd: input.cwd,
             },
+            { config: providerLaunchConfig, storedConfig, launchContext },
           );
-          for (const event of imported.providerSubagentEvents ?? []) {
-            const update = this.providerSubagents.apply(agent.id, event.provider, event.event);
-            this.dispatch({ type: "provider_subagent", event: update });
+          this.trackStartedAgentRuntime(imported.session, reservation);
+          let handedToRegistration = false;
+          try {
+            const importedConfig = await this.normalizeConfig(
+              stripInternalPaseoMcpServer(imported.config),
+            );
+            const timelineRows = buildImportedTimelineRows(imported.timeline);
+            const initialTitle = resolveImportedAgentTitle(importedConfig, timelineRows);
+
+            handedToRegistration = true;
+            const agent = await this.registerSession(
+              imported.session,
+              importedConfig,
+              resolvedAgentId,
+              {
+                labels: input.labels,
+                workspaceId: input.workspaceId,
+                timelineRows,
+                timelineNextSeq: timelineRows.length + 1,
+                persistence: imported.persistence,
+                historyPrimed: true,
+                initialTitle,
+                publishWhenReady: true,
+                incarnation: agentIncarnation,
+              },
+            );
+            for (const event of imported.providerSubagentEvents ?? []) {
+              const update = this.providerSubagents.apply(agent.id, event.provider, event.event);
+              this.dispatch({ type: "provider_subagent", event: update });
+            }
+            return agent;
+          } finally {
+            if (!handedToRegistration) {
+              await this.closeUnregisteredSession(imported.session);
+            }
           }
-          return agent;
-        } finally {
-          if (!handedToRegistration) {
-            await this.closeUnregisteredSession(imported.session);
-          }
-        }
-      },
-    );
+        },
+      );
+    } finally {
+      membershipLease?.release();
+    }
   }
 
   // Hot-reload an active agent session with config overrides. By default the
@@ -1618,6 +1704,31 @@ export class AgentManager {
   }
 
   private async reloadAgentSessionInternal(
+    reservation: AgentRuntimeCapacityReservation,
+    agentId: string,
+    overrides?: Partial<AgentSessionConfig>,
+    options?: { rehydrateFromDisk?: boolean },
+  ): Promise<ManagedAgent> {
+    const existing = this.requireSessionAgent(agentId);
+    const membershipLease = await this.beginAgentMembershipMutation({
+      agentId,
+      cwd: existing.cwd,
+      workspaceId: existing.workspaceId,
+      labels: existing.labels,
+    });
+    try {
+      return await this.reloadAgentSessionWithStableMembership(
+        reservation,
+        agentId,
+        overrides,
+        options,
+      );
+    } finally {
+      membershipLease?.release();
+    }
+  }
+
+  private async reloadAgentSessionWithStableMembership(
     reservation: AgentRuntimeCapacityReservation,
     agentId: string,
     overrides?: Partial<AgentSessionConfig>,
@@ -1858,27 +1969,48 @@ export class AgentManager {
     recheck?: DestructiveActionRecheck,
     cascadePlan?: AgentArchiveCascadePlan,
   ): Promise<{ archivedAt: string }> {
-    this.requireAgent(agentId);
+    const targetAgent = this.requireAgent(agentId);
     if (!this.registry) {
       throw new Error("Agent storage is not configured");
     }
-    const resolvedCascadePlan = cascadePlan ?? (await this.resolveArchiveCascadePlan([agentId]));
+    const destructiveLease = await this.membershipGate?.acquireDestructive({
+      agentIds: [agentId],
+    });
+    try {
+      let resolvedCascadePlan = cascadePlan ?? (await this.resolveArchiveCascadePlan([agentId]));
+      if (destructiveLease) {
+        await destructiveLease.extend({
+          agentIds: resolvedCascadePlan.targetAgentIds,
+          workspaceIds: resolvedCascadePlan.targetWorkspaceIds,
+        });
+        resolvedCascadePlan = await this.resolveArchiveCascadePlan([agentId]);
+      }
 
-    // Close first so a caller revoked during later storage preparation leaves a
-    // durable, resumable closed agent instead of an archived record with a live runtime.
-    await this.closeAgent(agentId, recheck);
-    const stored = await this.registry.get(agentId);
-    if (!stored) {
-      throw new Error(`Agent ${agentId} not found in storage after close`);
+      // Internal agents remain ephemeral during normal execution, but an
+      // explicit archive needs one durable source record for the same
+      // close-then-archive contract as a public agent.
+      if (targetAgent.internal) {
+        await this.registry.applySnapshot(targetAgent, { internal: true, recheck });
+      }
+
+      // Close first so a caller revoked during later storage preparation leaves a
+      // durable, resumable closed agent instead of an archived record with a live runtime.
+      await this.closeAgent(agentId, recheck);
+      const stored = await this.registry.get(agentId);
+      if (!stored) {
+        throw new Error(`Agent ${agentId} not found in storage after close`);
+      }
+
+      await recheck?.();
+      const { archivedAt } = await this.markRecordArchived(stored, recheck);
+      this.discardRetainedAgentState(agentId);
+
+      await this.cascadeArchiveChildren(agentId, resolvedCascadePlan, recheck);
+
+      return { archivedAt };
+    } finally {
+      destructiveLease?.release();
     }
-
-    await recheck?.();
-    const { archivedAt } = await this.markRecordArchived(stored, recheck);
-    this.discardRetainedAgentState(agentId);
-
-    await this.cascadeArchiveChildren(agentId, resolvedCascadePlan, recheck);
-
-    return { archivedAt };
   }
 
   // Children created via the MCP `create_agent` tool carry the parent-agent-id
@@ -2087,18 +2219,31 @@ export class AgentManager {
     const liveAgent = this.agents.get(agentId);
     if (liveAgent) {
       const previousParentAgentId = getParentAgentIdFromLabels(liveAgent.labels);
-      liveAgent.labels = applyLabelPatch(liveAgent.labels, patch);
-      if (
-        !liveAgent.internal &&
-        getParentAgentIdFromLabels(liveAgent.labels) !== previousParentAgentId
-      ) {
-        this.membershipVersion += 1;
+      const nextLabels = applyLabelPatch(liveAgent.labels, patch);
+      const nextParentAgentId = getParentAgentIdFromLabels(nextLabels);
+      const membershipLease =
+        !liveAgent.internal && nextParentAgentId !== previousParentAgentId
+          ? await this.beginAgentMembershipMutation({
+              agentId,
+              cwd: liveAgent.cwd,
+              workspaceId: liveAgent.workspaceId,
+              labels: nextLabels,
+              additionalParentAgentIds: previousParentAgentId ? [previousParentAgentId] : [],
+            })
+          : null;
+      try {
+        liveAgent.labels = nextLabels;
+        if (!liveAgent.internal && nextParentAgentId !== previousParentAgentId) {
+          this.membershipVersion += 1;
+        }
+        this.touchUpdatedAt(liveAgent);
+        await this.persistSnapshot(liveAgent);
+        this.emitState(liveAgent, { persist: false });
+        const record = this.registry ? await this.registry.get(agentId) : null;
+        return { record, live: true };
+      } finally {
+        membershipLease?.release();
       }
-      this.touchUpdatedAt(liveAgent);
-      await this.persistSnapshot(liveAgent);
-      this.emitState(liveAgent, { persist: false });
-      const record = this.registry ? await this.registry.get(agentId) : null;
-      return { record, live: true };
     }
 
     const nextRecord = await this.writeStoredMetadata(agentId, { labels: patch });
@@ -2121,14 +2266,27 @@ export class AgentManager {
       ...(patch.labels ? { labels: applyLabelPatch(record.labels, patch.labels) } : {}),
       updatedAt: this.nextStoredUpdatedAt(record),
     };
-    await registry.upsert(nextRecord);
-    if (
-      !record.internal &&
-      getParentAgentIdFromLabels(record.labels) !== getParentAgentIdFromLabels(nextRecord.labels)
-    ) {
-      this.membershipVersion += 1;
+    const previousParentAgentId = getParentAgentIdFromLabels(record.labels);
+    const nextParentAgentId = getParentAgentIdFromLabels(nextRecord.labels);
+    const membershipLease =
+      !record.internal && previousParentAgentId !== nextParentAgentId
+        ? await this.beginAgentMembershipMutation({
+            agentId,
+            cwd: record.cwd,
+            workspaceId: record.workspaceId,
+            labels: nextRecord.labels,
+            additionalParentAgentIds: previousParentAgentId ? [previousParentAgentId] : [],
+          })
+        : null;
+    try {
+      await registry.upsert(nextRecord);
+      if (!record.internal && previousParentAgentId !== nextParentAgentId) {
+        this.membershipVersion += 1;
+      }
+      return nextRecord;
+    } finally {
+      membershipLease?.release();
     }
-    return nextRecord;
   }
 
   async detachAgent(agentId: string): Promise<{
@@ -2197,38 +2355,52 @@ export class AgentManager {
     cascadePlan?: AgentArchiveCascadePlan,
   ): Promise<StoredAgentRecord> {
     const registry = this.requireRegistry();
-    const resolvedCascadePlan = cascadePlan ?? (await this.resolveArchiveCascadePlan([agentId]));
-    const liveAgent = this.getAgent(agentId);
-    if (liveAgent) {
-      await this.persistSnapshot(liveAgent, {
-        internal: liveAgent.internal,
-      });
-    }
-
-    const record = await registry.get(agentId);
-    if (!record) {
-      throw new Error(`Agent not found: ${agentId}`);
-    }
-
-    await recheck?.();
-    const nextRecord = buildArchivedAgentRecord(record, { archivedAt });
-    await registry.upsert(nextRecord, { recheck });
-
-    await this.archiveNativeSessionBestEffort(record.provider, record.persistence);
-
-    if (this.agents.has(agentId)) {
-      this.notifyAgentState(agentId);
-    } else {
-      this.discardRetainedAgentState(agentId);
-      if (!nextRecord.internal) {
-        this.dispatchArchivedStoredAgent(nextRecord);
+    const destructiveLease = await this.membershipGate?.acquireDestructive({
+      agentIds: [agentId],
+    });
+    try {
+      let resolvedCascadePlan = cascadePlan ?? (await this.resolveArchiveCascadePlan([agentId]));
+      if (destructiveLease) {
+        await destructiveLease.extend({
+          agentIds: resolvedCascadePlan.targetAgentIds,
+          workspaceIds: resolvedCascadePlan.targetWorkspaceIds,
+        });
+        resolvedCascadePlan = await this.resolveArchiveCascadePlan([agentId]);
       }
+      const liveAgent = this.getAgent(agentId);
+      if (liveAgent) {
+        await this.persistSnapshot(liveAgent, {
+          internal: liveAgent.internal,
+        });
+      }
+
+      const record = await registry.get(agentId);
+      if (!record) {
+        throw new Error(`Agent not found: ${agentId}`);
+      }
+
+      await recheck?.();
+      const nextRecord = buildArchivedAgentRecord(record, { archivedAt });
+      await registry.upsert(nextRecord, { recheck });
+
+      await this.archiveNativeSessionBestEffort(record.provider, record.persistence);
+
+      if (this.agents.has(agentId)) {
+        this.notifyAgentState(agentId);
+      } else {
+        this.discardRetainedAgentState(agentId);
+        if (!nextRecord.internal) {
+          this.dispatchArchivedStoredAgent(nextRecord);
+        }
+      }
+
+      await this.fireAgentArchived(agentId);
+      await this.cascadeArchiveChildren(agentId, resolvedCascadePlan, recheck);
+
+      return nextRecord;
+    } finally {
+      destructiveLease?.release();
     }
-
-    await this.fireAgentArchived(agentId);
-    await this.cascadeArchiveChildren(agentId, resolvedCascadePlan, recheck);
-
-    return nextRecord;
   }
 
   async unarchiveSnapshot(
@@ -2240,24 +2412,36 @@ export class AgentManager {
     if (!record || !record.archivedAt) {
       return false;
     }
-
-    await this.unarchiveNativeSession(record.provider, record.persistence);
-
-    await registry.upsert({
-      ...record,
-      ...(updates?.workspaceId ? { workspaceId: updates.workspaceId } : {}),
-      ...(updates?.labels ? { labels: applyLabelPatch(record.labels, updates.labels) } : {}),
-      archivedAt: null,
-      updatedAt: new Date().toISOString(),
+    const nextLabels = updates?.labels
+      ? applyLabelPatch(record.labels, updates.labels)
+      : record.labels;
+    const membershipLease = await this.beginAgentMembershipMutation({
+      agentId,
+      cwd: record.cwd,
+      workspaceId: updates?.workspaceId ?? record.workspaceId,
+      labels: nextLabels,
     });
-    if (!record.internal) {
-      this.membershipVersion += 1;
-    }
+    try {
+      await this.unarchiveNativeSession(record.provider, record.persistence);
 
-    if (this.getAgent(agentId)) {
-      this.notifyAgentState(agentId);
+      await registry.upsert({
+        ...record,
+        ...(updates?.workspaceId ? { workspaceId: updates.workspaceId } : {}),
+        labels: nextLabels,
+        archivedAt: null,
+        updatedAt: new Date().toISOString(),
+      });
+      if (!record.internal) {
+        this.membershipVersion += 1;
+      }
+
+      if (this.getAgent(agentId)) {
+        this.notifyAgentState(agentId);
+      }
+      return true;
+    } finally {
+      membershipLease?.release();
     }
-    return true;
   }
 
   async unarchiveSnapshotByHandle(handle: AgentPersistenceHandle): Promise<void> {
@@ -2285,20 +2469,35 @@ export class AgentManager {
     const liveAgent = this.agents.get(agentId);
     if (liveAgent) {
       const previousParentAgentId = getParentAgentIdFromLabels(liveAgent.labels);
-      if (updates.labels) {
-        liveAgent.labels = applyLabelPatch(liveAgent.labels, updates.labels);
+      const nextLabels = updates.labels
+        ? applyLabelPatch(liveAgent.labels, updates.labels)
+        : liveAgent.labels;
+      const nextParentAgentId = getParentAgentIdFromLabels(nextLabels);
+      const membershipLease =
+        !liveAgent.internal && nextParentAgentId !== previousParentAgentId
+          ? await this.beginAgentMembershipMutation({
+              agentId,
+              cwd: liveAgent.cwd,
+              workspaceId: liveAgent.workspaceId,
+              labels: nextLabels,
+              additionalParentAgentIds: previousParentAgentId ? [previousParentAgentId] : [],
+            })
+          : null;
+      try {
+        if (updates.labels) {
+          liveAgent.labels = nextLabels;
+        }
+        if (!liveAgent.internal && nextParentAgentId !== previousParentAgentId) {
+          this.membershipVersion += 1;
+        }
+        const title = updates.title?.trim();
+        this.touchUpdatedAt(liveAgent);
+        await this.persistSnapshot(liveAgent, title ? { title } : undefined);
+        this.emitState(liveAgent, { persist: false });
+        return;
+      } finally {
+        membershipLease?.release();
       }
-      if (
-        !liveAgent.internal &&
-        getParentAgentIdFromLabels(liveAgent.labels) !== previousParentAgentId
-      ) {
-        this.membershipVersion += 1;
-      }
-      const title = updates.title?.trim();
-      this.touchUpdatedAt(liveAgent);
-      await this.persistSnapshot(liveAgent, title ? { title } : undefined);
-      this.emitState(liveAgent, { persist: false });
-      return;
     }
 
     await this.writeStoredMetadata(agentId, updates);

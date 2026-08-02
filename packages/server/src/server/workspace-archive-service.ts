@@ -12,6 +12,7 @@ import {
   DestructiveMembershipChangedError,
   type DestructiveMembershipVersionSource,
 } from "./agent/destructive-membership-fence.js";
+import type { DestructiveMembershipLease } from "./destructive-membership-gate.js";
 import type { AgentStorage, StoredAgentRecord } from "./agent/agent-storage.js";
 import { resolveAgentArchiveCascadeTarget } from "./agent/lifecycle-command.js";
 import type { WorkspaceGitService } from "./workspace-git-service.js";
@@ -67,7 +68,9 @@ export interface ArchiveDependencies {
   github: ForgeService;
   workspaceGitService: Pick<WorkspaceGitService, "getCheckout" | "getSnapshot">;
   agentManager: Pick<AgentManager, "getAgent" | "listAgents" | "archiveAgent" | "archiveSnapshot"> &
-    Partial<Pick<AgentManager, "isCurrentAgentIncarnation" | "getMembershipVersion">>;
+    Partial<
+      Pick<AgentManager, "isCurrentAgentIncarnation" | "getMembershipVersion" | "getMembershipGate">
+    >;
   agentStorage: Pick<AgentStorage, "list">;
   // Resolves the worktree at a path to its workspaceId for archive-by-path. The
   // path uniquely identifies a worktree workspace; this is a directory lookup for
@@ -234,6 +237,7 @@ export async function archiveByScope(
     operationKey,
     async () => {
       const initialTarget = await resolveArchiveTarget(dependencies, request.scope);
+      const membershipGate = dependencies.agentManager.getMembershipGate?.() ?? null;
       const archiveReservation = lifecycleCoordinator.reserveWorkspaceArchive(
         initialTarget.workspaceIds,
       );
@@ -254,11 +258,49 @@ export async function archiveByScope(
           const newlyDiscoveredWorkspaceIds = refreshedTarget.workspaceIds.filter(
             (workspaceId) => !closureWorkspaceIds.has(workspaceId),
           );
-          if (newlyDiscoveredWorkspaceIds.length === 0) {
-            return archiveResolvedTarget(dependencies, lifecycleCoordinator, request, target);
+          if (newlyDiscoveredWorkspaceIds.length > 0) {
+            for (const workspaceId of newlyDiscoveredWorkspaceIds) {
+              closureWorkspaceIds.add(workspaceId);
+            }
+            continue;
           }
-          for (const workspaceId of newlyDiscoveredWorkspaceIds) {
-            closureWorkspaceIds.add(workspaceId);
+
+          const destructiveLease = await membershipGate?.acquireDestructive(
+            resolveTargetMembershipScope(target),
+          );
+          try {
+            if (!destructiveLease) {
+              return await archiveResolvedTarget(
+                dependencies,
+                lifecycleCoordinator,
+                request,
+                target,
+                null,
+              );
+            }
+            let gatedTarget = await resolveArchiveTarget(dependencies, request.scope);
+            await destructiveLease.extend(resolveTargetMembershipScope(gatedTarget));
+            gatedTarget = await resolveArchiveTarget(dependencies, request.scope);
+            archiveReservation.add(gatedTarget.workspaceIds);
+            target = mergeArchiveTargets(target, gatedTarget);
+            const gatedWorkspaceIds = gatedTarget.workspaceIds.filter(
+              (workspaceId) => !closureWorkspaceIds.has(workspaceId),
+            );
+            if (gatedWorkspaceIds.length > 0) {
+              for (const workspaceId of gatedWorkspaceIds) {
+                closureWorkspaceIds.add(workspaceId);
+              }
+              continue;
+            }
+            return await archiveResolvedTarget(
+              dependencies,
+              lifecycleCoordinator,
+              request,
+              target,
+              destructiveLease,
+            );
+          } finally {
+            destructiveLease?.release();
           }
         }
       };
@@ -280,7 +322,6 @@ export async function archiveByScope(
     request.signal,
   );
 }
-
 // Retries only the physical teardown intent already persisted on archived
 // workspace records. Unlike normal worktree-scope archive, this never archives
 // active workspace owners that may now occupy a reused path.
@@ -411,9 +452,8 @@ async function archiveResolvedTarget(
   lifecycleCoordinator: WorkspaceLifecycleCoordinator,
   request: ArchiveByScopeRequest,
   target: ArchiveTarget,
+  destructiveLease: DestructiveMembershipLease | null | undefined,
 ): Promise<ArchiveResult> {
-  const membershipSources = resolveArchiveMembershipSources(dependencies);
-  const membershipFence = captureDestructiveMembershipFence(membershipSources);
   const targetWorkspaceIds = target.workspaceIds;
   const resolveCallerAuthorization = () =>
     assertCallerCanArchive(
@@ -423,27 +463,42 @@ async function archiveResolvedTarget(
       request.scope.kind === "worktree" ? "worktree.archive" : "workspace.archive",
       request.signal,
     );
-  const recheckCaller: DestructiveActionRecheck = async () => {
-    assertDestructiveMembershipFence(membershipFence, membershipSources);
-    await resolveCallerAuthorization();
-    assertDestructiveMembershipFence(membershipFence, membershipSources);
-  };
+  let cascadePlan = await resolveCallerAuthorization();
+  await destructiveLease?.extend({
+    agentIds: cascadePlan.targetAgentIds,
+    workspaceIds: cascadePlan.targetWorkspaceIds,
+  });
+  if (destructiveLease) {
+    cascadePlan = await resolveCallerAuthorization();
+  }
 
-  await resolveCallerAuthorization();
-  assertDestructiveMembershipFence(membershipFence, membershipSources);
+  const membershipSources = resolveArchiveMembershipSources(dependencies);
+  const membershipFence = destructiveLease
+    ? null
+    : captureDestructiveMembershipFence(membershipSources);
+  const recheckCaller: DestructiveActionRecheck = async () => {
+    if (membershipFence) {
+      assertDestructiveMembershipFence(membershipFence, membershipSources);
+    }
+    await resolveCallerAuthorization();
+    if (membershipFence) {
+      assertDestructiveMembershipFence(membershipFence, membershipSources);
+    }
+  };
+  if (membershipFence) {
+    assertDestructiveMembershipFence(membershipFence, membershipSources);
+  }
 
   if (targetWorkspaceIds.length > 0) {
     dependencies.markWorkspaceArchiving(targetWorkspaceIds, new Date().toISOString());
   }
 
   let removedDirectory = false;
-
   try {
     if (targetWorkspaceIds.length > 0) {
       await dependencies.emitWorkspaceUpdatesForWorkspaceIds(targetWorkspaceIds);
     }
 
-    const cascadePlan = await resolveCallerAuthorization();
     await recheckCaller();
     await persistTargetCleanupPending(dependencies, target);
 
@@ -493,7 +548,6 @@ async function archiveResolvedTarget(
     }
 
     const cleanupPendingWorkspaceIds = await getCleanupPendingWorkspaceIds(dependencies, target);
-
     return {
       archivedAgentIds: Array.from(archivedAgents),
       archivedWorkspaceIds,
@@ -506,6 +560,17 @@ async function archiveResolvedTarget(
       await dependencies.emitWorkspaceUpdatesForWorkspaceIds(targetWorkspaceIds);
     }
   }
+}
+function resolveTargetMembershipScope(target: ArchiveTarget) {
+  return {
+    workspaceIds: target.workspaceIds,
+    paths: Array.from(
+      new Set([
+        ...(target.backing ? [target.backing.path] : []),
+        ...target.teardownTargets.map((teardownTarget) => teardownTarget.cwd),
+      ]),
+    ),
+  };
 }
 
 function resolveArchiveMembershipSources(

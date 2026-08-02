@@ -30,7 +30,11 @@ import {
 import { readPaseoWorktreeIncarnationId } from "../utils/worktree-metadata.js";
 import type { ManagedAgent } from "./agent/agent-manager.js";
 import type { AgentStorage, StoredAgentRecord } from "./agent/agent-storage.js";
-import type { TerminalManager } from "../terminal/terminal-manager.js";
+import { createTerminalManager, type TerminalManager } from "../terminal/terminal-manager.js";
+import {
+  DestructiveMembershipExcludedError,
+  DestructiveMembershipGate,
+} from "./destructive-membership-gate.js";
 import {
   assertDestructiveCallerActive,
   createAgentDestructiveCaller,
@@ -43,6 +47,7 @@ import {
   archiveByScope,
   killTerminalsForWorkspace,
   type ActiveWorkspaceRef,
+  type ArchiveByScopeRequest,
   type ArchiveDependencies,
   type ArchiveResult,
   requireActiveWorkspaceForArchive,
@@ -187,6 +192,7 @@ interface ArchiveDepsInput {
   getAgentMembershipVersion?: () => number;
   getWorkspaceMembershipVersion?: () => number;
   getTerminalMembershipVersion?: () => number;
+  membershipGate?: DestructiveMembershipGate;
 }
 
 interface ArchiveTestDependencies extends ArchiveDependencies {
@@ -198,6 +204,7 @@ interface ArchiveTestDependencies extends ArchiveDependencies {
 function createArchiveDeps(input: ArchiveDepsInput): ArchiveTestDependencies {
   const archivedWorkspaceIds = new Set<string>();
   const active = [...input.activeWorkspaces];
+  const liveAgents = input.liveAgents ?? [];
   const archivedAgentIds: string[] = [];
   const archivedSnapshotIds: string[] = [];
 
@@ -231,15 +238,18 @@ function createArchiveDeps(input: ArchiveDepsInput): ArchiveTestDependencies {
       }),
     } as Pick<WorkspaceGitService, "getSnapshot" | "getCheckout">,
     agentManager: {
+      getMembershipGate: () => input.membershipGate ?? null,
       getMembershipVersion: input.getAgentMembershipVersion,
-      listAgents: () => (input.liveAgents ?? []) as ManagedAgent[],
+      listAgents: () => liveAgents as ManagedAgent[],
       getAgent: (agentId: string) =>
-        ((input.liveAgents ?? []).find((agent) => agent.id === agentId) as
-          | ManagedAgent
-          | undefined) ?? null,
+        (liveAgents.find((agent) => agent.id === agentId) as ManagedAgent | undefined) ?? null,
       archiveAgent: vi.fn(async (agentId: string, recheck?: () => void | Promise<void>) => {
         await recheck?.();
         archivedAgentIds.push(agentId);
+        const liveIndex = liveAgents.findIndex((agent) => agent.id === agentId);
+        if (liveIndex !== -1) {
+          liveAgents.splice(liveIndex, 1);
+        }
         return { archivedAt: new Date().toISOString() };
       }),
       archiveSnapshot: vi.fn(
@@ -251,7 +261,7 @@ function createArchiveDeps(input: ArchiveDepsInput): ArchiveTestDependencies {
       ),
       isCurrentAgentIncarnation: (agentId: string, incarnation: string) =>
         (input.incarnations?.[agentId] ?? `incarnation-${agentId}`) === incarnation &&
-        (input.liveAgents ?? []).some((agent) => agent.id === agentId),
+        liveAgents.some((agent) => agent.id === agentId),
     },
     agentStorage: {
       list: async (): Promise<StoredAgentRecord[]> => input.storedAgents ?? [],
@@ -278,6 +288,18 @@ function createArchiveDeps(input: ArchiveDepsInput): ArchiveTestDependencies {
     archivedAgentIds,
     archivedSnapshotIds,
   };
+}
+
+function archiveAsCoordinator(
+  dependencies: ArchiveDependencies,
+  request: Omit<ArchiveByScopeRequest, "caller"> & {
+    caller?: ArchiveByScopeRequest["caller"];
+  },
+): Promise<ArchiveResult> {
+  return archiveByScope(dependencies, {
+    caller: createCoordinatorDestructiveCaller(),
+    ...request,
+  });
 }
 
 function assertArchiveResult(
@@ -352,7 +374,7 @@ describe("archiveByScope", () => {
     deps.lifecycleCoordinator = lifecycleCoordinator;
     deps.archiveWorkspaceRecord = vi.fn(deps.archiveWorkspaceRecord);
 
-    const archiveTask = archiveByScope(deps, {
+    const archiveTask = archiveAsCoordinator(deps, {
       scope: { kind: "workspace", workspaceId },
       requestId: "req-setup-race",
     });
@@ -386,7 +408,7 @@ describe("archiveByScope", () => {
     deps.archiveWorkspaceRecord = vi.fn(deps.archiveWorkspaceRecord);
 
     await expect(
-      archiveByScope(deps, {
+      archiveAsCoordinator(deps, {
         scope: { kind: "workspace", workspaceId },
         requestId: "req-vanished-before-archive",
       }),
@@ -436,7 +458,7 @@ describe("archiveByScope", () => {
       },
     );
 
-    const archiveTask = archiveByScope(deps, {
+    const archiveTask = archiveAsCoordinator(deps, {
       scope: { kind: "worktree", targetPath: workspaceCwd },
       requestId: "req-refresh-closure",
     });
@@ -477,11 +499,11 @@ describe("archiveByScope", () => {
       await originalArchiveWorkspaceRecord(id);
     });
 
-    const first = archiveByScope(deps, {
+    const first = archiveAsCoordinator(deps, {
       scope: { kind: "workspace", workspaceId },
       requestId: "req-simultaneous-first",
     });
-    const second = archiveByScope(deps, {
+    const second = archiveAsCoordinator(deps, {
       scope: { kind: "workspace", workspaceId },
       requestId: "req-simultaneous-second",
     });
@@ -517,11 +539,11 @@ describe("archiveByScope", () => {
     deps.archiveWorkspaceRecord = vi.fn(deps.archiveWorkspaceRecord);
 
     const [resultA, resultB] = await Promise.all([
-      archiveByScope(deps, {
+      archiveAsCoordinator(deps, {
         scope: { kind: "workspace", workspaceId: workspaceA },
         requestId: "req-concurrent-sibling-a",
       }),
-      archiveByScope(deps, {
+      archiveAsCoordinator(deps, {
         scope: { kind: "workspace", workspaceId: workspaceB },
         requestId: "req-concurrent-sibling-b",
       }),
@@ -530,8 +552,8 @@ describe("archiveByScope", () => {
     expect(resultA.archivedWorkspaceIds).toEqual([workspaceA]);
     expect(resultB.archivedWorkspaceIds).toEqual([workspaceB]);
     expect(deps.archiveWorkspaceRecord).toHaveBeenCalledTimes(2);
-    expect(deps.archiveWorkspaceRecord).toHaveBeenCalledWith(workspaceA);
-    expect(deps.archiveWorkspaceRecord).toHaveBeenCalledWith(workspaceB);
+    expect(deps.archiveWorkspaceRecord).toHaveBeenCalledWith(workspaceA, expect.any(Function));
+    expect(deps.archiveWorkspaceRecord).toHaveBeenCalledWith(workspaceB, expect.any(Function));
     expect(existsSync(worktree.worktreePath)).toBe(false);
   });
 
@@ -576,7 +598,7 @@ describe("archiveByScope", () => {
       markRecordArchived?.();
     };
 
-    const archiveTask = archiveByScope(deps, {
+    const archiveTask = archiveAsCoordinator(deps, {
       scope: { kind: "workspace", workspaceId },
       requestId: "req-reserved-sibling",
     });
@@ -601,7 +623,7 @@ describe("archiveByScope", () => {
     });
     deps.archiveWorkspaceRecord = vi.fn(deps.archiveWorkspaceRecord);
 
-    const archive = archiveByScope(deps, {
+    const archive = archiveAsCoordinator(deps, {
       scope: { kind: "workspace", workspaceId },
       requestId: "req-self-archive",
       caller: createAgentDestructiveCaller({
@@ -638,7 +660,7 @@ describe("archiveByScope", () => {
       liveAgents: [{ id: "agent-caller", workspaceId: callerWorkspaceId, cwd: callerCwd }],
     });
 
-    const result = await archiveByScope(deps, {
+    const result = await archiveAsCoordinator(deps, {
       scope: { kind: "workspace", workspaceId: targetWorkspaceId },
       requestId: "req-cross-workspace-archive",
       caller: createAgentDestructiveCaller({
@@ -681,7 +703,7 @@ describe("archiveByScope", () => {
       });
 
       await expect(
-        archiveByScope(deps, {
+        archiveAsCoordinator(deps, {
           scope: { kind: "workspace", workspaceId },
           requestId: `req-new-${membershipKind}-race`,
           caller: createCoordinatorDestructiveCaller(),
@@ -748,7 +770,7 @@ describe("archiveByScope", () => {
     deps.archiveWorkspaceRecord = vi.fn(deps.archiveWorkspaceRecord);
 
     await expect(
-      archiveByScope(deps, {
+      archiveAsCoordinator(deps, {
         scope: { kind: "workspace", workspaceId: parentWorkspaceId },
         requestId: "req-parent-cascade-self-archive",
         caller: createAgentDestructiveCaller({
@@ -772,7 +794,7 @@ describe("archiveByScope", () => {
       liveAgents: [{ id: "agent-in-target", workspaceId }],
     });
 
-    const result = await archiveByScope(deps, {
+    const result = await archiveAsCoordinator(deps, {
       scope: { kind: "workspace", workspaceId },
       requestId: "req-external-archive",
       caller: createCoordinatorDestructiveCaller(),
@@ -796,7 +818,7 @@ describe("archiveByScope", () => {
       { agentId: "unknown-agent", incarnation: "incarnation-unknown-agent" },
     ]) {
       await expect(
-        archiveByScope(deps, {
+        archiveAsCoordinator(deps, {
           scope: { kind: "workspace", workspaceId },
           requestId: `req-${identity.agentId}`,
           caller: createAgentDestructiveCaller(identity),
@@ -832,7 +854,7 @@ describe("archiveByScope", () => {
     });
 
     await expect(
-      archiveByScope(deps, {
+      archiveAsCoordinator(deps, {
         scope: { kind: "worktree", targetPath: symlinkPath },
         requestId: "req-symlink-self-archive",
         caller: createAgentDestructiveCaller({
@@ -871,7 +893,7 @@ describe("archiveByScope", () => {
     });
 
     await expect(
-      archiveByScope(deps, {
+      archiveAsCoordinator(deps, {
         scope: { kind: "worktree", targetPath: symlinkPath },
         requestId: "req-legacy-cwd-self-archive",
         caller: createAgentDestructiveCaller({
@@ -898,7 +920,7 @@ describe("archiveByScope", () => {
     });
 
     await expect(
-      archiveByScope(deps, {
+      archiveAsCoordinator(deps, {
         scope: { kind: "worktree", targetPath: worktree.worktreePath },
         requestId: "req-zero-record-live-agent",
         caller: createUncertainDestructiveCaller("partial legacy identity"),
@@ -934,7 +956,7 @@ describe("archiveByScope", () => {
       });
     });
 
-    const archive = archiveByScope(deps, {
+    const archive = archiveAsCoordinator(deps, {
       scope: { kind: "workspace", workspaceId },
       requestId: "req-revoked-after-authorize",
       caller,
@@ -975,7 +997,7 @@ describe("archiveByScope", () => {
       return { archivedAt: new Date().toISOString() };
     });
 
-    const archive = archiveByScope(deps, {
+    const archive = archiveAsCoordinator(deps, {
       scope: { kind: "workspace", workspaceId },
       requestId: "req-revoked-during-agent-archive",
       caller,
@@ -1008,7 +1030,7 @@ describe("archiveByScope", () => {
     });
 
     await expect(
-      archiveByScope(deps, {
+      archiveAsCoordinator(deps, {
         scope: { kind: "workspace", workspaceId },
         requestId: "req-sibling-checkout-target",
         caller: createAgentDestructiveCaller({
@@ -1026,7 +1048,7 @@ describe("archiveByScope", () => {
     const worktree = await createPaseoOwnedWorktree(repoDir, paseoHome, "last-ref-workspace");
     const workspaceId = "ws-last-ref";
 
-    const result = await archiveByScope(
+    const result = await archiveAsCoordinator(
       createArchiveDeps({
         paseoHome,
         activeWorkspaces: [
@@ -1073,7 +1095,7 @@ describe("archiveByScope", () => {
     const workspaceA = "ws-sibling-a";
     const workspaceB = "ws-sibling-b";
 
-    const result = await archiveByScope(
+    const result = await archiveAsCoordinator(
       createArchiveDeps({
         paseoHome,
         activeWorkspaces: [
@@ -1105,7 +1127,7 @@ describe("archiveByScope", () => {
     const siblingDirectory = path.join(worktree.worktreePath, "packages", "app");
     mkdirSync(siblingDirectory, { recursive: true });
 
-    const result = await archiveByScope(
+    const result = await archiveAsCoordinator(
       createArchiveDeps({
         paseoHome,
         activeWorkspaces: [
@@ -1168,7 +1190,7 @@ describe("archiveByScope", () => {
       });
     };
 
-    const result = await archiveByScope(deps, {
+    const result = await archiveAsCoordinator(deps, {
       scope: { kind: "workspace", workspaceId },
       requestId: "req-late-owner",
     });
@@ -1186,7 +1208,7 @@ describe("archiveByScope", () => {
     const subdirectory = path.join(worktree.worktreePath, "packages", "app");
     mkdirSync(subdirectory, { recursive: true });
 
-    const result = await archiveByScope(
+    const result = await archiveAsCoordinator(
       createArchiveDeps({
         paseoHome,
         activeWorkspaces: [
@@ -1247,7 +1269,7 @@ describe("archiveByScope", () => {
     const matchesWorkspaceCwd = createRealpathAwarePathMatcher(workspaceCwd);
     const workspaceId = "ws-nested-teardown";
 
-    const result = await archiveByScope(
+    const result = await archiveAsCoordinator(
       createArchiveDeps({
         paseoHome,
         activeWorkspaces: [
@@ -1315,7 +1337,7 @@ describe("archiveByScope", () => {
     const workspaceC = "ws-worktree-subdirectory";
     const subdirectory = path.join(worktree.worktreePath, nestedRelative);
 
-    const result = await archiveByScope(
+    const result = await archiveAsCoordinator(
       createArchiveDeps({
         paseoHome,
         activeWorkspaces: [
@@ -1364,7 +1386,7 @@ describe("archiveByScope", () => {
     const localCheckoutDir = mkdtempSync(path.join(tempDir, "local-checkout-"));
     const workspaceId = "ws-local-checkout";
 
-    const result = await archiveByScope(
+    const result = await archiveAsCoordinator(
       createArchiveDeps({
         paseoHome: path.join(tempDir, ".paseo"),
         activeWorkspaces: [{ workspaceId, cwd: localCheckoutDir, kind: "local_checkout" }],
@@ -1406,7 +1428,7 @@ describe("archiveByScope", () => {
     };
 
     await expect(
-      archiveByScope(deps, {
+      archiveAsCoordinator(deps, {
         scope: { kind: "worktree", targetPath: worktree.worktreePath },
         requestId: "req-partial-failure",
         caller: createCoordinatorDestructiveCaller(),
@@ -1480,7 +1502,7 @@ describe("archiveByScope", () => {
     };
 
     await expect(
-      archiveByScope(deps, {
+      archiveAsCoordinator(deps, {
         scope: { kind: "workspace", workspaceId },
         requestId: "req-cleanup-retry-first",
       }),
@@ -1493,7 +1515,7 @@ describe("archiveByScope", () => {
     });
     expect(existsSync(worktree.worktreePath)).toBe(true);
 
-    const retryResult = await archiveByScope(deps, {
+    const retryResult = await archiveAsCoordinator(deps, {
       scope: { kind: "workspace", workspaceId },
       requestId: "req-cleanup-retry-second",
     });
@@ -1558,7 +1580,7 @@ describe("archiveByScope", () => {
     };
 
     await expect(
-      archiveByScope(deps, {
+      archiveAsCoordinator(deps, {
         scope: { kind: "workspace", workspaceId },
         requestId: "req-reused-incarnation-first",
       }),
@@ -1601,7 +1623,7 @@ describe("archiveByScope", () => {
       mainRepoRoot: repoDir,
     });
 
-    const replacementResult = await archiveByScope(deps, {
+    const replacementResult = await archiveAsCoordinator(deps, {
       scope: { kind: "workspace", workspaceId: replacementWorkspaceId },
       requestId: "req-reused-incarnation-replacement",
     });
@@ -1610,7 +1632,7 @@ describe("archiveByScope", () => {
     expect((await registry.get(replacementWorkspaceId))?.cleanupPending).toBeNull();
     expect((await registry.get(workspaceId))?.cleanupPending).not.toBeNull();
 
-    const retryResult = await archiveByScope(deps, {
+    const retryResult = await archiveAsCoordinator(deps, {
       scope: { kind: "workspace", workspaceId },
       requestId: "req-reused-incarnation-retry",
     });
@@ -1685,7 +1707,7 @@ describe("archiveByScope", () => {
     };
 
     await expect(
-      archiveByScope(deps, {
+      archiveAsCoordinator(deps, {
         scope: { kind: "worktree", targetPath: worktree.worktreePath },
         requestId: "req-partial-retry-first",
       }),
@@ -1694,7 +1716,7 @@ describe("archiveByScope", () => {
     expect((await registry.get(workspaceB))?.archivedAt).toBeNull();
     expect(existsSync(worktree.worktreePath)).toBe(true);
 
-    const retry = await archiveByScope(deps, {
+    const retry = await archiveAsCoordinator(deps, {
       scope: { kind: "worktree", targetPath: worktree.worktreePath },
       requestId: "req-partial-retry-second",
     });
@@ -2371,7 +2393,7 @@ describe("archiveByScope", () => {
     deps.archiveWorkspaceRecord = vi.fn(deps.archiveWorkspaceRecord);
 
     await expect(
-      archiveByScope(deps, {
+      archiveAsCoordinator(deps, {
         scope: { kind: "workspace", workspaceId },
         requestId: "req-strict-teardown",
       }),
@@ -2395,7 +2417,7 @@ describe("archiveByScope", () => {
     });
 
     await expect(
-      archiveByScope(deps, {
+      archiveAsCoordinator(deps, {
         scope: { kind: "workspace", workspaceId: "ws-does-not-exist" },
         requestId: "req-unknown-workspace",
         caller: createCoordinatorDestructiveCaller(),
@@ -2406,12 +2428,50 @@ describe("archiveByScope", () => {
     expect(deps.emitWorkspaceUpdatesForWorkspaceIds).not.toHaveBeenCalled();
   });
 
+  test("rejects a terminal registration after the workspace record is durably archived", async () => {
+    const { tempDir } = createGitRepo();
+    const paseoHome = path.join(tempDir, ".paseo");
+    const workspaceId = "workspace-late-terminal";
+    const workspaceCwd = path.join(tempDir, "workspace");
+    mkdirSync(workspaceCwd);
+    const membershipGate = new DestructiveMembershipGate();
+    const terminalManager = createTerminalManager({ membershipGate });
+    const deps = createArchiveDeps({
+      paseoHome,
+      membershipGate,
+      activeWorkspaces: [{ workspaceId, cwd: workspaceCwd, kind: "local_checkout" }],
+    });
+    const originalArchiveWorkspaceRecord = deps.archiveWorkspaceRecord;
+    let lateRegistrationError: unknown;
+    deps.archiveWorkspaceRecord = async (id, recheck) => {
+      await originalArchiveWorkspaceRecord(id, recheck);
+      try {
+        await terminalManager.createTerminal({ cwd: workspaceCwd, workspaceId });
+      } catch (error) {
+        lateRegistrationError = error;
+      }
+    };
+
+    try {
+      await archiveAsCoordinator(deps, {
+        scope: { kind: "workspace", workspaceId },
+        requestId: "req-late-terminal",
+        caller: createCoordinatorDestructiveCaller(),
+      });
+    } finally {
+      terminalManager.killAll();
+    }
+
+    expect(lateRegistrationError).toBeInstanceOf(DestructiveMembershipExcludedError);
+    expect(terminalManager.listDirectories()).toEqual([]);
+  });
+
   test("worktree scope removes an owned directory with zero matching records", async () => {
     const { tempDir, repoDir } = createGitRepo();
     const paseoHome = path.join(tempDir, ".paseo");
     const worktree = await createPaseoOwnedWorktree(repoDir, paseoHome, "zero-records");
 
-    const result = await archiveByScope(
+    const result = await archiveAsCoordinator(
       createArchiveDeps({
         paseoHome,
         activeWorkspaces: [],
@@ -2496,7 +2556,7 @@ describe("archiveByScope", () => {
       events.push({ type: "emit", workspaceIds: ids, updates });
     });
 
-    await archiveByScope(deps, {
+    await archiveAsCoordinator(deps, {
       scope: { kind: "workspace", workspaceId },
       requestId: "req-lifecycle",
       caller: createCoordinatorDestructiveCaller(),
@@ -2554,7 +2614,7 @@ describe("archiveByScope", () => {
       list: async () => storedRecords,
     } as Pick<AgentStorage, "list">;
 
-    const result = await archiveByScope(deps, {
+    const result = await archiveAsCoordinator(deps, {
       scope: { kind: "workspace", workspaceId: targetWorkspaceId },
       requestId: "req-snapshot-scope",
       caller: createCoordinatorDestructiveCaller(),
@@ -2579,7 +2639,7 @@ describe("archiveByScope", () => {
     const workspaceB = "ws-worktree-n3-b";
     const workspaceC = "ws-worktree-n3-c";
 
-    const result = await archiveByScope(
+    const result = await archiveAsCoordinator(
       createArchiveDeps({
         paseoHome,
         activeWorkspaces: [

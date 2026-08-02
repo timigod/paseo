@@ -58,6 +58,7 @@ import type { BrowserToolsResponsePayload } from "../browser-tools/errors.js";
 import { readPaseoWorktreeMetadata } from "../../utils/worktree-metadata.js";
 import { createWorkspaceProvisioningService } from "../session/workspace-provisioning/workspace-provisioning-service.js";
 import { WorkspaceLifecycleCoordinator } from "../workspace-lifecycle-coordinator.js";
+import { createCoordinatorDestructiveCaller } from "./destructive-action-authority.js";
 
 const REPO_CWD = resolvePath("/tmp/repo");
 const TARGET_CWD = resolvePath("/tmp/target");
@@ -2917,6 +2918,7 @@ describe("create_agent MCP tool", () => {
           "getSnapshot" | "listWorktrees" | "resolveRepoRoot"
         >,
         findWorkspaceIdForCwd: vi.fn(async () => "ws-archive-tool-worktree"),
+        destructiveCaller: createCoordinatorDestructiveCaller(),
         listActiveWorkspaces,
         archiveWorkspaceRecord,
         emitWorkspaceUpdatesForWorkspaceIds,
@@ -3033,6 +3035,7 @@ describe("create_agent MCP tool", () => {
           "getSnapshot" | "listWorktrees" | "resolveRepoRoot"
         >,
         findWorkspaceIdForCwd: vi.fn(async () => "ws-mcp-A"),
+        destructiveCaller: createCoordinatorDestructiveCaller(),
         listActiveWorkspaces,
         archiveWorkspaceRecord,
         emitWorkspaceUpdatesForWorkspaceIds: vi.fn(async () => undefined),

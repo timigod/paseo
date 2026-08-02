@@ -35,6 +35,7 @@ export function asAgentManager(stub: {
 }): SessionOptions["agentManager"] {
   return createStub<SessionOptions["agentManager"]>({
     getMembershipVersion: () => 0,
+    getMembershipGate: () => null,
     ...stub,
   });
 }

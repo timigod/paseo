@@ -11,9 +11,16 @@ import {
   createAgentLifecycleDispatchStub,
   createProviderSnapshotManagerStub,
 } from "./test-utils/session-stubs.js";
+import {
+  createCoordinatorDestructiveCaller,
+  type DestructiveCallerContext,
+} from "./agent/destructive-action-authority.js";
 
 interface SessionInternals {
-  archiveAgentForClose(agentId: string): Promise<{ archivedAt: string }>;
+  archiveAgentForClose(
+    agentId: string,
+    caller: DestructiveCallerContext,
+  ): Promise<{ archivedAt: string }>;
   handleUpdateAgentRequest(
     agentId: string,
     title: string,
@@ -112,6 +119,7 @@ describe("snapshot mutation ownership boundary", () => {
           subscribe: () => () => {},
           listAgents: () => [],
           getAgent: () => null,
+          getMembershipVersion: () => 0,
           archiveSnapshot,
           updateAgentMetadata,
         }),
@@ -152,7 +160,10 @@ describe("snapshot mutation ownership boundary", () => {
       }),
     );
 
-    const archiveResult = await session.archiveAgentForClose("agent-1");
+    const archiveResult = await session.archiveAgentForClose(
+      "agent-1",
+      createCoordinatorDestructiveCaller(),
+    );
     expect(archiveSnapshot).toHaveBeenCalledTimes(1);
     expect(archiveResult.archivedAt).toBeTruthy();
 

@@ -4,7 +4,11 @@ import type { Logger } from "pino";
 import { z } from "zod";
 
 import { writeJsonFileAtomic } from "./atomic-file.js";
-import { areEquivalentPaths } from "../utils/path.js";
+import {
+  DestructiveMembershipGate,
+  type DestructiveMembershipScope,
+} from "./destructive-membership-gate.js";
+import { areEquivalentPaths, normalizePathForIdentity } from "../utils/path.js";
 import {
   generateProjectId,
   type PersistedProjectKind,
@@ -172,6 +176,10 @@ class FileBackedRegistry<TRecord extends RegistryRecord> {
   private readonly logger: Logger;
   private readonly schema: z.ZodType<TRecord, unknown>;
   private readonly getId: (record: TRecord) => string;
+  private readonly membershipGate: DestructiveMembershipGate | null;
+  private readonly resolveMembershipMutationScope:
+    | ((existing: TRecord | null, next: TRecord) => DestructiveMembershipScope | null)
+    | null;
   private loaded = false;
   private loadPromise: Promise<void> | null = null;
   private readonly cache = new Map<string, TRecord>();
@@ -185,10 +193,17 @@ class FileBackedRegistry<TRecord extends RegistryRecord> {
     schema: z.ZodType<TRecord, unknown>;
     getId: (record: TRecord) => string;
     component: string;
+    membershipGate?: DestructiveMembershipGate;
+    resolveMembershipMutationScope?: (
+      existing: TRecord | null,
+      next: TRecord,
+    ) => DestructiveMembershipScope | null;
   }) {
     this.filePath = options.filePath;
     this.schema = options.schema;
     this.getId = options.getId;
+    this.membershipGate = options.membershipGate ?? null;
+    this.resolveMembershipMutationScope = options.resolveMembershipMutationScope ?? null;
     this.logger = options.logger.child({
       module: "workspace-registry",
       component: options.component,
@@ -225,11 +240,17 @@ class FileBackedRegistry<TRecord extends RegistryRecord> {
   async upsert(record: TRecord): Promise<void> {
     await this.load();
     const parsed = this.schema.parse(record);
-    this.membershipVersion += 1;
-    this.membershipMutationsInFlight += 1;
-    try {
-      await this.enqueueOperation(async () => {
-        const id = this.getId(parsed);
+    await this.enqueueOperation(async () => {
+      const id = this.getId(parsed);
+      const existing = this.cache.get(id) ?? null;
+      const membershipScope = this.resolveMembershipMutationScope?.(existing, parsed) ?? null;
+      const membershipLease = membershipScope
+        ? this.membershipGate?.beginMembershipMutation(membershipScope)
+        : null;
+      const finishMembershipTracking = membershipScope
+        ? this.beginMembershipMutationTracking()
+        : null;
+      try {
         const records = Array.from(this.cache.values(), (current) =>
           this.getId(current) === id ? parsed : current,
         );
@@ -238,35 +259,40 @@ class FileBackedRegistry<TRecord extends RegistryRecord> {
         }
         await this.persistRecords(records);
         this.cache.set(id, parsed);
-      });
-    } finally {
-      this.membershipVersion += 1;
-      this.membershipMutationsInFlight -= 1;
-    }
+      } finally {
+        finishMembershipTracking?.();
+        membershipLease?.release();
+      }
+    });
   }
 
   async update(id: string, updater: (record: TRecord) => TRecord): Promise<TRecord | null> {
     await this.load();
-    this.membershipVersion += 1;
-    this.membershipMutationsInFlight += 1;
-    try {
-      return await this.enqueueOperation(async () => {
-        const existing = this.cache.get(id);
-        if (!existing) {
-          return null;
-        }
-        const next = this.schema.parse(updater(existing));
+    return this.enqueueOperation(async () => {
+      const existing = this.cache.get(id);
+      if (!existing) {
+        return null;
+      }
+      const next = this.schema.parse(updater(existing));
+      const membershipScope = this.resolveMembershipMutationScope?.(existing, next) ?? null;
+      const membershipLease = membershipScope
+        ? this.membershipGate?.beginMembershipMutation(membershipScope)
+        : null;
+      const finishMembershipTracking = membershipScope
+        ? this.beginMembershipMutationTracking()
+        : null;
+      try {
         const records = Array.from(this.cache.values(), (current) =>
           this.getId(current) === id ? next : current,
         );
         await this.persistRecords(records);
         this.cache.set(id, next);
         return next;
-      });
-    } finally {
-      this.membershipVersion += 1;
-      this.membershipMutationsInFlight -= 1;
-    }
+      } finally {
+        finishMembershipTracking?.();
+        membershipLease?.release();
+      }
+    });
   }
 
   async archive(id: string, archivedAt: string, options?: RegistryArchiveOptions): Promise<void> {
@@ -300,18 +326,23 @@ class FileBackedRegistry<TRecord extends RegistryRecord> {
       if (!current || (behavior?.onlyIfActive && current.archivedAt)) {
         return null;
       }
-      await options?.recheck?.();
-      const next = this.schema.parse({
-        ...current,
-        updatedAt: archivedAt,
-        archivedAt,
-      });
-      const records = Array.from(this.cache.values(), (record) =>
-        this.getId(record) === id ? next : record,
-      );
-      await this.persistRecords(records, options?.recheck);
-      this.cache.set(id, next);
-      return next;
+      const finishMembershipTracking = this.beginMembershipMutationTracking();
+      try {
+        await options?.recheck?.();
+        const next = this.schema.parse({
+          ...current,
+          updatedAt: archivedAt,
+          archivedAt,
+        });
+        const records = Array.from(this.cache.values(), (record) =>
+          this.getId(record) === id ? next : record,
+        );
+        await this.persistRecords(records, options?.recheck);
+        this.cache.set(id, next);
+        return next;
+      } finally {
+        finishMembershipTracking();
+      }
     });
   }
 
@@ -329,11 +360,18 @@ class FileBackedRegistry<TRecord extends RegistryRecord> {
       if (!current) {
         return null;
       }
-      await options?.recheck?.();
-      const records = Array.from(this.cache.values()).filter((record) => this.getId(record) !== id);
-      await this.persistRecords(records, options?.recheck);
-      this.cache.delete(id);
-      return current;
+      const finishMembershipTracking = this.beginMembershipMutationTracking();
+      try {
+        await options?.recheck?.();
+        const records = Array.from(this.cache.values()).filter(
+          (record) => this.getId(record) !== id,
+        );
+        await this.persistRecords(records, options?.recheck);
+        this.cache.delete(id);
+        return current;
+      } finally {
+        finishMembershipTracking();
+      }
     });
   }
 
@@ -386,6 +424,79 @@ class FileBackedRegistry<TRecord extends RegistryRecord> {
     );
     return nextOperation;
   }
+
+  private beginMembershipMutationTracking(): () => void {
+    this.membershipVersion += 1;
+    this.membershipMutationsInFlight += 1;
+    return () => {
+      this.membershipVersion += 1;
+      this.membershipMutationsInFlight -= 1;
+    };
+  }
+}
+
+function projectMembershipMutationScope(
+  existing: PersistedProjectRecord | null,
+  next: PersistedProjectRecord,
+): DestructiveMembershipScope | null {
+  if (next.archivedAt && (!existing || existing.archivedAt)) {
+    return null;
+  }
+  if (
+    existing &&
+    existing.archivedAt === next.archivedAt &&
+    areEquivalentPaths(existing.rootPath, next.rootPath)
+  ) {
+    return null;
+  }
+  return {
+    projectIds: [next.projectId],
+    paths: Array.from(
+      new Set(
+        [existing?.rootPath, next.rootPath]
+          .filter((candidate): candidate is string => typeof candidate === "string")
+          .map(normalizePathForIdentity),
+      ),
+    ),
+  };
+}
+
+function workspaceMembershipMutationScope(
+  existing: PersistedWorkspaceRecord | null,
+  next: PersistedWorkspaceRecord,
+): DestructiveMembershipScope | null {
+  if (next.archivedAt && (!existing || existing.archivedAt)) {
+    return null;
+  }
+  if (
+    existing &&
+    existing.projectId === next.projectId &&
+    existing.archivedAt === next.archivedAt &&
+    existing.kind === next.kind &&
+    existing.isPaseoOwnedWorktree === next.isPaseoOwnedWorktree &&
+    existing.worktreeRoot === next.worktreeRoot &&
+    existing.mainRepoRoot === next.mainRepoRoot &&
+    areEquivalentPaths(existing.cwd, next.cwd)
+  ) {
+    return null;
+  }
+  return {
+    workspaceIds: [next.workspaceId],
+    projectIds: Array.from(
+      new Set(
+        [existing?.projectId, next.projectId].filter(
+          (candidate): candidate is string => typeof candidate === "string",
+        ),
+      ),
+    ),
+    paths: Array.from(
+      new Set(
+        [existing?.cwd, existing?.worktreeRoot, next.cwd, next.worktreeRoot]
+          .filter((candidate): candidate is string => typeof candidate === "string")
+          .map(normalizePathForIdentity),
+      ),
+    ),
+  };
 }
 
 export class FileBackedProjectRegistry
@@ -401,13 +512,22 @@ export class FileBackedProjectRegistry
       project: PersistedProjectRecord | null;
     }) => void | Promise<void>
   >();
-  constructor(filePath: string, logger: Logger, options?: { projectIdFactory?: () => string }) {
+  constructor(
+    filePath: string,
+    logger: Logger,
+    options?: {
+      projectIdFactory?: () => string;
+      membershipGate?: DestructiveMembershipGate;
+    },
+  ) {
     super({
       filePath,
       logger,
       schema: PersistedProjectRecordSchema,
       getId: (record) => record.projectId,
       component: "projects",
+      membershipGate: options?.membershipGate,
+      resolveMembershipMutationScope: projectMembershipMutationScope,
     });
     this.projectIdFactory = options?.projectIdFactory ?? generateProjectId;
   }
@@ -515,13 +635,19 @@ export class FileBackedWorkspaceRegistry
     (mutation: WorkspaceMutation) => void | Promise<void>
   >();
 
-  constructor(filePath: string, logger: Logger) {
+  constructor(
+    filePath: string,
+    logger: Logger,
+    options?: { membershipGate?: DestructiveMembershipGate },
+  ) {
     super({
       filePath,
       logger,
       schema: PersistedWorkspaceRecordSchema,
       getId: (record) => record.workspaceId,
       component: "workspaces",
+      membershipGate: options?.membershipGate,
+      resolveMembershipMutationScope: workspaceMembershipMutationScope,
     });
   }
 

@@ -11,6 +11,7 @@ import { resolve, sep } from "node:path";
 import { assertAbsolutePath, isSameOrDescendantPath } from "../server/path-utils.js";
 import type { TerminalActivity, TerminalActivityState } from "@getpaseo/protocol/terminal-activity";
 import { deriveTerminalActivityStatusBucket } from "@getpaseo/protocol/terminal-activity";
+import type { DestructiveMembershipGate } from "../server/destructive-membership-gate.js";
 
 export interface TerminalListItem {
   id: string;
@@ -96,6 +97,7 @@ export interface TerminalManager {
 
 export interface TerminalManagerOptions {
   getTerminalActivityUrl?: () => string | null;
+  membershipGate?: DestructiveMembershipGate;
 }
 
 function createActivityToken(): string {
@@ -330,51 +332,59 @@ export function createTerminalManager(
       activityUrl?: string | null;
     }): Promise<TerminalSession> {
       assertAbsolutePath(options.cwd);
+      const membershipLease = managerOptions.membershipGate?.beginMembershipMutation({
+        workspaceIds: [options.workspaceId],
+        paths: [options.cwd],
+      });
 
-      const terminals = terminalsByCwd.get(options.cwd) ?? [];
-      const defaultName = `Terminal ${terminals.length + 1}`;
-      const inheritedEnv = resolveDefaultEnvForCwd(options.cwd);
-      const mergedEnv =
-        inheritedEnv || options.env ? { ...inheritedEnv, ...options.env } : undefined;
-      const terminalId = options.id ?? randomUUID();
-      const activityToken = options.activityToken ?? createActivityToken();
-      const terminalActivityUrl =
-        options.activityUrl === undefined
-          ? (managerOptions.getTerminalActivityUrl?.() ?? null)
-          : options.activityUrl;
-      const activityEnv = {
-        PASEO_TERMINAL_ID: terminalId,
-        PASEO_ACTIVITY_TOKEN: activityToken,
-        ...(terminalActivityUrl ? { PASEO_TERMINAL_ACTIVITY_URL: terminalActivityUrl } : {}),
-      };
-      terminalActivityTokenById.set(terminalId, activityToken);
-      let session: TerminalSession;
       try {
-        session = registerSession(
-          await createTerminal({
-            id: terminalId,
-            cwd: options.cwd,
-            workspaceId: options.workspaceId,
-            name: options.name ?? defaultName,
-            ...(options.title ? { title: options.title } : {}),
-            ...(options.command ? { command: options.command } : {}),
-            ...(options.args ? { args: options.args } : {}),
-            ...(options.rows !== undefined ? { rows: options.rows } : {}),
-            ...(options.cols !== undefined ? { cols: options.cols } : {}),
-            ...(mergedEnv ? { env: mergedEnv } : {}),
-            activityEnv,
-          }),
-        );
-      } catch (error) {
-        terminalActivityTokenById.delete(terminalId);
-        throw error;
+        const terminals = terminalsByCwd.get(options.cwd) ?? [];
+        const defaultName = `Terminal ${terminals.length + 1}`;
+        const inheritedEnv = resolveDefaultEnvForCwd(options.cwd);
+        const mergedEnv =
+          inheritedEnv || options.env ? { ...inheritedEnv, ...options.env } : undefined;
+        const terminalId = options.id ?? randomUUID();
+        const activityToken = options.activityToken ?? createActivityToken();
+        const terminalActivityUrl =
+          options.activityUrl === undefined
+            ? (managerOptions.getTerminalActivityUrl?.() ?? null)
+            : options.activityUrl;
+        const activityEnv = {
+          PASEO_TERMINAL_ID: terminalId,
+          PASEO_ACTIVITY_TOKEN: activityToken,
+          ...(terminalActivityUrl ? { PASEO_TERMINAL_ACTIVITY_URL: terminalActivityUrl } : {}),
+        };
+        terminalActivityTokenById.set(terminalId, activityToken);
+        let session: TerminalSession;
+        try {
+          session = registerSession(
+            await createTerminal({
+              id: terminalId,
+              cwd: options.cwd,
+              workspaceId: options.workspaceId,
+              name: options.name ?? defaultName,
+              ...(options.title ? { title: options.title } : {}),
+              ...(options.command ? { command: options.command } : {}),
+              ...(options.args ? { args: options.args } : {}),
+              ...(options.rows !== undefined ? { rows: options.rows } : {}),
+              ...(options.cols !== undefined ? { cols: options.cols } : {}),
+              ...(mergedEnv ? { env: mergedEnv } : {}),
+              activityEnv,
+            }),
+          );
+        } catch (error) {
+          terminalActivityTokenById.delete(terminalId);
+          throw error;
+        }
+
+        terminals.push(session);
+        terminalsByCwd.set(options.cwd, terminals);
+        emitTerminalsChanged({ cwd: options.cwd });
+
+        return session;
+      } finally {
+        membershipLease?.release();
       }
-
-      terminals.push(session);
-      terminalsByCwd.set(options.cwd, terminals);
-      emitTerminalsChanged({ cwd: options.cwd });
-
-      return session;
     },
 
     registerCwdEnv(options: { cwd: string; env: Record<string, string> }): void {

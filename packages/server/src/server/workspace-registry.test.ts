@@ -14,6 +14,10 @@ import {
   resolveWorkspaceDisplayName,
   resolveWorkspaceName,
 } from "./workspace-registry.js";
+import {
+  DestructiveMembershipExcludedError,
+  DestructiveMembershipGate,
+} from "./destructive-membership-gate.js";
 
 describe("resolveWorkspaceName", () => {
   test("prefers the user-set title over the derived display name", () => {
@@ -825,5 +829,76 @@ describe("workspace registries", () => {
       title: "Cold title",
       pinnedAt: "2026-03-03T00:00:00.000Z",
     });
+  });
+
+  test("does not advance membership for unrelated workspace metadata", async () => {
+    await workspaceRegistry.upsert(
+      createPersistedWorkspaceRecord({
+        workspaceId: "workspace-metadata-only",
+        projectId: "project-one",
+        cwd: "/tmp/metadata-only",
+        kind: "local_checkout",
+        displayName: "main",
+        createdAt: "2026-03-01T00:00:00.000Z",
+        updatedAt: "2026-03-01T00:00:00.000Z",
+      }),
+    );
+    const membershipVersion = workspaceRegistry.getMembershipVersion();
+
+    await workspaceRegistry.update("workspace-metadata-only", (record) => ({
+      ...record,
+      title: "Metadata only",
+      pinnedAt: "2026-03-02T00:00:00.000Z",
+      updatedAt: "2026-03-02T00:00:00.000Z",
+    }));
+
+    expect(workspaceRegistry.getMembershipVersion()).toBe(membershipVersion);
+  });
+
+  test("rejects a workspace registration after its project is durably removed", async () => {
+    const membershipGate = new DestructiveMembershipGate();
+    const gatedProjectRegistry = new FileBackedProjectRegistry(
+      path.join(tmpDir, "gated", "projects.json"),
+      logger,
+      { membershipGate },
+    );
+    const gatedWorkspaceRegistry = new FileBackedWorkspaceRegistry(
+      path.join(tmpDir, "gated", "workspaces.json"),
+      logger,
+      { membershipGate },
+    );
+    const project = createPersistedProjectRecord({
+      projectId: "project-late-workspace",
+      rootPath: "/tmp/project-late-workspace",
+      kind: "git",
+      displayName: "late-workspace",
+      createdAt: "2026-03-01T00:00:00.000Z",
+      updatedAt: "2026-03-01T00:00:00.000Z",
+    });
+    await gatedProjectRegistry.upsert(project);
+    const destructiveLease = await membershipGate.acquireDestructive({
+      projectIds: [project.projectId],
+      paths: [project.rootPath],
+    });
+
+    try {
+      await gatedProjectRegistry.remove(project.projectId, { recheck: () => undefined });
+      expect(await gatedProjectRegistry.get(project.projectId)).toBeNull();
+      await expect(
+        gatedWorkspaceRegistry.upsert(
+          createPersistedWorkspaceRecord({
+            workspaceId: "workspace-too-late",
+            projectId: project.projectId,
+            cwd: project.rootPath,
+            kind: "local_checkout",
+            displayName: "main",
+            createdAt: "2026-03-02T00:00:00.000Z",
+            updatedAt: "2026-03-02T00:00:00.000Z",
+          }),
+        ),
+      ).rejects.toBeInstanceOf(DestructiveMembershipExcludedError);
+    } finally {
+      destructiveLease.release();
+    }
   });
 });

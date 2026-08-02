@@ -45,6 +45,10 @@ import type {
 import type { PaseoToolCatalog } from "./tools/types.js";
 import type { ProviderDefinition } from "./provider-registry.js";
 import {
+  DestructiveMembershipExcludedError,
+  DestructiveMembershipGate,
+} from "../destructive-membership-gate.js";
+import {
   createPersistedWorkspaceRecord,
   type PersistedWorkspaceRecord,
 } from "../workspace-registry.js";
@@ -6858,6 +6862,38 @@ test("archiveAgent closes the runtime before committing the archived record", as
   expect(lifecycles.slice(-2)).toEqual(["closed", "closed"]);
 });
 
+test("archiveAgent durably archives an otherwise-ephemeral internal agent", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-archive-internal-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const manager = new AgentManager({
+    clients: { codex: new TestAgentClient() },
+    registry: storage,
+    logger,
+  });
+
+  const agent = await manager.createAgent(
+    {
+      provider: "codex",
+      cwd: workdir,
+      title: "Internal archive target",
+      internal: true,
+    },
+    undefined,
+    { workspaceId: "workspace-internal" },
+  );
+
+  expect(await storage.get(agent.id)).toBeNull();
+
+  const { archivedAt } = await manager.archiveAgent(agent.id);
+
+  expect(await storage.get(agent.id)).toMatchObject({
+    id: agent.id,
+    workspaceId: "workspace-internal",
+    internal: true,
+    archivedAt,
+  });
+});
+
 test("fires onAgentArchived for archived parent and cascaded children", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-archived-hook-cascade-"));
   const storagePath = join(workdir, "agents");
@@ -6889,6 +6925,46 @@ test("fires onAgentArchived for archived parent and cascaded children", async ()
 
   await manager.archiveAgent(liveParent.id);
   expect([...archivedIds].sort()).toEqual([liveChild.id, liveParent.id].sort());
+});
+
+test("rejects a child registration after its parent is durably archived", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-late-child-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const membershipGate = new DestructiveMembershipGate();
+  const manager = new AgentManager({
+    clients: { codex: new TestAgentClient() },
+    registry: storage,
+    membershipGate,
+    logger,
+  });
+  const parent = await manager.createAgent(
+    { provider: "codex", cwd: workdir, title: "Parent" },
+    undefined,
+    { workspaceId: "workspace-parent" },
+  );
+  let lateRegistrationError: unknown;
+  manager.setAgentArchivedCallback(async (archivedAgentId) => {
+    if (archivedAgentId !== parent.id) return;
+    expect((await storage.get(parent.id))?.archivedAt).toEqual(expect.any(String));
+    try {
+      await manager.createAgent(
+        { provider: "codex", cwd: workdir, title: "Late child" },
+        undefined,
+        {
+          labels: { [PARENT_AGENT_ID_LABEL]: parent.id },
+          workspaceId: "workspace-child",
+        },
+      );
+    } catch (error) {
+      lateRegistrationError = error;
+    }
+  });
+
+  await manager.archiveAgent(parent.id);
+
+  expect(lateRegistrationError).toBeInstanceOf(DestructiveMembershipExcludedError);
+  expect(manager.listAgents()).toEqual([]);
+  expect(await storage.list()).toHaveLength(1);
 });
 
 test("fires onAgentArchived for stored-only snapshot archives", async () => {
@@ -7114,6 +7190,7 @@ test.each([
     const manager = new AgentManager({
       clients: { codex: new TestAgentClient() },
       registry: storage,
+      membershipGate: new DestructiveMembershipGate(),
       logger,
     });
     const root = await manager.createAgent(
@@ -7144,20 +7221,20 @@ test.each([
 
     const persistenceReached = deferred<void>();
     const releasePersistence = deferred<void>();
-    const originalUpsert = storage.upsert.bind(storage);
+    const originalApplySnapshot = storage.applySnapshot.bind(storage);
     let holdMutationPersistence = true;
-    vi.spyOn(storage, "upsert").mockImplementation(async (record, options) => {
-      const parentAgentId = record.labels?.[PARENT_AGENT_ID_LABEL];
+    vi.spyOn(storage, "applySnapshot").mockImplementation(async (agent, options) => {
+      const parentAgentId = agent.labels?.[PARENT_AGENT_ID_LABEL];
       if (
         holdMutationPersistence &&
-        record.id === callerAgent.id &&
+        agent.id === callerAgent.id &&
         parentAgentId === nextParentAgentId
       ) {
         holdMutationPersistence = false;
         persistenceReached.resolve();
         await releasePersistence.promise;
       }
-      await originalUpsert(record, options);
+      await originalApplySnapshot(agent, options);
     });
 
     const mutationPromise =
@@ -7170,14 +7247,25 @@ test.each([
     expect(manager.getAgent(callerAgent.id)?.labels[PARENT_AGENT_ID_LABEL]).toBe(nextParentAgentId);
     expect((await storage.get(callerAgent.id))?.labels[PARENT_AGENT_ID_LABEL]).toBe(middle.id);
 
-    try {
-      await archiveAgentCommand({ agentManager: manager, agentStorage: storage, logger }, root.id, {
+    let archiveSettled = false;
+    const archivePromise = archiveAgentCommand(
+      { agentManager: manager, agentStorage: storage, logger },
+      root.id,
+      {
         caller: createAgentDestructiveCaller(callerIdentity),
-      });
+      },
+    ).finally(() => {
+      archiveSettled = true;
+    });
+    try {
+      await Promise.resolve();
+      expect(archiveSettled).toBe(false);
+      expect((await storage.get(root.id))?.archivedAt).toBeUndefined();
     } finally {
       releasePersistence.resolve();
     }
     await mutationPromise;
+    await archivePromise;
 
     expectArchivedAgentRecord(await storage.get(root.id), "closed");
     expectArchivedAgentRecord(await storage.get(middle.id), "closed");

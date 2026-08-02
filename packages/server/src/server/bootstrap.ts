@@ -180,6 +180,7 @@ import { loadPersistedConfig, type PersistedConfig } from "./persisted-config.js
 import { createServiceProxySubsystem, type ServiceProxySubsystem } from "./service-proxy.js";
 import { releaseWorkspaceServicePortPlan } from "./workspace-service-port-registry.js";
 import { ScriptHealthMonitor } from "./script-health-monitor.js";
+import { DestructiveMembershipGate } from "./destructive-membership-gate.js";
 import { createScriptStatusEmitter } from "./script-status-projection.js";
 import { WorkspaceScriptRuntimeStore } from "./workspace-script-runtime-store.js";
 import { createWorkspaceScriptsService } from "./session/workspace-scripts/workspace-scripts-service.js";
@@ -823,6 +824,7 @@ export async function createPaseoDaemon(
   const downloadTokenStore = new DownloadTokenStore({
     ttlMs: downloadTokenTtlMs,
   });
+  const destructiveMembershipGate = new DestructiveMembershipGate();
 
   // Coordinator and managed-agent ingress capabilities are deliberately
   // distinct. The coordinator token is never injected into agent runtimes;
@@ -839,6 +841,7 @@ export async function createPaseoDaemon(
   let workspaceRegistry: FileBackedWorkspaceRegistry | null = null;
   const terminalManager = createConfiguredTerminalManager({
     getTerminalActivityUrl: () => createTerminalActivityUrl(boundListenTarget),
+    membershipGate: destructiveMembershipGate,
   });
   applyTerminalAgentHookSetting({ store: daemonConfigStore, logger });
 
@@ -1036,10 +1039,12 @@ export async function createPaseoDaemon(
   const projectRegistry = new FileBackedProjectRegistry(
     path.join(config.paseoHome, "projects", "projects.json"),
     logger,
+    { membershipGate: destructiveMembershipGate },
   );
   workspaceRegistry = new FileBackedWorkspaceRegistry(
     path.join(config.paseoHome, "projects", "workspaces.json"),
     logger,
+    { membershipGate: destructiveMembershipGate },
   );
   const chatService = new FileBackedChatService({
     paseoHome: config.paseoHome,
@@ -1083,6 +1088,7 @@ export async function createPaseoDaemon(
       workspaceGitService.onWorkspaceStateMayHaveChanged(cwd);
     },
     issueAgentAuthToken: (identity) => agentIngressAuthority.issueAgentToken(identity),
+    membershipGate: destructiveMembershipGate,
     logger,
   });
 

@@ -116,6 +116,7 @@ import {
   captureDestructiveMembershipFence,
   type DestructiveMembershipVersionSource,
 } from "./agent/destructive-membership-fence.js";
+import type { DestructiveMembershipLease } from "./destructive-membership-gate.js";
 import {
   buildStoredAgentPayload,
   resolveStoredAgentPayloadUpdatedAt,
@@ -2953,6 +2954,26 @@ export class Session {
     }
   }
 
+  private async acquireProjectRemovalMembershipLease(
+    projectId: string,
+  ): Promise<DestructiveMembershipLease | null> {
+    const membershipGate = this.agentManager.getMembershipGate?.();
+    if (!membershipGate) return null;
+    const project = await this.projectRegistry.get(projectId);
+    const resolvedProjectId = project?.projectId ?? projectId;
+    const projectWorkspaces = (await this.workspaceRegistry.list()).filter(
+      (workspace) => workspace.projectId === resolvedProjectId,
+    );
+    return membershipGate.acquireDestructive({
+      projectIds: [resolvedProjectId],
+      workspaceIds: projectWorkspaces.map((workspace) => workspace.workspaceId),
+      paths: [
+        ...(project?.rootPath ? [project.rootPath] : []),
+        ...projectWorkspaces.map((workspace) => workspace.cwd),
+      ],
+    });
+  }
+
   private async handleProjectRemoveRequest(
     request: Extract<SessionInboundMessage, { type: "project.remove.request" }>,
     source?: object,
@@ -2984,125 +3005,153 @@ export class Session {
           getVersion: () => this.terminalController.getMembershipVersion(),
         },
       ];
-      const membershipFence = captureDestructiveMembershipFence(membershipSources);
-      const authorizeRemoval = async () => {
-        const project = await this.projectRegistry.get(projectId);
-        const resolvedProjectId = project?.projectId ?? projectId;
-        const projectWorkspaces = (await this.workspaceRegistry.list()).filter(
-          (workspace) => workspace.projectId === resolvedProjectId,
-        );
-        const projectWorkspaceIds = projectWorkspaces.map((workspace) => workspace.workspaceId);
-        const targetPaths = Array.from(
-          new Set([
-            ...(project?.rootPath ? [project.rootPath] : []),
-            ...projectWorkspaces.map((workspace) => workspace.cwd),
-          ]),
-        );
-        const liveAgents = this.agentManager.listAgents();
-        const storedRecords = await this.agentStorage.list();
-        const directAgentIds = [
-          ...liveAgents
-            .filter(
-              (agent) =>
-                (agent.workspaceId && projectWorkspaceIds.includes(agent.workspaceId)) ||
-                agentCheckoutIsWithinTarget(agent, targetPaths),
-            )
-            .map((agent) => agent.id),
-          ...storedRecords
-            .filter(
-              (record) =>
-                !record.archivedAt &&
-                ((record.workspaceId && projectWorkspaceIds.includes(record.workspaceId)) ||
-                  agentCheckoutIsWithinTarget(record, targetPaths)),
-            )
-            .map((record) => record.id),
-        ];
-        const cascadePlan = await resolveAgentArchiveCascadeTarget(
-          { agentManager: this.agentManager, agentStorage: this.agentStorage },
-          directAgentIds,
-        );
-        assertDestructiveActionAuthorized(this.agentManager, caller, {
-          action: "project.remove",
-          targetAgentIds: cascadePlan.targetAgentIds,
-          targetWorkspaceIds: Array.from(
-            new Set([...projectWorkspaceIds, ...cascadePlan.targetWorkspaceIds]),
-          ),
-          targetPaths,
-          hasLiveTarget:
-            project !== null ||
-            projectWorkspaces.length > 0 ||
-            cascadePlan.targetAgentIds.length > 0,
+      const destructiveLease = await this.acquireProjectRemovalMembershipLease(projectId);
+      try {
+        const authorizeRemoval = async () => {
+          const project = await this.projectRegistry.get(projectId);
+          const resolvedProjectId = project?.projectId ?? projectId;
+          const projectWorkspaces = (await this.workspaceRegistry.list()).filter(
+            (workspace) => workspace.projectId === resolvedProjectId,
+          );
+          const projectWorkspaceIds = projectWorkspaces.map((workspace) => workspace.workspaceId);
+          const targetPaths = Array.from(
+            new Set([
+              ...(project?.rootPath ? [project.rootPath] : []),
+              ...projectWorkspaces.map((workspace) => workspace.cwd),
+            ]),
+          );
+          const liveAgents = this.agentManager.listAgents();
+          const storedRecords = await this.agentStorage.list();
+          const directAgentIds = [
+            ...liveAgents
+              .filter(
+                (agent) =>
+                  (agent.workspaceId && projectWorkspaceIds.includes(agent.workspaceId)) ||
+                  agentCheckoutIsWithinTarget(agent, targetPaths),
+              )
+              .map((agent) => agent.id),
+            ...storedRecords
+              .filter(
+                (record) =>
+                  !record.archivedAt &&
+                  ((record.workspaceId && projectWorkspaceIds.includes(record.workspaceId)) ||
+                    agentCheckoutIsWithinTarget(record, targetPaths)),
+              )
+              .map((record) => record.id),
+          ];
+          const cascadePlan = await resolveAgentArchiveCascadeTarget(
+            { agentManager: this.agentManager, agentStorage: this.agentStorage },
+            directAgentIds,
+          );
+          assertDestructiveActionAuthorized(this.agentManager, caller, {
+            action: "project.remove",
+            targetAgentIds: cascadePlan.targetAgentIds,
+            targetWorkspaceIds: Array.from(
+              new Set([...projectWorkspaceIds, ...cascadePlan.targetWorkspaceIds]),
+            ),
+            targetPaths,
+            hasLiveTarget:
+              project !== null ||
+              projectWorkspaces.length > 0 ||
+              cascadePlan.targetAgentIds.length > 0,
+          });
+          return { project, resolvedProjectId, projectWorkspaces, cascadePlan };
+        };
+        let authorizedTarget = await authorizeRemoval();
+        await destructiveLease?.extend({
+          agentIds: authorizedTarget.cascadePlan.targetAgentIds,
+          workspaceIds: [
+            ...authorizedTarget.projectWorkspaces.map((workspace) => workspace.workspaceId),
+            ...authorizedTarget.cascadePlan.targetWorkspaceIds,
+          ],
+          projectIds: [authorizedTarget.resolvedProjectId],
+          paths: [
+            ...(authorizedTarget.project?.rootPath ? [authorizedTarget.project.rootPath] : []),
+            ...authorizedTarget.projectWorkspaces.map((workspace) => workspace.cwd),
+          ],
         });
-        return { project, resolvedProjectId, projectWorkspaces };
-      };
-      const authorizedTarget = await authorizeRemoval();
-      assertDestructiveMembershipFence(membershipFence, membershipSources);
-      const recheck: DestructiveActionRecheck = async () => {
-        assertDestructiveMembershipFence(membershipFence, membershipSources);
-        await authorizeRemoval();
-        assertDestructiveMembershipFence(membershipFence, membershipSources);
-      };
-      const { resolvedProjectId, projectWorkspaces } = authorizedTarget;
-      const workspaceIdsToArchive = projectWorkspaces
-        .filter((workspace) => !workspace.archivedAt || workspace.cleanupPending)
-        .map((workspace) => workspace.workspaceId);
+        if (destructiveLease) {
+          authorizedTarget = await authorizeRemoval();
+        }
+        const membershipFence = destructiveLease
+          ? null
+          : captureDestructiveMembershipFence(membershipSources);
+        if (membershipFence) {
+          assertDestructiveMembershipFence(membershipFence, membershipSources);
+        }
+        const recheck: DestructiveActionRecheck = async () => {
+          if (membershipFence) {
+            assertDestructiveMembershipFence(membershipFence, membershipSources);
+          }
+          await authorizeRemoval();
+          if (membershipFence) {
+            assertDestructiveMembershipFence(membershipFence, membershipSources);
+          }
+        };
+        const { resolvedProjectId, projectWorkspaces } = authorizedTarget;
+        const workspaceIdsToArchive = projectWorkspaces
+          .filter((workspace) => !workspace.archivedAt || workspace.cleanupPending)
+          .map((workspace) => workspace.workspaceId);
 
-      const removedWorkspaceIds: string[] = [];
-      for (const workspaceId of workspaceIdsToArchive) {
+        const removedWorkspaceIds: string[] = [];
+        for (const workspaceId of workspaceIdsToArchive) {
+          await recheck();
+          const archiveResult = await archiveByScope(
+            {
+              paseoHome: this.paseoHome,
+              paseoWorktreesBaseRoot: this.worktreesRoot,
+              github: this.github,
+              workspaceGitService: this.workspaceGitService,
+              agentManager: this.agentManager,
+              agentStorage: this.agentStorage,
+              findWorkspaceIdForCwd: (cwd) => this.findWorkspaceIdForCwd(cwd),
+              listActiveWorkspaces: () => this.listActiveWorkspaceRefs(),
+              archiveWorkspaceRecord: (id, archiveRecheck) =>
+                this.archiveWorkspaceRecord(id, undefined, archiveRecheck),
+              workspaceRegistry: this.workspaceRegistry,
+              emitWorkspaceUpdatesForWorkspaceIds: (workspaceIds) =>
+                this.emitWorkspaceUpdatesForWorkspaceIds(workspaceIds),
+              markWorkspaceArchiving: (workspaceIds, archivingAt) =>
+                this.markWorkspaceArchiving(workspaceIds, archivingAt),
+              clearWorkspaceArchiving: (workspaceIds) => this.clearWorkspaceArchiving(workspaceIds),
+              killTerminalsForWorkspace: (id, terminalRecheck) =>
+                this.terminalController.killTerminalsForWorkspace(id, terminalRecheck),
+              sessionLogger: this.sessionLogger,
+            },
+            {
+              scope: { kind: "workspace", workspaceId },
+              requestId,
+              caller,
+            },
+          );
+          requireArchiveCleanupComplete(archiveResult, "Project workspace archive");
+          removedWorkspaceIds.push(workspaceId);
+        }
+
         await recheck();
-        const archiveResult = await archiveByScope(
-          {
-            paseoHome: this.paseoHome,
-            paseoWorktreesBaseRoot: this.worktreesRoot,
-            github: this.github,
-            workspaceGitService: this.workspaceGitService,
-            agentManager: this.agentManager,
-            agentStorage: this.agentStorage,
-            findWorkspaceIdForCwd: (cwd) => this.findWorkspaceIdForCwd(cwd),
-            listActiveWorkspaces: () => this.listActiveWorkspaceRefs(),
-            archiveWorkspaceRecord: (id, archiveRecheck) =>
-              this.archiveWorkspaceRecord(id, undefined, archiveRecheck),
-            workspaceRegistry: this.workspaceRegistry,
-            emitWorkspaceUpdatesForWorkspaceIds: (workspaceIds) =>
-              this.emitWorkspaceUpdatesForWorkspaceIds(workspaceIds),
-            markWorkspaceArchiving: (workspaceIds, archivingAt) =>
-              this.markWorkspaceArchiving(workspaceIds, archivingAt),
-            clearWorkspaceArchiving: (workspaceIds) => this.clearWorkspaceArchiving(workspaceIds),
-            killTerminalsForWorkspace: (id, terminalRecheck) =>
-              this.terminalController.killTerminalsForWorkspace(id, terminalRecheck),
-            sessionLogger: this.sessionLogger,
-          },
-          {
-            scope: { kind: "workspace", workspaceId },
+        await this.projectRegistry.remove(resolvedProjectId, { recheck });
+
+        const updateIds =
+          removedWorkspaceIds.length > 0
+            ? removedWorkspaceIds
+            : [projectWorkspaces[0]?.workspaceId ?? projectId];
+        await this.emitWorkspaceUpdatesForWorkspaceIds(updateIds, {
+          removedProjectId: projectId,
+        });
+
+        this.emit({
+          type: "project.remove.response",
+          payload: {
             requestId,
-            caller,
+            projectId,
+            accepted: true,
+            removedWorkspaceIds,
+            error: null,
           },
-        );
-        requireArchiveCleanupComplete(archiveResult, "Project workspace archive");
-        removedWorkspaceIds.push(workspaceId);
+        });
+      } finally {
+        destructiveLease?.release();
       }
-
-      await recheck();
-      await this.projectRegistry.remove(resolvedProjectId, { recheck });
-
-      const updateIds =
-        removedWorkspaceIds.length > 0
-          ? removedWorkspaceIds
-          : [projectWorkspaces[0]?.workspaceId ?? projectId];
-      await this.emitWorkspaceUpdatesForWorkspaceIds(updateIds, {
-        removedProjectId: projectId,
-      });
-
-      this.emit({
-        type: "project.remove.response",
-        payload: {
-          requestId,
-          projectId,
-          accepted: true,
-          removedWorkspaceIds,
-          error: null,
-        },
-      });
     } catch (error) {
       this.sessionLogger.error(
         { err: error, projectId, requestId },

@@ -9,6 +9,7 @@ import {
   CreateAgentLifecycleDispatch,
   registerAgentAutoArchive,
 } from "./create-agent-lifecycle-dispatch.js";
+import { DestructiveMembershipChangedError } from "./destructive-membership-fence.js";
 import {
   requireArchiveCleanupComplete,
   WorkspaceCleanupPendingError,
@@ -1136,4 +1137,29 @@ test("auto-archive participates in the agent lifecycle shutdown drain", async ()
   expect(flushResolved).toBe(false);
   finishArchive();
   await flushing;
+});
+
+test("one terminal event retries a fenced auto-archive and eventually releases", async () => {
+  const agentId = "4a7e2521-286d-4ad5-af35-e091c55302e4";
+  const agents = new AgentLifecycleEvents();
+  let archiveCount = 0;
+  const registration = registerAgentAutoArchive({
+    agentManager: agents,
+    agentId,
+    archive: async () => {
+      archiveCount += 1;
+      if (archiveCount === 1) {
+        throw new DestructiveMembershipChangedError("agents");
+      }
+    },
+    retryBaseMs: 0,
+    retryMaxMs: 0,
+  });
+
+  agents.completeTurn(agentId);
+  await expect(registration.settled).resolves.toBe("completed");
+  await registration.cancel();
+
+  expect(archiveCount).toBe(2);
+  expect(agents.listenerCount()).toBe(0);
 });
