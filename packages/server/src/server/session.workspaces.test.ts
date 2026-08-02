@@ -7296,7 +7296,7 @@ test("fetch_workspaces_response emits before cold registration-triggered git wor
   expect(events[0]).toBe("response");
 });
 
-test("paginated one-shot workspace inventory never installs live git observers", async () => {
+test("paginated one-shot workspace inventory beyond 200 records never installs live git observers", async () => {
   const emitted: SessionOutboundMessage[] = [];
   const workspaceGitService = createNoopWorkspaceGitService({
     peekSnapshot: (cwd) => createWorkspaceRuntimeSnapshot(cwd),
@@ -7311,7 +7311,7 @@ test("paginated one-shot workspace inventory never installs live git observers",
     createdAt: "2026-08-01T00:00:00.000Z",
     updatedAt: "2026-08-01T00:00:00.000Z",
   });
-  const workspaces = Array.from({ length: 120 }, (_, index) =>
+  const workspaces = Array.from({ length: 220 }, (_, index) =>
     createPersistedWorkspaceRecord({
       workspaceId: `ws-one-shot-inventory-${String(index).padStart(3, "0")}`,
       projectId: project.projectId,
@@ -7332,12 +7332,12 @@ test("paginated one-shot workspace inventory never installs live git observers",
 
   const pageSizes: number[] = [];
   let cursor: string | undefined;
-  for (let pageIndex = 0; pageIndex < 3; pageIndex += 1) {
+  for (let pageIndex = 0; pageIndex < 2; pageIndex += 1) {
     emitted.length = 0;
     await session.handleMessage({
       type: "fetch_workspaces_request",
       requestId: `req-one-shot-inventory-${pageIndex}`,
-      page: { limit: 50, ...(cursor ? { cursor } : {}) },
+      page: { limit: 200, ...(cursor ? { cursor } : {}) },
     });
     const response = findByType(emitted, "fetch_workspaces_response");
     expect(response).toBeDefined();
@@ -7345,9 +7345,81 @@ test("paginated one-shot workspace inventory never installs live git observers",
     cursor = response!.payload.pageInfo.nextCursor ?? undefined;
   }
 
-  expect(pageSizes).toEqual([50, 50, 20]);
+  expect(pageSizes).toEqual([200, 20]);
   expect(cursor).toBeUndefined();
   expect(workspaceGitService.registerWorkspace).not.toHaveBeenCalled();
+});
+
+test("later pages of a subscribed workspace inventory retain live git observers", async () => {
+  const emitted: SessionOutboundMessage[] = [];
+  const listeners = new Map<string, (snapshot: WorkspaceGitRuntimeSnapshot) => void>();
+  const workspaceGitService = createNoopWorkspaceGitService({
+    peekSnapshot: (cwd) => createWorkspaceRuntimeSnapshot(cwd),
+    registerWorkspace: vi.fn(({ cwd }, listener) => {
+      listeners.set(path.resolve(cwd), listener);
+      return { unsubscribe: () => listeners.delete(path.resolve(cwd)) };
+    }),
+  });
+  const session = asTestSession(createSessionForWorkspaceTests({ workspaceGitService }));
+  const project = createPersistedProjectRecord({
+    projectId: "proj-subscribed-inventory",
+    rootPath: "/tmp/subscribed-inventory",
+    kind: "git",
+    displayName: "subscribed-inventory",
+    createdAt: "2026-08-01T00:00:00.000Z",
+    updatedAt: "2026-08-01T00:00:00.000Z",
+  });
+  const workspaces = Array.from({ length: 220 }, (_, index) =>
+    createPersistedWorkspaceRecord({
+      workspaceId: `ws-subscribed-inventory-${String(index).padStart(3, "0")}`,
+      projectId: project.projectId,
+      cwd: `/tmp/subscribed-inventory/worktree-${index}`,
+      kind: "worktree",
+      displayName: `worktree-${index}`,
+      createdAt: "2026-08-01T00:00:00.000Z",
+      updatedAt: "2026-08-01T00:00:00.000Z",
+    }),
+  );
+
+  session.emit = (message) => {
+    if (isSessionOutboundMessage(message)) emitted.push(message);
+  };
+  session.listAgentPayloads = async () => [];
+  session.projectRegistry.list = async () => [project];
+  session.workspaceRegistry.list = async () => workspaces;
+
+  await session.handleMessage({
+    type: "fetch_workspaces_request",
+    requestId: "req-subscribed-inventory-first",
+    subscribe: { subscriptionId: "sub-subscribed-inventory" },
+    page: { limit: 200 },
+  });
+  const firstResponse = findByType(emitted, "fetch_workspaces_response");
+  const cursor = firstResponse?.payload.pageInfo.nextCursor;
+  expect(cursor).toEqual(expect.any(String));
+
+  emitted.length = 0;
+  await session.handleMessage({
+    type: "fetch_workspaces_request",
+    requestId: "req-subscribed-inventory-second",
+    page: { limit: 200, cursor: cursor! },
+  });
+
+  expect(workspaceGitService.registerWorkspace).toHaveBeenCalledTimes(220);
+  const laterPageCwd = path.resolve(workspaces[205].cwd);
+  const laterPageListener = listeners.get(laterPageCwd);
+  expect(laterPageListener).toBeDefined();
+  laterPageListener?.(
+    createWorkspaceRuntimeSnapshot(laterPageCwd, {
+      git: { currentBranch: "later-page-live-update", isDirty: true },
+    }),
+  );
+  await flushWorkspaceUpdateBackgroundWork();
+
+  expect(filterByType(emitted, "checkout_status_update")).toContainEqual({
+    type: "checkout_status_update",
+    payload: expect.objectContaining({ cwd: laterPageCwd }),
+  });
 });
 
 test("fetch_workspaces_response serves 120 cached snapshots while git refreshes are blocked", async () => {
