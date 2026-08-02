@@ -20,6 +20,7 @@ import type {
 import type { ManagedAgent } from "./agent-manager.js";
 import type { JsonValue } from "../json-utils.js";
 import { isStoredAgentProviderAvailable, toAgentPersistenceHandle } from "../persistence-hooks.js";
+import { boundMaterialProgressCheckpoint, materialProgressPayload } from "./material-progress.js";
 export type { ManagedAgent };
 
 interface ProjectionOptions {
@@ -88,6 +89,7 @@ export function toStoredAgentRecord(
     persistence,
     lastError: agent.lastError ?? undefined,
     historyPrimed: agent.historyPrimed,
+    materialProgress: boundMaterialProgressCheckpoint(agent.materialProgress),
     requiresAttention: agent.attention.requiresAttention,
     attentionReason: agent.attention.requiresAttention ? agent.attention.attentionReason : null,
     attentionTimestamp: agent.attention.requiresAttention
@@ -130,6 +132,7 @@ export function toAgentPayload(
     persistence: sanitizePersistenceHandle(agent.persistence),
     title: options?.title ?? null,
     labels: agent.labels,
+    materialProgress: materialProgressPayload(agent.materialProgress),
   };
 
   const usage = sanitizeUsage(agent.lastUsage);
@@ -237,6 +240,7 @@ export function buildStoredAgentPayload(
     attentionTimestamp: record.attentionTimestamp ?? null,
     archivedAt: record.archivedAt ?? null,
     labels: normalizeLabels(record.labels),
+    materialProgress: materialProgressPayload(record.materialProgress),
     ...(providerAvailable ? {} : { providerUnavailable: true }),
   };
 }

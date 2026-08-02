@@ -9,6 +9,7 @@ import { toStoredAgentRecord } from "./agent-projections.js";
 import type { ManagedAgent } from "./agent-manager.js";
 import type { AgentSessionConfig } from "./agent-sdk-types.js";
 import { AgentOwnerSchema, daemonExecutionKey, type DaemonAgentOwner } from "./agent-owner.js";
+import { MaterialProgressCheckpointSchema } from "./material-progress.js";
 import type { DestructiveActionRecheck } from "./destructive-action-authority.js";
 
 const SERIALIZABLE_CONFIG_SCHEMA = z
@@ -95,6 +96,7 @@ const STORED_AGENT_SCHEMA = z.object({
   persistence: PERSISTENCE_HANDLE_SCHEMA,
   lastError: z.string().nullable().optional(),
   historyPrimed: z.boolean().optional(),
+  materialProgress: MaterialProgressCheckpointSchema.optional(),
   requiresAttention: z.boolean().optional(),
   attentionReason: z.enum(["finished", "error", "permission"]).nullable().optional(),
   attentionTimestamp: z.string().nullable().optional(),

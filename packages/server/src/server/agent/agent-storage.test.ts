@@ -14,6 +14,7 @@ import type {
   AgentSession,
   AgentSessionConfig,
 } from "./agent-sdk-types.js";
+import { createMaterialProgressCheckpoint } from "./material-progress.js";
 
 type ManagedAgentOverrides = Omit<
   Partial<ManagedAgent>,
@@ -113,6 +114,9 @@ function createManagedAgent(overrides: ManagedAgentOverrides = {}): ManagedAgent
     foregroundTurnWaiters: new Set(),
     unsubscribeSession: null,
     timeline: overrides.timeline ?? [],
+    materialProgress:
+      overrides.materialProgress ??
+      createMaterialProgressCheckpoint({ timelineEpoch: "epoch-1", nextSeq: 1 }),
     attention: overrides.attention ?? { requiresAttention: false },
     runtimeInfo:
       overrides.runtimeInfo ??
@@ -190,6 +194,75 @@ describe("AgentStorage", () => {
     const [persisted] = await reloaded.list();
     expect(persisted.cwd).toBe("/tmp/project");
     expect(persisted.config?.extra?.claude).toMatchObject({ maxThinkingTokens: 1024 });
+  });
+
+  test("applySnapshot stores and reloads the epoch-bound material progress checkpoint", async () => {
+    const archivedBloom = Buffer.alloc(4096);
+    archivedBloom[0] = 1;
+    const checkpoint = {
+      ...createMaterialProgressCheckpoint({ timelineEpoch: "epoch-persisted", nextSeq: 1 }),
+      continuationBoundarySeq: 1,
+      acceptedTurnId: "turn-persisted",
+      observedThroughSeq: 3,
+      completedCompactionsSinceMaterialProgress: 1,
+      lastMaterialProgressAt: "2026-08-01T00:00:03.000Z",
+      lastMaterialProgressKind: "write" as const,
+      seenMaterialProgressFingerprints: ["write:proof"],
+      seenMaterialProgressFingerprintBloom: Buffer.alloc(4096).toString("base64"),
+      seenMaterialProgressFingerprintBloomArchive: [archivedBloom.toString("base64")],
+    };
+
+    await storage.applySnapshot(
+      createManagedAgent({ id: "agent-material-progress", materialProgress: checkpoint }),
+    );
+
+    const reloaded = new AgentStorage(storagePath, logger);
+    expect((await reloaded.get("agent-material-progress"))?.materialProgress).toEqual(checkpoint);
+  });
+
+  test("applySnapshot bounds durable material progress fingerprints", async () => {
+    const checkpoint = {
+      ...createMaterialProgressCheckpoint({ timelineEpoch: "epoch-bounded", nextSeq: 1 }),
+      seenMaterialProgressFingerprints: Array.from(
+        { length: 300 },
+        (_, index) => `write:proof-${index}`,
+      ),
+    };
+
+    await storage.applySnapshot(
+      createManagedAgent({ id: "agent-bounded-progress", materialProgress: checkpoint }),
+    );
+
+    const reloaded = new AgentStorage(storagePath, logger);
+    const persisted = (await reloaded.get("agent-bounded-progress"))?.materialProgress;
+    expect(persisted?.seenMaterialProgressFingerprints).toHaveLength(256);
+    expect(persisted?.seenMaterialProgressFingerprints[0]).toBe("write:proof-44");
+    expect(persisted?.seenMaterialProgressFingerprints.at(-1)).toBe("write:proof-299");
+    expect(persisted?.seenMaterialProgressFingerprintBloom).toEqual(expect.any(String));
+  });
+
+  test("applySnapshot persists saturated material progress fingerprint history fail-closed", async () => {
+    const checkpoint = {
+      ...createMaterialProgressCheckpoint({ timelineEpoch: "epoch-saturated", nextSeq: 1 }),
+      continuationBoundarySeq: 1,
+      acceptedTurnId: "turn-saturated",
+      seenMaterialProgressFingerprintBloom: Buffer.alloc(4096, 0xff).toString("base64"),
+    };
+
+    await storage.applySnapshot(
+      createManagedAgent({ id: "agent-saturated-progress", materialProgress: checkpoint }),
+    );
+
+    const reloaded = new AgentStorage(storagePath, logger);
+    const persisted = (await reloaded.get("agent-saturated-progress"))?.materialProgress;
+    expect(persisted).toMatchObject({
+      timelineEpoch: "epoch-saturated",
+      continuationBoundarySeq: null,
+      acceptedTurnId: null,
+      seenMaterialProgressFingerprints: [],
+    });
+    expect(persisted?.seenMaterialProgressFingerprintBloom).toBeUndefined();
+    expect(persisted?.unavailableReason).toMatch(/fingerprint history.*saturated/i);
   });
 
   test("persists auto-archive obligations across restart", async () => {
@@ -578,6 +651,47 @@ describe("AgentStorage", () => {
     await applySnapshotPromise;
     const record = await storage.get(agentId);
     expect(record?.title).toBe("Generated title");
+  });
+
+  test("a concurrent title mutation cannot overwrite a newer material progress checkpoint", async () => {
+    const agentId = "agent-material-progress-race";
+    const initialCheckpoint = createMaterialProgressCheckpoint({
+      timelineEpoch: "epoch-race",
+      nextSeq: 1,
+    });
+    await storage.applySnapshot(
+      createManagedAgent({ id: agentId, materialProgress: initialCheckpoint }),
+    );
+
+    let releasePendingWrite: (() => void) | null = null;
+    const pendingWrite = new Promise<void>((resolve) => {
+      releasePendingWrite = resolve;
+    });
+    const storageInternals = storage as unknown as {
+      pendingWrites: Map<string, Promise<void>>;
+    };
+    storageInternals.pendingWrites.set(agentId, pendingWrite);
+
+    const newerCheckpoint = {
+      ...initialCheckpoint,
+      continuationBoundarySeq: 1,
+      acceptedTurnId: "turn-race",
+      observedThroughSeq: 4,
+      lastMaterialProgressAt: "2026-08-01T00:00:04.000Z",
+      lastMaterialProgressKind: "verification" as const,
+      seenMaterialProgressFingerprints: ["verification:race"],
+    };
+    const snapshotWrite = storage.applySnapshot(
+      createManagedAgent({ id: agentId, materialProgress: newerCheckpoint }),
+    );
+    const titleWrite = storage.setTitle(agentId, "Generated during snapshot");
+    releasePendingWrite?.();
+
+    await Promise.all([snapshotWrite, titleWrite]);
+    const reloaded = new AgentStorage(storagePath, logger);
+    const record = await reloaded.get(agentId);
+    expect(record?.title).toBe("Generated during snapshot");
+    expect(record?.materialProgress).toEqual(newerCheckpoint);
   });
 
   test.each([

@@ -97,6 +97,17 @@ import {
   type MembershipMutationLease,
 } from "../destructive-membership-gate.js";
 import { createExternalProcessEnv } from "../paseo-env.js";
+import {
+  advanceMaterialProgressCheckpoint,
+  createMaterialProgressCheckpoint,
+  invalidateMaterialProgressCheckpoint,
+  materialProgressPayload,
+  openMaterialProgressContinuation,
+  restoreMaterialProgressCheckpoint,
+  settleMaterialProgressContinuation,
+  type MaterialProgressCheckpoint,
+  type MaterialProgressTurnOutcome,
+} from "./material-progress.js";
 
 const RELOAD_SESSION_CLOSE_TIMEOUT_MS = 3_000;
 const INTERRUPT_SESSION_TIMEOUT_MS = 2_000;
@@ -113,6 +124,21 @@ const STORED_AGENT_CAPABILITIES: AgentCapabilityFlags = {
 };
 
 type TimeoutResult = "completed" | "timed_out";
+
+function restoreAgentMaterialProgressCheckpoint(
+  checkpoint: MaterialProgressCheckpoint | undefined,
+  timeline: { epoch: string; nextSeq: number },
+): MaterialProgressCheckpoint {
+  return checkpoint
+    ? restoreMaterialProgressCheckpoint(checkpoint, {
+        timelineEpoch: timeline.epoch,
+        nextSeq: timeline.nextSeq,
+      })
+    : createMaterialProgressCheckpoint({
+        timelineEpoch: timeline.epoch,
+        nextSeq: timeline.nextSeq,
+      });
+}
 
 export class AgentManagerShuttingDownError extends Error {
   constructor() {
@@ -457,6 +483,7 @@ interface ManagedAgentBase {
   persistence: AgentPersistenceHandle | null;
   historyPrimed: boolean;
   lastUserMessageAt: Date | null;
+  materialProgress: MaterialProgressCheckpoint;
   lastUsage?: AgentUsage;
   lastError?: string;
   attention: AttentionState;
@@ -1275,6 +1302,10 @@ export class AgentManager {
     return this.timelineStore.getRows(id);
   }
 
+  getMaterialProgress(id: string) {
+    return materialProgressPayload(this.requireAgent(id).materialProgress);
+  }
+
   fetchTimeline(id: string, options?: AgentTimelineFetchOptions): AgentTimelineFetchResult {
     this.requireAgent(id);
     return this.timelineStore.fetch(id, options);
@@ -1561,6 +1592,7 @@ export class AgentManager {
       workspaceId?: string;
       owner?: AgentOwner;
       historyPrimed?: boolean;
+      materialProgress?: MaterialProgressCheckpoint;
       autoArchiveObligation?: AutoArchiveObligation;
       resumeRunning?: boolean;
     },
@@ -1593,6 +1625,7 @@ export class AgentManager {
       workspaceId?: string;
       owner?: AgentOwner;
       historyPrimed?: boolean;
+      materialProgress?: MaterialProgressCheckpoint;
       autoArchiveObligation?: AutoArchiveObligation;
       resumeRunning?: boolean;
     },
@@ -1850,6 +1883,7 @@ export class AgentManager {
     const preservedHistoryPrimed = existing.historyPrimed;
     const preservedLastUsage = existing.lastUsage;
     const preservedLastError = existing.lastError;
+    const preservedMaterialProgress = existing.materialProgress;
     const preservedAttention = existing.attention;
     const handle = existing.persistence;
     const provider = handle?.provider ?? existing.provider;
@@ -1910,6 +1944,7 @@ export class AgentManager {
             historyPrimed: rehydrateFromDisk ? false : preservedHistoryPrimed,
             lastUsage: preservedLastUsage,
             lastError: preservedLastError,
+            materialProgress: preservedMaterialProgress,
             attention: preservedAttention,
             incarnation: agentIncarnation,
           });
@@ -2215,6 +2250,9 @@ export class AgentManager {
         lastUserMessageAt: record.lastUserMessageAt ? new Date(record.lastUserMessageAt) : null,
         lastUsage: undefined,
         lastError: record.lastError ?? undefined,
+        materialProgress:
+          record.materialProgress ??
+          createMaterialProgressCheckpoint({ timelineEpoch: "stored", nextSeq: 1 }),
         attention: { requiresAttention: false },
         internal: record.internal,
         labels: record.labels,
@@ -2720,10 +2758,16 @@ export class AgentManager {
     await this.runOrBufferTimelineWriter(
       agentId,
       async () => {
-        await this.recordTimeline(agentId, item, undefined, (row) => {
+        const turnId = agent.materialProgress.acceptedTurnId ?? undefined;
+        await this.recordTimeline(agentId, item, { turnId }, (row) => {
           this.dispatchStream(
             agentId,
-            { type: "timeline", item, provider: agent.provider },
+            {
+              type: "timeline",
+              item,
+              provider: agent.provider,
+              ...(turnId ? { turnId } : {}),
+            },
             {
               seq: row.seq,
               epoch: this.timelineStore.getEpoch(agentId),
@@ -2820,6 +2864,7 @@ export class AgentManager {
         agent.pendingReplacement = false;
       }
       agent.activeForegroundTurnId = turnId;
+      this.openMaterialProgressContinuation(agent, turnId);
       agent.lifecycle = "running";
       this.touchUpdatedAt(agent);
       this.emitState(agent);
@@ -2897,6 +2942,71 @@ export class AgentManager {
       this.touchUpdatedAt(mutableAgent);
       this.emitState(mutableAgent);
     }
+  }
+
+  private openMaterialProgressContinuation(agent: ActiveManagedAgent, turnId: string): void {
+    const timeline = this.timelineStore.fetch(agent.id, { direction: "tail", limit: 1 });
+    agent.materialProgress = openMaterialProgressContinuation({
+      timelineEpoch: timeline.epoch,
+      boundarySeq: timeline.window.nextSeq,
+      turnId,
+    });
+  }
+
+  private settleMaterialProgress(
+    agent: ActiveManagedAgent,
+    turnId: string,
+    outcome: MaterialProgressTurnOutcome,
+  ): void {
+    agent.materialProgress = settleMaterialProgressContinuation(agent.materialProgress, {
+      turnId,
+      outcome,
+    });
+  }
+
+  private resetMaterialProgress(agent: ActiveManagedAgent, unavailableReason?: string): void {
+    const timeline = this.timelineStore.fetch(agent.id, { direction: "tail", limit: 1 });
+    agent.materialProgress = unavailableReason
+      ? invalidateMaterialProgressCheckpoint({
+          timelineEpoch: timeline.epoch,
+          nextSeq: timeline.window.nextSeq,
+          reason: unavailableReason,
+        })
+      : createMaterialProgressCheckpoint({
+          timelineEpoch: timeline.epoch,
+          nextSeq: timeline.window.nextSeq,
+        });
+  }
+
+  private materialProgressAfterTimelineReplacement(
+    agent: ActiveManagedAgent,
+    replacementRows: readonly AgentTimelineRow[],
+    timelineEpoch: string,
+  ): MaterialProgressCheckpoint {
+    const checkpoint = agent.materialProgress;
+    const currentTimelineEpoch = this.timelineStore.getEpoch(agent.id);
+    const nextSeq = (replacementRows.at(-1)?.seq ?? 0) + 1;
+    const acceptedTurnId = checkpoint.acceptedTurnId;
+    if (
+      acceptedTurnId === null ||
+      checkpoint.continuationBoundarySeq === null ||
+      checkpoint.turnOutcome !== null ||
+      checkpoint.unavailableReason !== undefined ||
+      checkpoint.timelineEpoch !== currentTimelineEpoch
+    ) {
+      return createMaterialProgressCheckpoint({ timelineEpoch, nextSeq });
+    }
+
+    const firstAcceptedTurnRow = replacementRows.find((row) => row.turnId === acceptedTurnId);
+    let rebound = openMaterialProgressContinuation({
+      timelineEpoch,
+      boundarySeq: firstAcceptedTurnRow?.seq ?? nextSeq,
+      turnId: acceptedTurnId,
+    });
+    for (const row of replacementRows) {
+      rebound = advanceMaterialProgressCheckpoint(rebound, row, timelineEpoch);
+    }
+    return rebound;
   }
 
   async replaceAgentRun(
@@ -3317,6 +3427,12 @@ export class AgentManager {
         "agent.rewind.start",
       );
       await invokeRewindCapability(agent.session, { messageId, mode });
+      this.resetMaterialProgress(
+        agent,
+        "Material progress is unavailable because the provider session was rewound.",
+      );
+      await this.persistSnapshot(agent);
+      this.emitState(agent, { persist: false });
       if (mode !== "files") {
         await this.hydrateTimelineFromProvider(agentId, { force: true, broadcast: true });
       }
@@ -3591,6 +3707,7 @@ export class AgentManager {
       historyPrimed?: boolean;
       lastUsage?: AgentUsage;
       lastError?: string;
+      materialProgress?: MaterialProgressCheckpoint;
       attention?: AttentionState;
       initialTitle?: string | null;
       publishWhenReady?: boolean;
@@ -3653,6 +3770,7 @@ export class AgentManager {
         this.membershipVersion += 1;
       }
       inserted = true;
+      await this.catchUpMaterialProgress(managed);
       if (options?.resumeRunning) {
         managed.lifecycle = "running";
         this.runs.trackAutonomousRun(managed.id, null);
@@ -3838,6 +3956,7 @@ export class AgentManager {
           historyPrimed?: boolean;
           lastUsage?: AgentUsage;
           lastError?: string;
+          materialProgress?: MaterialProgressCheckpoint;
           attention?: AttentionState;
           persistence?: AgentPersistenceHandle;
           workspaceId?: string;
@@ -3846,6 +3965,11 @@ export class AgentManager {
       | undefined;
   }): ActiveManagedAgent {
     const { resolvedAgentId, session, config, now, durableTimelineHasRows, options } = params;
+    const timeline = this.timelineStore.fetch(resolvedAgentId, { direction: "tail", limit: 1 });
+    const materialProgress = restoreAgentMaterialProgressCheckpoint(options?.materialProgress, {
+      epoch: timeline.epoch,
+      nextSeq: timeline.window.nextSeq,
+    });
     return {
       id: resolvedAgentId,
       provider: config.provider,
@@ -3875,12 +3999,25 @@ export class AgentManager {
       ),
       historyPrimed: options?.historyPrimed ?? durableTimelineHasRows,
       lastUserMessageAt: options?.lastUserMessageAt ?? null,
+      materialProgress,
       lastUsage: options?.lastUsage,
       lastError: options?.lastError,
       attention: resolveInitialAttention(options?.attention),
       internal: config.internal ?? false,
       labels: options?.labels ?? {},
     } as ActiveManagedAgent;
+  }
+
+  private async catchUpMaterialProgress(agent: ActiveManagedAgent): Promise<void> {
+    const rows = await this.getTimelineRows(agent.id);
+    const timelineEpoch = this.timelineStore.getEpoch(agent.id);
+    for (const row of rows.toSorted((left, right) => left.seq - right.seq)) {
+      agent.materialProgress = advanceMaterialProgressCheckpoint(
+        agent.materialProgress,
+        row,
+        timelineEpoch,
+      );
+    }
   }
 
   private async loadCommittedTimelineSeed(
@@ -4332,6 +4469,11 @@ export class AgentManager {
       throw error;
     }
     this.requireLiveHistoryHydration(agent.id, activeHydration.token);
+    const materialProgress = this.materialProgressAfterTimelineReplacement(
+      agent,
+      replacementRows,
+      epoch,
+    );
     this.timelineStore.initialize(agent.id, {
       epoch,
       rows: replacementRows,
@@ -4341,6 +4483,7 @@ export class AgentManager {
     activeHydration.carriedLiveTimelineRows = carriedRows;
     activeHydration.nextUncapturedTimelineSeq = (replacementRows.at(-1)?.seq ?? 0) + 1;
     activeHydration.lastProviderHistoryItems = historyRows.map((row) => structuredClone(row.item));
+    agent.materialProgress = materialProgress;
     agent.historyPrimed = true;
 
     const shouldBroadcast = typeof broadcast === "function" ? broadcast() : broadcast;
@@ -4407,7 +4550,12 @@ export class AgentManager {
     for (const row of carriedRows) {
       this.dispatchStream(
         agent.id,
-        { type: "timeline", provider: agent.provider, item: row.item },
+        {
+          type: "timeline",
+          provider: agent.provider,
+          item: row.item,
+          ...(row.turnId !== undefined ? { turnId: row.turnId } : {}),
+        },
         { seq: row.seq, epoch, timestamp: row.timestamp },
       );
     }
@@ -4418,7 +4566,12 @@ export class AgentManager {
     for (const row of this.timelineStore.getRows(agent.id)) {
       this.dispatchStream(
         agent.id,
-        { type: "timeline", provider: agent.provider, item: row.item },
+        {
+          type: "timeline",
+          provider: agent.provider,
+          item: row.item,
+          ...(row.turnId !== undefined ? { turnId: row.turnId } : {}),
+        },
         { seq: row.seq, epoch, timestamp: row.timestamp },
       );
     }
@@ -4469,6 +4622,11 @@ export class AgentManager {
       throw error;
     }
     this.requireLiveHistoryHydration(agent.id, activeHydration.token);
+    const materialProgress = this.materialProgressAfterTimelineReplacement(
+      agent,
+      replacementRows,
+      epoch,
+    );
     this.timelineStore.initialize(agent.id, {
       epoch,
       rows: replacementRows,
@@ -4481,6 +4639,7 @@ export class AgentManager {
       provider: event.provider,
       event: structuredClone(event.event),
     }));
+    agent.materialProgress = materialProgress;
     agent.historyPrimed = true;
     await this.persistSnapshot(agent);
 
@@ -4514,6 +4673,7 @@ export class AgentManager {
       seq: nextSeq++,
       timestamp: event.timestamp ?? new Date().toISOString(),
       item: limitAgentTimelineItemContent(event.item),
+      ...(event.turnId !== undefined ? { turnId: event.turnId } : {}),
     }));
   }
 
@@ -5159,7 +5319,12 @@ export class AgentManager {
           await this.recordTimeline(
             agent.id,
             event.item,
-            event.timestamp ? { timestamp: event.timestamp } : undefined,
+            event.timestamp || event.turnId
+              ? {
+                  ...(event.timestamp ? { timestamp: event.timestamp } : {}),
+                  ...(event.turnId ? { turnId: event.turnId } : {}),
+                }
+              : undefined,
           );
         },
         options.historyHydrationToken,
@@ -5208,6 +5373,9 @@ export class AgentManager {
     if (event.usage) {
       agent.lastUsage = { ...agent.lastUsage, ...event.usage };
     }
+    if (eventTurnId) {
+      this.settleMaterialProgress(agent, eventTurnId, "completed");
+    }
     // If no usage on turn_completed, keep lastUsage as-is so context window
     // data accumulated during streaming isn't lost when the provider omits
     // it from the completion event.
@@ -5242,6 +5410,9 @@ export class AgentManager {
       },
       "handleStreamEvent: turn_failed",
     );
+    if (eventTurnId) {
+      this.settleMaterialProgress(agent, eventTurnId, "failed");
+    }
     if (!isForegroundEvent) {
       agent.lifecycle = "error";
     }
@@ -5251,6 +5422,7 @@ export class AgentManager {
       event.provider,
       this.formatTurnFailedMessage(event),
       options,
+      eventTurnId,
     );
     this.resolvePendingPermissionsForAgent(agent, event.provider, options, "Turn failed");
     if (!isForegroundEvent) {
@@ -5282,6 +5454,9 @@ export class AgentManager {
       },
       "agent.manager.turn.canceled",
     );
+    if (eventTurnId) {
+      this.settleMaterialProgress(agent, eventTurnId, "canceled");
+    }
     if (!isForegroundEvent && !agent.pendingReplacement) {
       agent.lifecycle = "idle";
     }
@@ -5311,6 +5486,9 @@ export class AgentManager {
     );
     if (!isForegroundEvent) {
       this.runs.trackAutonomousRun(agent.id, eventTurnId ?? null);
+      if (eventTurnId) {
+        this.openMaterialProgressContinuation(agent, eventTurnId);
+      }
       agent.lifecycle = "running";
       this.emitState(agent);
     }
@@ -5375,7 +5553,7 @@ export class AgentManager {
       provider,
       ...(turnId !== undefined ? { turnId } : {}),
     };
-    await this.recordTimeline(agentId, item, undefined, async (row) => {
+    await this.recordTimeline(agentId, item, turnId ? { turnId } : undefined, async (row) => {
       this.dispatchStream(agentId, event, {
         seq: row.seq,
         epoch: this.timelineStore.getEpoch(agentId),
@@ -5392,6 +5570,7 @@ export class AgentManager {
     provider: AgentProvider,
     message: string,
     options?: HandleStreamEventOptions,
+    turnId?: string,
   ): Promise<void> {
     if (options?.fromHistory) {
       return;
@@ -5410,7 +5589,7 @@ export class AgentManager {
         if (lastItem?.type === "assistant_message" && lastItem.text === text) return;
 
         const item: AgentTimelineItem = { type: "assistant_message", text };
-        await this.recordTimeline(agent.id, item, undefined, (row) => {
+        await this.recordTimeline(agent.id, item, turnId ? { turnId } : undefined, (row) => {
           this.dispatchStream(
             agent.id,
             { type: "timeline", item, provider },
@@ -5445,7 +5624,7 @@ export class AgentManager {
   private recordTimeline(
     agentId: string,
     item: AgentTimelineItem,
-    options?: { timestamp?: string },
+    options?: { timestamp?: string; turnId?: string },
     afterCommit?: (row: AgentTimelineRow) => Promise<void> | void,
   ): Promise<AgentTimelineRow> {
     if (!this.durableTimelineStore) {
@@ -5471,7 +5650,7 @@ export class AgentManager {
   private async recordTimelineWithDurability(
     agentId: string,
     item: AgentTimelineItem,
-    options?: { timestamp?: string },
+    options?: { timestamp?: string; turnId?: string },
     afterCommit?: (row: AgentTimelineRow) => Promise<void> | void,
   ): Promise<AgentTimelineRow> {
     item = limitAgentTimelineItemContent(item);
@@ -5479,6 +5658,13 @@ export class AgentManager {
     if (!this.durableTimelineStore) {
       const row = this.timelineStore.append(agentId, item, options);
       if (agent && !this.activeHistoryHydrations.has(agentId)) agent.historyPrimed = true;
+      if (agent) {
+        agent.materialProgress = advanceMaterialProgressCheckpoint(
+          agent.materialProgress,
+          row,
+          this.timelineStore.getEpoch(agentId),
+        );
+      }
       await afterCommit?.(row);
       return row;
     }
@@ -5493,7 +5679,10 @@ export class AgentManager {
     this.durableTimelineWriteVersions.set(agentId, version);
     const row = await this.commitDurableTimelineAppend(agentId, item, options);
 
-    const inMemoryRow = this.timelineStore.append(agentId, item, { timestamp: row.timestamp });
+    const inMemoryRow = this.timelineStore.append(agentId, item, {
+      timestamp: row.timestamp,
+      ...(row.turnId !== undefined ? { turnId: row.turnId } : {}),
+    });
     if (inMemoryRow.seq !== row.seq) {
       const committed = await this.durableTimelineStore.fetchCommitted(agentId, { limit: 0 });
       this.timelineStore.initialize(agentId, {
@@ -5501,6 +5690,13 @@ export class AgentManager {
         rows: committed.rows,
         nextSeq: committed.window.nextSeq,
       });
+    }
+    if (agent) {
+      agent.materialProgress = advanceMaterialProgressCheckpoint(
+        agent.materialProgress,
+        row,
+        this.timelineStore.getEpoch(agentId),
+      );
     }
     await afterCommit?.(row);
     if (!inheritedIncomplete) this.incompleteDurableTimelineHistories.delete(agentId);
@@ -5603,7 +5799,7 @@ export class AgentManager {
   private async commitDurableTimelineAppend(
     agentId: string,
     item: AgentTimelineItem,
-    options?: { timestamp?: string },
+    options?: { timestamp?: string; turnId?: string },
   ): Promise<AgentTimelineRow> {
     const store = this.durableTimelineStore;
     if (!store) throw new Error("Durable timeline store unavailable");

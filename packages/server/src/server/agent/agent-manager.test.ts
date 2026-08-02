@@ -4432,6 +4432,118 @@ test("a broadcast admitted inside delayed buffered replay receives the complete 
   }
 });
 
+test("a successor hydration preserves material progress opened by replayed live events", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-hydration-progress-successor-"));
+  const agentId = "00000000-0000-4000-8000-000000000164";
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const epochs = ["initial-progress-epoch", "first-progress-epoch", "successor-progress-epoch"];
+  const durableTimelineStore = new FileAgentTimelineStore(join(workdir, "timelines"), logger, {
+    epochFactory: () => epochs.shift() ?? "unexpected-progress-epoch",
+  });
+  let session: TestAgentSession | null = null;
+  let historyGeneration = 0;
+
+  class SuccessorProgressHistorySession extends TestAgentSession {
+    override async *streamHistory(): AsyncGenerator<AgentStreamEvent> {
+      historyGeneration += 1;
+      if (historyGeneration === 2) {
+        yield {
+          type: "timeline",
+          provider: "codex",
+          turnId: "accepted-live-turn",
+          item: {
+            type: "tool_call",
+            callId: "write-replayed-behind-successor",
+            name: "write",
+            status: "completed",
+            error: null,
+            detail: { type: "write", filePath: "proof.txt", content: "durable successor proof" },
+          },
+        };
+      }
+    }
+  }
+
+  class SuccessorProgressHistoryClient extends TestAgentClient {
+    override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+      session = new SuccessorProgressHistorySession(config);
+      return session;
+    }
+  }
+
+  const manager = new AgentManager({
+    clients: { codex: new SuccessorProgressHistoryClient() },
+    registry: storage,
+    durableTimelineStore,
+    logger,
+    idFactory: () => agentId,
+  });
+
+  try {
+    const created = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+    const turnId = "accepted-live-turn";
+
+    const firstHydration = manager.hydrateTimelineFromProvider(created.id, { force: true });
+    session!.pushEvent({ type: "turn_started", provider: "codex", turnId });
+    session!.pushEvent({
+      type: "timeline",
+      provider: "codex",
+      turnId,
+      item: {
+        type: "tool_call",
+        callId: "write-replayed-behind-successor",
+        name: "write",
+        status: "completed",
+        error: null,
+        detail: { type: "write", filePath: "proof.txt", content: "durable successor proof" },
+      },
+    });
+    session!.pushEvent({
+      type: "usage_updated",
+      provider: "codex",
+      turnId,
+      usage: { inputTokens: 1 },
+    });
+
+    await firstHydration;
+    expect(manager.getMaterialProgress(created.id)).toMatchObject({
+      state: "progressing",
+      observedThroughSeq: 1,
+      lastMaterialProgressKind: "write",
+    });
+    await manager.hydrateTimelineFromProvider(created.id, { force: true });
+    await manager.flush();
+
+    expect(historyGeneration).toBe(2);
+    expect(manager.getMaterialProgress(created.id)).toMatchObject({
+      state: "progressing",
+      timelineEpoch: "successor-progress-epoch",
+      continuationBoundarySeq: 1,
+      observedThroughSeq: 1,
+      lastMaterialProgressKind: "write",
+    });
+    await expect(durableTimelineStore.getCommittedRows(agentId)).resolves.toMatchObject([
+      {
+        seq: 1,
+        turnId,
+        item: { type: "tool_call", callId: "write-replayed-behind-successor" },
+      },
+    ]);
+    expect((await storage.get(agentId))?.materialProgress).toMatchObject({
+      timelineEpoch: "successor-progress-epoch",
+      continuationBoundarySeq: 1,
+      acceptedTurnId: turnId,
+      observedThroughSeq: 1,
+      lastMaterialProgressKind: "write",
+    });
+  } finally {
+    await manager.closeAgent(agentId).catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
 test("provider history consumes ordered live timeline and child overlap exactly once", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-history-overlap-"));
   const agentId = "00000000-0000-4000-8000-000000000183";
@@ -8537,6 +8649,108 @@ test("streamAgent clears pending run when startTurn fails before a turn id exist
       canceled: false,
     }),
   );
+});
+
+test("a pre-accept start failure preserves the prior accepted continuation progress", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-material-progress-rejection-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+
+  class MaterialThenRejectSession extends TestAgentSession {
+    private attempt = 0;
+
+    override async startTurn(): Promise<{ turnId: string }> {
+      this.attempt += 1;
+      if (this.attempt === 2) {
+        throw new Error("rejected before provider turn acceptance");
+      }
+      const turnId = "accepted-material-turn";
+      setTimeout(() => {
+        this.pushEvent({ type: "turn_started", provider: this.provider, turnId });
+        this.pushEvent({
+          type: "timeline",
+          provider: this.provider,
+          turnId,
+          item: {
+            type: "tool_call",
+            callId: "write-proof",
+            name: "write",
+            status: "completed",
+            error: null,
+            detail: { type: "write", filePath: "proof.txt", content: "material result" },
+          },
+        });
+        this.pushEvent({ type: "turn_completed", provider: this.provider, turnId });
+      }, 0);
+      return { turnId };
+    }
+  }
+
+  class MaterialThenRejectClient implements AgentClient {
+    readonly provider = "codex" as const;
+    readonly capabilities = TEST_CAPABILITIES;
+    readonly session = new MaterialThenRejectSession({ provider: "codex", cwd: workdir });
+
+    async isAvailable(): Promise<boolean> {
+      return true;
+    }
+
+    async createSession(): Promise<AgentSession> {
+      return this.session;
+    }
+
+    async resumeSession(): Promise<AgentSession> {
+      return this.session;
+    }
+  }
+
+  const manager = new AgentManager({
+    clients: { codex: new MaterialThenRejectClient() },
+    registry: storage,
+    logger,
+    idFactory: () => "00000000-0000-4000-8000-000000000132",
+  });
+
+  try {
+    const agent = await manager.createAgent(
+      { provider: "codex", cwd: workdir, title: "Material progress rejection" },
+      undefined,
+      { workspaceId: undefined },
+    );
+    await manager.runAgent(agent.id, "accepted turn");
+    const accepted = manager.getMaterialProgress(agent.id);
+    expect(accepted).toMatchObject({
+      state: "progressing",
+      continuationBoundarySeq: 1,
+      observedThroughSeq: 1,
+      lastMaterialProgressKind: "write",
+    });
+
+    await expect(manager.runAgent(agent.id, "rejected turn")).rejects.toThrow(
+      "rejected before provider turn acceptance",
+    );
+    const afterRejection = manager.getMaterialProgress(agent.id);
+    expect(afterRejection).toMatchObject({
+      state: accepted.state,
+      timelineEpoch: accepted.timelineEpoch,
+      continuationBoundarySeq: accepted.continuationBoundarySeq,
+      completedCompactionsSinceMaterialProgress: accepted.completedCompactionsSinceMaterialProgress,
+      lastMaterialProgressAt: accepted.lastMaterialProgressAt,
+      lastMaterialProgressKind: accepted.lastMaterialProgressKind,
+    });
+    expect(afterRejection.observedThroughSeq).toBe(accepted.observedThroughSeq! + 1);
+
+    await manager.flush();
+    expect((await storage.get(agent.id))?.materialProgress).toMatchObject({
+      timelineEpoch: afterRejection.timelineEpoch,
+      continuationBoundarySeq: afterRejection.continuationBoundarySeq,
+      observedThroughSeq: afterRejection.observedThroughSeq,
+      lastMaterialProgressKind: "write",
+    });
+  } finally {
+    await manager.flush().catch(() => undefined);
+    await storage.flush().catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
 });
 
 test("archiveAgent closes the runtime before committing the archived record", async () => {

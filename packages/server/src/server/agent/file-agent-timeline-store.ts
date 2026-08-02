@@ -95,13 +95,14 @@ export class FileAgentTimelineStore implements AgentTimelineStore {
   async appendCommitted(
     agentId: string,
     item: AgentTimelineItem,
-    options?: { timestamp?: string },
+    options?: { timestamp?: string; turnId?: string },
   ): Promise<AgentTimelineRow> {
     return await this.queueMutation(agentId, (current) => {
       const row: AgentTimelineRow = {
         seq: (current.rows.at(-1)?.seq ?? 0) + 1,
         timestamp: options?.timestamp ?? new Date().toISOString(),
         item: structuredClone(item),
+        ...(options?.turnId !== undefined ? { turnId: options.turnId } : {}),
       };
       return {
         next: { ...current, rows: [...current.rows, row] },

@@ -687,6 +687,37 @@ const AgentRuntimeInfoSchema: z.ZodType<AgentRuntimeInfo> = z.object({
   extra: z.record(z.string(), z.unknown()).optional(),
 });
 
+export interface MaterialProgressPayload {
+  state: "none" | "progressing" | "warning" | "stalled";
+  timelineEpoch: string | null;
+  continuationBoundarySeq: number | null;
+  observedThroughSeq: number | null;
+  completedCompactionsSinceMaterialProgress: number;
+  lastMaterialProgressAt: string | null;
+  lastMaterialProgressKind:
+    | "edit"
+    | "write"
+    | "evidence"
+    | "verification"
+    | "decision"
+    | "assistant_result"
+    | null;
+  reason: string;
+}
+
+export const MaterialProgressPayloadSchema: z.ZodType<MaterialProgressPayload> = z.object({
+  state: z.enum(["none", "progressing", "warning", "stalled"]),
+  timelineEpoch: z.string().nullable(),
+  continuationBoundarySeq: z.number().int().positive().nullable(),
+  observedThroughSeq: z.number().int().nonnegative().nullable(),
+  completedCompactionsSinceMaterialProgress: z.number().int().nonnegative(),
+  lastMaterialProgressAt: z.string().nullable(),
+  lastMaterialProgressKind: z
+    .enum(["edit", "write", "evidence", "verification", "decision", "assistant_result"])
+    .nullable(),
+  reason: z.string(),
+});
+
 export const AgentSnapshotPayloadSchema = z.object({
   id: z.string(),
   provider: AgentProviderSchema,
@@ -715,6 +746,8 @@ export const AgentSnapshotPayloadSchema = z.object({
   attentionTimestamp: z.string().nullable().optional(),
   archivedAt: z.string().nullable().optional(),
   providerUnavailable: z.boolean().optional(),
+  // COMPAT(materialProgress): added in v0.2.5, remove optional after 2027-02-01.
+  materialProgress: MaterialProgressPayloadSchema.optional(),
 });
 
 export type AgentSnapshotPayload = z.infer<typeof AgentSnapshotPayloadSchema>;
@@ -2810,6 +2843,8 @@ export const ServerInfoStatusPayloadSchema = z
         agentDetach: z.boolean().optional(),
         // COMPAT(agentThinkingUpdate): added in v0.2.4, remove gate after 2027-01-28.
         agentThinkingUpdate: z.boolean().optional(),
+        // COMPAT(materialProgress): added in v0.2.5, remove gate after 2027-02-01.
+        materialProgress: z.boolean().optional(),
         // COMPAT(daemonDiagnostics): added in v0.1.100, remove gate after 2026-12-25 once daemon floor >= v0.1.100.
         daemonDiagnostics: z.boolean().optional(),
         // COMPAT(daemonSelfUpdate): added in v0.1.93, remove gate after 2026-12-13.

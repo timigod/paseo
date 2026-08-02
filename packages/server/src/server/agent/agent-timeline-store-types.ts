@@ -4,6 +4,7 @@ export interface AgentTimelineRow {
   seq: number;
   timestamp: string;
   item: AgentTimelineItem;
+  turnId?: string;
 }
 
 export interface AgentTimelineReplacementResult {
@@ -50,7 +51,7 @@ export interface AgentTimelineStore {
   appendCommitted(
     agentId: string,
     item: AgentTimelineItem,
-    options?: { timestamp?: string },
+    options?: { timestamp?: string; turnId?: string },
   ): Promise<AgentTimelineRow>;
   fetchCommitted(
     agentId: string,
