@@ -9,6 +9,7 @@ import { createTestLogger } from "../../test-utils/test-logger.js";
 import {
   AgentManager,
   AgentManagerShuttingDownError,
+  ManagedWorktreeWriterConflictError,
   commandMayHaveChangedExternalState,
   type AgentManagerEvent,
   type ManagedAgent,
@@ -41,6 +42,10 @@ import type {
 } from "./agent-sdk-types.js";
 import type { PaseoToolCatalog } from "./tools/types.js";
 import type { ProviderDefinition } from "./provider-registry.js";
+import {
+  createPersistedWorkspaceRecord,
+  type PersistedWorkspaceRecord,
+} from "../workspace-registry.js";
 
 interface Deferred<T> {
   promise: Promise<T>;
@@ -9134,4 +9139,323 @@ test("onWorkspaceStateMayHaveChanged is not called for running shell tool calls"
   await manager.runAgent(snapshot.id, { text: "merge it" });
 
   expect(onWorkspaceStateMayHaveChanged).not.toHaveBeenCalled();
+});
+
+const MANAGED_WRITER_AGENT_IDS = [
+  "00000000-0000-4000-8000-000000001001",
+  "00000000-0000-4000-8000-000000001002",
+  "00000000-0000-4000-8000-000000001003",
+  "00000000-0000-4000-8000-000000001004",
+] as const;
+
+class ManagedWriterTestClient extends TestAgentClient {
+  readonly sessions: TestAgentSession[] = [];
+  createCalls = 0;
+  importCalls = 0;
+  private readonly firstCreateStarted = deferred<void>();
+  private readonly firstCreateAllowed = deferred<void>();
+
+  constructor(private readonly holdFirstCreate = false) {
+    super();
+  }
+
+  override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+    this.createCalls += 1;
+    if (this.createCalls === 1) {
+      this.firstCreateStarted.resolve();
+      if (this.holdFirstCreate) {
+        await this.firstCreateAllowed.promise;
+      }
+    }
+    const session = (await super.createSession(config)) as TestAgentSession;
+    this.sessions.push(session);
+    return session;
+  }
+
+  async importSession(input: ImportProviderSessionInput, context: ImportProviderSessionContext) {
+    this.importCalls += 1;
+    const session = new TestAgentSession(context.storedConfig);
+    this.sessions.push(session);
+    return {
+      session,
+      config: context.storedConfig,
+      persistence: {
+        provider: "codex" as const,
+        sessionId: input.providerHandleId,
+      },
+      timeline: [],
+    };
+  }
+
+  waitForFirstCreate(): Promise<void> {
+    return this.firstCreateStarted.promise;
+  }
+
+  allowFirstCreate(): void {
+    this.firstCreateAllowed.resolve();
+  }
+}
+
+function createManagedWriterWorkspace(cwd: string): PersistedWorkspaceRecord {
+  return createPersistedWorkspaceRecord({
+    workspaceId: "wks_managed_writer",
+    projectId: "prj_managed_writer",
+    cwd,
+    kind: "worktree",
+    displayName: "managed-writer",
+    worktreeRoot: cwd,
+    isPaseoOwnedWorktree: true,
+    mainRepoRoot: join(cwd, "..", "main"),
+    createdAt: "2026-08-01T00:00:00.000Z",
+    updatedAt: "2026-08-01T00:00:00.000Z",
+  });
+}
+
+function createManagedWriterManager(input: {
+  cwd: string;
+  storage: AgentStorage;
+  client: ManagedWriterTestClient;
+  agentIds?: readonly string[];
+}): AgentManager {
+  const agentIds = [...(input.agentIds ?? MANAGED_WRITER_AGENT_IDS)];
+  const workspace = createManagedWriterWorkspace(input.cwd);
+  return new AgentManager({
+    clients: { codex: input.client },
+    registry: input.storage,
+    workspaceRegistry: { list: async () => [workspace] },
+    idFactory: () => {
+      const agentId = agentIds.shift();
+      if (!agentId) throw new Error("Managed writer test exhausted agent IDs");
+      return agentId;
+    },
+    logger,
+  });
+}
+
+function createManagedWriterAgent(manager: AgentManager, cwd: string): Promise<ManagedAgent> {
+  return manager.createAgent({ provider: "codex", cwd }, undefined, {
+    workspaceId: "wks_managed_writer",
+  });
+}
+
+test("managed worktree writer fence serializes concurrent creates before provider launch", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "managed-writer-concurrent-"));
+  try {
+    const client = new ManagedWriterTestClient(true);
+    const manager = createManagedWriterManager({
+      cwd: workdir,
+      storage: new AgentStorage(join(workdir, "agents"), logger),
+      client,
+    });
+
+    const first = createManagedWriterAgent(manager, workdir);
+    await client.waitForFirstCreate();
+    const second = createManagedWriterAgent(manager, workdir);
+    await Promise.resolve();
+    expect(client.createCalls).toBe(1);
+
+    client.allowFirstCreate();
+    await first;
+    await expect(second).rejects.toBeInstanceOf(ManagedWorktreeWriterConflictError);
+    expect(client.createCalls).toBe(1);
+  } finally {
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("managed worktree writer fence keeps an idle agent as owner", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "managed-writer-idle-"));
+  try {
+    const client = new ManagedWriterTestClient();
+    const manager = createManagedWriterManager({
+      cwd: workdir,
+      storage: new AgentStorage(join(workdir, "agents"), logger),
+      client,
+    });
+    const owner = await createManagedWriterAgent(manager, workdir);
+
+    await expect(createManagedWriterAgent(manager, workdir)).rejects.toMatchObject({
+      code: "managed_worktree_writer_conflict",
+      ownerAgentId: owner.id,
+      ownerWorkspaceId: "wks_managed_writer",
+      requestedWorkspaceId: "wks_managed_writer",
+      worktreeRoot: workdir,
+    });
+    expect(client.createCalls).toBe(1);
+  } finally {
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("managed worktree writer fence permits same-agent same-session recovery", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "managed-writer-recovery-"));
+  try {
+    const storagePath = join(workdir, "agents");
+    const firstClient = new ManagedWriterTestClient();
+    const firstManager = createManagedWriterManager({
+      cwd: workdir,
+      storage: new AgentStorage(storagePath, logger),
+      client: firstClient,
+    });
+    const owner = await createManagedWriterAgent(firstManager, workdir);
+    expect(owner.persistence).not.toBeNull();
+
+    const recoveryClient = new ManagedWriterTestClient();
+    const recoveryManager = createManagedWriterManager({
+      cwd: workdir,
+      storage: new AgentStorage(storagePath, logger),
+      client: recoveryClient,
+    });
+    const recovered = await recoveryManager.resumeAgentFromPersistence(
+      owner.persistence!,
+      { cwd: workdir },
+      owner.id,
+      { workspaceId: "wks_managed_writer" },
+    );
+
+    expect(recovered.id).toBe(owner.id);
+    expect(recoveryClient.resumeOverrides).toHaveLength(1);
+  } finally {
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("managed worktree writer fence leaves provider-native children on the owning root", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "managed-writer-provider-child-"));
+  try {
+    const client = new ManagedWriterTestClient();
+    const manager = createManagedWriterManager({
+      cwd: workdir,
+      storage: new AgentStorage(join(workdir, "agents"), logger),
+      client,
+    });
+    const owner = await createManagedWriterAgent(manager, workdir);
+    const childPublished = new Promise<void>((resolve) => {
+      const unsubscribe = manager.subscribe((event) => {
+        if (
+          event.type === "provider_subagent" &&
+          event.event.type === "upsert" &&
+          event.event.subagent.id === "provider-child"
+        ) {
+          unsubscribe();
+          resolve();
+        }
+      });
+    });
+
+    client.sessions[0].pushEvent({
+      type: "provider_subagent",
+      provider: "codex",
+      event: {
+        type: "upsert",
+        id: "provider-child",
+        title: "Provider child with parentID",
+        status: "running",
+      },
+    });
+    await childPublished;
+
+    expect(manager.listProviderSubagents(owner.id)).toMatchObject([
+      { id: "provider-child", status: "running" },
+    ]);
+    expect(client.createCalls).toBe(1);
+  } finally {
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("managed worktree writer fence transfers ownership after close", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "managed-writer-release-"));
+  try {
+    const client = new ManagedWriterTestClient();
+    const manager = createManagedWriterManager({
+      cwd: workdir,
+      storage: new AgentStorage(join(workdir, "agents"), logger),
+      client,
+    });
+    const owner = await createManagedWriterAgent(manager, workdir);
+    await manager.closeAgent(owner.id);
+
+    const successor = await createManagedWriterAgent(manager, workdir);
+
+    expect(successor.id).not.toBe(owner.id);
+    expect(client.createCalls).toBe(2);
+  } finally {
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("managed worktree writer fence reconstructs an active owner after daemon restart", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "managed-writer-restart-"));
+  try {
+    const storagePath = join(workdir, "agents");
+    const firstManager = createManagedWriterManager({
+      cwd: workdir,
+      storage: new AgentStorage(storagePath, logger),
+      client: new ManagedWriterTestClient(),
+    });
+    const owner = await createManagedWriterAgent(firstManager, workdir);
+
+    const contenderClient = new ManagedWriterTestClient();
+    const restartedManager = createManagedWriterManager({
+      cwd: workdir,
+      storage: new AgentStorage(storagePath, logger),
+      client: contenderClient,
+    });
+
+    await expect(createManagedWriterAgent(restartedManager, workdir)).rejects.toMatchObject({
+      ownerAgentId: owner.id,
+    });
+    expect(contenderClient.createCalls).toBe(0);
+  } finally {
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("managed worktree writer fence rejects create, resume, and import before provider calls", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "managed-writer-side-effects-"));
+  try {
+    const storagePath = join(workdir, "agents");
+    const ownerManager = createManagedWriterManager({
+      cwd: workdir,
+      storage: new AgentStorage(storagePath, logger),
+      client: new ManagedWriterTestClient(),
+    });
+    await createManagedWriterAgent(ownerManager, workdir);
+
+    const contenderClient = new ManagedWriterTestClient();
+    const contenderManager = createManagedWriterManager({
+      cwd: workdir,
+      storage: new AgentStorage(storagePath, logger),
+      client: contenderClient,
+      agentIds: MANAGED_WRITER_AGENT_IDS.slice(1),
+    });
+    const conflict = ManagedWorktreeWriterConflictError;
+
+    await expect(createManagedWriterAgent(contenderManager, workdir)).rejects.toBeInstanceOf(
+      conflict,
+    );
+    await expect(
+      contenderManager.resumeAgentFromPersistence(
+        { provider: "codex", sessionId: "different-provider-session" },
+        { cwd: workdir },
+        MANAGED_WRITER_AGENT_IDS[2],
+        { workspaceId: "wks_managed_writer" },
+      ),
+    ).rejects.toBeInstanceOf(conflict);
+    await expect(
+      contenderManager.importProviderSession({
+        provider: "codex",
+        providerHandleId: "imported-provider-session",
+        cwd: workdir,
+        workspaceId: "wks_managed_writer",
+      }),
+    ).rejects.toBeInstanceOf(conflict);
+
+    expect(contenderClient.createCalls).toBe(0);
+    expect(contenderClient.resumeOverrides).toHaveLength(0);
+    expect(contenderClient.importCalls).toBe(0);
+  } finally {
+    rmSync(workdir, { recursive: true, force: true });
+  }
 });

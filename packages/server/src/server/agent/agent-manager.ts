@@ -13,6 +13,8 @@ import {
 import type { Logger } from "pino";
 import { z } from "zod";
 import type { TerminalManager } from "../../terminal/terminal-manager.js";
+import { isRealpathInsideRoot, normalizePathForIdentity } from "../../utils/path.js";
+import type { WorkspaceRegistry } from "../workspace-registry.js";
 
 import {
   getAgentStreamEventTurnId,
@@ -109,6 +111,23 @@ export class AgentRunCancellationError extends Error {
       `Cannot ${action} agent ${agentId} because its active run cancellation was not acknowledged`,
     );
     this.name = "AgentRunCancellationError";
+  }
+}
+
+export class ManagedWorktreeWriterConflictError extends Error {
+  readonly code = "managed_worktree_writer_conflict";
+
+  constructor(
+    readonly ownerAgentId: string,
+    readonly ownerWorkspaceId: string,
+    readonly requestedWorkspaceId: string,
+    readonly worktreeRoot: string,
+  ) {
+    super(
+      `Managed worktree ${worktreeRoot} is already owned by agent ${ownerAgentId} ` +
+        `in workspace ${ownerWorkspaceId}; requested workspace ${requestedWorkspaceId}`,
+    );
+    this.name = "ManagedWorktreeWriterConflictError";
   }
 }
 
@@ -240,6 +259,32 @@ interface ProviderEnabledFlag {
 type ProviderEnabledMap = Partial<Record<AgentProvider, ProviderEnabledFlag>>;
 type ProviderClientMap = Partial<Record<AgentProvider, AgentClient>>;
 
+interface ManagedWorktreeWriterCandidate {
+  agentId: string;
+  cwd: string;
+  workspaceId?: string;
+  providerSession?: {
+    provider: string;
+    sessionId: string;
+  } | null;
+}
+
+interface ManagedWorktreeWriterScope {
+  key: string;
+  worktreeRoot: string;
+  workspaceId: string;
+  workspaceIds: Set<string>;
+}
+
+interface ManagedWorktreeWriterOwner {
+  agentId: string;
+  workspaceId: string;
+  providerSession?: {
+    provider: string;
+    sessionId: string;
+  } | null;
+}
+
 export interface CreateAgentOptions {
   labels?: Record<string, string>;
   initialPrompt?: string;
@@ -257,6 +302,7 @@ export interface AgentManagerOptions {
   providerDefinitions?: ProviderEnabledMap;
   idFactory?: () => string;
   registry?: AgentStorage;
+  workspaceRegistry?: Pick<WorkspaceRegistry, "list">;
   onAgentAttention?: AgentAttentionCallback;
   onWorkspaceStateMayHaveChanged?: (params: { cwd: string }) => void;
   durableTimelineStore?: AgentTimelineStore;
@@ -582,6 +628,8 @@ export class AgentManager {
   private readonly subscribers = new Set<SubscriptionRecord>();
   private readonly idFactory: () => string;
   private readonly registry?: AgentStorage;
+  private readonly workspaceRegistry?: Pick<WorkspaceRegistry, "list">;
+  private readonly managedWorktreeWriterTasks = new Map<string, Promise<unknown>>();
   private readonly durableTimelineStore?: AgentTimelineStore;
   private readonly previousStatuses = new Map<string, AgentLifecycleStatus>();
   private readonly backgroundTasks = new Set<Promise<void>>();
@@ -606,6 +654,7 @@ export class AgentManager {
   constructor(options: AgentManagerOptions) {
     this.idFactory = options?.idFactory ?? (() => randomUUID());
     this.registry = options?.registry;
+    this.workspaceRegistry = options?.workspaceRegistry;
     this.durableTimelineStore = options?.durableTimelineStore;
     this.onAgentAttention = options?.onAgentAttention;
     this.onWorkspaceStateMayHaveChanged = options?.onWorkspaceStateMayHaveChanged;
@@ -1086,7 +1135,6 @@ export class AgentManager {
   ): Promise<ManagedAgent> {
     this.assertAcceptingAgentRegistrations();
     const resolvedAgentId = validateAgentId(agentId ?? this.idFactory(), "createAgent");
-    await this.deleteAgentState(resolvedAgentId);
     const { storedConfig, launchConfig } = await this.prepareSessionConfig(
       config,
       resolvedAgentId,
@@ -1104,15 +1152,187 @@ export class AgentManager {
     );
     const providerLaunchConfig = this.resolveProviderLaunchConfig(launchConfig, launchContext);
     const createOptions = this.buildCreateSessionOptions(options);
-    const session = await client.createSession(providerLaunchConfig, launchContext, createOptions);
-    this.trackStartedAgentRuntime(session, reservation);
-    return this.registerSession(session, storedConfig, resolvedAgentId, {
-      labels: options.labels,
-      initialTitle: options.initialTitle,
-      workspaceId: options.workspaceId,
-      owner: options.owner,
-      autoArchiveObligation: options.autoArchiveObligation,
-    });
+    return this.withManagedWorktreeWriter(
+      {
+        agentId: resolvedAgentId,
+        cwd: storedConfig.cwd,
+        workspaceId: options.workspaceId,
+      },
+      async () => {
+        await this.deleteAgentState(resolvedAgentId);
+        const session = await client.createSession(
+          providerLaunchConfig,
+          launchContext,
+          createOptions,
+        );
+        this.trackStartedAgentRuntime(session, reservation);
+        return this.registerSession(session, storedConfig, resolvedAgentId, {
+          labels: options.labels,
+          initialTitle: options.initialTitle,
+          workspaceId: options.workspaceId,
+          owner: options.owner,
+          autoArchiveObligation: options.autoArchiveObligation,
+        });
+      },
+    );
+  }
+
+  private async withManagedWorktreeWriter<T>(
+    candidate: ManagedWorktreeWriterCandidate,
+    operation: () => Promise<T>,
+  ): Promise<T> {
+    const scope = await this.resolveManagedWorktreeWriterScope(candidate);
+    if (!scope) {
+      return operation();
+    }
+
+    const previous = this.managedWorktreeWriterTasks.get(scope.key) ?? Promise.resolve();
+    const current = previous
+      .catch(() => undefined)
+      .then(async () => {
+        await this.assertManagedWorktreeWriterAvailable(scope, candidate);
+        return operation();
+      });
+    this.managedWorktreeWriterTasks.set(scope.key, current);
+    try {
+      return await current;
+    } finally {
+      if (this.managedWorktreeWriterTasks.get(scope.key) === current) {
+        this.managedWorktreeWriterTasks.delete(scope.key);
+      }
+    }
+  }
+
+  private async resolveManagedWorktreeWriterScope(
+    candidate: ManagedWorktreeWriterCandidate,
+  ): Promise<ManagedWorktreeWriterScope | null> {
+    const workspaces = await this.workspaceRegistry?.list();
+    if (!workspaces) {
+      return null;
+    }
+    const managedWorkspaces = workspaces.filter((workspace) => workspace.isPaseoOwnedWorktree);
+    const requestedWorkspace = candidate.workspaceId
+      ? managedWorkspaces.find((workspace) => workspace.workspaceId === candidate.workspaceId)
+      : undefined;
+    const workspace =
+      requestedWorkspace ??
+      managedWorkspaces
+        .filter((entry) => isRealpathInsideRoot(entry.worktreeRoot ?? entry.cwd, candidate.cwd))
+        .sort(
+          (left, right) =>
+            (right.worktreeRoot ?? right.cwd).length - (left.worktreeRoot ?? left.cwd).length,
+        )[0];
+    if (!workspace) {
+      return null;
+    }
+
+    const worktreeRoot = workspace.worktreeRoot ?? workspace.cwd;
+    const key = normalizePathForIdentity(worktreeRoot);
+    return {
+      key,
+      worktreeRoot,
+      workspaceId: workspace.workspaceId,
+      workspaceIds: new Set(
+        managedWorkspaces
+          .filter((entry) => normalizePathForIdentity(entry.worktreeRoot ?? entry.cwd) === key)
+          .map((entry) => entry.workspaceId),
+      ),
+    };
+  }
+
+  private async assertManagedWorktreeWriterAvailable(
+    scope: ManagedWorktreeWriterScope,
+    candidate: ManagedWorktreeWriterCandidate,
+  ): Promise<void> {
+    const liveOwner = Array.from(this.agents.values()).find(
+      (agent) =>
+        this.agentOwnsManagedWorktree(agent, scope) &&
+        !this.isSameManagedWorktreeWriter(
+          {
+            agentId: agent.id,
+            workspaceId: agent.workspaceId ?? scope.workspaceId,
+            providerSession: agent.persistence,
+          },
+          candidate,
+        ),
+    );
+    if (liveOwner) {
+      throw new ManagedWorktreeWriterConflictError(
+        liveOwner.id,
+        liveOwner.workspaceId ?? scope.workspaceId,
+        scope.workspaceId,
+        scope.worktreeRoot,
+      );
+    }
+
+    const records = await this.registry?.list();
+    const storedOwner = records?.find(
+      (record) =>
+        !record.archivedAt &&
+        record.lastStatus !== "closed" &&
+        this.agentOwnsManagedWorktree(record, scope) &&
+        !this.isSameManagedWorktreeWriter(
+          {
+            agentId: record.id,
+            workspaceId: record.workspaceId ?? scope.workspaceId,
+            providerSession: record.persistence,
+          },
+          candidate,
+        ),
+    );
+    if (storedOwner) {
+      throw new ManagedWorktreeWriterConflictError(
+        storedOwner.id,
+        storedOwner.workspaceId ?? scope.workspaceId,
+        scope.workspaceId,
+        scope.worktreeRoot,
+      );
+    }
+  }
+
+  private agentOwnsManagedWorktree(
+    agent: Pick<ManagedAgent, "cwd" | "workspaceId">,
+    scope: ManagedWorktreeWriterScope,
+  ): boolean {
+    return (
+      (agent.workspaceId !== undefined && scope.workspaceIds.has(agent.workspaceId)) ||
+      isRealpathInsideRoot(scope.worktreeRoot, agent.cwd)
+    );
+  }
+
+  private isSameManagedWorktreeWriter(
+    owner: ManagedWorktreeWriterOwner,
+    candidate: ManagedWorktreeWriterCandidate,
+  ): boolean {
+    if (owner.agentId !== candidate.agentId) {
+      return false;
+    }
+    if (!owner.providerSession || !candidate.providerSession) {
+      return !owner.providerSession && !candidate.providerSession;
+    }
+    return (
+      owner.providerSession.provider === candidate.providerSession.provider &&
+      owner.providerSession.sessionId === candidate.providerSession.sessionId
+    );
+  }
+
+  private buildManagedWorktreeWriterCandidate(input: {
+    agentId: string;
+    cwd: string;
+    workspaceId?: string;
+    persistence?: AgentPersistenceHandle | null;
+  }): ManagedWorktreeWriterCandidate {
+    return {
+      agentId: input.agentId,
+      cwd: input.cwd,
+      workspaceId: input.workspaceId,
+      providerSession: input.persistence
+        ? {
+            provider: input.persistence.provider,
+            sessionId: input.persistence.sessionId,
+          }
+        : null,
+    };
   }
 
   private buildCreateSessionOptions(options?: {
@@ -1195,17 +1415,40 @@ export class AgentManager {
     }
     const launchContext = await this.buildLaunchContext(resolvedAgentId, client, storedConfig.cwd);
     const providerLaunchConfig = this.resolveProviderLaunchConfig(launchConfig, launchContext);
-    const session = await client.resumeSession(
-      handle,
-      providerLaunchConfig,
-      launchContext,
-      resumeOptions,
+    if (resumeOptions?.purpose === "history") {
+      const session = await client.resumeSession(
+        handle,
+        providerLaunchConfig,
+        launchContext,
+        resumeOptions,
+      );
+      this.trackStartedAgentRuntime(session, reservation);
+      return this.registerSession(session, storedConfig, resolvedAgentId, {
+        ...options,
+        persistence: handle,
+      });
+    }
+    return this.withManagedWorktreeWriter(
+      this.buildManagedWorktreeWriterCandidate({
+        agentId: resolvedAgentId,
+        cwd: storedConfig.cwd,
+        workspaceId: options?.workspaceId,
+        persistence: handle,
+      }),
+      async () => {
+        const session = await client.resumeSession(
+          handle,
+          providerLaunchConfig,
+          launchContext,
+          resumeOptions,
+        );
+        this.trackStartedAgentRuntime(session, reservation);
+        return this.registerSession(session, storedConfig, resolvedAgentId, {
+          ...options,
+          persistence: handle,
+        });
+      },
     );
-    this.trackStartedAgentRuntime(session, reservation);
-    return this.registerSession(session, storedConfig, resolvedAgentId, {
-      ...options,
-      persistence: handle,
-    });
   }
 
   importProviderSession(input: {
@@ -1249,43 +1492,57 @@ export class AgentManager {
     );
     const launchContext = await this.buildLaunchContext(resolvedAgentId, client, storedConfig.cwd);
     const providerLaunchConfig = this.resolveProviderLaunchConfig(launchConfig, launchContext);
-    const imported = await client.importSession(
+    return this.withManagedWorktreeWriter(
       {
-        providerHandleId: input.providerHandleId,
-        cwd: input.cwd,
-      },
-      { config: providerLaunchConfig, storedConfig, launchContext },
-    );
-    this.trackStartedAgentRuntime(imported.session, reservation);
-    let handedToRegistration = false;
-    try {
-      const importedConfig = await this.normalizeConfig(
-        stripInternalPaseoMcpServer(imported.config),
-      );
-      const timelineRows = buildImportedTimelineRows(imported.timeline);
-      const initialTitle = resolveImportedAgentTitle(importedConfig, timelineRows);
-
-      handedToRegistration = true;
-      const agent = await this.registerSession(imported.session, importedConfig, resolvedAgentId, {
-        labels: input.labels,
+        agentId: resolvedAgentId,
+        cwd: storedConfig.cwd,
         workspaceId: input.workspaceId,
-        timelineRows,
-        timelineNextSeq: timelineRows.length + 1,
-        persistence: imported.persistence,
-        historyPrimed: true,
-        initialTitle,
-        publishWhenReady: true,
-      });
-      for (const event of imported.providerSubagentEvents ?? []) {
-        const update = this.providerSubagents.apply(agent.id, event.provider, event.event);
-        this.dispatch({ type: "provider_subagent", event: update });
-      }
-      return agent;
-    } finally {
-      if (!handedToRegistration) {
-        await this.closeUnregisteredSession(imported.session);
-      }
-    }
+      },
+      async () => {
+        const imported = await client.importSession!(
+          {
+            providerHandleId: input.providerHandleId,
+            cwd: input.cwd,
+          },
+          { config: providerLaunchConfig, storedConfig, launchContext },
+        );
+        this.trackStartedAgentRuntime(imported.session, reservation);
+        let handedToRegistration = false;
+        try {
+          const importedConfig = await this.normalizeConfig(
+            stripInternalPaseoMcpServer(imported.config),
+          );
+          const timelineRows = buildImportedTimelineRows(imported.timeline);
+          const initialTitle = resolveImportedAgentTitle(importedConfig, timelineRows);
+
+          handedToRegistration = true;
+          const agent = await this.registerSession(
+            imported.session,
+            importedConfig,
+            resolvedAgentId,
+            {
+              labels: input.labels,
+              workspaceId: input.workspaceId,
+              timelineRows,
+              timelineNextSeq: timelineRows.length + 1,
+              persistence: imported.persistence,
+              historyPrimed: true,
+              initialTitle,
+              publishWhenReady: true,
+            },
+          );
+          for (const event of imported.providerSubagentEvents ?? []) {
+            const update = this.providerSubagents.apply(agent.id, event.provider, event.event);
+            this.dispatch({ type: "provider_subagent", event: update });
+          }
+          return agent;
+        } finally {
+          if (!handedToRegistration) {
+            await this.closeUnregisteredSession(imported.session);
+          }
+        }
+      },
+    );
   }
 
   // Hot-reload an active agent session with config overrides. By default the
@@ -1335,52 +1592,62 @@ export class AgentManager {
     const launchContext = await this.buildLaunchContext(agentId, client, storedConfig.cwd);
     const providerLaunchConfig = this.resolveProviderLaunchConfig(launchConfig, launchContext);
 
-    const session = handle
-      ? await client.resumeSession(handle, providerLaunchConfig, launchContext)
-      : await client.createSession(providerLaunchConfig, launchContext);
-    this.trackStartedAgentRuntime(session, reservation);
-
-    let handedToRegistration = false;
-    try {
-      this.assertAcceptingAgentRegistrations();
-
-      const closedExisting = this.prepareAgentForClosure(existing, "agent reloaded");
-      try {
-        await this.persistSnapshot(closedExisting);
-      } finally {
-        await this.closeReloadedSession(existing.session, agentId);
-      }
-
-      if (rehydrateFromDisk) {
-        // Wipe both durable and in-memory timeline so registerSession mints a
-        // new epoch and hydrateTimelineFromProvider re-streams the freshly read
-        // provider history into an empty timeline.
-        await this.deleteCommittedTimeline(agentId);
-        this.timelineStore.delete(agentId);
-        for (const event of this.providerSubagents.deleteParent(agentId)) {
-          this.dispatch({ type: "provider_subagent", event });
-        }
-      }
-
-      // Preserve existing labels and timeline during reload.
-      handedToRegistration = true;
-      return this.registerSession(session, storedConfig, agentId, {
-        labels: existing.labels,
+    return this.withManagedWorktreeWriter(
+      this.buildManagedWorktreeWriterCandidate({
+        agentId,
+        cwd: storedConfig.cwd,
         workspaceId: existing.workspaceId,
-        owner: existing.owner,
-        createdAt: existing.createdAt,
-        updatedAt: existing.updatedAt,
-        lastUserMessageAt: existing.lastUserMessageAt,
-        historyPrimed: rehydrateFromDisk ? false : preservedHistoryPrimed,
-        lastUsage: preservedLastUsage,
-        lastError: preservedLastError,
-        attention: preservedAttention,
-      });
-    } finally {
-      if (!handedToRegistration) {
-        await this.closeUnregisteredSession(session);
-      }
-    }
+        persistence: handle,
+      }),
+      async () => {
+        const session = handle
+          ? await client.resumeSession(handle, providerLaunchConfig, launchContext)
+          : await client.createSession(providerLaunchConfig, launchContext);
+        this.trackStartedAgentRuntime(session, reservation);
+
+        let handedToRegistration = false;
+        try {
+          this.assertAcceptingAgentRegistrations();
+
+          const closedExisting = this.prepareAgentForClosure(existing, "agent reloaded");
+          try {
+            await this.persistSnapshot(closedExisting);
+          } finally {
+            await this.closeReloadedSession(existing.session, agentId);
+          }
+
+          if (rehydrateFromDisk) {
+            // Wipe both durable and in-memory timeline so registerSession mints a
+            // new epoch and hydrateTimelineFromProvider re-streams the freshly read
+            // provider history into an empty timeline.
+            await this.deleteCommittedTimeline(agentId);
+            this.timelineStore.delete(agentId);
+            for (const event of this.providerSubagents.deleteParent(agentId)) {
+              this.dispatch({ type: "provider_subagent", event });
+            }
+          }
+
+          // Preserve existing labels and timeline during reload.
+          handedToRegistration = true;
+          return this.registerSession(session, storedConfig, agentId, {
+            labels: existing.labels,
+            workspaceId: existing.workspaceId,
+            owner: existing.owner,
+            createdAt: existing.createdAt,
+            updatedAt: existing.updatedAt,
+            lastUserMessageAt: existing.lastUserMessageAt,
+            historyPrimed: rehydrateFromDisk ? false : preservedHistoryPrimed,
+            lastUsage: preservedLastUsage,
+            lastError: preservedLastError,
+            attention: preservedAttention,
+          });
+        } finally {
+          if (!handedToRegistration) {
+            await this.closeUnregisteredSession(session);
+          }
+        }
+      },
+    );
   }
 
   private async closeReloadedSession(session: AgentSession, agentId: string): Promise<void> {
