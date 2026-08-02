@@ -6,6 +6,7 @@ import {
   createWorktree as createWorktreePrimitive,
   deriveWorktreeProjectHash,
   deletePaseoWorktree,
+  getPaseoWorktreeCleanupCompletedMarkerPath,
   getPaseoWorktreeCleanupMarkerPath,
   getPaseoWorktreeCleanupQuarantinePath,
   InvalidGitBranchNameError,
@@ -42,9 +43,10 @@ import {
   statSync,
   writeFileSync,
   readFileSync,
+  readdirSync,
   chmodSync,
 } from "fs";
-import { delimiter, dirname, join } from "path";
+import { basename, delimiter, dirname, join } from "path";
 import { tmpdir } from "os";
 import net from "node:net";
 
@@ -1433,8 +1435,146 @@ describe.skipIf(isPlatform("win32"))("worktree POSIX-only", () => {
         expectedQuarantineMarker: quarantineMarker,
       });
 
-      expect(existsSync(quarantinePath)).toBe(false);
+      const completedMarkerPath = getPaseoWorktreeCleanupCompletedMarkerPath(
+        quarantinePath,
+        quarantineMarker,
+      );
+      expect(existsSync(quarantinePath)).toBe(true);
+      expect(existsSync(completedMarkerPath)).toBe(true);
+      expect(readdirSync(quarantinePath)).toEqual([basename(completedMarkerPath)]);
     });
+
+    it.each([
+      ["before-marker-removal", "active"],
+      ["after-marker-removal", "completed"],
+      ["before-completion-acknowledgement", "completed"],
+    ] as const)(
+      "recovers the authenticated tombstone after a %s crash",
+      async (cleanupFaultPoint, expectedMarkerState) => {
+        const created = await createLegacyWorktreeForTest({
+          branchName: `cleanup-fault-${cleanupFaultPoint}`,
+          cwd: repoDir,
+          baseBranch: "main",
+          worktreeSlug: `cleanup-fault-${cleanupFaultPoint}`,
+          paseoHome,
+        });
+        const incarnationId = readPaseoWorktreeIncarnationId(created.worktreePath)!;
+        const quarantineMarker = {
+          "before-marker-removal": "00000000-0000-4000-8000-000000000052",
+          "after-marker-removal": "00000000-0000-4000-8000-000000000053",
+          "before-completion-acknowledgement": "00000000-0000-4000-8000-000000000054",
+        }[cleanupFaultPoint];
+        const quarantinePath = getPaseoWorktreeCleanupQuarantinePath(
+          created.worktreePath,
+          incarnationId,
+        );
+
+        await expect(
+          deletePaseoWorktree({
+            cwd: repoDir,
+            worktreePath: created.worktreePath,
+            teardownCwds: [],
+            paseoHome,
+            expectedWorktreeIncarnationId: incarnationId,
+            expectedQuarantineMarker: quarantineMarker,
+            cleanupFaultPoint,
+          }),
+        ).rejects.toThrow("Worktree cleanup remains");
+
+        const expectedMarkerPath =
+          expectedMarkerState === "active"
+            ? getPaseoWorktreeCleanupMarkerPath(quarantinePath, quarantineMarker)
+            : getPaseoWorktreeCleanupCompletedMarkerPath(quarantinePath, quarantineMarker);
+        expect(readdirSync(quarantinePath)).toEqual([basename(expectedMarkerPath)]);
+
+        await expect(
+          deletePaseoWorktree({
+            cwd: repoDir,
+            worktreePath: created.worktreePath,
+            teardownCwds: [],
+            paseoHome,
+            expectedWorktreeIncarnationId: incarnationId,
+            expectedQuarantineMarker: quarantineMarker,
+          }),
+        ).resolves.toBeUndefined();
+        const completedMarkerPath = getPaseoWorktreeCleanupCompletedMarkerPath(
+          quarantinePath,
+          quarantineMarker,
+        );
+        expect(readdirSync(quarantinePath)).toEqual([basename(completedMarkerPath)]);
+      },
+    );
+
+    it.skipIf(process.platform !== "darwin")(
+      "does not cross a mounted filesystem while deleting quarantine contents",
+      async () => {
+        const created = await createLegacyWorktreeForTest({
+          branchName: "mounted-cleanup-boundary",
+          cwd: repoDir,
+          baseBranch: "main",
+          worktreeSlug: "mounted-cleanup-boundary",
+          paseoHome,
+        });
+        const incarnationId = readPaseoWorktreeIncarnationId(created.worktreePath)!;
+        const quarantineMarker = "00000000-0000-4000-8000-000000000055";
+        const quarantinePath = getPaseoWorktreeCleanupQuarantinePath(
+          created.worktreePath,
+          incarnationId,
+        );
+        const mountPoint = join(quarantinePath, "mounted-device");
+        const diskImagePath = join(tempDir, "cleanup-boundary.dmg");
+        mkdirSync(join(created.worktreePath, "mounted-device"));
+        execFileSync(
+          "hdiutil",
+          [
+            "create",
+            "-quiet",
+            "-size",
+            "8m",
+            "-fs",
+            "HFS+",
+            "-volname",
+            "PaseoCleanupBoundary",
+            diskImagePath,
+          ],
+          { stdio: "pipe" },
+        );
+        let mounted = false;
+
+        try {
+          await expect(
+            deletePaseoWorktree({
+              cwd: repoDir,
+              worktreePath: created.worktreePath,
+              teardownCwds: [],
+              paseoHome,
+              expectedWorktreeIncarnationId: incarnationId,
+              expectedQuarantineMarker: quarantineMarker,
+              onCleanupDirectoryPinned: () => {
+                if (mounted) return;
+                execFileSync(
+                  "hdiutil",
+                  ["attach", "-quiet", "-nobrowse", "-mountpoint", mountPoint, diskImagePath],
+                  { stdio: "pipe" },
+                );
+                mounted = true;
+                writeFileSync(join(mountPoint, "protected.txt"), "protected");
+              },
+            }),
+          ).rejects.toThrow("Worktree cleanup remains");
+
+          expect(readFileSync(join(mountPoint, "protected.txt"), "utf8")).toBe("protected");
+          expect(
+            existsSync(getPaseoWorktreeCleanupMarkerPath(quarantinePath, quarantineMarker)),
+          ).toBe(true);
+        } finally {
+          if (mounted) {
+            execFileSync("hdiutil", ["detach", "-quiet", mountPoint], { stdio: "pipe" });
+          }
+        }
+      },
+      20_000,
+    );
 
     it("refuses a same-name quarantine whose marker does not match", async () => {
       const created = await createLegacyWorktreeForTest({
@@ -1538,6 +1678,43 @@ describe.skipIf(isPlatform("win32"))("worktree POSIX-only", () => {
 
       expect(readFileSync(join(quarantinePath, "keep.txt"), "utf8")).toBe("replacement");
       expect(existsSync(displacedPath)).toBe(true);
+    });
+
+    it("does not remove an empty replacement installed after cleanup completes", async () => {
+      const created = await createLegacyWorktreeForTest({
+        branchName: "completed-empty-replacement-branch",
+        cwd: repoDir,
+        baseBranch: "main",
+        worktreeSlug: "completed-empty-replacement",
+        paseoHome,
+      });
+      const incarnationId = readPaseoWorktreeIncarnationId(created.worktreePath)!;
+      const quarantineMarker = "00000000-0000-4000-8000-000000000056";
+      const quarantinePath = getPaseoWorktreeCleanupQuarantinePath(
+        created.worktreePath,
+        incarnationId,
+      );
+      const displacedPath = `${quarantinePath}-displaced`;
+
+      await expect(
+        deletePaseoWorktree({
+          cwd: repoDir,
+          worktreePath: created.worktreePath,
+          teardownCwds: [],
+          paseoHome,
+          expectedWorktreeIncarnationId: incarnationId,
+          expectedQuarantineMarker: quarantineMarker,
+          onCleanupDirectoryCompleted: (completedPath) => {
+            renameSync(completedPath, displacedPath);
+            mkdirSync(completedPath);
+          },
+        }),
+      ).rejects.toThrow("Cleanup path identity changed");
+
+      expect(readdirSync(quarantinePath)).toEqual([]);
+      expect(
+        existsSync(getPaseoWorktreeCleanupCompletedMarkerPath(displacedPath, quarantineMarker)),
+      ).toBe(true);
     });
 
     it("does not follow a symlink installed after cleanup is pinned", async () => {

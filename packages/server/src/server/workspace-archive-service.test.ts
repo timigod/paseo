@@ -1,6 +1,7 @@
 import { execFileSync } from "node:child_process";
 import {
   existsSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -18,6 +19,8 @@ import type { ForgeService } from "../services/forge-service.js";
 import { createRealpathAwarePathMatcher } from "../utils/path.js";
 import {
   createWorktree,
+  deletePaseoWorktree,
+  getPaseoWorktreeCleanupCompletedMarkerPath,
   getPaseoWorktreeCleanupMarkerPath,
   getPaseoWorktreeCleanupQuarantinePath,
   type WorktreeConfig,
@@ -1295,10 +1298,13 @@ describe("archiveByScope", () => {
     });
 
     await service.start();
-    await vi.waitFor(async () => {
-      expect((await registry.get("ws-completed-schedule-root"))?.cleanupPending).toBeNull();
-      expect((await registry.get("ws-completed-schedule-nested"))?.cleanupPending).toBeNull();
-    });
+    await vi.waitFor(
+      async () => {
+        expect((await registry.get("ws-completed-schedule-root"))?.cleanupPending).toBeNull();
+        expect((await registry.get("ws-completed-schedule-nested"))?.cleanupPending).toBeNull();
+      },
+      { timeout: 10_000 },
+    );
     await service.stop();
 
     expect(readFileSync(path.join(repoDir, "retry-root.log"), "utf8")).toBe("root");
@@ -1404,6 +1410,20 @@ describe("archiveByScope", () => {
       mode: 0o600,
     });
     renameSync(original.worktreePath, quarantinePath);
+    await expect(
+      deletePaseoWorktree({
+        cwd: repoDir,
+        worktreePath: original.worktreePath,
+        teardownCwds: [],
+        paseoHome,
+        expectedWorktreeIncarnationId: incarnationId,
+        expectedQuarantineMarker: quarantineMarker,
+        cleanupFaultPoint: "before-completion-acknowledgement",
+      }),
+    ).rejects.toThrow("Worktree cleanup remains");
+    expect(
+      existsSync(getPaseoWorktreeCleanupCompletedMarkerPath(quarantinePath, quarantineMarker)),
+    ).toBe(true);
     execFileSync("git", ["worktree", "prune", "--expire=now"], { cwd: repoDir, stdio: "pipe" });
     execFileSync("git", ["branch", "-D", slug], { cwd: repoDir, stdio: "pipe" });
     const replacement = await createPaseoOwnedWorktree(repoDir, paseoHome, slug);
@@ -1476,7 +1496,10 @@ describe("archiveByScope", () => {
     });
 
     expect(result.removedDirectory).toBe(true);
-    expect(existsSync(quarantinePath)).toBe(false);
+    expect(existsSync(quarantinePath)).toBe(true);
+    expect(
+      existsSync(getPaseoWorktreeCleanupCompletedMarkerPath(quarantinePath, quarantineMarker)),
+    ).toBe(true);
     expect(existsSync(replacement.worktreePath)).toBe(true);
     expect((await registry.get(staleWorkspaceId))?.cleanupPending).toBeNull();
     expect((await registry.get(replacementWorkspaceId))?.archivedAt).toBeNull();
@@ -1538,7 +1561,10 @@ describe("archiveByScope", () => {
     });
 
     expect(result.removedDirectory).toBe(true);
-    expect(existsSync(quarantinePath)).toBe(false);
+    expect(existsSync(quarantinePath)).toBe(true);
+    expect(
+      existsSync(getPaseoWorktreeCleanupCompletedMarkerPath(quarantinePath, quarantineMarker)),
+    ).toBe(true);
     expect((await registry.get(workspaceId))?.cleanupPending).toBeNull();
   });
 
@@ -1656,6 +1682,64 @@ describe("archiveByScope", () => {
     expect((await registry.get(workspaceId))?.cleanupPending).not.toBeNull();
     expect(existsSync(worktree.worktreePath)).toBe(true);
   });
+
+  test.each([
+    ["identified", "dangling-incarnation", "00000000-0000-4000-8000-000000000057"],
+    ["legacy", null, null],
+  ] as const)(
+    "retry leaves a dangling symlink %s receipt pending",
+    async (_, incarnationId, marker) => {
+      const { tempDir } = createGitRepo();
+      const paseoHome = path.join(tempDir, ".paseo");
+      const danglingPath = path.join(paseoHome, "worktrees", "project", "dangling-worktree");
+      mkdirSync(path.dirname(danglingPath), { recursive: true });
+      symlinkSync(path.join(tempDir, "missing-target"), danglingPath, "dir");
+      const workspaceId = `ws-dangling-${incarnationId ?? "legacy"}`;
+      const registry = new FileBackedWorkspaceRegistry(
+        path.join(tempDir, "workspaces.json"),
+        createLogger(),
+      );
+      await registry.initialize();
+      const timestamp = new Date().toISOString();
+      await registry.upsert(
+        createPersistedWorkspaceRecord({
+          workspaceId,
+          projectId: "project-dangling-cleanup",
+          cwd: danglingPath,
+          kind: "worktree",
+          displayName: "Dangling cleanup",
+          worktreeRoot: danglingPath,
+          isPaseoOwnedWorktree: true,
+          mainRepoRoot: null,
+          createdAt: timestamp,
+          updatedAt: timestamp,
+          archivedAt: timestamp,
+          cleanupPending: {
+            directoryPath: danglingPath,
+            teardownCwd: danglingPath,
+            mainRepoRoot: null,
+            paseoWorktreesRoot: path.dirname(danglingPath),
+            worktreeIncarnationId: incarnationId,
+            quarantineMarker: marker,
+          },
+        }),
+      );
+      const deps = createArchiveDeps({ paseoHome, activeWorkspaces: [] });
+      deps.workspaceRegistry = registry;
+
+      const result = await retryPendingWorkspaceCleanup(deps, {
+        directoryPath: danglingPath,
+        worktreeIncarnationId: incarnationId,
+        quarantineMarker: marker,
+        requestId: `retry-dangling-${incarnationId ?? "legacy"}`,
+      });
+
+      expect(result.removedDirectory).toBe(false);
+      expect(result.cleanupPendingWorkspaceIds).toEqual([workspaceId]);
+      expect((await registry.get(workspaceId))?.cleanupPending).not.toBeNull();
+      expect(lstatSync(danglingPath).isSymbolicLink()).toBe(true);
+    },
+  );
 
   test("directory workspace creation waits for cleanup and revalidates after final owner read", async () => {
     const { tempDir, repoDir } = createGitRepo();

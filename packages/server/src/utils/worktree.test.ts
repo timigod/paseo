@@ -3,6 +3,8 @@ import {
   createWorktree as createWorktreePrimitive,
   deriveWorktreeProjectHash,
   deletePaseoWorktree,
+  getWorktreeCleanupFindArguments,
+  getWorktreeCleanupTraversalContract,
   getPaseoWorktreeCleanupMarkerPath,
   isPaseoOwnedWorktreeCwd,
   mapWorkspaceCwdToWorktree,
@@ -198,6 +200,61 @@ describe("paseo worktree manager", () => {
     expect(() => getPaseoWorktreeCleanupMarkerPath(repoDir, "../../outside")).toThrow(
       "Invalid cleanup quarantine marker",
     );
+  });
+
+  it("uses the BSD one-filesystem option before the search path", () => {
+    expect(getWorktreeCleanupTraversalContract("darwin")).toEqual({
+      kind: "posix-find",
+      boundaryArgument: "-x",
+    });
+    expect(
+      getWorktreeCleanupFindArguments("darwin", ".active-marker", ".completed-marker"),
+    ).toEqual([
+      "-P",
+      "-x",
+      ".",
+      "!",
+      "-path",
+      ".",
+      "!",
+      "-path",
+      "./.active-marker",
+      "!",
+      "-path",
+      "./.completed-marker",
+      "-delete",
+    ]);
+  });
+
+  it("uses the GNU one-filesystem expression after the search path", () => {
+    expect(getWorktreeCleanupTraversalContract("linux")).toEqual({
+      kind: "posix-find",
+      boundaryArgument: "-xdev",
+    });
+    expect(getWorktreeCleanupFindArguments("linux", ".active-marker", ".completed-marker")).toEqual(
+      [
+        "-P",
+        ".",
+        "-xdev",
+        "!",
+        "-path",
+        ".",
+        "!",
+        "-path",
+        "./.active-marker",
+        "!",
+        "-path",
+        "./.completed-marker",
+        "-delete",
+      ],
+    );
+  });
+
+  it("uses the device-checking native traversal on Windows", () => {
+    expect(getWorktreeCleanupTraversalContract("win32")).toEqual({ kind: "windows-native" });
+    expect(() =>
+      getWorktreeCleanupFindArguments("win32", ".active-marker", ".completed-marker"),
+    ).toThrow("POSIX cleanup traversal is unavailable on win32");
   });
 
   it("refuses to delete a worktree whose durable metadata is no longer readable", async () => {

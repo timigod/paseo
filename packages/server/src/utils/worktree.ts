@@ -8,7 +8,7 @@ import {
   unlinkSync,
   writeFileSync,
 } from "fs";
-import { copyFile, lstat, rename, rm, rmdir, stat, writeFile } from "fs/promises";
+import { copyFile, lstat, rename, stat, writeFile } from "fs/promises";
 import { join, basename, dirname, isAbsolute, resolve, sep } from "path";
 import { spawn } from "node:child_process";
 import net from "node:net";
@@ -47,7 +47,7 @@ import { createExternalProcessEnv } from "../server/paseo-env.js";
 import { parseGitRevParsePath, resolveGitRevParsePath } from "./git-rev-parse-path.js";
 import { validateBranchSlug } from "@getpaseo/protocol/branch-slug";
 import { expandTilde, getRealpathAwareRelativePath, isPathInsideRoot } from "./path.js";
-import { findExecutable } from "../executable-resolution/executable-resolution.js";
+import { findExecutable as findExecutableOnPath } from "../executable-resolution/executable-resolution.js";
 import {
   appendWorktreeSetupOutput,
   createWorktreeSetupOutputAccumulator,
@@ -61,6 +61,7 @@ const READ_ONLY_GIT_ENV = {
   GIT_OPTIONAL_LOCKS: "0",
 } as const;
 const WORKTREE_CLEANUP_MARKER_PREFIX = ".paseo-cleanup-marker-";
+const WORKTREE_CLEANUP_COMPLETED_MARKER_PREFIX = ".paseo-cleanup-completed-";
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const POSIX_CLEANUP_READY = "PASEO_CLEANUP_READY";
 const POSIX_CLEANUP_DONE = "PASEO_CLEANUP_DONE ";
@@ -71,9 +72,13 @@ const path = require("node:path");
 const { spawnSync } = require("node:child_process");
 
 const expectedIdentity = process.argv[1];
-const markerName = process.argv[2];
-const trustedParent = process.argv[3];
-const rmExecutable = process.argv[4];
+const activeMarkerName = process.argv[2];
+const completedMarkerName = process.argv[3];
+const trustedParent = process.argv[4];
+const traversalKind = process.argv[5];
+const findExecutable = process.argv[6];
+const findArguments = JSON.parse(process.argv[7]);
+const faultPoint = process.argv[8] || null;
 const pinnedPath = process.cwd();
 
 function fail(kind, message) {
@@ -81,7 +86,25 @@ function fail(kind, message) {
   process.exit(1);
 }
 
-function validatePinnedDirectory(requireMarker) {
+function markerIsFile(markerName) {
+  try {
+    return fs.lstatSync(markerName).isFile();
+  } catch (error) {
+    if (error && error.code === "ENOENT") return false;
+    throw error;
+  }
+}
+
+function readMarkerState() {
+  const hasActiveMarker = markerIsFile(activeMarkerName);
+  const hasCompletedMarker = markerIsFile(completedMarkerName);
+  if (hasActiveMarker === hasCompletedMarker) {
+    fail("AUTHORITY", "Pinned cleanup quarantine marker changed");
+  }
+  return hasActiveMarker ? "active" : "completed";
+}
+
+function validatePinnedDirectory() {
   if (path.dirname(pinnedPath) !== trustedParent) {
     fail("AUTHORITY", "Pinned cleanup directory left its trusted parent");
   }
@@ -90,12 +113,7 @@ function validatePinnedDirectory(requireMarker) {
   if (!stats.isDirectory() || identity !== expectedIdentity) {
     fail("AUTHORITY", "Pinned cleanup directory identity changed");
   }
-  if (requireMarker) {
-    const markerStats = fs.lstatSync(markerName);
-    if (!markerStats.isFile()) {
-      fail("AUTHORITY", "Pinned cleanup quarantine marker changed");
-    }
-  }
+  return readMarkerState();
 }
 
 function validateTrustedPath() {
@@ -114,36 +132,86 @@ function validateTrustedPath() {
   }
 }
 
-function removePinnedContents() {
-  validatePinnedDirectory(true);
-  validateTrustedPath();
-  for (let sweep = 0; sweep < 64; sweep += 1) {
-    validatePinnedDirectory(false);
-    validateTrustedPath();
-    const entries = fs.readdirSync(".");
-    if (entries.length === 0) {
-      validatePinnedDirectory(false);
-      validateTrustedPath();
-      process.stdout.write(${JSON.stringify(POSIX_CLEANUP_DONE)} + JSON.stringify(pinnedPath) + "\n");
-      process.exit(0);
-    }
-    entries.sort((left, right) => Number(left === markerName) - Number(right === markerName));
-    for (const entry of entries) {
-      const result = spawnSync(rmExecutable, ["-rf", "--", "./" + entry], {
-        cwd: ".",
-        encoding: "utf8",
-        stdio: ["ignore", "ignore", "pipe"],
-      });
-      if (result.error || result.status !== 0) {
-        const detail = result.error ? result.error.message : result.stderr.trim();
-        fail("REMOVE", detail || "POSIX removal helper failed");
-      }
-    }
-  }
-  fail("REMOVE", "Pinned cleanup directory did not become empty");
+function failAt(point) {
+  if (faultPoint !== point) return;
+  fail("FAULT", point);
 }
 
-validatePinnedDirectory(true);
+function removeWindowsEntry(entryPath, expectedDevice) {
+  const initialStats = fs.lstatSync(entryPath);
+  if (String(initialStats.dev) !== expectedDevice) {
+    fail("BOUNDARY", "Refusing to cross a filesystem boundary at " + entryPath);
+  }
+  if (initialStats.isSymbolicLink() || !initialStats.isDirectory()) {
+    fs.unlinkSync(entryPath);
+    return;
+  }
+  const expectedEntryIdentity = String(initialStats.dev) + ":" + String(initialStats.ino);
+  for (const childName of fs.readdirSync(entryPath)) {
+    removeWindowsEntry(path.join(entryPath, childName), expectedDevice);
+  }
+  const finalStats = fs.lstatSync(entryPath);
+  const finalIdentity = String(finalStats.dev) + ":" + String(finalStats.ino);
+  if (!finalStats.isDirectory() || finalIdentity !== expectedEntryIdentity) {
+    fail("AUTHORITY", "Cleanup entry identity changed at " + entryPath);
+  }
+  fs.rmdirSync(entryPath);
+}
+
+function runBoundedTraversal() {
+  if (traversalKind === "windows-native") {
+    const expectedDevice = expectedIdentity.slice(0, expectedIdentity.indexOf(":"));
+    for (const entry of fs.readdirSync(".")) {
+      if (entry !== activeMarkerName && entry !== completedMarkerName) {
+        removeWindowsEntry("./" + entry, expectedDevice);
+      }
+    }
+    return;
+  }
+  if (traversalKind !== "posix-find") {
+    fail("BOUNDARY", "Unknown filesystem-bounded cleanup strategy");
+  }
+  const result = spawnSync(findExecutable, findArguments, {
+    cwd: ".",
+    encoding: "utf8",
+    stdio: ["ignore", "ignore", "pipe"],
+  });
+  if (result.error || result.status !== 0) {
+    const detail = result.error ? result.error.message : result.stderr.trim();
+    fail("REMOVE", detail || "Filesystem-bounded removal helper failed");
+  }
+}
+
+function removePinnedContents() {
+  const initialMarkerState = validatePinnedDirectory();
+  validateTrustedPath();
+  runBoundedTraversal();
+  validatePinnedDirectory();
+  validateTrustedPath();
+  const expectedMarker = initialMarkerState === "active" ? activeMarkerName : completedMarkerName;
+  const entries = fs.readdirSync(".");
+  if (entries.length !== 1 || entries[0] !== expectedMarker) {
+    fail("REMOVE", "Pinned cleanup directory did not become marker-only");
+  }
+  if (initialMarkerState === "active") {
+    failAt("before-marker-removal");
+    fs.renameSync(activeMarkerName, completedMarkerName);
+    failAt("after-marker-removal");
+  }
+  if (validatePinnedDirectory() !== "completed") {
+    fail("AUTHORITY", "Pinned cleanup completion marker changed");
+  }
+  validateTrustedPath();
+  const completedEntries = fs.readdirSync(".");
+  if (completedEntries.length !== 1 || completedEntries[0] !== completedMarkerName) {
+    fail("REMOVE", "Pinned cleanup directory did not remain marker-only");
+  }
+  failAt("before-completion-acknowledgement");
+  process.stdout.write(${JSON.stringify(POSIX_CLEANUP_DONE)} + JSON.stringify(pinnedPath) + "\n");
+  process.exit(0);
+}
+
+validatePinnedDirectory();
 process.stdout.write(${JSON.stringify(`${POSIX_CLEANUP_READY}\n`)});
 process.stdin.setEncoding("utf8");
 let command = "";
@@ -159,7 +227,60 @@ process.stdin.on("data", (chunk) => {
 process.stdin.on("end", () => fail("AUTHORITY", "Pinned cleanup command was not received"));
 `;
 
-let posixRmExecutablePromise: Promise<string> | null = null;
+let posixFindExecutablePromise: Promise<string> | null = null;
+
+export type WorktreeCleanupFaultPoint =
+  | "before-marker-removal"
+  | "after-marker-removal"
+  | "before-completion-acknowledgement";
+
+export type WorktreeCleanupTraversalContract =
+  | { kind: "windows-native" }
+  | { kind: "posix-find"; boundaryArgument: "-x" | "-xdev" };
+
+export function getWorktreeCleanupTraversalContract(
+  platform: NodeJS.Platform,
+): WorktreeCleanupTraversalContract {
+  if (platform === "win32") return { kind: "windows-native" };
+  if (platform === "darwin" || platform === "freebsd" || platform === "openbsd") {
+    return { kind: "posix-find", boundaryArgument: "-x" };
+  }
+  if (
+    platform === "linux" ||
+    platform === "aix" ||
+    platform === "android" ||
+    platform === "sunos"
+  ) {
+    return { kind: "posix-find", boundaryArgument: "-xdev" };
+  }
+  throw new Error(`Filesystem-bounded cleanup is unsupported on ${platform}`);
+}
+
+export function getWorktreeCleanupFindArguments(
+  platform: NodeJS.Platform,
+  activeMarkerName: string,
+  completedMarkerName: string,
+): string[] {
+  const contract = getWorktreeCleanupTraversalContract(platform);
+  if (contract.kind !== "posix-find") {
+    throw new Error(`POSIX cleanup traversal is unavailable on ${platform}`);
+  }
+  const expression = [
+    "!",
+    "-path",
+    ".",
+    "!",
+    "-path",
+    `./${activeMarkerName}`,
+    "!",
+    "-path",
+    `./${completedMarkerName}`,
+    "-delete",
+  ];
+  return contract.boundaryArgument === "-x"
+    ? ["-P", "-x", ".", ...expression]
+    : ["-P", ".", "-xdev", ...expression];
+}
 
 export interface WorktreeConfig {
   branchName: string;
@@ -1245,6 +1366,9 @@ export interface DeletePaseoWorktreeOptions {
   expectedWorktreeIncarnationId?: string | null;
   expectedQuarantineMarker?: string | null;
   onCleanupDirectoryPinned?: (quarantinePath: string) => void | Promise<void>;
+  onCleanupDirectoryCompleted?: (quarantinePath: string) => void | Promise<void>;
+  cleanupFaultPoint?: WorktreeCleanupFaultPoint;
+  cleanupFindExecutable?: string;
   signal?: AbortSignal;
 }
 
@@ -1264,6 +1388,13 @@ class WorktreeCleanupAuthorityError extends Error {
   constructor(message: string) {
     super(message);
     this.name = "WorktreeCleanupAuthorityError";
+  }
+}
+
+class WorktreeCleanupFaultError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "WorktreeCleanupFaultError";
   }
 }
 
@@ -1307,6 +1438,9 @@ export async function deletePaseoWorktree({
   expectedWorktreeIncarnationId,
   expectedQuarantineMarker,
   onCleanupDirectoryPinned,
+  onCleanupDirectoryCompleted,
+  cleanupFaultPoint,
+  cleanupFindExecutable,
   signal,
 }: DeletePaseoWorktreeOptions): Promise<void> {
   throwIfWorktreeDeletionCanceled(signal);
@@ -1375,7 +1509,15 @@ export async function deletePaseoWorktree({
       quarantineMarker,
       requestedQuarantine,
     }));
-  await removeQuarantinedWorktree({ cwd, quarantined, onCleanupDirectoryPinned, signal });
+  await removeQuarantinedWorktree({
+    cwd,
+    quarantined,
+    onCleanupDirectoryPinned,
+    onCleanupDirectoryCompleted,
+    cleanupFaultPoint,
+    cleanupFindExecutable,
+    signal,
+  });
 }
 
 interface WorktreeCleanupTarget {
@@ -1488,6 +1630,9 @@ async function removeQuarantinedWorktree(input: {
   cwd: string | null;
   quarantined: QuarantinedDirectory | null;
   onCleanupDirectoryPinned?: (quarantinePath: string) => void | Promise<void>;
+  onCleanupDirectoryCompleted?: (quarantinePath: string) => void | Promise<void>;
+  cleanupFaultPoint?: WorktreeCleanupFaultPoint;
+  cleanupFindExecutable?: string;
   signal?: AbortSignal;
 }): Promise<void> {
   try {
@@ -1512,6 +1657,9 @@ async function removeQuarantinedWorktree(input: {
         input.quarantined.identity,
         input.quarantined.quarantineMarker,
         input.onCleanupDirectoryPinned,
+        input.onCleanupDirectoryCompleted,
+        input.cleanupFaultPoint,
+        input.cleanupFindExecutable,
         input.signal,
       );
     }
@@ -1660,17 +1808,45 @@ export function getPaseoWorktreeCleanupMarkerPath(
   return join(directoryPath, `${WORKTREE_CLEANUP_MARKER_PREFIX}${quarantineMarker}`);
 }
 
+export function getPaseoWorktreeCleanupCompletedMarkerPath(
+  directoryPath: string,
+  quarantineMarker: string,
+): string {
+  if (!UUID_PATTERN.test(quarantineMarker)) {
+    throw new Error("Invalid cleanup quarantine marker");
+  }
+  return join(directoryPath, `${WORKTREE_CLEANUP_COMPLETED_MARKER_PREFIX}${quarantineMarker}`);
+}
+
+type WorktreeCleanupMarkerState = "active" | "completed";
+
+async function readPaseoWorktreeCleanupMarkerState(
+  directoryPath: string,
+  quarantineMarker: string,
+): Promise<WorktreeCleanupMarkerState | null> {
+  const markerPaths = [
+    getPaseoWorktreeCleanupMarkerPath(directoryPath, quarantineMarker),
+    getPaseoWorktreeCleanupCompletedMarkerPath(directoryPath, quarantineMarker),
+  ];
+  const markerFiles = await Promise.all(
+    markerPaths.map(async (markerPath) => {
+      try {
+        return (await lstat(markerPath)).isFile();
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+        throw error;
+      }
+    }),
+  );
+  if (markerFiles[0] === markerFiles[1]) return null;
+  return markerFiles[0] ? "active" : "completed";
+}
+
 async function hasPaseoWorktreeCleanupMarker(
   directoryPath: string,
   quarantineMarker: string,
 ): Promise<boolean> {
-  try {
-    const stats = await lstat(getPaseoWorktreeCleanupMarkerPath(directoryPath, quarantineMarker));
-    return stats.isFile();
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
-    throw error;
-  }
+  return (await readPaseoWorktreeCleanupMarkerState(directoryPath, quarantineMarker)) !== null;
 }
 
 async function ensurePaseoWorktreeCleanupMarker(
@@ -1737,23 +1913,14 @@ export async function rollbackCreatedPaseoWorktree(
   throw cause;
 }
 
-async function pathExists(path: string): Promise<boolean> {
-  try {
-    await lstat(path);
-    return true;
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-      return false;
-    }
-    throw error;
-  }
-}
-
 async function removeDirectoryWithRetries(
   path: string,
   expectedDirectoryIdentity: string,
   quarantineMarker: string,
   onDirectoryPinned?: (quarantinePath: string) => void | Promise<void>,
+  onDirectoryCompleted?: (quarantinePath: string) => void | Promise<void>,
+  faultPoint?: WorktreeCleanupFaultPoint,
+  findExecutable?: string,
   signal?: AbortSignal,
 ): Promise<void> {
   throwIfWorktreeDeletionCanceled(signal);
@@ -1761,7 +1928,7 @@ async function removeDirectoryWithRetries(
     throw new Error(`Cleanup quarantine marker changed for ${path}`);
   }
   if (!(await assertDirectoryIdentity(path, expectedDirectoryIdentity))) {
-    return;
+    throw new WorktreeCleanupAuthorityError(`Cleanup path disappeared: ${path}`);
   }
 
   const delaysMs = [0, 100, 300, 700, 1500];
@@ -1773,66 +1940,90 @@ async function removeDirectoryWithRetries(
         throw new Error(`Cleanup quarantine marker changed for ${path}`);
       }
       if (!(await assertDirectoryIdentity(path, expectedDirectoryIdentity))) {
-        return;
+        throw new WorktreeCleanupAuthorityError(`Cleanup path disappeared: ${path}`);
       }
-      if (process.platform === "win32") {
-        await rm(path, { recursive: true, force: true });
-      } else {
-        await removePinnedPosixDirectory({
-          path,
-          expectedDirectoryIdentity,
-          quarantineMarker,
-          onDirectoryPinned,
-        });
-      }
+      await removePinnedDirectory({
+        path,
+        expectedDirectoryIdentity,
+        quarantineMarker,
+        onDirectoryPinned,
+        onDirectoryCompleted,
+        faultPoint,
+        findExecutable,
+      });
       throwIfWorktreeDeletionCanceled(signal);
-      if (!(await pathExists(path))) {
+      if (
+        (await assertDirectoryIdentity(path, expectedDirectoryIdentity)) &&
+        (await readPaseoWorktreeCleanupMarkerState(path, quarantineMarker)) === "completed"
+      ) {
         return;
       }
-      lastError = new Error(`Directory still present after rm: ${path}`);
+      lastError = new Error(`Cleanup tombstone is incomplete: ${path}`);
     } catch (error) {
       throwIfWorktreeDeletionCanceled(signal);
-      if (error instanceof WorktreeCleanupAuthorityError) throw error;
+      if (
+        error instanceof WorktreeCleanupAuthorityError ||
+        error instanceof WorktreeCleanupFaultError
+      ) {
+        throw error;
+      }
       lastError = error;
     }
   }
 
-  if (await pathExists(path)) {
-    throw lastError instanceof Error
-      ? lastError
-      : new Error(`Failed to remove worktree directory: ${path}`);
-  }
+  throw lastError instanceof Error
+    ? lastError
+    : new Error(`Failed to complete worktree cleanup: ${path}`);
 }
 
-async function resolvePosixRmExecutable(): Promise<string> {
-  if (existsSync("/bin/rm")) return "/bin/rm";
-  posixRmExecutablePromise ??= findExecutable("rm").then((executable) => {
-    if (!executable) throw new Error("POSIX removal helper is unavailable");
+async function resolvePosixFindExecutable(): Promise<string> {
+  if (existsSync("/usr/bin/find")) return "/usr/bin/find";
+  if (existsSync("/bin/find")) return "/bin/find";
+  posixFindExecutablePromise ??= findExecutableOnPath("find").then((executable) => {
+    if (!executable) throw new Error("Filesystem-bounded POSIX cleanup helper is unavailable");
     return executable;
   });
-  return posixRmExecutablePromise;
+  return posixFindExecutablePromise;
 }
 
-async function removePinnedPosixDirectory(input: {
+async function removePinnedDirectory(input: {
   path: string;
   expectedDirectoryIdentity: string;
   quarantineMarker: string;
   onDirectoryPinned?: (quarantinePath: string) => void | Promise<void>;
+  onDirectoryCompleted?: (quarantinePath: string) => void | Promise<void>;
+  faultPoint?: WorktreeCleanupFaultPoint;
+  findExecutable?: string;
 }): Promise<void> {
-  const markerName = basename(
+  const activeMarkerName = basename(
     getPaseoWorktreeCleanupMarkerPath(input.path, input.quarantineMarker),
   );
+  const completedMarkerName = basename(
+    getPaseoWorktreeCleanupCompletedMarkerPath(input.path, input.quarantineMarker),
+  );
   const trustedParent = realpathSync(dirname(input.path));
-  const rmExecutable = await resolvePosixRmExecutable();
+  const traversalContract = getWorktreeCleanupTraversalContract(process.platform);
+  const findExecutable =
+    traversalContract.kind === "posix-find"
+      ? (input.findExecutable ?? (await resolvePosixFindExecutable()))
+      : "";
+  const findArguments =
+    traversalContract.kind === "posix-find"
+      ? getWorktreeCleanupFindArguments(process.platform, activeMarkerName, completedMarkerName)
+      : [];
   const child = spawn(
     process.execPath,
     [
       "-e",
       POSIX_PINNED_CLEANUP_SCRIPT,
       input.expectedDirectoryIdentity,
-      markerName,
+      activeMarkerName,
+      completedMarkerName,
       trustedParent,
-      rmExecutable,
+      traversalContract.kind,
+      findExecutable,
+      JSON.stringify(findArguments),
+      input.faultPoint ?? "",
     ],
     {
       cwd: input.path,
@@ -1901,12 +2092,9 @@ async function removePinnedPosixDirectory(input: {
   if (authorizationError) throw authorizationError;
   if (launchError) throw launchError;
   if (exit.code !== 0 || !ready || !completedPath) {
-    const detail = stderr.trim() || `helper exited with ${exit.signal ?? exit.code ?? "no status"}`;
-    if (detail.startsWith("AUTHORITY:")) {
-      throw new WorktreeCleanupAuthorityError(detail.slice("AUTHORITY:".length));
-    }
-    throw new Error(`Pinned worktree cleanup failed: ${detail}`);
+    throwPinnedCleanupProcessError(stderr, exit);
   }
+  await input.onDirectoryCompleted?.(input.path);
   if (dirname(completedPath) !== trustedParent) {
     throw new WorktreeCleanupAuthorityError("Pinned cleanup directory left its trusted parent");
   }
@@ -1919,19 +2107,31 @@ async function removePinnedPosixDirectory(input: {
       error instanceof Error ? error.message : "Pinned cleanup directory identity changed",
     );
   }
-  try {
-    await rmdir(completedPath);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  if (
+    (await readPaseoWorktreeCleanupMarkerState(completedPath, input.quarantineMarker)) !==
+    "completed"
+  ) {
+    throw new WorktreeCleanupAuthorityError(
+      `Cleanup completion marker changed for ${completedPath}`,
+    );
   }
+}
 
-  const requestedIdentity = await readDirectoryIdentity(input.path);
-  if (requestedIdentity !== null) {
-    if (requestedIdentity !== input.expectedDirectoryIdentity) {
-      throw new WorktreeCleanupAuthorityError(`Cleanup path identity changed for ${input.path}`);
-    }
-    throw new Error(`Directory still present after pinned removal: ${input.path}`);
+function throwPinnedCleanupProcessError(
+  stderr: string,
+  exit: { code: number | null; signal: NodeJS.Signals | null },
+): never {
+  const detail = stderr.trim() || `helper exited with ${exit.signal ?? exit.code ?? "no status"}`;
+  if (detail.startsWith("AUTHORITY:")) {
+    throw new WorktreeCleanupAuthorityError(detail.slice("AUTHORITY:".length));
   }
+  if (detail.startsWith("BOUNDARY:")) {
+    throw new WorktreeCleanupAuthorityError(detail.slice("BOUNDARY:".length));
+  }
+  if (detail.startsWith("FAULT:")) {
+    throw new WorktreeCleanupFaultError(detail.slice("FAULT:".length));
+  }
+  throw new Error(`Pinned worktree cleanup failed: ${detail}`);
 }
 
 /**

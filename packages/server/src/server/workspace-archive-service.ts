@@ -1,5 +1,5 @@
-import { existsSync } from "node:fs";
 import { randomUUID } from "node:crypto";
+import { lstat } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 
 import type { Logger } from "pino";
@@ -826,7 +826,7 @@ async function compareCleanupIncarnation(
   backing: BackingDirectory,
   pendingCleanupTargets: PendingCleanupTarget[],
 ): Promise<"match" | "missing" | "mismatch" | "unverifiable"> {
-  if (isAbsentUnidentifiedCleanup(backing, pendingCleanupTargets)) {
+  if (await isAbsentUnidentifiedCleanup(backing, pendingCleanupTargets)) {
     return "missing";
   }
   const expectedIncarnations = new Set(
@@ -861,13 +861,13 @@ async function compareCleanupIncarnation(
     expectedIncarnation,
   );
   if (requestedQuarantine) {
-    if (!existsSync(backing.path)) return "missing";
+    if (!(await pathEntryExists(backing.path))) return "missing";
     return compareAuthenticatedQuarantine(backing.path, expectedIncarnation, expectedMarker);
   }
   const quarantinePath = getPaseoWorktreeCleanupQuarantinePath(backing.path, expectedIncarnation);
-  const quarantineExists = existsSync(quarantinePath);
+  const quarantineExists = await pathEntryExists(quarantinePath);
   let currentIncarnationId: string | null = null;
-  if (!existsSync(backing.path)) {
+  if (!(await pathEntryExists(backing.path))) {
     if (!quarantineExists) return "missing";
     return compareAuthenticatedQuarantine(backing.path, expectedIncarnation, expectedMarker);
   }
@@ -900,14 +900,24 @@ async function compareAuthenticatedQuarantine(
     : "mismatch";
 }
 
-function isAbsentUnidentifiedCleanup(
+async function isAbsentUnidentifiedCleanup(
   backing: BackingDirectory,
   pendingCleanupTargets: PendingCleanupTarget[],
-): boolean {
+): Promise<boolean> {
   return (
-    !existsSync(backing.path) &&
+    !(await pathEntryExists(backing.path)) &&
     pendingCleanupTargets.every((target) => target.worktreeIncarnationId === null)
   );
+}
+
+async function pathEntryExists(entryPath: string): Promise<boolean> {
+  try {
+    await lstat(entryPath);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw error;
+  }
 }
 
 async function findAuthenticatedCleanupQuarantine(
@@ -964,7 +974,7 @@ async function persistTargetCleanupPending(
   )?.cleanupPending?.quarantineMarker;
   const quarantineMarker = existingMarker ?? randomUUID();
 
-  const worktreeIncarnationId = existsSync(backing.path)
+  const worktreeIncarnationId = (await pathEntryExists(backing.path))
     ? ensurePaseoWorktreeIncarnationId(backing.path)
     : null;
 
@@ -1021,7 +1031,7 @@ async function listPendingCleanupTargets(
   const archivedWorkspaceIdSet = new Set(archivedWorkspaceIds);
   let fallbackIncarnationId: string | null = null;
   const fallbackQuarantineMarker = randomUUID();
-  if (target.backing && existsSync(target.backing.path)) {
+  if (target.backing && (await pathEntryExists(target.backing.path))) {
     try {
       fallbackIncarnationId = readPaseoWorktreeIncarnationId(target.backing.path);
     } catch {
