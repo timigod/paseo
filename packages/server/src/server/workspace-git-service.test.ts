@@ -4,6 +4,12 @@ import path, { join } from "node:path";
 import type { FSWatcher } from "node:fs";
 import type pino from "pino";
 import type { ForgeService } from "../services/forge-service.js";
+import {
+  createGitHubService,
+  GitHubCommandError,
+  GitHubRateLimitCooldownError,
+  type GitHubCommandRunner,
+} from "../services/github-service.js";
 import type {
   CheckoutSnapshotFacts,
   CheckoutStatusGit,
@@ -414,6 +420,61 @@ describe("WorkspaceGitServiceImpl", () => {
     service.dispose();
   });
 
+  test("getSnapshot preserves confirmed GitHub auth when core API admission is cooling down", async () => {
+    let now = 1_000;
+    let authStatusCalls = 0;
+    const githubRunner: GitHubCommandRunner = async (args, options) => {
+      if (args[0] === "auth" && args[1] === "status") {
+        authStatusCalls += 1;
+        if (authStatusCalls === 1) {
+          return { stdout: "", stderr: "" };
+        }
+        throw new GitHubCommandError({
+          args,
+          cwd: options.cwd,
+          exitCode: 1,
+          stderr: "HTTP 429: API rate limit exceeded",
+          stdout: "HTTP/2.0 429 Too Many Requests\nRetry-After: 60\n\nrate limited",
+        });
+      }
+      if (args[0] === "api") {
+        throw new GitHubCommandError({
+          args,
+          cwd: options.cwd,
+          exitCode: 1,
+          stderr: "HTTP 429: API rate limit exceeded",
+          stdout: "HTTP/2.0 429 Too Many Requests\nRetry-After: 60\n\nrate limited",
+        });
+      }
+      return { stdout: "", stderr: "" };
+    };
+    const github = createGitHubService({
+      ttlMs: 1,
+      runner: githubRunner,
+      resolveGhPath: async () => "/usr/bin/gh",
+      now: () => now,
+    });
+    const service = createService({ forgeOverrides: { github } });
+
+    await expect(service.getSnapshot(REPO_CWD)).resolves.toEqual(createSnapshot(REPO_CWD));
+    await expect(
+      github.getCheckDetails({
+        cwd: REPO_CWD,
+        repoOwner: "acme",
+        repoName: "repo",
+        checkRunId: 123,
+      }),
+    ).rejects.toBeInstanceOf(GitHubRateLimitCooldownError);
+
+    now = 1_002;
+    await expect(
+      service.getSnapshot(REPO_CWD, { force: true, reason: "rate-limit-regression" }),
+    ).resolves.toEqual(createSnapshot(REPO_CWD));
+    expect(authStatusCalls).toBe(1);
+
+    service.dispose();
+  });
+
   test("getSnapshot keeps plain git classification when shortstat lookup fails", async () => {
     const getCheckoutShortstat = vi.fn(async () => {
       throw new Error(
@@ -667,6 +728,107 @@ describe("WorkspaceGitServiceImpl", () => {
     );
 
     subscription.unsubscribe();
+    service.dispose();
+  });
+
+  test("forced cooldown preserves same-head pull request state and reports retry timing", async () => {
+    const retryAt = Date.parse("2026-04-12T00:06:00.000Z");
+    const getPullRequestStatus = vi
+      .fn<() => Promise<PullRequestStatusResult>>()
+      .mockResolvedValueOnce(createPullRequestStatusResult())
+      .mockRejectedValueOnce(new GitHubRateLimitCooldownError(retryAt));
+    const service = createService({ getPullRequestStatus });
+
+    const initial = await service.getSnapshot(REPO_CWD);
+    const cooledDown = await service.getSnapshot(REPO_CWD, {
+      force: true,
+      reason: "rate-limit-regression",
+    });
+
+    expect(cooledDown.forge.pullRequest).toEqual(initial.forge.pullRequest);
+    expect(cooledDown.forge.error).toEqual({
+      message: "GitHub API rate limit cooldown active",
+      retryAt,
+    });
+
+    service.dispose();
+  });
+
+  test("forced cooldown rejects pull request state after the checkout identity changes", async () => {
+    const getCheckoutStatus = vi
+      .fn<() => Promise<CheckoutStatusGit>>()
+      .mockResolvedValueOnce(createCheckoutStatus(REPO_CWD))
+      .mockResolvedValueOnce(createCheckoutStatus(REPO_CWD, { currentBranch: "other-head" }));
+    const getPullRequestStatus = vi
+      .fn<() => Promise<PullRequestStatusResult>>()
+      .mockResolvedValueOnce(createPullRequestStatusResult())
+      .mockRejectedValueOnce(new GitHubRateLimitCooldownError(123_000));
+    const service = createService({ getCheckoutStatus, getPullRequestStatus });
+
+    await service.getSnapshot(REPO_CWD);
+    const cooledDown = await service.getSnapshot(REPO_CWD, {
+      force: true,
+      reason: "head-change-rate-limit-regression",
+    });
+
+    expect(cooledDown.git.currentBranch).toBe("other-head");
+    expect(cooledDown.forge.pullRequest).toBeNull();
+    expect(cooledDown.forge.error).toEqual({
+      message: "GitHub API rate limit cooldown active",
+      retryAt: 123_000,
+    });
+
+    service.dispose();
+  });
+
+  test("forced cooldown rejects pull request state after the repository changes", async () => {
+    const getCheckoutStatus = vi
+      .fn<() => Promise<CheckoutStatusGit>>()
+      .mockResolvedValueOnce(createCheckoutStatus(REPO_CWD))
+      .mockResolvedValueOnce(
+        createCheckoutStatus(REPO_CWD, {
+          remoteUrl: "https://github.com/acme/other-repo.git",
+        }),
+      );
+    const getPullRequestStatus = vi
+      .fn<() => Promise<PullRequestStatusResult>>()
+      .mockResolvedValueOnce(createPullRequestStatusResult())
+      .mockRejectedValueOnce(new GitHubRateLimitCooldownError(123_000));
+    const service = createService({ getCheckoutStatus, getPullRequestStatus });
+
+    await service.getSnapshot(REPO_CWD);
+    const cooledDown = await service.getSnapshot(REPO_CWD, {
+      force: true,
+      reason: "repository-change-rate-limit-regression",
+    });
+
+    expect(cooledDown.git.remoteUrl).toBe("https://github.com/acme/other-repo.git");
+    expect(cooledDown.forge.pullRequest).toBeNull();
+    expect(cooledDown.forge.error).toEqual({
+      message: "GitHub API rate limit cooldown active",
+      retryAt: 123_000,
+    });
+
+    service.dispose();
+  });
+
+  test("forced permanent forge failure does not preserve pull request state", async () => {
+    const permanentError = new Error("repository not found");
+    const getPullRequestStatus = vi
+      .fn<() => Promise<PullRequestStatusResult>>()
+      .mockResolvedValueOnce(createPullRequestStatusResult())
+      .mockRejectedValueOnce(permanentError);
+    const service = createService({ getPullRequestStatus });
+
+    await service.getSnapshot(REPO_CWD);
+    const failed = await service.getSnapshot(REPO_CWD, {
+      force: true,
+      reason: "permanent-forge-failure",
+    });
+
+    expect(failed.forge.pullRequest).toBeNull();
+    expect(failed.forge.error).toEqual({ message: permanentError.message });
+
     service.dispose();
   });
 

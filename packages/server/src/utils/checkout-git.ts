@@ -12,7 +12,7 @@ import {
   parseDiff,
 } from "../server/utils/diff-highlighter.js";
 import { parseGitHubRepoFromRemote } from "../server/workspace-git-metadata.js";
-import { createGitHubService } from "../services/github-service.js";
+import { createGitHubService, GitHubRateLimitCooldownError } from "../services/github-service.js";
 import type {
   CurrentPullRequestStatus,
   ForgeAuthState,
@@ -3443,6 +3443,7 @@ export interface PullRequestStatusResult {
   authState: ForgeAuthState;
   /** Kept in sync with {@link authState} for back-compat; true iff authenticated. */
   githubFeaturesEnabled: boolean;
+  error?: { message: string; retryAt?: number };
 }
 
 function buildPullRequestStatusResult(
@@ -3549,10 +3550,18 @@ export async function getPullRequestStatus(
       return status;
     })
     .catch((error) => {
-      if (!options?.force && error instanceof ForgeCommandError) {
+      if (!options?.force) {
         const stale = lastSuccessfulPullRequestStatus.get(cacheKey);
         if (stale) {
-          return stale;
+          if (error instanceof GitHubRateLimitCooldownError) {
+            return {
+              ...stale,
+              error: { message: error.message, retryAt: error.retryAt },
+            };
+          }
+          if (isTransientForgeCommandError(error)) {
+            return stale;
+          }
         }
       }
       throw error;
@@ -3563,6 +3572,15 @@ export async function getPullRequestStatus(
 
   pullRequestStatusInFlight.set(cacheKey, lookup);
   return lookup;
+}
+
+function isTransientForgeCommandError(error: unknown): error is ForgeCommandError {
+  if (!(error instanceof ForgeCommandError)) {
+    return false;
+  }
+  return /could not resolve host|network is unreachable|connection (?:timed out|refused|reset)|request timed out|etimedout|temporary failure|http 5\d\d|internal server error|bad gateway|service unavailable|gateway timeout/i.test(
+    error.stderr,
+  );
 }
 
 async function getPullRequestStatusUncached(

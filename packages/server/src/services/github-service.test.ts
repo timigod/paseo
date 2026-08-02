@@ -7,6 +7,7 @@ import {
   GitHubAuthenticationError,
   GitHubCliMissingError,
   GitHubCommandError,
+  GitHubRateLimitCooldownError,
   computeGithubNextInterval,
   createGitHubService,
   type GitHubCommandRunner,
@@ -729,7 +730,7 @@ describe("ForgeService", () => {
       args: ["repo", "view", "--json", "owner,name,parent"],
     });
     expect(runner.calls[1]?.cwd).toBe("/repo");
-    expect(runner.calls[1]?.args.slice(0, 3)).toEqual(["api", "graphql", "-f"]);
+    expect(runner.calls[1]?.args.slice(0, 4)).toEqual(["api", "--include", "graphql", "-f"]);
     expect(runner.calls[1]?.args).toContain("owner=getpaseo");
     expect(runner.calls[1]?.args).toContain("name=paseo");
     expect(runner.calls[1]?.args).toContain("number=526");
@@ -802,6 +803,7 @@ describe("ForgeService", () => {
       ttlMs: 0,
       runner: runner.runner,
       resolveGhPath: async () => "/usr/bin/gh",
+      resolveRepoHost: async () => null,
     });
     const reads = recordCurrentPullRequestStatusReads(service);
 
@@ -840,6 +842,7 @@ describe("ForgeService", () => {
       ttlMs: 0,
       runner: runner.runner,
       resolveGhPath: async () => "/usr/bin/gh",
+      resolveRepoHost: async () => null,
       now: () => now,
     });
     const reads = recordCurrentPullRequestStatusReads(service);
@@ -885,6 +888,7 @@ describe("ForgeService", () => {
       ttlMs: 0,
       runner: runner.runner,
       resolveGhPath: async () => "/usr/bin/gh",
+      resolveRepoHost: async () => null,
       now: () => now,
     });
     const reads = recordCurrentPullRequestStatusReads(service);
@@ -990,6 +994,7 @@ describe("ForgeService", () => {
       cwd: "/repo",
       args: [
         "api",
+        "--include",
         "graphql",
         "-f",
         expect.stringContaining("query="),
@@ -1001,11 +1006,11 @@ describe("ForgeService", () => {
         "number=42",
       ],
     });
-    expect(runner.calls[0]?.args[3]).toContain("reviews(first: 100)");
-    expect(runner.calls[0]?.args[3]).toContain("comments(first: 100)");
-    expect(runner.calls[0]?.args[3]).toContain("bodyHTML");
-    expect(runner.calls[0]?.args[3]).toContain("avatarUrl");
-    expect(runner.calls[0]?.args[3]).toContain("reviewThreads(first: 100)");
+    expect(runner.calls[0]?.args[4]).toContain("reviews(first: 100)");
+    expect(runner.calls[0]?.args[4]).toContain("comments(first: 100)");
+    expect(runner.calls[0]?.args[4]).toContain("bodyHTML");
+    expect(runner.calls[0]?.args[4]).toContain("avatarUrl");
+    expect(runner.calls[0]?.args[4]).toContain("reviewThreads(first: 100)");
     expect(timeline).toEqual({
       prNumber: 42,
       repoOwner: "parentOwner",
@@ -1047,6 +1052,35 @@ describe("ForgeService", () => {
         },
       ],
     });
+  });
+
+  it("uses the final HTTP envelope to unwrap successful GitHub API JSON", async () => {
+    const runner = createRunner([
+      [
+        "HTTP/1.1 301 Moved Permanently",
+        "Location: https://api.github.com/graphql",
+        "",
+        "HTTP/2.0 200 OK",
+        "X-RateLimit-Remaining: 42",
+        "",
+        pullRequestTimelineJson(),
+      ].join("\n"),
+    ]);
+    const service = createGitHubService({
+      runner: runner.runner,
+      resolveGhPath: async () => "/usr/bin/gh",
+      now: () => 100,
+    });
+
+    const timeline = await service.getPullRequestTimeline({
+      cwd: "/repo",
+      prNumber: 42,
+      repoOwner: "parentOwner",
+      repoName: "parentRepo",
+    });
+
+    expect(timeline.error).toBeNull();
+    expect(timeline.items).not.toHaveLength(0);
   });
 
   it("rewrites GitHub attachment image URLs in timeline comments", async () => {
@@ -1318,7 +1352,7 @@ describe("ForgeService", () => {
         isOutdated: false,
       },
     });
-    expect(runner.calls[0]?.args[3]).toContain("pullRequestReview");
+    expect(runner.calls[0]?.args[4]).toContain("pullRequestReview");
   });
 
   it("keeps inline review thread comments once when they also appear in PR comments", async () => {
@@ -1431,6 +1465,7 @@ describe("ForgeService", () => {
 
     expect(runner.calls[0]?.args).toEqual([
       "api",
+      "--include",
       "graphql",
       "-f",
       expect.stringContaining("repository(owner: $owner, name: $name)"),
@@ -1651,8 +1686,464 @@ describe("ForgeService", () => {
 
     expect(timeline.error).toEqual({
       kind: "unknown",
-      message: "GraphQL: API rate limit exceeded for user ID 123",
+      message: "GitHub API rate limit cooldown active",
     });
+  });
+
+  it("retains only rate-limit metadata when a GitHub command fails", async () => {
+    const privateResponse = JSON.stringify({ data: { viewer: { login: "private-user" } } });
+    const runner = createScriptedRunner([
+      {
+        error: Object.assign(new Error("GitHub API request failed"), {
+          code: 1,
+          stderr: "HTTP 429: API rate limit exceeded",
+          stdout: [
+            "HTTP/2.0 429 Too Many Requests",
+            "Retry-After: 7",
+            "X-RateLimit-Reset: 999999",
+            "",
+            privateResponse,
+          ].join("\n"),
+        }),
+      },
+    ]);
+    const service = createGitHubService({
+      runner: runner.runner,
+      resolveGhPath: async () => "/usr/bin/gh",
+      now: () => 100,
+    });
+
+    const error = await service
+      .listIssues({ cwd: "/repo", query: "private" })
+      .catch((caught) => caught);
+
+    expect(error).toBeInstanceOf(GitHubRateLimitCooldownError);
+    expect(error).not.toHaveProperty("stdout");
+    expect(JSON.stringify(error)).not.toContain(privateResponse);
+  });
+
+  it("shares a Retry-After cooldown across concurrent requests and recovers at its clock deadline", async () => {
+    let now = 1_000_000;
+    const runner = createScriptedRunner([
+      {
+        error: new GitHubCommandError({
+          args: ["api", "graphql"],
+          cwd: "/repo",
+          exitCode: 1,
+          stderr: "HTTP 429: API rate limit exceeded",
+          stdout:
+            "HTTP/2.0 429 Too Many Requests\nRetry-After: 7\nX-RateLimit-Reset: 999999\n\nrate limited",
+        }),
+      },
+      '{"url":"","number":0}',
+    ]);
+    const service = createGitHubService({
+      runner: runner.runner,
+      resolveGhPath: async () => "/usr/bin/gh",
+      now: () => now,
+    });
+
+    const timeline = await service.getPullRequestTimeline({
+      cwd: "/repo",
+      prNumber: 42,
+      repoOwner: "parentOwner",
+      repoName: "parentRepo",
+    });
+
+    expect(timeline.error).toEqual({
+      kind: "unknown",
+      message: "GitHub API rate limit cooldown active",
+    });
+    expect(runner.calls).toHaveLength(1);
+    expect(runner.calls[0].args).toContain("--include");
+
+    const blocked = await Promise.all([
+      service.getPullRequestTimeline({
+        cwd: "/repo",
+        prNumber: 43,
+        repoOwner: "parentOwner",
+        repoName: "parentRepo",
+      }),
+      service.getPullRequestTimeline({
+        cwd: "/repo",
+        prNumber: 44,
+        repoOwner: "parentOwner",
+        repoName: "parentRepo",
+      }),
+    ]);
+
+    expect(blocked).toHaveLength(2);
+    for (const blockedTimeline of blocked) {
+      expect(blockedTimeline.error).toEqual({
+        kind: "unknown",
+        message: "GitHub API rate limit cooldown active",
+      });
+    }
+    expect(runner.calls).toHaveLength(1);
+
+    now = 1_007_000;
+    await service.getPullRequestTimeline({
+      cwd: "/repo",
+      prNumber: 42,
+      repoOwner: "parentOwner",
+      repoName: "parentRepo",
+    });
+    expect(runner.calls).toHaveLength(2);
+  });
+
+  it("uses the response rate-limit resource to isolate REST and GraphQL cooldowns", async () => {
+    const runner = createScriptedRunner([
+      {
+        error: new GitHubCommandError({
+          args: ["api", "repos/parentOwner/parentRepo/check-runs/1"],
+          cwd: "/repo",
+          exitCode: 1,
+          stderr: "HTTP 429: API rate limit exceeded",
+          stdout:
+            "HTTP/2.0 429 Too Many Requests\nRetry-After: 60\nX-RateLimit-Resource: graphql\n\nrate limited",
+        }),
+      },
+      JSON.stringify({ id: 2, name: "test", status: "completed", conclusion: "success" }),
+      "[]",
+    ]);
+    const service = createGitHubService({
+      runner: runner.runner,
+      resolveGhPath: async () => "/usr/bin/gh",
+      now: () => 1_000,
+    });
+
+    await expect(
+      service.getCheckDetails({
+        cwd: "/repo",
+        repoOwner: "parentOwner",
+        repoName: "parentRepo",
+        checkRunId: 1,
+      }),
+    ).rejects.toBeInstanceOf(GitHubRateLimitCooldownError);
+
+    await expect(service.getPullRequest({ cwd: "/repo", number: 42 })).rejects.toMatchObject({
+      message: "GitHub API rate limit cooldown active",
+    });
+
+    await expect(
+      service.getCheckDetails({
+        cwd: "/repo",
+        repoOwner: "parentOwner",
+        repoName: "parentRepo",
+        checkRunId: 2,
+      }),
+    ).resolves.toMatchObject({ checkRunId: 2, name: "test" });
+    expect(runner.calls).toHaveLength(3);
+    expect(runner.calls[1].args).toEqual([
+      "api",
+      "--include",
+      "repos/parentOwner/parentRepo/check-runs/2",
+    ]);
+  });
+
+  it("admits one GraphQL request at a time before a rate limit response", async () => {
+    const calls: RunnerCall[] = [];
+    let activeCalls = 0;
+    let maxActiveCalls = 0;
+    let releaseGraphql: (() => void) | null = null;
+    let releaseRest: (() => void) | null = null;
+    const runner: GitHubCommandRunner = async (args, options) => {
+      calls.push({ args, cwd: options.cwd, envOverlay: options.envOverlay });
+      activeCalls += 1;
+      maxActiveCalls = Math.max(maxActiveCalls, activeCalls);
+      if (args[0] === "pr" && releaseGraphql === null) {
+        await new Promise<void>((resolve) => {
+          releaseGraphql = resolve;
+        });
+      }
+      if (args.includes("repos/parentOwner/parentRepo/check-runs/2")) {
+        await new Promise<void>((resolve) => {
+          releaseRest = resolve;
+        });
+      }
+      activeCalls -= 1;
+      return {
+        stdout: args.includes("repos/parentOwner/parentRepo/check-runs/2")
+          ? JSON.stringify({ id: 2, name: "test", status: "completed", conclusion: "success" })
+          : "[]",
+        stderr: "",
+      };
+    };
+    const service = createGitHubService({
+      runner,
+      resolveGhPath: async () => "/usr/bin/gh",
+      now: () => 1_000,
+      resolveRepoHost: async () => null,
+    });
+
+    const first = service.listPullRequests({ cwd: "/repo", query: "first" });
+    await flushMicrotasks();
+    const second = service.listPullRequests({ cwd: "/repo", query: "second" });
+    await flushMicrotasks();
+
+    expect(calls).toHaveLength(1);
+    expect(maxActiveCalls).toBe(1);
+    const rest = service.getCheckDetails({
+      cwd: "/repo",
+      repoOwner: "parentOwner",
+      repoName: "parentRepo",
+      checkRunId: 2,
+    });
+    await flushMicrotasks();
+
+    expect(calls).toHaveLength(2);
+    expect(maxActiveCalls).toBe(2);
+    releaseRest?.();
+    await flushMicrotasks();
+    expect(calls).toHaveLength(3);
+    releaseGraphql?.();
+
+    const [firstResult, secondResult, checkDetails] = await Promise.all([first, second, rest]);
+    expect(firstResult).toEqual([]);
+    expect(secondResult).toEqual([]);
+    expect(checkDetails).toMatchObject({ checkRunId: 2, name: "test" });
+    expect(maxActiveCalls).toBe(2);
+  });
+
+  it("uses the GitHub reset timestamp when Retry-After is absent", async () => {
+    let now = 100_000;
+    const runner = createScriptedRunner([
+      {
+        error: new GitHubCommandError({
+          args: ["api", "graphql"],
+          cwd: "/repo",
+          exitCode: 1,
+          stderr: "GraphQL: API rate limit exceeded",
+          stdout:
+            "HTTP/2.0 403 Forbidden\nX-RateLimit-Remaining: 0\nX-RateLimit-Reset: 123\n\nrate limited",
+        }),
+      },
+    ]);
+    const service = createGitHubService({
+      runner: runner.runner,
+      resolveGhPath: async () => "/usr/bin/gh",
+      now: () => now,
+    });
+
+    await service.getPullRequestTimeline({
+      cwd: "/repo",
+      prNumber: 42,
+      repoOwner: "parentOwner",
+      repoName: "parentRepo",
+    });
+
+    const blocked = await service.getPullRequestTimeline({
+      cwd: "/repo",
+      prNumber: 43,
+      repoOwner: "parentOwner",
+      repoName: "parentRepo",
+    });
+    expect(blocked.error).toEqual({
+      kind: "unknown",
+      message: "GitHub API rate limit cooldown active",
+    });
+    expect(runner.calls).toHaveLength(1);
+  });
+
+  it("normalizes an originating rate-limit response to a typed cooldown", async () => {
+    const runner = createScriptedRunner([
+      {
+        error: new GitHubCommandError({
+          args: ["pr", "view"],
+          cwd: "/repo",
+          exitCode: 1,
+          stderr: "HTTP 429: API rate limit exceeded",
+          stdout: "HTTP/2.0 429 Too Many Requests\nRetry-After: 60\n\nrate limited",
+        }),
+      },
+    ]);
+    const service = createGitHubService({
+      runner: runner.runner,
+      resolveGhPath: async () => "/usr/bin/gh",
+      now: () => 1_000,
+    });
+
+    await expect(
+      service.getCurrentPullRequestStatus({ cwd: "/repo", headRef: "feature" }),
+    ).rejects.toBeInstanceOf(GitHubRateLimitCooldownError);
+    expect(runner.calls).toHaveLength(1);
+  });
+
+  it.each([
+    [
+      "malformed headers",
+      "GraphQL: API rate limit exceeded",
+      "Retry-After: tomorrow\nX-RateLimit-Reset: nope",
+    ],
+    ["missing headers", "GraphQL: API rate limit exceeded", ""],
+    ["an exhausted GitHub account", "API rate limit already exceeded for user ID 8492819", ""],
+  ])("uses the bounded fallback cooldown for %s", async (_name, stderr, headers) => {
+    const now = 500_000;
+    const runner = createScriptedRunner([
+      {
+        error: new GitHubCommandError({
+          args: ["api", "graphql"],
+          cwd: "/repo",
+          exitCode: 1,
+          stderr,
+          stdout: headers ? `HTTP/2.0 429 Too Many Requests\n${headers}\n\nrate limited` : "",
+        }),
+      },
+    ]);
+    const service = createGitHubService({
+      runner: runner.runner,
+      resolveGhPath: async () => "/usr/bin/gh",
+      now: () => now,
+    });
+
+    await service.getPullRequestTimeline({
+      cwd: "/repo",
+      prNumber: 42,
+      repoOwner: "parentOwner",
+      repoName: "parentRepo",
+    });
+
+    const blocked = await service.getPullRequestTimeline({
+      cwd: "/repo",
+      prNumber: 43,
+      repoOwner: "parentOwner",
+      repoName: "parentRepo",
+    });
+    expect(blocked.error).toEqual({
+      kind: "unknown",
+      message: "GitHub API rate limit cooldown active",
+    });
+    expect(runner.calls).toHaveLength(1);
+  });
+
+  it.each([
+    ["caps a large Retry-After value", "Retry-After: 999999", 3_600_000],
+    ["falls back from an unsafe reset timestamp", "X-RateLimit-Reset: 9007199254740992", 60_000],
+  ])("%s", async (_name, header, cooldownMs) => {
+    let now = 1_000;
+    const runner = createScriptedRunner([
+      {
+        error: new GitHubCommandError({
+          args: ["api", "graphql"],
+          cwd: "/repo",
+          exitCode: 1,
+          stderr: "HTTP 429: API rate limit exceeded",
+          stdout: `HTTP/2.0 429 Too Many Requests\n${header}\n\nrate limited`,
+        }),
+      },
+      '{"url":"","number":0}',
+    ]);
+    const service = createGitHubService({
+      runner: runner.runner,
+      resolveGhPath: async () => "/usr/bin/gh",
+      now: () => now,
+    });
+
+    await service.getPullRequestTimeline({
+      cwd: "/repo",
+      prNumber: 42,
+      repoOwner: "parentOwner",
+      repoName: "parentRepo",
+    });
+
+    now += cooldownMs;
+    await service.getPullRequestTimeline({
+      cwd: "/repo",
+      prNumber: 43,
+      repoOwner: "parentOwner",
+      repoName: "parentRepo",
+    });
+    expect(runner.calls).toHaveLength(2);
+  });
+
+  it("keeps cooldowns isolated to the resolved GitHub host", async () => {
+    const runner = createScriptedRunner([
+      {
+        error: new GitHubCommandError({
+          args: ["api", "graphql"],
+          cwd: "/github-com",
+          exitCode: 1,
+          stderr: "HTTP 429: API rate limit exceeded",
+          stdout: "HTTP/2.0 429 Too Many Requests\nRetry-After: 60\n\nrate limited",
+        }),
+      },
+      '{"url":"","number":0}',
+    ]);
+    const service = createGitHubService({
+      runner: runner.runner,
+      resolveGhPath: async () => "/usr/bin/gh",
+      now: () => 1_000,
+      resolveRepoHost: async (cwd) => (cwd === "/enterprise" ? "github.acme.test" : null),
+    });
+
+    await service.getPullRequestTimeline({
+      cwd: "/github-com",
+      prNumber: 42,
+      repoOwner: "parentOwner",
+      repoName: "parentRepo",
+    });
+
+    await service.getPullRequestTimeline({
+      cwd: "/enterprise",
+      prNumber: 42,
+      repoOwner: "parentOwner",
+      repoName: "parentRepo",
+    });
+    expect(runner.calls).toHaveLength(2);
+    expect(runner.calls[1].envOverlay).toEqual({ GH_HOST: "github.acme.test" });
+  });
+
+  it("blocks GraphQL commands but keeps REST search and local commands available during a GraphQL cooldown", async () => {
+    const calls: RunnerCall[] = [];
+    const runner: GitHubCommandRunner = async (args, options) => {
+      calls.push({ args, cwd: options.cwd, envOverlay: options.envOverlay });
+      if (args[0] === "api") {
+        throw new GitHubCommandError({
+          args,
+          cwd: options.cwd,
+          exitCode: 1,
+          stderr: "HTTP 429: API rate limit exceeded",
+          stdout: "HTTP/2.0 429 Too Many Requests\nRetry-After: 60\n\nrate limited",
+        });
+      }
+      if (args[0] === "search") {
+        return { stdout: "[]", stderr: "" };
+      }
+      return { stdout: "ssh", stderr: "" };
+    };
+    const service = createGitHubService({
+      runner,
+      resolveGhPath: async () => "/usr/bin/gh",
+      now: () => 1_000,
+    });
+
+    await service.getPullRequestTimeline({
+      cwd: "/repo",
+      prNumber: 42,
+      repoOwner: "parentOwner",
+      repoName: "parentRepo",
+    });
+
+    await expect(service.isAuthenticated({ cwd: "/repo" })).resolves.toBe(true);
+    await expect(service.listIssues({ cwd: "/repo", query: "open" })).rejects.toMatchObject({
+      message: "GitHub API rate limit cooldown active",
+    });
+    await expect(service.getPullRequest({ cwd: "/repo", number: 42 })).rejects.toMatchObject({
+      message: "GitHub API rate limit cooldown active",
+    });
+    await expect(service.searchRepositories({ cwd: "/repo", query: "" })).rejects.toThrow(
+      "GitHub API rate limit cooldown active",
+    );
+    await expect(
+      service.getPullRequestCheckoutTarget?.({ cwd: "/repo", number: 42 }),
+    ).rejects.toBeInstanceOf(GitHubRateLimitCooldownError);
+    await expect(service.searchRepositories({ cwd: "/repo", query: "paseo" })).resolves.toEqual([]);
+    expect(calls.some((call) => call.args[0] === "auth")).toBe(true);
+    expect(calls.some((call) => call.args[0] === "config")).toBe(true);
+    expect(calls.some((call) => call.args[0] === "search" && call.args[1] === "repos")).toBe(true);
+    expect(calls.some((call) => call.args[0] === "issue")).toBe(false);
+    expect(calls.some((call) => call.args[0] === "pr")).toBe(false);
+    expect(calls.some((call) => call.args[0] === "repo")).toBe(false);
   });
 
   it("maps PR timeline network timeouts to unknown timeline errors with runner details", async () => {
@@ -2042,14 +2533,60 @@ describe("ForgeService", () => {
     });
     expect(second.failedJobs[0]?.logTail).toBe(first.failedJobs[0]?.logTail);
     expect(runner.calls.map((call) => call.args)).toEqual([
-      ["api", "repos/acme/repo/check-runs/12345"],
-      ["api", "repos/acme/repo/check-runs/12345/annotations", "-f", "per_page=20"],
-      ["api", "repos/acme/repo/actions/runs/456/jobs", "-f", "per_page=100"],
-      ["api", "repos/acme/repo/actions/jobs/789/logs"],
-      ["api", "repos/acme/repo/check-runs/12345"],
-      ["api", "repos/acme/repo/check-runs/12345/annotations", "-f", "per_page=20"],
-      ["api", "repos/acme/repo/actions/runs/456/jobs", "-f", "per_page=100"],
+      ["api", "--include", "repos/acme/repo/check-runs/12345"],
+      ["api", "--include", "repos/acme/repo/check-runs/12345/annotations", "-f", "per_page=20"],
+      ["api", "--include", "repos/acme/repo/actions/runs/456/jobs", "-f", "per_page=100"],
+      ["api", "--include", "repos/acme/repo/actions/jobs/789/logs"],
+      ["api", "--include", "repos/acme/repo/check-runs/12345"],
+      ["api", "--include", "repos/acme/repo/check-runs/12345/annotations", "-f", "per_page=20"],
+      ["api", "--include", "repos/acme/repo/actions/runs/456/jobs", "-f", "per_page=100"],
     ]);
+  });
+
+  it("preserves failed job logs that begin with an HTTP response-like block", async () => {
+    const log = [
+      "HTTP/2.0 200 OK",
+      "content-type: text/plain",
+      "",
+      "this text is part of the job log",
+    ].join("\n");
+    const runner = createRunner([
+      JSON.stringify({
+        id: 12345,
+        name: "server-tests",
+        status: "completed",
+        conclusion: "failure",
+        html_url: "https://github.com/acme/repo/actions/runs/456/job/789",
+        check_suite: { workflow_run: { id: 456 } },
+      }),
+      JSON.stringify([]),
+      JSON.stringify({
+        jobs: [
+          {
+            id: 789,
+            name: "test",
+            status: "completed",
+            conclusion: "failure",
+            html_url: "https://github.com/acme/repo/actions/runs/456/job/789",
+            completed_at: "2026-04-02T13:52:14Z",
+          },
+        ],
+      }),
+      ["HTTP/2.0 200 OK", "content-type: text/plain", "", log].join("\n"),
+    ]);
+    const service = createGitHubService({
+      runner: runner.runner,
+      resolveGhPath: async () => "/usr/bin/gh",
+    });
+
+    const details = await service.getCheckDetails({
+      cwd: "/repo",
+      repoOwner: "acme",
+      repoName: "repo",
+      checkRunId: 12345,
+    });
+
+    expect(details.failedJobs[0]?.logTail).toBe(log);
   });
 
   it("caps failed check jobs at five and caps each log tail to 16 KiB", async () => {
@@ -2108,14 +2645,14 @@ describe("ForgeService", () => {
       16 * 1024,
     ]);
     expect(runner.calls.map((call) => call.args)).toEqual([
-      ["api", "repos/acme/repo/check-runs/12345"],
-      ["api", "repos/acme/repo/check-runs/12345/annotations", "-f", "per_page=20"],
-      ["api", "repos/acme/repo/actions/runs/456/jobs", "-f", "per_page=100"],
-      ["api", "repos/acme/repo/actions/jobs/800/logs"],
-      ["api", "repos/acme/repo/actions/jobs/801/logs"],
-      ["api", "repos/acme/repo/actions/jobs/802/logs"],
-      ["api", "repos/acme/repo/actions/jobs/803/logs"],
-      ["api", "repos/acme/repo/actions/jobs/804/logs"],
+      ["api", "--include", "repos/acme/repo/check-runs/12345"],
+      ["api", "--include", "repos/acme/repo/check-runs/12345/annotations", "-f", "per_page=20"],
+      ["api", "--include", "repos/acme/repo/actions/runs/456/jobs", "-f", "per_page=100"],
+      ["api", "--include", "repos/acme/repo/actions/jobs/800/logs"],
+      ["api", "--include", "repos/acme/repo/actions/jobs/801/logs"],
+      ["api", "--include", "repos/acme/repo/actions/jobs/802/logs"],
+      ["api", "--include", "repos/acme/repo/actions/jobs/803/logs"],
+      ["api", "--include", "repos/acme/repo/actions/jobs/804/logs"],
     ]);
     expect(details.truncated).toBe(true);
   });
@@ -2332,6 +2869,38 @@ describe("ForgeService", () => {
         isInMergeQueue: false,
       },
     });
+  });
+
+  it("keeps fresh merged PR state when supplemental facts hit a rate-limit cooldown", async () => {
+    const headSha = "1111111111111111111111111111111111111111";
+    const runner = createScriptedRunner([
+      currentPullRequestJson({ state: "MERGED", mergedAt: "2026-07-17T12:00:00Z" }),
+      {
+        error: new GitHubCommandError({
+          args: ["api", "graphql"],
+          cwd: "/repo",
+          exitCode: 1,
+          stderr: "HTTP 429: API rate limit exceeded",
+          stdout: "HTTP/2.0 429 Too Many Requests\nRetry-After: 60\n\nrate limited",
+        }),
+      },
+    ]);
+    const service = createGitHubService({
+      runner: runner.runner,
+      resolveGhPath: async () => "/usr/bin/gh",
+      now: () => 1_000,
+    });
+
+    const merged = await service.getCurrentPullRequestStatus({
+      cwd: "/repo",
+      headRef: "feature/fork",
+      headSha,
+      force: true,
+      reason: "test",
+    });
+
+    expect(merged).toMatchObject({ isMerged: true, state: "merged" });
+    expect(merged).not.toHaveProperty("forgeSpecific");
   });
 
   it("keeps a merged PR only when headRefOid matches the checkout HEAD", async () => {
@@ -2804,6 +3373,37 @@ describe("ForgeService", () => {
     ).rejects.toBe(dnsError);
   });
 
+  it("propagates a repo-view rate limit after current PR view has no result", async () => {
+    const runner = createScriptedRunner([
+      { error: noPullRequestError() },
+      {
+        error: new GitHubCommandError({
+          args: ["repo", "view"],
+          cwd: "/repo",
+          exitCode: 1,
+          stderr: "HTTP 429: API rate limit exceeded",
+          stdout: "HTTP/2.0 429 Too Many Requests\nRetry-After: 60\n\nrate limited",
+        }),
+      },
+    ]);
+    const service = createGitHubService({
+      runner: runner.runner,
+      resolveGhPath: async () => "/usr/bin/gh",
+      now: () => 100,
+    });
+
+    await expect(
+      service.getCurrentPullRequestStatus({
+        cwd: "/repo",
+        headRef: "feature/pr-pane",
+      }),
+    ).rejects.toBeInstanceOf(GitHubRateLimitCooldownError);
+    expect(runner.calls.map((call) => call.args.slice(0, 2))).toEqual([
+      ["pr", "view"],
+      ["repo", "view"],
+    ]);
+  });
+
   it("returns null when no current branch PR is matched by view or qualified fork lookup", async () => {
     const runner = createScriptedRunner([
       { error: noPullRequestError() },
@@ -3052,6 +3652,76 @@ describe("ForgeService", () => {
     await expect(service.isAuthenticated({ cwd: "/repo" })).rejects.toBeInstanceOf(
       GitHubAuthenticationError,
     );
+  });
+
+  it("forgets confirmed auth after a permanent auth failure", async () => {
+    let authStatusCalls = 0;
+    let now = 100;
+    const service = createGitHubService({
+      ttlMs: 1,
+      runner: async (args, options) => {
+        authStatusCalls += 1;
+        if (authStatusCalls === 1) {
+          return { stdout: "", stderr: "" };
+        }
+        if (authStatusCalls === 2) {
+          throw new GitHubCommandError({
+            args,
+            cwd: options.cwd,
+            exitCode: 1,
+            stderr: "To authenticate, run: gh auth login",
+          });
+        }
+        throw new GitHubCommandError({
+          args,
+          cwd: options.cwd,
+          exitCode: 1,
+          stderr: "could not resolve host: github.com",
+        });
+      },
+      resolveGhPath: async () => "/usr/bin/gh",
+      now: () => now,
+    });
+
+    await expect(service.isAuthenticated({ cwd: "/repo" })).resolves.toBe(true);
+    now += 2;
+    await expect(service.isAuthenticated({ cwd: "/repo" })).rejects.toBeInstanceOf(
+      GitHubAuthenticationError,
+    );
+    await expect(service.isAuthenticated({ cwd: "/repo" })).rejects.toMatchObject({
+      stderr: "could not resolve host: github.com",
+    });
+  });
+
+  it("forgets confirmed auth when invalidation changes the repository host", async () => {
+    let authStatusCalls = 0;
+    let hostCall = 0;
+    const routedHosts: Array<string | undefined> = [];
+    const service = createGitHubService({
+      runner: async (args, options) => {
+        routedHosts.push(options.envOverlay?.GH_HOST);
+        authStatusCalls += 1;
+        if (authStatusCalls === 1) {
+          return { stdout: "", stderr: "" };
+        }
+        throw new GitHubCommandError({
+          args,
+          cwd: options.cwd,
+          exitCode: 1,
+          stderr: "could not resolve host: host-b.internal",
+        });
+      },
+      resolveGhPath: async () => "/usr/bin/gh",
+      resolveRepoHost: async () => (hostCall++ === 0 ? "host-a.internal" : "host-b.internal"),
+    });
+
+    await expect(service.isAuthenticated({ cwd: "/repo" })).resolves.toBe(true);
+    service.invalidate({ cwd: "/repo" });
+
+    await expect(service.isAuthenticated({ cwd: "/repo" })).rejects.toMatchObject({
+      stderr: "could not resolve host: host-b.internal",
+    });
+    expect(routedHosts).toEqual(["host-a.internal", "host-b.internal"]);
   });
 
   it("throws a typed command error for non-zero exits", async () => {
@@ -3464,6 +4134,7 @@ describe("ForgeService", () => {
     expect(runner.calls[0]?.args).toEqual(["repo", "view", "--json", "owner,name,parent"]);
     expect(runner.calls[1]?.args).toEqual([
       "api",
+      "--include",
       "-X",
       "POST",
       "repos/acme/repo/pulls",
@@ -3497,6 +4168,7 @@ describe("ForgeService", () => {
 
     expect(runner.calls[1]?.args).toEqual([
       "api",
+      "--include",
       "-X",
       "POST",
       "repos/acme/repo/pulls",
@@ -3536,7 +4208,7 @@ describe("ForgeService", () => {
           expect.arrayContaining([
             "auth status --hostname github.acme.internal|",
             "repo view --json owner,name,parent|github.acme.internal",
-            "api -X POST repos/acme/repo/pulls -f title=Add thing -f head=feature -f base=main|github.acme.internal",
+            "api --include -X POST repos/acme/repo/pulls -f title=Add thing -f head=feature -f base=main|github.acme.internal",
           ]),
         );
       } finally {
@@ -3581,7 +4253,7 @@ describe("ForgeService", () => {
         expect(log).toEqual(
           expect.arrayContaining([
             "repo view --json owner,name,parent|github.acme.internal",
-            "api -X POST repos/acme/repo/pulls -f title=Add thing -f head=feature -f base=main|github.acme.internal",
+            "api --include -X POST repos/acme/repo/pulls -f title=Add thing -f head=feature -f base=main|github.acme.internal",
           ]),
         );
       } finally {

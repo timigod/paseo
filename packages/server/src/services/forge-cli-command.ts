@@ -38,6 +38,7 @@ interface NormalizeCliCommandErrorOptions {
     cwd: string;
     exitCode: number | null;
     stderr: string;
+    stdout?: string;
   }) => Error;
 }
 
@@ -151,6 +152,7 @@ export interface ForgeCommandFailureParams {
   cwd: string;
   exitCode: number | null;
   stderr: string;
+  stdout?: string;
 }
 
 export class ForgeCommandError extends Error {
@@ -239,6 +241,7 @@ export function normalizeCliCommandError(options: NormalizeCliCommandErrorOption
       stderr:
         stderr ||
         `${options.commandName} was terminated before completing (timed out after ${options.timeoutMs}ms or exceeded the output limit)`,
+      stdout: bufferOrStringToString(failure.stdout),
     });
   }
   return options.createCommandError({
@@ -246,6 +249,7 @@ export function normalizeCliCommandError(options: NormalizeCliCommandErrorOption
     cwd: options.cwd,
     exitCode: typeof failure.code === "number" ? failure.code : null,
     stderr: stderr || message,
+    stdout: bufferOrStringToString(failure.stdout),
   });
 }
 
