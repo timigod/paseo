@@ -439,7 +439,8 @@ into the repository.
 
 `defaults.provider` is required so `fleet run` and provider readiness checks use the same configured
 provider. `defaults.model` and `defaults.thinking` are optional. Command-line flags override these
-defaults for one run.
+defaults for one run. Fleet host selectors match normalized IDs before endpoints, so an exact host ID
+wins when another host uses the same text as its endpoint.
 
 When `fleet run` uses an idempotency key, the CLI persists the fully resolved create intent and the
 daemon identity before creation. A retry can follow a changed endpoint for the same configured host,

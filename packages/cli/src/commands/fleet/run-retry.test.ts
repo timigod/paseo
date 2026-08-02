@@ -34,6 +34,7 @@ vi.mock("./run.js", () => ({
   resolveFleetWorktreeBase: mocks.resolveFleetWorktreeBase,
 }));
 
+import { claimFleetAffinity } from "./affinity.js";
 import { runFleetRunCommand } from "./index.js";
 
 const directories: string[] = [];
@@ -244,5 +245,37 @@ describe("fleet run retry affinity", () => {
       runFleetRunCommand(undefined, runOptions, {} as Parameters<typeof runFleetRunCommand>[2]),
     ).rejects.toMatchObject({ code: "FLEET_AFFINITY_HOST_MISSING" });
     expect(mocks.runAgentRunIntent).toHaveBeenCalledTimes(1);
+  });
+
+  it("accepts a mixed-case concurrent claim owner and reloads its current endpoint", async () => {
+    const configPath = await createFleetConfig([fleetHost()]);
+    const intent = configureRunMocks();
+    mocks.prepareAgentRunIntent.mockImplementationOnce(async () => {
+      await writeFleetConfig(
+        configPath,
+        [fleetHost({ endpoint: "builder-a.internal:7777" })],
+        "gpt-original",
+      );
+      await claimFleetAffinity({
+        callerId: "caller-1",
+        idempotencyKey: "create-1",
+        affinity: {
+          host: fleetHost({ id: "Builder-A" }),
+          daemonId: "daemon-winner",
+          intent,
+        },
+      });
+      return { intent, daemonId: "daemon-candidate" };
+    });
+
+    await runFleetRunCommand(undefined, runOptions, {} as Parameters<typeof runFleetRunCommand>[2]);
+
+    const { idempotencyKey: _idempotencyKey, ...persistedCreate } = intent.create;
+    expect(mocks.runAgentRunIntent).toHaveBeenCalledWith({
+      intent: { ...intent, create: persistedCreate },
+      host: "builder-a.internal:7777",
+      expectedDaemonId: "daemon-winner",
+      idempotencyKey: "create-1",
+    });
   });
 });

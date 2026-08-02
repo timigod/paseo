@@ -36,6 +36,7 @@ import {
   findFleetHostForCwd,
   findFleetHostForHostname,
   loadFleetConfig,
+  matchesFleetHostId,
   type FleetHost,
 } from "./topology.js";
 import {
@@ -194,13 +195,13 @@ export async function runFleetRunCommand(
       idempotencyKey,
       affinity: { host: plan.host, daemonId: prepared.daemonId, intent: prepared.intent },
     });
-    if (pinnedHost && pinnedHost.id !== affinity.host.id) {
+    if (pinnedHost && !matchesFleetHostId(affinity.host, pinnedHost.id)) {
       throw {
         code: "FLEET_KEY_HOST_CONFLICT",
         message: `Idempotency key is owned by ${affinity.host.id}, not pinned host ${pinnedHost.id}`,
       } satisfies CommandError;
     }
-    const currentHost = findFleetHostById(affinity.host.id, config.hosts);
+    const currentHost = findFleetHostById(affinity.host.id, loadFleetConfig().hosts);
     if (!currentHost) {
       throw {
         code: "FLEET_AFFINITY_HOST_MISSING",

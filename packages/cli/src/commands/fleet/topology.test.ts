@@ -2,7 +2,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { loadFleetConfig, resolveFleetConfigPath } from "./topology.js";
+import { findFleetHost, loadFleetConfig, resolveFleetConfigPath } from "./topology.js";
 
 const cleanup: string[] = [];
 
@@ -11,6 +11,25 @@ afterEach(async () => {
 });
 
 describe("fleet topology configuration", () => {
+  it("prefers an exact normalized host ID over an earlier endpoint match", () => {
+    const endpointShadow = {
+      id: "builder-shadow",
+      name: "Builder Shadow",
+      endpoint: "builder-a",
+      codeRoot: "/srv/code",
+      hostnamePrefixes: ["builder-shadow"],
+      capacity: 8,
+    };
+    const exactOwner = {
+      ...endpointShadow,
+      id: "Builder-A",
+      name: "Builder A",
+      endpoint: "builder-a.internal:6767",
+    };
+
+    expect(findFleetHost("builder-a", [endpointShadow, exactOwner])).toBe(exactOwner);
+  });
+
   it("loads machine-local hosts and run defaults without repository policy", async () => {
     const directory = await mkdtemp(path.join(tmpdir(), "paseo-fleet-config-"));
     cleanup.push(directory);

@@ -107,16 +107,19 @@ export function findFleetHost(value: string, hosts: readonly FleetHost[]): Fleet
   const normalized = value.trim().toLowerCase();
   if (!normalized) return null;
   return (
-    hosts.find(
-      (host) => host.id.toLowerCase() === normalized || host.endpoint.toLowerCase() === normalized,
-    ) ?? null
+    findFleetHostById(normalized, hosts) ??
+    hosts.find((host) => host.endpoint.toLowerCase() === normalized) ??
+    null
   );
 }
 
-export function findFleetHostById(value: string, hosts: readonly FleetHost[]): FleetHost | null {
+export function matchesFleetHostId(host: FleetHost, value: string): boolean {
   const normalized = value.trim().toLowerCase();
-  if (!normalized) return null;
-  return hosts.find((host) => host.id.toLowerCase() === normalized) ?? null;
+  return normalized.length > 0 && host.id.toLowerCase() === normalized;
+}
+
+export function findFleetHostById(value: string, hosts: readonly FleetHost[]): FleetHost | null {
+  return hosts.find((host) => matchesFleetHostId(host, value)) ?? null;
 }
 
 export function findFleetHostForHostname(
