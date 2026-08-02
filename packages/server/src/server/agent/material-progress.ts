@@ -524,7 +524,9 @@ function hasAuthoritativeVerificationFailure(output: string): boolean {
       /^Found\s+(?=.*\b[1-9]\d*\s+errors?\b)\d+\s+(?:warnings?|errors?)(?:\s+and\s+\d+\s+(?:warnings?|errors?))?\.?$/.test(
         trimmed,
       ) ||
-      /^[1-9]\d*\s+problems?\s+\([1-9]\d*\s+errors?\b/.test(trimmed) ||
+      /^(?:✖\s+)?\d+\s+problems?\s+\((?:[1-9]\d*\s+errors?,\s+\d+\s+warnings?|\d+\s+errors?,\s+[1-9]\d*\s+warnings?)\)$/.test(
+        trimmed,
+      ) ||
       /^(?:Build failed|Failed to compile|error during build)\b/i.test(trimmed) ||
       /^ERROR in\s+\S/.test(trimmed)
     );

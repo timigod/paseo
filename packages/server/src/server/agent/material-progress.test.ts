@@ -147,7 +147,12 @@ describe("material progress checkpoint", () => {
     ["vitest-prose", "npm test", "12 tests passed\nThe fail-safe behavior remains covered."],
     ["jest", "npx jest", "Test Suites: 2 passed, 2 total\nTests: 12 passed, 12 total"],
     ["typecheck", "npm run typecheck", "Found 0 errors."],
-    ["lint", "npm run lint", "0 problems (0 errors, 0 warnings)"],
+    ["lint-zero-count", "npm run lint", "0 problems (0 errors, 0 warnings)"],
+    [
+      "lint-summary-prose",
+      "npm run lint",
+      "The previous report mentioned 2 problems (1 error, 1 warning).",
+    ],
   ])("counts successful %s command output as verification", (_kind, command, output) => {
     const checkpoint = applyRows([
       row(1, {
@@ -176,7 +181,15 @@ describe("material progress checkpoint", () => {
       "npm run typecheck",
       "\u001b[33mFound 1 warning and \u001b[31m1 error.\u001b[0m",
     ],
-    ["lint", "npm run lint", "2 problems (2 errors, 0 warnings)"],
+    ["lint-plain-error", "npm run lint", "2 problems (2 errors, 0 warnings)"],
+    ["lint-plain-warning", "npm run lint", "2 problems (0 errors, 2 warnings)"],
+    ["lint-ansi-warning", "npm run lint", "\u001b[33m2 problems (0 errors, 2 warnings)\u001b[0m"],
+    ["lint-symbol-mixed", "npm run lint", "✖ 2 problems (1 error, 1 warning)"],
+    [
+      "lint-ansi-symbol-mixed",
+      "npm run lint",
+      "\u001b[31m✖ 2 problems (1 error, 1 warning)\u001b[0m",
+    ],
     ["build", "npm run build", "Build failed with 1 error:"],
     ["standard-fail", "npm test", "FAIL src/main.test.ts"],
   ])("rejects %s failure output even when the exit code is zero", (_kind, command, output) => {
