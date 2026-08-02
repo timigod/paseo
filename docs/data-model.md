@@ -243,6 +243,12 @@ startup, so changing it requires a restart and does not evict existing runtimes.
 slot until provider close completes successfully; reload needs a spare slot while its replacement
 runtime starts.
 
+`daemon.get_status.response.payload.runtimeCapacity` projects that same admission gate as
+`{ limit, live, reserved, free }`. `limit` and `free` are `null` when capacity is unbounded;
+otherwise `free` is the remaining provider-runtime headroom after both live runtimes and in-flight
+startup reservations. The field is optional for compatibility with older daemons. Fleet clients
+should prefer this authoritative projection and use active agent records only as a legacy fallback.
+
 `agents.metadataGeneration.providers` controls the preferred structured-generation fallback order for daemon-side metadata tasks such as commit messages, PR text, branch names, and generated agent titles. Entries are tried first in the configured order, then Paseo falls through to dynamically discovered defaults and finally the current selection when available.
 
 Local speech model ids are intentionally narrow: STT uses `parakeet-tdt-0.6b-v2-int8`, TTS uses `kokoro-en-v0_19`, and turn detection uses the bundled Silero VAD model.

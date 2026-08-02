@@ -49,6 +49,7 @@ import {
   type ListImportableSessionsOptions,
 } from "./agent-sdk-types.js";
 import {
+  type AgentRuntimeCapacitySnapshot,
   HostAgentRuntimeCapacityController,
   UNMANAGED_AGENT_RUNTIME_RESERVATION,
 } from "./agent-runtime-capacity.js";
@@ -1095,6 +1096,10 @@ export class AgentManager {
         maxItemsPerAgent,
       },
     };
+  }
+
+  getRuntimeCapacitySnapshot(): AgentRuntimeCapacitySnapshot {
+    return this.runtimeCapacity.snapshot();
   }
 
   private touchUpdatedAt(agent: ManagedAgent): Date {

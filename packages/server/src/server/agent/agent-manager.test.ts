@@ -872,6 +872,13 @@ test("reserves host runtime capacity before concurrent provider startup", async 
   );
   await client.waitForCreationToStart();
 
+  expect(manager.getRuntimeCapacitySnapshot()).toEqual({
+    limit: 1,
+    live: 0,
+    reserved: 1,
+    free: 0,
+  });
+
   await expect(
     manager.createAgent(
       { provider: "codex", cwd: process.cwd() },
@@ -888,7 +895,19 @@ test("reserves host runtime capacity before concurrent provider startup", async 
 
   client.finishCreating();
   const created = await first;
+  expect(manager.getRuntimeCapacitySnapshot()).toEqual({
+    limit: 1,
+    live: 1,
+    reserved: 0,
+    free: 0,
+  });
   await manager.closeAgent(created.id);
+  expect(manager.getRuntimeCapacitySnapshot()).toEqual({
+    limit: 1,
+    live: 0,
+    reserved: 0,
+    free: 1,
+  });
 });
 
 test("lets a source-managed provider admit normal agent creation without double charging", async () => {

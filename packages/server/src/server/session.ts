@@ -1003,6 +1003,7 @@ export class Session {
       daemonRuntimeConfig,
       getWebSocketRuntimeMetrics,
       listProviderAvailability: () => this.agentManager.listProviderAvailability(),
+      getAgentRuntimeCapacity: () => this.agentManager.getRuntimeCapacitySnapshot(),
       listAgents: () => this.agentManager.listAgents(),
       listProjects: () => this.projectRegistry.list(),
       listWorkspaces: () => this.workspaceRegistry.list(),

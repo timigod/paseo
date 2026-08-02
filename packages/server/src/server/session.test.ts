@@ -409,6 +409,12 @@ function createSessionForTest(options: SessionForTestOptions = {}): Session {
     paseoHome: options.paseoHome ?? "/tmp/paseo-home",
     agentManager: asAgentManager({
       listAgents: vi.fn(() => []),
+      getRuntimeCapacitySnapshot: vi.fn(() => ({
+        limit: null,
+        live: 0,
+        reserved: 0,
+        free: null,
+      })),
       subscribe: vi.fn(() => () => {}),
       ...options.agentManager,
     }),
@@ -1595,6 +1601,12 @@ describe("daemon status + pairing RPC", () => {
           { provider: "claude", available: true },
           { provider: "codex", available: false, error: "boom" },
         ]),
+        getRuntimeCapacitySnapshot: vi.fn(() => ({
+          limit: 12,
+          live: 10,
+          reserved: 1,
+          free: 1,
+        })),
       },
     });
 
@@ -1616,6 +1628,7 @@ describe("daemon status + pairing RPC", () => {
             { provider: "claude", available: true, error: null },
             { provider: "codex", available: false, error: "boom" },
           ],
+          runtimeCapacity: { limit: 12, live: 10, reserved: 1, free: 1 },
         },
       },
     ]);
@@ -1652,6 +1665,7 @@ describe("daemon status + pairing RPC", () => {
           listen: null,
           relay: null,
           providers: [],
+          runtimeCapacity: { limit: null, live: 0, reserved: 0, free: null },
         },
       },
     ]);
