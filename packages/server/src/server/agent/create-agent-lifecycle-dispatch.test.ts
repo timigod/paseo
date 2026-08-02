@@ -38,6 +38,7 @@ function pendingWorktreeTarget(
 
 class AgentLifecycleEvents {
   private readonly listeners = new Set<AgentSubscriber>();
+  private readonly backgroundTasks = new Set<Promise<void>>();
 
   subscribe(listener: AgentSubscriber): () => void {
     this.listeners.add(listener);
@@ -55,6 +56,20 @@ class AgentLifecycleEvents {
 
   listenerCount(): number {
     return this.listeners.size;
+  }
+
+  trackBackgroundTask(task: Promise<void>): void {
+    this.backgroundTasks.add(task);
+    void task.then(
+      () => this.backgroundTasks.delete(task),
+      () => this.backgroundTasks.delete(task),
+    );
+  }
+
+  async flushForShutdown(): Promise<void> {
+    while (this.backgroundTasks.size > 0) {
+      await Promise.allSettled(this.backgroundTasks);
+    }
   }
 }
 
@@ -1095,4 +1110,29 @@ test.each([
     expect(retryArchive).toHaveBeenCalledWith("ws-restart", expect.any(AbortSignal)),
   );
   await vi.waitFor(() => expect(records.get(agentId)?.autoArchiveObligation).toBeUndefined());
+
+test("auto-archive participates in the agent lifecycle shutdown drain", async () => {
+  const agentId = "4a7e2521-286d-4ad5-af35-e091c55302e3";
+  const agents = new AgentLifecycleEvents();
+  let finishArchive!: () => void;
+  const archiveFinished = new Promise<void>((resolve) => {
+    finishArchive = resolve;
+  });
+  registerAgentAutoArchive({
+    agentManager: agents,
+    agentId,
+    archive: async () => archiveFinished,
+  });
+
+  agents.completeTurn(agentId);
+  let flushResolved = false;
+  const flushing = agents.flushForShutdown().then(() => {
+    flushResolved = true;
+    return undefined;
+  });
+  await Promise.resolve();
+
+  expect(flushResolved).toBe(false);
+  finishArchive();
+  await flushing;
 });

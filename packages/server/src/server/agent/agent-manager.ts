@@ -4312,7 +4312,7 @@ export class AgentManager {
     this.trackBackgroundTask(task);
   }
 
-  private trackBackgroundTask(task: Promise<void>): void {
+  trackBackgroundTask(task: Promise<void>): void {
     this.backgroundTasks.add(task);
     void task.finally(() => {
       this.backgroundTasks.delete(task);

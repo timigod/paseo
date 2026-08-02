@@ -2,7 +2,7 @@ import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { afterEach, beforeEach, expect, test } from "vitest";
+import { afterEach, beforeEach, describe, expect, test } from "vitest";
 
 import { getFullAccessConfig } from "./daemon-e2e/agent-configs.js";
 import { createDaemonTestContext, type DaemonTestContext } from "./test-utils/index.js";
@@ -100,6 +100,7 @@ async function createAgentInBranchOffWorktree(options?: {
   branchName?: string;
   deferInitialPrompt?: boolean;
   repoDir?: string;
+  startTurn?: boolean;
 }): Promise<{ repoDir: string; agentId: string; worktreePath: string }> {
   const repoDir = options?.repoDir ?? createGitRepo();
   const branchName = options?.branchName ?? `agent-lifecycle-${Date.now()}`;
@@ -114,7 +115,9 @@ async function createAgentInBranchOffWorktree(options?: {
       base: "main",
     },
     ...(options?.autoArchive !== undefined ? { autoArchive: options.autoArchive } : {}),
-    ...(options?.deferInitialPrompt ? {} : { initialPrompt: "Say done." }),
+    ...(options?.deferInitialPrompt || options?.startTurn === false
+      ? {}
+      : { initialPrompt: "Say done." }),
   });
   return { repoDir, agentId: created.id, worktreePath: created.cwd };
 }
@@ -338,26 +341,35 @@ test("create_agent_request without autoArchive keeps today's active listing beha
   await expectAgentPresentInActiveList(created.id);
 });
 
-test("create_agent_request with worktree but no autoArchive leaves agent and worktree active", async () => {
-  const created = await createAgentInBranchOffWorktree();
+describe("created worktree without auto-archive", () => {
+  let created: Awaited<ReturnType<typeof createAgentInBranchOffWorktree>>;
 
-  await ctx.client.waitForFinish(created.agentId, 10000);
+  beforeEach(async () => {
+    created = await createAgentInBranchOffWorktree();
+  });
 
-  await expectAgentPresentInActiveList(created.agentId);
-  await expectWorktreePresentInList(created.repoDir, created.worktreePath);
+  test("create_agent_request with worktree but no autoArchive leaves agent and worktree active", async () => {
+    await ctx.client.waitForFinish(created.agentId, 10000);
 
-  await ctx.client.archivePaseoWorktree({ worktreePath: created.worktreePath });
+    await expectAgentPresentInActiveList(created.agentId);
+    await expectWorktreePresentInList(created.repoDir, created.worktreePath);
+  });
 });
 
-test("archiving a created worktree removes the directory on last reference", async () => {
-  const created = await createAgentInBranchOffWorktree();
+describe("manual worktree archive", () => {
+  let created: Awaited<ReturnType<typeof createAgentInBranchOffWorktree>>;
 
-  await ctx.client.waitForFinish(created.agentId, 10000);
-  await ctx.client.archivePaseoWorktree({ worktreePath: created.worktreePath });
+  beforeEach(async () => {
+    created = await createAgentInBranchOffWorktree({ startTurn: false });
+  });
 
-  await expectAgentAbsentFromActiveList(created.agentId);
-  await expectWorktreeListEmpty(created.repoDir);
-  expect(existsSync(created.worktreePath)).toBe(false);
+  test("archiving a created worktree removes the directory on last reference", async () => {
+    await ctx.client.archivePaseoWorktree({ worktreePath: created.worktreePath });
+
+    await expectAgentAbsentFromActiveList(created.agentId);
+    await expectWorktreeListEmpty(created.repoDir);
+    expect(existsSync(created.worktreePath)).toBe(false);
+  });
 });
 
 test("resume_agent_request restores the archived managed-worktree agent identity", async () => {

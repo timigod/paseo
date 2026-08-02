@@ -649,6 +649,8 @@ export class Session {
   private readonly terminalController: TerminalSessionController;
   private inflightRequests = 0;
   private peakInflightRequests = 0;
+  private inflightRequestsDrained: Promise<void> | null = null;
+  private resolveInflightRequestsDrained: (() => void) | null = null;
   private readonly workspaceSetupSnapshots: Map<string, WorkspaceSetupSnapshot>;
   private readonly workspaceGitObserver: WorkspaceGitObserverService;
   private readonly workspaceDirectory: WorkspaceDirectory;
@@ -1755,6 +1757,11 @@ export class Session {
    * Main entry point for processing session messages
    */
   public async handleMessage(msg: SessionInboundMessage, source?: object): Promise<void> {
+    if (this.inflightRequests === 0) {
+      this.inflightRequestsDrained = new Promise((finishDraining) => {
+        this.resolveInflightRequestsDrained = finishDraining;
+      });
+    }
     this.inflightRequests++;
     if (this.inflightRequests > this.peakInflightRequests) {
       this.peakInflightRequests = this.inflightRequests;
@@ -1818,6 +1825,11 @@ export class Session {
       }
     } finally {
       this.inflightRequests--;
+      if (this.inflightRequests === 0) {
+        this.resolveInflightRequestsDrained?.();
+        this.inflightRequestsDrained = null;
+        this.resolveInflightRequestsDrained = null;
+      }
     }
   }
 
@@ -6881,6 +6893,7 @@ export class Session {
   public async cleanup(): Promise<void> {
     this.sessionLogger.trace({}, "agent.session.lifecycle.cleanup");
     this.isCleanedUp = true;
+    await this.inflightRequestsDrained;
 
     if (this.unsubscribeAgentEvents) {
       this.unsubscribeAgentEvents();

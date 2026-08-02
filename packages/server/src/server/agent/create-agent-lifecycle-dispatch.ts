@@ -54,6 +54,7 @@ export interface LifecycleRegistration {
 
 interface AgentLifecycleEvents {
   subscribe(callback: AgentSubscriber, options?: SubscribeOptions): () => void;
+  trackBackgroundTask(task: Promise<void>): void;
 }
 
 const inactiveRegistration: LifecycleRegistration = {
@@ -565,6 +566,7 @@ export function registerAgentAutoArchive(input: {
     const attemptMutationVersion = mutationVersion;
     const task = Promise.resolve().then(input.archive);
     archiveTask = task;
+    input.agentManager.trackBackgroundTask(task.then(() => undefined));
     void task.then(
       () => {
         if (archiveTask !== task) return;

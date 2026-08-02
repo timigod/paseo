@@ -200,7 +200,8 @@ test("createAgent with background initialPrompt returns a running snapshot befor
     const fetchedWhileRunning = await client.fetchAgent({ agentId: agent.id });
     expect(fetchedWhileRunning?.agent.status).toBe("running");
 
-    await new Promise((resolve) => setTimeout(resolve, 350));
+    const finished = await client.waitForFinish(agent.id, 10_000);
+    expect(finished.status).toBe("idle");
 
     const fetchedAfterCompletion = await client.fetchAgent({ agentId: agent.id });
     expect(fetchedAfterCompletion?.agent.status).toBe("idle");
@@ -955,9 +956,8 @@ test("returns home-scoped directory suggestions", async () => {
     expect(blankResult.error).toBeNull();
     expect(blankResult.entries).toEqual([]);
 
-    const outsideQuery = path.basename(outsideHomeDir);
     const outsideResult = await ctx.client.getDirectorySuggestions({
-      query: outsideQuery,
+      query: outsideHomeDir,
       limit: 25,
     });
     expect(outsideResult.error).toBeNull();

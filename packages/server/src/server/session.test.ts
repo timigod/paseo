@@ -2,6 +2,7 @@ import { execSync } from "child_process";
 import { existsSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join, resolve as resolvePath } from "path";
+import { setImmediate as waitForImmediate } from "timers/promises";
 import pino from "pino";
 import { afterEach, describe, expect, test, vi } from "vitest";
 
@@ -497,6 +498,39 @@ describe("session authorization scopes", () => {
       },
     ]);
   });
+});
+
+test("cleanup waits for requests that are already using session resources", async () => {
+  const searchStarted = deferred<void>();
+  const releaseSearch = deferred<void>();
+  const session = createSessionForTest({
+    github: {
+      searchRepositories: vi.fn(async () => {
+        searchStarted.resolve(undefined);
+        await releaseSearch.promise;
+        return [];
+      }),
+    },
+  });
+  const request = session.handleMessage({
+    type: "workspace.github.search_repositories.request",
+    query: "paseo",
+    limit: 10,
+    requestId: "cleanup-inflight-request",
+  });
+  await searchStarted.promise;
+
+  let cleanupResolved = false;
+  const cleanup = session.cleanup().then(() => {
+    cleanupResolved = true;
+    return undefined;
+  });
+  await waitForImmediate();
+
+  expect(cleanupResolved).toBe(false);
+  releaseSearch.resolve(undefined);
+  await request;
+  await cleanup;
 });
 
 describe("project command-center RPCs", () => {
