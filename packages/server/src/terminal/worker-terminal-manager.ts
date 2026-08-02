@@ -25,6 +25,8 @@ import type {
   TerminalsChangedEvent,
   TerminalsChangedListener,
 } from "./terminal-manager.js";
+import type { DestructiveMembershipGate } from "../server/destructive-membership-gate.js";
+import { createExternalProcessEnv } from "../server/paseo-env.js";
 import type {
   TerminalWorkerRequest,
   TerminalWorkerResponse,
@@ -93,6 +95,7 @@ interface WorkerTerminalManagerOptions {
   requestTimeoutMs?: number;
   forkWorker?: () => TerminalWorkerProcess;
   getTerminalActivityUrl?: () => string | null;
+  membershipGate?: DestructiveMembershipGate;
 }
 
 function createActivityToken(): string {
@@ -141,6 +144,7 @@ function cloneTerminalInfo(info: RequiredWorkerTerminalInfo): RequiredWorkerTerm
 
 function forkTerminalWorker(): TerminalWorkerProcess {
   return fork(fileURLToPath(resolveWorkerUrl()), [], {
+    env: createExternalProcessEnv(process.env),
     execArgv: resolveWorkerExecArgv(),
     serialization: "advanced",
     stdio: ["ignore", "ignore", "inherit", "ipc"],
@@ -161,6 +165,7 @@ export function createWorkerTerminalManager(
   const terminalWorkspaceContributionChangedListeners =
     new Set<TerminalWorkspaceContributionChangedListener>();
   let workerExited = false;
+  let membershipVersion = 0;
   let workerShutdownTimer: ReturnType<typeof setTimeout> | null = null;
 
   function emitTerminalsChanged(event: TerminalsChangedEvent): void {
@@ -228,6 +233,8 @@ export function createWorkerTerminalManager(
       existing.state = input.state;
       return existing.session;
     }
+
+    membershipVersion += 1;
 
     const record: WorkerTerminalRecord = {
       info: cloneTerminalInfo(input.info),
@@ -647,6 +654,10 @@ export function createWorkerTerminalManager(
   }
 
   return {
+    getMembershipVersion(): number {
+      return membershipVersion;
+    },
+
     async getTerminals(
       cwd: string,
       options?: { workspaceId?: string },
@@ -682,6 +693,10 @@ export function createWorkerTerminalManager(
     async createTerminal(
       options: WorkerCreateTerminalOptions & { workspaceId: string },
     ): Promise<TerminalSession> {
+      const membershipLease = managerOptions.membershipGate?.beginMembershipMutation({
+        workspaceIds: [options.workspaceId],
+        paths: [options.cwd],
+      });
       const terminalId = options.id ?? randomUUID();
       const activityToken = createActivityToken();
       const terminalActivityUrl = managerOptions.getTerminalActivityUrl?.() ?? null;
@@ -691,24 +706,27 @@ export function createWorkerTerminalManager(
         state: TerminalState;
       };
       try {
-        result = (await sendRequest({
-          type: "createTerminal",
-          options: {
-            ...options,
-            id: terminalId,
-            activityToken,
-            activityUrl: terminalActivityUrl,
-          },
-        })) as {
-          terminal: RequiredWorkerTerminalInfo;
-          state: TerminalState;
-        };
-      } catch (error) {
-        terminalActivityTokenById.delete(terminalId);
-        throw error;
+        try {
+          result = (await sendRequest({
+            type: "createTerminal",
+            options: {
+              ...options,
+              id: terminalId,
+              activityToken,
+              activityUrl: terminalActivityUrl,
+            },
+          })) as {
+            terminal: RequiredWorkerTerminalInfo;
+            state: TerminalState;
+          };
+        } catch (error) {
+          terminalActivityTokenById.delete(terminalId);
+          throw error;
+        }
+        return registerRecord({ info: result.terminal, state: result.state });
+      } finally {
+        membershipLease?.release();
       }
-      const session = registerRecord({ info: result.terminal, state: result.state });
-      return session;
     },
 
     registerCwdEnv(options: { cwd: string; env: Record<string, string> }): void {

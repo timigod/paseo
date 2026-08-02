@@ -1,9 +1,12 @@
 import { describe, expect, test } from "vitest";
 import {
+  PASEO_MANAGED_AGENT_CONTEXT,
+  applyManagedChildEnvOverlay,
   buildSelfNodeCommand,
   createExternalCommandProcessEnv,
   createExternalProcessEnv,
   createPaseoInternalEnv,
+  isManagedAgentContext,
   resolvePaseoNodeEnv,
 } from "./paseo-env.js";
 
@@ -16,11 +19,14 @@ describe("paseo env contract", () => {
     NODE_ENV: "development",
     PATH: "/usr/bin",
     PASEO_AGENT_ID: "agent-123",
+    PASEO_COORDINATOR_AUTH_TOKEN: "coordinator-token",
+    PASEO_COORDINATOR_CAPABILITY: "coordinator-capability",
     PASEO_DESKTOP_MANAGED: "1",
     [PASEO_NODE_ENV]: "production",
     PASEO_SUPERVISED: "1",
     PASEO_SUPERVISOR_INCARNATION: "supervisor-incarnation",
     PASEO_SUPERVISOR_WORKER_TOKEN: "worker-token",
+    PASEO_PASSWORD: "daemon-password",
   };
   const runtimeControlEnvKeys = [
     "ELECTRON_RUN_AS_NODE",
@@ -56,6 +62,9 @@ describe("paseo env contract", () => {
       EXTRA_VALUE: "from-overlay",
       PASEO_DESKTOP_MANAGED: "1",
       PASEO_NODE_ENV: "test",
+      PASEO_COORDINATOR_AUTH_TOKEN: "overlay-token",
+      PASEO_COORDINATOR_CAPABILITY: "overlay-capability",
+      PASEO_PASSWORD: "overlay-password",
       PASEO_SUPERVISED: "1",
       PATH: "/custom/bin",
     });
@@ -64,6 +73,10 @@ describe("paseo env contract", () => {
       expect(env[key]).toBeUndefined();
     }
     expect(env.NODE_ENV).toBe("development");
+    expect(env[PASEO_MANAGED_AGENT_CONTEXT]).toBe("1");
+    expect(env.PASEO_PASSWORD).toBeUndefined();
+    expect(env.PASEO_COORDINATOR_AUTH_TOKEN).toBeUndefined();
+    expect(env.PASEO_COORDINATOR_CAPABILITY).toBeUndefined();
     expect(env.PASEO_AGENT_ID).toBe("agent-123");
     expect(env.PATH).toBe("/custom/bin");
   });
@@ -74,6 +87,25 @@ describe("paseo env contract", () => {
     expect(env.CUSTOM).toBe("value");
     expect(env.NODE_ENV).toBe("development");
     expect(env.PATH).toBe("/custom/bin");
+  });
+
+  test("builds provider-style overlays that cannot reintroduce coordinator authority", () => {
+    const overlay = {
+      PASEO_PASSWORD: "overlay-password",
+      PASEO_COORDINATOR_AUTH_TOKEN: "overlay-token",
+      PASEO_COORDINATOR_CAPABILITY: "overlay-capability",
+    };
+
+    applyManagedChildEnvOverlay(overlay);
+
+    expect(overlay).toEqual({
+      [PASEO_MANAGED_AGENT_CONTEXT]: "1",
+      PASEO_PASSWORD: undefined,
+      PASEO_COORDINATOR_AUTH_TOKEN: undefined,
+      PASEO_COORDINATOR_CAPABILITY: undefined,
+    });
+    expect(isManagedAgentContext(overlay)).toBe(true);
+    expect(isManagedAgentContext({ [PASEO_MANAGED_AGENT_CONTEXT]: "0" })).toBe(false);
   });
 
   test("builds external command env without process.execPath special-casing", () => {
@@ -100,7 +132,9 @@ describe("paseo env contract", () => {
     expect(command.command).toBe(process.execPath);
     expect(command.args).toEqual(["script.js"]);
     expect(command.env[ELECTRON_RUN_AS_NODE]).toBe("1");
+    expect(command.env[PASEO_MANAGED_AGENT_CONTEXT]).toBe("1");
     expect(command.env.CUSTOM).toBe("value");
+    expect(command.env.PASEO_PASSWORD).toBeUndefined();
     expect(command.env.ELECTRON_NO_ATTACH_CONSOLE).toBeUndefined();
     expect(command.env.PASEO_DESKTOP_MANAGED).toBeUndefined();
     expect(command.env[PASEO_NODE_ENV]).toBeUndefined();

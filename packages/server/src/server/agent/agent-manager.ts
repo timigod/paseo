@@ -94,6 +94,7 @@ import {
   DestructiveMembershipGate,
   type MembershipMutationLease,
 } from "../destructive-membership-gate.js";
+import { createExternalProcessEnv } from "../paseo-env.js";
 
 const RELOAD_SESSION_CLOSE_TIMEOUT_MS = 3_000;
 const INTERRUPT_SESSION_TIMEOUT_MS = 2_000;
@@ -5003,7 +5004,7 @@ export class AgentManager {
     const context: AgentLaunchContext = {
       agentId,
       env: {
-        ...env,
+        ...createExternalProcessEnv({}, env ?? {}),
         PASEO_AGENT_ID: agentId,
         PASEO_AGENT_INCARNATION: agentIncarnation,
         PASEO_AGENT_CWD: cwd,

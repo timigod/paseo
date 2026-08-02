@@ -6,6 +6,7 @@ import { afterEach, describe, expect, test } from "vitest";
 import {
   checkProviderLaunchAvailable,
   createProviderEnv,
+  createProviderEnvSpec,
   migrateProviderSettings,
   ProviderOverrideSchema,
   resolveProviderLaunch,
@@ -264,6 +265,38 @@ describe("createProviderEnv", () => {
     expect(env.CLAUDE_CODE_SSE_PORT).toBeUndefined();
     expect(env.CLAUDE_AGENT_SDK_VERSION).toBeUndefined();
     expect(env.CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING).toBe("true");
+  });
+
+  test("marks provider descendants and strips coordinator authority after runtime overrides", () => {
+    const env = createProviderEnv({
+      baseEnv: {
+        PASEO_PASSWORD: "base-password",
+        PASEO_COORDINATOR_AUTH_TOKEN: "base-token",
+        PASEO_COORDINATOR_CAPABILITY: "base-capability",
+      },
+      runtimeSettings: {
+        env: {
+          PASEO_PASSWORD: "override-password",
+          PASEO_COORDINATOR_AUTH_TOKEN: "override-token",
+          PASEO_COORDINATOR_CAPABILITY: "override-capability",
+        },
+      },
+    });
+
+    expect(env.PASEO_MANAGED_AGENT_CONTEXT).toBe("1");
+    expect(env.PASEO_PASSWORD).toBeUndefined();
+    expect(env.PASEO_COORDINATOR_AUTH_TOKEN).toBeUndefined();
+    expect(env.PASEO_COORDINATOR_CAPABILITY).toBeUndefined();
+
+    const spec = createProviderEnvSpec({
+      runtimeSettings: { env: { PASEO_PASSWORD: "override-password" } },
+    });
+    expect(spec.envOverlay).toMatchObject({
+      PASEO_MANAGED_AGENT_CONTEXT: "1",
+      PASEO_PASSWORD: undefined,
+      PASEO_COORDINATOR_AUTH_TOKEN: undefined,
+      PASEO_COORDINATOR_CAPABILITY: undefined,
+    });
   });
 });
 

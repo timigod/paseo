@@ -2515,7 +2515,16 @@ test("createAgent passes daemon launch env through the provider launch context",
       cwd: workdir,
     },
     undefined,
-    { workspaceId: undefined },
+    {
+      workspaceId: undefined,
+      env: {
+        CUSTOM_CHILD_VALUE: "preserved",
+        PASEO_MANAGED_AGENT_CONTEXT: "0",
+        PASEO_PASSWORD: "must-not-reach-provider",
+        PASEO_COORDINATOR_AUTH_TOKEN: "must-not-reach-provider",
+        PASEO_COORDINATOR_CAPABILITY: "must-not-reach-provider",
+      },
+    },
   );
 
   expect(client.lastConfig).toEqual({
@@ -2527,9 +2536,11 @@ test("createAgent passes daemon launch env through the provider launch context",
   expect(client.lastLaunchContext).toEqual({
     agentId: snapshot.id,
     env: {
+      CUSTOM_CHILD_VALUE: "preserved",
       PASEO_AGENT_ID: snapshot.id,
       PASEO_AGENT_INCARNATION: expect.any(String),
       PASEO_AGENT_CWD: workdir,
+      PASEO_MANAGED_AGENT_CONTEXT: "1",
     },
   });
 });
@@ -3347,6 +3358,7 @@ test("resumeAgentFromPersistence keeps metadata config, applies overrides, and p
       PASEO_AGENT_ID: resumed.id,
       PASEO_AGENT_INCARNATION: expect.any(String),
       PASEO_AGENT_CWD: workdir,
+      PASEO_MANAGED_AGENT_CONTEXT: "1",
     },
   });
 });
@@ -3456,6 +3468,7 @@ test("importProviderSession imports the selected session without listing and pub
       PASEO_AGENT_ID: imported.id,
       PASEO_AGENT_INCARNATION: expect.any(String),
       PASEO_AGENT_CWD: workdir,
+      PASEO_MANAGED_AGENT_CONTEXT: "1",
     },
   });
   expect(imported.lifecycle).toBe("idle");
@@ -3560,6 +3573,7 @@ test("reloadAgentSession passes daemon launch env through the provider launch co
       PASEO_AGENT_ID: snapshot.id,
       PASEO_AGENT_INCARNATION: expect.any(String),
       PASEO_AGENT_CWD: workdir,
+      PASEO_MANAGED_AGENT_CONTEXT: "1",
     },
   });
   const initialIncarnation = client.lastCreateLaunchContext?.env?.PASEO_AGENT_INCARNATION;
@@ -3576,6 +3590,7 @@ test("reloadAgentSession passes daemon launch env through the provider launch co
       PASEO_AGENT_ID: snapshot.id,
       PASEO_AGENT_INCARNATION: expect.any(String),
       PASEO_AGENT_CWD: workdir,
+      PASEO_MANAGED_AGENT_CONTEXT: "1",
     },
   });
   const reloadedIncarnation = client.lastResumeLaunchContext?.env?.PASEO_AGENT_INCARNATION;

@@ -222,8 +222,8 @@ import {
   type IngressPrincipal,
 } from "./agent/ingress-capability.js";
 import {
-  removeCoordinatorCapability,
-  writeCoordinatorCapability,
+  removeLocalCoordinatorRoutingCapability,
+  writeLocalCoordinatorRoutingCapability,
 } from "./coordinator-capability-file.js";
 import { CreateAgentLifecycleDispatch } from "./agent/create-agent-lifecycle-dispatch.js";
 import {
@@ -831,7 +831,7 @@ export async function createPaseoDaemon(
   // each agent receives an HMAC-bound token for only its own incarnation.
   const coordinatorAuthToken = randomUUID();
   const agentIngressAuthority = new AgentIngressCapabilityAuthority(coordinatorAuthToken);
-  await writeCoordinatorCapability(config.paseoHome, coordinatorAuthToken);
+  await writeLocalCoordinatorRoutingCapability(config.paseoHome, coordinatorAuthToken);
 
   const listenTarget = parseListenString(config.listen);
 
@@ -2129,7 +2129,7 @@ export async function createPaseoDaemon(
     if (errors.length > 0) {
       throw new AggregateError(errors, "One or more daemon shutdown steps failed");
     }
-    await removeCoordinatorCapability(config.paseoHome, coordinatorAuthToken).catch(
+    await removeLocalCoordinatorRoutingCapability(config.paseoHome, coordinatorAuthToken).catch(
       () => undefined,
     );
   };

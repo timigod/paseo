@@ -3,14 +3,20 @@ import { chmod, mkdir, open, readFile, rename, rm } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { dirname, join } from "node:path";
 
-const COORDINATOR_CAPABILITY_FILENAME = "coordinator-auth-token";
+// This is a same-user routing capability for trusted local coordinator
+// surfaces. Mode 0600 excludes other OS users, but it is not isolation from a
+// deliberately hostile descendant running as the same user.
+const LOCAL_COORDINATOR_ROUTING_CAPABILITY_FILENAME = "coordinator-auth-token";
 
-export function coordinatorCapabilityPath(paseoHome: string): string {
-  return join(paseoHome, COORDINATOR_CAPABILITY_FILENAME);
+export function localCoordinatorRoutingCapabilityPath(paseoHome: string): string {
+  return join(paseoHome, LOCAL_COORDINATOR_ROUTING_CAPABILITY_FILENAME);
 }
 
-export async function writeCoordinatorCapability(paseoHome: string, token: string): Promise<void> {
-  const filePath = coordinatorCapabilityPath(paseoHome);
+export async function writeLocalCoordinatorRoutingCapability(
+  paseoHome: string,
+  token: string,
+): Promise<void> {
+  const filePath = localCoordinatorRoutingCapabilityPath(paseoHome);
   await mkdir(dirname(filePath), { recursive: true });
   const temporaryPath = `${filePath}.${process.pid}.${randomUUID()}.tmp`;
   try {
@@ -33,21 +39,23 @@ export async function writeCoordinatorCapability(paseoHome: string, token: strin
   }
 }
 
-export async function readCoordinatorCapability(paseoHome: string): Promise<string | null> {
+export async function readLocalCoordinatorRoutingCapability(
+  paseoHome: string,
+): Promise<string | null> {
   try {
-    const token = (await readFile(coordinatorCapabilityPath(paseoHome), "utf8")).trim();
+    const token = (await readFile(localCoordinatorRoutingCapabilityPath(paseoHome), "utf8")).trim();
     return token.length > 0 ? token : null;
   } catch {
     return null;
   }
 }
 
-export async function removeCoordinatorCapability(
+export async function removeLocalCoordinatorRoutingCapability(
   paseoHome: string,
   expectedToken: string,
 ): Promise<void> {
-  const filePath = coordinatorCapabilityPath(paseoHome);
-  const current = await readCoordinatorCapability(paseoHome);
+  const filePath = localCoordinatorRoutingCapabilityPath(paseoHome);
+  const current = await readLocalCoordinatorRoutingCapability(paseoHome);
   if (current !== expectedToken) {
     return;
   }

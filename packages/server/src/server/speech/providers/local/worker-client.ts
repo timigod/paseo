@@ -24,6 +24,7 @@ import type {
   LocalSpeechWorkerToParentMessage,
 } from "./worker-protocol.js";
 import { bufferToWorkerBytes, workerBytesToBuffer } from "./worker-bytes.js";
+import { createExternalProcessEnv } from "../../../paseo-env.js";
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 30000;
 const DEFAULT_IDLE_TTL_MS = 5 * 60 * 1000;
@@ -92,7 +93,7 @@ function resolveWorkerExecArgv(): string[] {
 }
 
 function forkLocalSpeechWorker(): LocalSpeechWorkerProcess {
-  const env = { ...process.env };
+  const env = createExternalProcessEnv(process.env);
   applySherpaLoaderEnv(env);
   return fork(fileURLToPath(resolveWorkerUrl()), [], {
     env,

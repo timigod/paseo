@@ -3,7 +3,11 @@ import {
   executableExists,
   findExecutable,
 } from "../../executable-resolution/executable-resolution.js";
-import { createExternalProcessEnv, type ProcessEnvRecord } from "../paseo-env.js";
+import {
+  applyManagedChildEnvOverlay,
+  createExternalProcessEnv,
+  type ProcessEnvRecord,
+} from "../paseo-env.js";
 export {
   AgentProviderRuntimeSettingsMapSchema,
   ProviderCommandSchema,
@@ -236,6 +240,7 @@ export function createProviderEnvSpec(options: ProviderEnvOptions = {}): Provide
   for (const key of PARENT_SESSION_ENV_VARS) {
     envOverlay[key] = undefined;
   }
+  applyManagedChildEnvOverlay(envOverlay);
   return {
     ...(options.baseEnv ? { baseEnv: options.baseEnv } : {}),
     envOverlay,

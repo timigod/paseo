@@ -1,7 +1,7 @@
 #!/usr/bin/env npx tsx
 
 import assert from "node:assert";
-import { writeFile } from "node:fs/promises";
+import { rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { createTestPaseoDaemon } from "../../server/src/server/test-utils/paseo-daemon.ts";
 import { runLocalPaseo } from "./helpers/local-cli.ts";
@@ -15,6 +15,9 @@ const daemon = await createTestPaseoDaemon({
 });
 
 try {
+  // This suite exercises the password-only fallback. A trusted local CLI would
+  // normally use the daemon's same-user coordinator routing capability instead.
+  await rm(join(daemon.paseoHome, "coordinator-auth-token"), { force: true });
   await writeFile(
     join(daemon.paseoHome, "paseo.pid"),
     `${JSON.stringify(

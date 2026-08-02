@@ -1,6 +1,14 @@
 const PASEO_NODE_ENV = "PASEO_NODE_ENV";
 const ELECTRON_RUN_AS_NODE = "ELECTRON_RUN_AS_NODE";
 
+export const PASEO_MANAGED_AGENT_CONTEXT = "PASEO_MANAGED_AGENT_CONTEXT";
+
+const MANAGED_CHILD_COORDINATOR_ENV_KEYS = [
+  "PASEO_PASSWORD",
+  "PASEO_COORDINATOR_AUTH_TOKEN",
+  "PASEO_COORDINATOR_CAPABILITY",
+] as const;
+
 const RUNTIME_CONTROL_ENV_KEYS = [
   PASEO_NODE_ENV,
   "PASEO_DESKTOP_MANAGED",
@@ -25,6 +33,15 @@ function buildExternalProcessEnv(
 ): ExternalProcessEnv {
   const sanitized = Object.assign({}, baseEnv, ...overlays);
   for (const key of RUNTIME_CONTROL_ENV_KEYS) {
+    delete sanitized[key];
+  }
+  // This marker is an inherited product boundary for daemon-managed children.
+  // It prevents ordinary CLI/Desktop code in a provider, terminal, or helper
+  // descendant from falling back to the local coordinator routing capability.
+  // It is not isolation from deliberately hostile code running as the same OS
+  // user, which can inspect or alter its own environment and local-user files.
+  sanitized[PASEO_MANAGED_AGENT_CONTEXT] = "1";
+  for (const key of MANAGED_CHILD_COORDINATOR_ENV_KEYS) {
     delete sanitized[key];
   }
   for (const [key, value] of Object.entries(sanitized)) {
@@ -55,6 +72,17 @@ export function createExternalCommandProcessEnv(
   return buildExternalProcessEnv(baseEnv, overlays);
 }
 
+export function applyManagedChildEnvOverlay(env: ProcessEnvRecord): void {
+  env[PASEO_MANAGED_AGENT_CONTEXT] = "1";
+  for (const key of MANAGED_CHILD_COORDINATOR_ENV_KEYS) {
+    env[key] = undefined;
+  }
+}
+
+export function isManagedAgentContext(env: ProcessEnvRecord = process.env): boolean {
+  return env[PASEO_MANAGED_AGENT_CONTEXT] === "1";
+}
+
 export function buildSelfNodeCommand(
   args: string[],
   envOverlay?: ProcessEnvRecord,
@@ -63,13 +91,8 @@ export function buildSelfNodeCommand(
   args: string[];
   env: ExternalProcessEnv;
 } {
-  const env = buildExternalProcessEnv(process.env, []);
-  Object.assign(env, { [ELECTRON_RUN_AS_NODE]: "1" }, envOverlay);
-  for (const [key, value] of Object.entries(env)) {
-    if (value === undefined) {
-      delete env[key];
-    }
-  }
+  const env = buildExternalProcessEnv(process.env, envOverlay ? [envOverlay] : []);
+  env[ELECTRON_RUN_AS_NODE] = "1";
   return {
     command: process.execPath,
     args,

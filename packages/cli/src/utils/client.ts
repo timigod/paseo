@@ -51,12 +51,21 @@ const DEFAULT_HOST = "localhost:6767";
 const DEFAULT_TIMEOUT = 15000;
 const WEBSOCKET_CLOSE_TIMEOUT_MS = 1000;
 const PID_FILENAME = "paseo.pid";
-const COORDINATOR_CAPABILITY_FILENAME = "coordinator-auth-token";
+// This file is a same-user routing capability for trusted local coordinator
+// surfaces. It is not a sandbox against hostile code running under the same UID.
+const LOCAL_COORDINATOR_ROUTING_CAPABILITY_FILENAME = "coordinator-auth-token";
 
-function readCoordinatorCapability(paseoHome: string): string | null {
+function isManagedAgentContext(env: NodeJS.ProcessEnv): boolean {
+  return env.PASEO_MANAGED_AGENT_CONTEXT === "1";
+}
+
+function readLocalCoordinatorRoutingCapability(paseoHome: string): string | null {
   try {
     return (
-      readFileSync(path.join(paseoHome, COORDINATOR_CAPABILITY_FILENAME), "utf8").trim() || null
+      readFileSync(
+        path.join(paseoHome, LOCAL_COORDINATOR_ROUTING_CAPABILITY_FILENAME),
+        "utf8",
+      ).trim() || null
     );
   } catch {
     return null;
@@ -296,13 +305,19 @@ export function resolveDaemonTarget(host: string): DaemonTarget {
   };
 }
 
-export function resolveDaemonPassword(host: string): string | undefined {
+export function resolveDaemonPassword(
+  host: string,
+  env: NodeJS.ProcessEnv = process.env,
+): string | undefined {
+  if (isManagedAgentContext(env)) {
+    return undefined;
+  }
   const trimmed = host.trim();
   if (trimmed.startsWith("tcp://")) {
     const fromUri = parseConnectionUri(trimmed).password;
     if (fromUri) return fromUri;
   }
-  const fromEnv = process.env.PASEO_PASSWORD;
+  const fromEnv = env.PASEO_PASSWORD;
   return fromEnv && fromEnv.length > 0 ? fromEnv : undefined;
 }
 
@@ -457,10 +472,17 @@ export async function connectToDaemon(options?: ConnectOptions): Promise<DaemonC
   const clientId = await getOrCreateCliClientId();
   const nodeWebSocketFactory = createNodeWebSocketFactory();
   const callerAgent = resolveCliCallerIdentity();
-  const agentAuthToken = process.env.PASEO_AGENT_AUTH_TOKEN?.trim() || null;
-  const coordinatorAuthToken = callerAgent
-    ? null
-    : readCoordinatorCapability(resolvePaseoHome(process.env));
+  const managedAgentContext = isManagedAgentContext(process.env);
+  const configuredAgentAuthToken = process.env.PASEO_AGENT_AUTH_TOKEN?.trim() || null;
+  const hasCompleteManagedIdentity = Boolean(
+    callerAgent?.agentId && callerAgent.incarnation && configuredAgentAuthToken,
+  );
+  const agentAuthToken =
+    managedAgentContext && !hasCompleteManagedIdentity ? null : configuredAgentAuthToken;
+  const coordinatorAuthToken =
+    managedAgentContext || callerAgent
+      ? null
+      : readLocalCoordinatorRoutingCapability(resolvePaseoHome(process.env));
 
   const explicitHost = options?.host ?? process.env.PASEO_HOST;
   const offer = parseHostOfferOrNull(explicitHost);
@@ -476,7 +498,7 @@ export async function connectToDaemon(options?: ConnectOptions): Promise<DaemonC
       throw new Error(`Unable to connect to Paseo daemon via ${hosts.join(", ")}`);
     }
     const host = hosts[index];
-    const password = resolveDaemonPassword(host);
+    const password = resolveDaemonPassword(host, process.env);
     const result = await tryConnectHost(
       host,
       password,
