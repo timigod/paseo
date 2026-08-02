@@ -145,17 +145,20 @@ class GitCommandExecutor {
       } catch (error) {
         this.finishTask();
         entry.reject(error);
+        this.resolveIdleWaiters();
         continue;
       }
       void task.then(
         (value) => {
           this.finishTask();
           entry.resolve(value);
+          this.resolveIdleWaiters();
           return undefined;
         },
         (error) => {
           this.finishTask();
           entry.reject(error);
+          this.resolveIdleWaiters();
           return undefined;
         },
       );
@@ -166,7 +169,6 @@ class GitCommandExecutor {
     this.runningCount = Math.max(0, this.runningCount - 1);
     this.promotePending();
     this.schedulePump();
-    this.resolveIdleWaiters();
   }
 
   private promotePending(): void {

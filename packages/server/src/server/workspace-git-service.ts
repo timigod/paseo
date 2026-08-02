@@ -39,7 +39,11 @@ import {
 } from "../services/forge-resolver.js";
 import { GitHubRateLimitCooldownError } from "../services/github-service.js";
 import { parseGitRevParsePath } from "../utils/git-rev-parse-path.js";
-import { runGitCommand, throwIfGitCommandBackpressure } from "../utils/run-git-command.js";
+import {
+  GitCommandBackpressureError,
+  runGitCommand,
+  throwIfGitCommandBackpressure,
+} from "../utils/run-git-command.js";
 import { listPaseoWorktrees, type PaseoWorktreeInfo } from "../utils/worktree.js";
 import { READ_ONLY_GIT_ENV } from "./checkout-git-utils.js";
 import { deriveProjectSlug } from "./workspace-git-metadata.js";
@@ -180,7 +184,7 @@ export interface WorkspaceGitService {
   refresh(cwd: string, options?: { priority?: "normal" | "high" }): Promise<void>;
   requestWorkingTreeWatch(
     cwd: string,
-    onChange: () => void,
+    onChange: (repoRoot?: string | null) => void,
   ): Promise<{ repoRoot: string | null; unsubscribe: () => void }>;
   scheduleRefreshForCwd(cwd: string): void;
   onWorkspaceStateMayHaveChanged(cwd: string): void;
@@ -402,9 +406,10 @@ interface WorkingTreeWatchTarget {
   watchers: FSWatcher[];
   watchedPaths: Set<string>;
   fallbackRefreshInterval: NodeJS.Timeout | null;
+  repoRootRetryTimer: NodeJS.Timeout | null;
   linuxTreeRefreshPromise: Promise<void> | null;
   linuxTreeRefreshQueued: boolean;
-  listeners: Set<() => void>;
+  listeners: Set<(repoRoot?: string | null) => void>;
   closed: boolean;
 }
 
@@ -891,7 +896,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
 
   async requestWorkingTreeWatch(
     cwd: string,
-    onChange: () => void,
+    onChange: (repoRoot?: string | null) => void,
   ): Promise<{ repoRoot: string | null; unsubscribe: () => void }> {
     cwd = resolve(cwd);
     const target = await this.ensureWorkingTreeWatchTarget(cwd);
@@ -1413,8 +1418,15 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     }
   }
 
-  private async createWorkingTreeWatchTarget(cwd: string): Promise<WorkingTreeWatchTarget> {
-    const repoRoot = await this.resolveCheckoutWatchRoot(cwd);
+  private async createWorkingTreeWatchTarget(
+    cwd: string,
+    knownRepoRoot?: string,
+    replaceTarget?: WorkingTreeWatchTarget,
+  ): Promise<WorkingTreeWatchTarget> {
+    const { repoRoot, retryRepoRoot } = await this.resolveInitialWorkingTreeWatchRoot(
+      cwd,
+      knownRepoRoot,
+    );
     this.assertWorkingTreeWatchSetupOpen();
     const target: WorkingTreeWatchTarget = {
       cwd,
@@ -1423,6 +1435,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
       watchers: [],
       watchedPaths: new Set<string>(),
       fallbackRefreshInterval: null,
+      repoRootRetryTimer: null,
       linuxTreeRefreshPromise: null,
       linuxTreeRefreshQueued: false,
       listeners: new Set(),
@@ -1487,12 +1500,51 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
       }
 
       this.assertWorkingTreeWatchSetupOpen();
-      this.workingTreeWatchTargets.set(cwd, target);
+      this.installWorkingTreeWatchTarget(cwd, target, replaceTarget);
+      if (retryRepoRoot) {
+        this.scheduleWorkingTreeWatchRootRetry(target);
+      }
       return target;
     } catch (error) {
       this.closeWorkingTreeWatchTarget(target);
       throw error;
     }
+  }
+
+  private async resolveInitialWorkingTreeWatchRoot(
+    cwd: string,
+    knownRepoRoot?: string,
+  ): Promise<{ repoRoot: string | null; retryRepoRoot: boolean }> {
+    if (knownRepoRoot !== undefined) {
+      return { repoRoot: knownRepoRoot, retryRepoRoot: false };
+    }
+    try {
+      return { repoRoot: await this.resolveCheckoutWatchRoot(cwd), retryRepoRoot: false };
+    } catch (error) {
+      if (!(error instanceof GitCommandBackpressureError)) {
+        throw error;
+      }
+      return { repoRoot: null, retryRepoRoot: true };
+    }
+  }
+
+  private installWorkingTreeWatchTarget(
+    cwd: string,
+    target: WorkingTreeWatchTarget,
+    replaceTarget?: WorkingTreeWatchTarget,
+  ): void {
+    if (
+      replaceTarget &&
+      (replaceTarget.closed ||
+        replaceTarget.listeners.size === 0 ||
+        this.workingTreeWatchTargets.get(cwd) !== replaceTarget)
+    ) {
+      throw createWorkspaceGitAbortError("Working tree watch target was closed during rearm");
+    }
+    for (const listener of replaceTarget?.listeners ?? []) {
+      target.listeners.add(listener);
+    }
+    this.workingTreeWatchTargets.set(cwd, target);
   }
 
   private async resolveCheckoutWatchRoot(cwd: string): Promise<string | null> {
@@ -1502,8 +1554,58 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
         envOverlay: READ_ONLY_GIT_ENV,
       });
       return parseGitRevParsePath(stdout);
-    } catch {
+    } catch (error) {
+      throwIfGitCommandBackpressure(error);
       return null;
+    }
+  }
+
+  private scheduleWorkingTreeWatchRootRetry(target: WorkingTreeWatchTarget): void {
+    if (target.repoRootRetryTimer || target.closed || this.disposed) {
+      return;
+    }
+    target.repoRootRetryTimer = setTimeout(() => {
+      target.repoRootRetryTimer = null;
+      void this.retryWorkingTreeWatchRoot(target);
+    }, WORKING_TREE_WATCH_FALLBACK_REFRESH_MS);
+  }
+
+  private async retryWorkingTreeWatchRoot(target: WorkingTreeWatchTarget): Promise<void> {
+    if (
+      target.closed ||
+      this.disposed ||
+      target.listeners.size === 0 ||
+      this.workingTreeWatchTargets.get(target.cwd) !== target
+    ) {
+      return;
+    }
+
+    let repoRoot: string | null;
+    try {
+      repoRoot = await this.resolveCheckoutWatchRoot(target.cwd);
+    } catch (error) {
+      if (error instanceof GitCommandBackpressureError) {
+        this.scheduleWorkingTreeWatchRootRetry(target);
+        return;
+      }
+      throw error;
+    }
+    if (!repoRoot) {
+      return;
+    }
+
+    let replacement: WorkingTreeWatchTarget;
+    try {
+      replacement = await this.createWorkingTreeWatchTarget(target.cwd, repoRoot, target);
+    } catch (error) {
+      if (error instanceof GitCommandBackpressureError) {
+        this.scheduleWorkingTreeWatchRootRetry(target);
+      }
+      return;
+    }
+    this.closeWorkingTreeWatchTarget(target);
+    for (const listener of replacement.listeners) {
+      listener(repoRoot);
     }
   }
 
@@ -2790,7 +2892,10 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     this.workspaceTargets.delete(target.cwd);
   }
 
-  private removeWorkingTreeWatchListener(cwd: string, listener: () => void): void {
+  private removeWorkingTreeWatchListener(
+    cwd: string,
+    listener: (repoRoot?: string | null) => void,
+  ): void {
     const target = this.workingTreeWatchTargets.get(cwd);
     if (!target) {
       return;
@@ -2842,6 +2947,10 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     if (target.fallbackRefreshInterval) {
       clearInterval(target.fallbackRefreshInterval);
       target.fallbackRefreshInterval = null;
+    }
+    if (target.repoRootRetryTimer) {
+      clearTimeout(target.repoRootRetryTimer);
+      target.repoRootRetryTimer = null;
     }
 
     for (const watcher of target.watchers) {

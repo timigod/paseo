@@ -1,3 +1,7 @@
+import { execFileSync } from "node:child_process";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 describe("checkout Git pressure propagation", () => {
@@ -154,4 +158,57 @@ describe("checkout Git pressure propagation", () => {
       await expect(resolveRepositoryDefaultBranch(process.cwd())).rejects.toBe(pressure);
     },
   );
+
+  it("aborts and restores the branch after conflict diagnostics use a tightly bounded executor", async () => {
+    const previousConcurrency = process.env.PASEO_GIT_CONCURRENCY;
+    const previousMaxPending = process.env.PASEO_GIT_MAX_PENDING;
+    const repoDir = mkdtempSync(join(tmpdir(), "checkout-merge-pressure-"));
+    try {
+      execFileSync("git", ["init", "-b", "main"], { cwd: repoDir });
+      execFileSync("git", ["config", "user.email", "test@example.com"], { cwd: repoDir });
+      execFileSync("git", ["config", "user.name", "Test"], { cwd: repoDir });
+      writeFileSync(join(repoDir, "conflict.txt"), "base\n");
+      execFileSync("git", ["add", "conflict.txt"], { cwd: repoDir });
+      execFileSync("git", ["commit", "-m", "base"], { cwd: repoDir });
+      execFileSync("git", ["checkout", "-b", "feature"], { cwd: repoDir });
+      writeFileSync(join(repoDir, "conflict.txt"), "feature\n");
+      execFileSync("git", ["commit", "-am", "feature"], { cwd: repoDir });
+      execFileSync("git", ["checkout", "main"], { cwd: repoDir });
+      writeFileSync(join(repoDir, "conflict.txt"), "main\n");
+      execFileSync("git", ["commit", "-am", "main"], { cwd: repoDir });
+      execFileSync("git", ["checkout", "feature"], { cwd: repoDir });
+
+      process.env.PASEO_GIT_CONCURRENCY = "1";
+      process.env.PASEO_GIT_MAX_PENDING = "1";
+      vi.resetModules();
+      const { mergeToBase, MergeConflictError } = await import("./checkout-git.js");
+
+      await expect(mergeToBase(repoDir, { baseRef: "main" })).rejects.toBeInstanceOf(
+        MergeConflictError,
+      );
+      expect(
+        execFileSync("git", ["rev-parse", "--abbrev-ref", "HEAD"], { cwd: repoDir })
+          .toString()
+          .trim(),
+      ).toBe("feature");
+      expect(
+        execFileSync("git", ["status", "--porcelain"], { cwd: repoDir }).toString().trim(),
+      ).toBe("");
+      expect(() =>
+        execFileSync("git", ["rev-parse", "-q", "--verify", "MERGE_HEAD"], { cwd: repoDir }),
+      ).toThrow();
+    } finally {
+      if (previousConcurrency === undefined) {
+        delete process.env.PASEO_GIT_CONCURRENCY;
+      } else {
+        process.env.PASEO_GIT_CONCURRENCY = previousConcurrency;
+      }
+      if (previousMaxPending === undefined) {
+        delete process.env.PASEO_GIT_MAX_PENDING;
+      } else {
+        process.env.PASEO_GIT_MAX_PENDING = previousMaxPending;
+      }
+      rmSync(repoDir, { recursive: true, force: true });
+    }
+  });
 });

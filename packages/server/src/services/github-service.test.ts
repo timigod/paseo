@@ -3636,6 +3636,31 @@ describe("ForgeService", () => {
     expect(runner.calls).toHaveLength(0);
   });
 
+  it("does not cache gh as missing when ENOENT came from a deleted cwd", async () => {
+    const deletedCwd = join(tmpdir(), "deleted-github-worktree");
+    rmSync(deletedCwd, { recursive: true, force: true });
+    const runner = vi.fn<GitHubCommandRunner>(async (_args, options) => {
+      if (options.cwd === deletedCwd) {
+        throw Object.assign(new Error(`spawn gh ENOENT in ${deletedCwd}`), { code: "ENOENT" });
+      }
+      return { stdout: pullRequestJson("Healthy repo"), stderr: "" };
+    });
+    const service = createGitHubService({
+      runner,
+      resolveGhPath: async () => "/usr/bin/gh",
+      resolveRepoHost: async () => null,
+      now: () => 100,
+    });
+
+    await expect(service.listPullRequests({ cwd: deletedCwd })).rejects.toBeInstanceOf(
+      GitHubCommandError,
+    );
+    await expect(service.listPullRequests({ cwd: process.cwd() })).resolves.toEqual([
+      expect.objectContaining({ title: "Healthy repo" }),
+    ]);
+    expect(runner).toHaveBeenCalledTimes(2);
+  });
+
   it("shares missing gh capability across targets and recovers after the cooldown", async () => {
     let now = 100;
     const resolveGhPath = vi

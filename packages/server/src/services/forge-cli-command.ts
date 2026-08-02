@@ -1,3 +1,4 @@
+import { existsSync } from "node:fs";
 import { z } from "zod";
 import { findExecutable } from "../executable-resolution/executable-resolution.js";
 import { runGitCommand, throwIfGitCommandBackpressure } from "../utils/run-git-command.js";
@@ -225,7 +226,7 @@ export function normalizeCliCommandError(options: NormalizeCliCommandErrorOption
     return options.error as Error;
   }
   const failure = toCommandFailureLike(options.error);
-  if (failure.code === "ENOENT") {
+  if (failure.code === "ENOENT" && existsSync(options.cwd)) {
     return options.createMissingError();
   }
   const stderr = bufferOrStringToString(failure.stderr);

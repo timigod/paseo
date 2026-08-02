@@ -295,7 +295,12 @@ export class CheckoutDiffManager {
   private async openTarget(target: CheckoutDiffWatchTarget): Promise<void> {
     const { repoRoot, unsubscribe } = await this.workspaceGitService.requestWorkingTreeWatch(
       target.cwd,
-      () => this.scheduleTargetRefresh(target),
+      (resolvedRepoRoot) => {
+        if (resolvedRepoRoot) {
+          target.diffCwd = resolvedRepoRoot;
+        }
+        this.scheduleTargetRefresh(target);
+      },
     );
     target.diffCwd = repoRoot ?? target.cwd;
     if (this.targets.get(target.key) !== target || target.listeners.size === 0) {

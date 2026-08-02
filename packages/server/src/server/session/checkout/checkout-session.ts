@@ -742,14 +742,36 @@ export class CheckoutSession {
         baseRef = baseRef.slice("origin/".length);
       }
 
-      const mutatedCwd = await mergeToBase(
-        cwd,
-        {
-          baseRef,
-          mode: msg.strategy === "squash" ? "squash" : "merge",
-        },
-        { paseoHome: this.paseoHome, worktreesRoot: this.worktreesRoot },
-      );
+      let mutatedCwd: string | null = null;
+      try {
+        const completedCwd = await mergeToBase(
+          cwd,
+          {
+            baseRef,
+            mode: msg.strategy === "squash" ? "squash" : "merge",
+          },
+          {
+            paseoHome: this.paseoHome,
+            worktreesRoot: this.worktreesRoot,
+            onMutationCwd: (operationCwd) => {
+              mutatedCwd = operationCwd;
+            },
+          },
+        );
+        mutatedCwd = completedCwd;
+      } catch (error) {
+        if (mutatedCwd) {
+          await Promise.all([
+            this.gitMutation.notifyGitMutation(mutatedCwd, "merge-to-base", {
+              invalidateForge: true,
+            }),
+            ...(mutatedCwd !== cwd
+              ? [this.gitMutation.notifyGitMutation(cwd, "merge-to-base")]
+              : []),
+          ]).catch(() => {});
+        }
+        throw error;
+      }
       await Promise.all([
         this.gitMutation.notifyGitMutation(mutatedCwd, "merge-to-base", { invalidateForge: true }),
         ...(mutatedCwd !== cwd ? [this.gitMutation.notifyGitMutation(cwd, "merge-to-base")] : []),
@@ -791,10 +813,28 @@ export class CheckoutSession {
         }
       }
 
-      await mergeFromBase(cwd, {
-        baseRef: msg.baseRef,
-        requireCleanTarget: msg.requireCleanTarget ?? true,
-      });
+      let mutationStarted = false;
+      try {
+        await mergeFromBase(
+          cwd,
+          {
+            baseRef: msg.baseRef,
+            requireCleanTarget: msg.requireCleanTarget ?? true,
+          },
+          {
+            onMutationCwd: () => {
+              mutationStarted = true;
+            },
+          },
+        );
+      } catch (error) {
+        if (mutationStarted) {
+          await this.gitMutation
+            .notifyGitMutation(cwd, "merge-from-base", { invalidateForge: true })
+            .catch(() => {});
+        }
+        throw error;
+      }
       await this.gitMutation.notifyGitMutation(cwd, "merge-from-base", { invalidateForge: true });
       this.scheduleDiffRefresh(cwd);
 

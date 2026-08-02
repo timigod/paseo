@@ -2543,6 +2543,43 @@ describe("WorkspaceGitServiceImpl", () => {
     service.dispose();
   });
 
+  test("retries a pressured watch-root read and rearms the existing subscription", async () => {
+    const nestedCwd = join(REPO_CWD, "packages", "server");
+    const pressure = new GitCommandBackpressureError(8, 64, 8, 64);
+    const runGitCommand = vi
+      .fn()
+      .mockRejectedValueOnce(pressure)
+      .mockResolvedValue({
+        stdout: `${REPO_CWD}\n`,
+        stderr: "",
+        truncated: false,
+        exitCode: 0,
+        signal: null,
+      });
+    const watchedPaths: string[] = [];
+    const watch = vi.fn((watchPath: string) => {
+      watchedPaths.push(watchPath);
+      return createWatcher();
+    });
+    const listener = vi.fn();
+    const service = createService({ runGitCommand, watch });
+
+    const subscription = await service.requestWorkingTreeWatch(nestedCwd, listener);
+    expect(subscription.repoRoot).toBeNull();
+    expect(watchedPaths).toContain(nestedCwd);
+
+    await vi.advanceTimersByTimeAsync(5_000);
+    await flushPromises();
+
+    expect(runGitCommand).toHaveBeenCalledTimes(2);
+    expect(watchedPaths).toContain(REPO_CWD);
+    expect(listener).toHaveBeenCalledWith(REPO_CWD);
+    expect(service.getMetrics().workingTreeWatchListenerCount).toBe(1);
+
+    subscription.unsubscribe();
+    service.dispose();
+  });
+
   test("working tree changes notify watch listeners immediately", async () => {
     const watchCallbacks: Array<() => void> = [];
     const watch = vi.fn(

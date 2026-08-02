@@ -793,6 +793,7 @@ export interface CheckoutContext {
   paseoHome?: string;
   worktreesRoot?: string;
   logger?: Pick<Logger, "trace" | "warn">;
+  onMutationCwd?: (cwd: string) => void;
   facts?: CheckoutSnapshotFacts | null;
   repositoryCommonDir?: string | null;
   repositoryFacts?: CheckoutRepositoryFactReader;
@@ -800,6 +801,10 @@ export interface CheckoutContext {
 
 export interface CheckoutRepositoryFactReader {
   read<T>(gitCommonDir: string, operation: string, load: () => Promise<T>): Promise<T>;
+}
+
+function notifyCheckoutMutation(context: CheckoutContext | undefined, cwd: string): void {
+  context?.onMutationCwd?.(cwd);
 }
 
 export type CheckoutSnapshotFacts =
@@ -3094,11 +3099,11 @@ async function detectAndThrowMergeToBaseConflict(
       ? `${error.message}\n${getErrorStderr(error)}\n${getErrorStdout(error)}`
       : String(error);
   try {
-    const [unmergedOutput, lsFilesOutput, statusOutput] = await Promise.all([
-      runGitCommand(["diff", "--name-only", "--diff-filter=U"], { cwd: operationCwd }),
-      runGitCommand(["ls-files", "-u"], { cwd: operationCwd }),
-      runGitCommand(["status", "--porcelain"], { cwd: operationCwd }),
-    ]);
+    const unmergedOutput = await runGitCommand(["diff", "--name-only", "--diff-filter=U"], {
+      cwd: operationCwd,
+    });
+    const lsFilesOutput = await runGitCommand(["ls-files", "-u"], { cwd: operationCwd });
+    const statusOutput = await runGitCommand(["status", "--porcelain"], { cwd: operationCwd });
     const statusConflicts = statusOutput.stdout
       .split("\n")
       .map((line) => line.trim())
@@ -3169,6 +3174,7 @@ export async function mergeToBase(
   const isSameCheckout = resolve(operationCwd) === resolve(currentWorktreeRoot);
   const originalBranch = await getCurrentBranch(operationCwd);
   const mode = options.mode ?? "merge";
+  notifyCheckoutMutation(context, operationCwd);
   try {
     await runGitCommand(["checkout", normalizedBaseRef], {
       cwd: operationCwd,
@@ -3249,6 +3255,7 @@ export async function mergeFromBase(
     return;
   }
 
+  notifyCheckoutMutation(context, cwd);
   try {
     await runGitCommand(["merge", bestBaseRef], { cwd, timeout: 120_000 });
   } catch (error) {
@@ -3278,11 +3285,11 @@ async function detectAndThrowMergeFromBaseConflict(
       ? `${error.message}\n${getErrorStderr(error)}\n${getErrorStdout(error)}`
       : String(error);
   try {
-    const [unmergedOutput, lsFilesOutput, statusOutput] = await Promise.all([
-      runGitCommand(["diff", "--name-only", "--diff-filter=U"], { cwd }),
-      runGitCommand(["ls-files", "-u"], { cwd }),
-      runGitCommand(["status", "--porcelain"], { cwd }),
-    ]);
+    const unmergedOutput = await runGitCommand(["diff", "--name-only", "--diff-filter=U"], {
+      cwd,
+    });
+    const lsFilesOutput = await runGitCommand(["ls-files", "-u"], { cwd });
+    const statusOutput = await runGitCommand(["status", "--porcelain"], { cwd });
     const statusConflicts = statusOutput.stdout
       .split("\n")
       .map((line) => line.trim())

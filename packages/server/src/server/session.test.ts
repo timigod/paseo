@@ -54,6 +54,7 @@ import {
 } from "../services/github-service.js";
 import type { CheckDetails, ForgeService } from "../services/forge-service.js";
 import type { GitHubPullRequestStatusFacts } from "../services/github-facts.js";
+import { MergeConflictError, type CheckoutContext } from "../utils/checkout-git.js";
 
 interface SessionHandlerInternals {
   interruptAgentIfRunning(agentId: string): Promise<void>;
@@ -1996,7 +1997,7 @@ describe("session checkout merge handling", () => {
         baseRef: "main",
         mode: "merge",
       },
-      { paseoHome: "/tmp/paseo-home" },
+      { paseoHome: "/tmp/paseo-home", onMutationCwd: expect.any(Function) },
     );
     expect(workspaceGitService.getSnapshot).toHaveBeenCalledWith("/tmp/base-worktree", {
       force: true,
@@ -2012,6 +2013,54 @@ describe("session checkout merge handling", () => {
         success: true,
         error: null,
         requestId: "request-1",
+      },
+    });
+  });
+
+  test("refreshes the mutated checkout after merge-to-base conflict cleanup", async () => {
+    const messages: unknown[] = [];
+    const github = { invalidate: vi.fn() };
+    const workspaceGitService = {
+      getSnapshot: vi.fn().mockResolvedValue(
+        createWorkspaceGitSnapshot("/tmp/request-worktree", {
+          git: { isGit: true, baseRef: "main", isDirty: false },
+        }),
+      ),
+    };
+    const session = createSessionForTest({ github, workspaceGitService, messages });
+    checkoutGitMocks.mergeToBase.mockImplementation(
+      async (_cwd: string, _options: unknown, context: CheckoutContext) => {
+        context.onMutationCwd?.("/tmp/base-worktree");
+        throw new MergeConflictError({
+          baseRef: "main",
+          currentBranch: "feature",
+          conflictFiles: ["conflict.txt"],
+        });
+      },
+    );
+
+    await session.handleMessage({
+      type: "checkout_merge_request",
+      cwd: "/tmp/request-worktree",
+      baseRef: "main",
+      requestId: "merge-conflict",
+    });
+
+    expect(workspaceGitService.getSnapshot).toHaveBeenCalledWith("/tmp/base-worktree", {
+      force: true,
+      reason: "merge-to-base",
+    });
+    expect(github.invalidate).toHaveBeenCalledWith({ cwd: "/tmp/base-worktree" });
+    expect(messages).toContainEqual({
+      type: "checkout_merge_response",
+      payload: {
+        cwd: "/tmp/request-worktree",
+        success: false,
+        error: {
+          code: "MERGE_CONFLICT",
+          message: "Merge conflict while merging feature into main",
+        },
+        requestId: "merge-conflict",
       },
     });
   });
@@ -2075,10 +2124,14 @@ describe("session checkout merge handling", () => {
       requestId: "request-merge-from-base-success",
     });
 
-    expect(checkoutGitMocks.mergeFromBase).toHaveBeenCalledWith("/tmp/request-worktree", {
-      baseRef: "main",
-      requireCleanTarget: true,
-    });
+    expect(checkoutGitMocks.mergeFromBase).toHaveBeenCalledWith(
+      "/tmp/request-worktree",
+      {
+        baseRef: "main",
+        requireCleanTarget: true,
+      },
+      { onMutationCwd: expect.any(Function) },
+    );
     expect(workspaceGitService.getSnapshot).toHaveBeenCalledWith("/tmp/request-worktree", {
       force: true,
       reason: "merge-from-base",

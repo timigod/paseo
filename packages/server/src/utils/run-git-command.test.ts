@@ -369,6 +369,35 @@ describe("runGitCommand", () => {
     );
   });
 
+  it("keeps drain blocked when a settled command resumes a sequential producer", async () => {
+    const { drainGitCommands, runGitCommand } = await loadRunGitCommand(1, 1);
+    enqueueSpawnBehaviors(
+      { stdoutData: "first" },
+      { delayMs: 5_000, deferCloseOnKill: true, stdoutData: "second" },
+    );
+
+    const producer = (async () => {
+      await runGitCommand(["status", "first"], { cwd: process.cwd() });
+      await runGitCommand(["status", "second"], { cwd: process.cwd() });
+    })();
+    let drained = false;
+    const drain = drainGitCommands().then(() => {
+      drained = true;
+      return undefined;
+    });
+
+    await vi.waitFor(() => expect(fakeSpawnController.spawnedArgs).toHaveLength(2));
+    expect(drained).toBe(false);
+
+    const secondProcess = fakeSpawnController.processes[1];
+    expect(secondProcess).toBeDefined();
+    secondProcess?.kill("SIGTERM");
+    secondProcess?.closeKilledProcess();
+    await expect(producer).rejects.toThrow("signal: SIGTERM");
+    await drain;
+    expect(drained).toBe(true);
+  });
+
   it("kills timed out processes and releases the limiter slot", async () => {
     const { runGitCommand } = await loadRunGitCommand(1);
 
