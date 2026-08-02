@@ -273,8 +273,23 @@ export class OpenCodeServerManager implements OpenCodeServerManagerLike {
     const currentStartup = this.currentStartup;
     if (currentStartup && !this.newServerStartup) {
       const prerequisite = await this.acquireFromStartup(currentStartup, options);
+      const prerequisiteServer = prerequisite.server;
       await prerequisite.release();
       this.throwIfAcquisitionCanceled(options);
+
+      const replacementStartup = this.currentStartup;
+      if (replacementStartup) {
+        return this.acquireFromStartup(replacementStartup, options);
+      }
+
+      const replacementServer = this.currentServer;
+      if (
+        replacementServer &&
+        replacementServer !== prerequisiteServer &&
+        this.isServerLive(replacementServer)
+      ) {
+        return this.acquireServer(replacementServer);
+      }
     }
     const startup = this.getNewServerStartup();
     return this.acquireFromStartup(startup, options);

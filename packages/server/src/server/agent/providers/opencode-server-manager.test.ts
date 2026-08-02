@@ -345,6 +345,56 @@ describe("OpenCodeServerManager generations", () => {
     }
   });
 
+  test("a concurrent current acquisition joins the forced replacement during prerequisite cleanup", async () => {
+    const { manager, runtime } = createTestManager([5101, 5102, 5103], {
+      autoAnnounce: false,
+      processGroupInspectionPending: true,
+    });
+    const currentController = new AbortController();
+    const current = manager.acquireCurrent({
+      signal: currentController.signal,
+      abortMessage: "prerequisite current acquisition aborted",
+    });
+    const currentFailure = expect(current).rejects.toThrow(
+      "prerequisite current acquisition aborted",
+    );
+    const forced = manager.acquireNew();
+    const observeForced = forced.catch(() => undefined);
+    let observeConcurrent: Promise<unknown> = Promise.resolve();
+
+    try {
+      await runtime.settle();
+      currentController.abort();
+      await currentFailure;
+
+      runtime.processForPort(5101).announceListening();
+      await runtime.waitForProcessGroupInspection();
+
+      const concurrent = manager.acquireCurrent();
+      observeConcurrent = concurrent.catch(() => undefined);
+      await runtime.settle();
+      expect(runtime.launchedPorts).toEqual([5101, 5102]);
+
+      runtime.releaseProcessGroupInspection();
+      await vi.waitFor(() => expect(runtime.terminatedPorts).toEqual([5101]));
+      expect(runtime.launchedPorts).toEqual([5101, 5102]);
+
+      runtime.processForPort(5102).announceListening();
+      const [forcedAcquisition, currentAcquisition] = await Promise.all([forced, concurrent]);
+      expect(forcedAcquisition.server.url).toBe("http://127.0.0.1:5102");
+      expect(currentAcquisition.server.url).toBe("http://127.0.0.1:5102");
+
+      await currentAcquisition.release();
+      await forcedAcquisition.release();
+      expect(runtime.terminatedPorts).toEqual([5101, 5102]);
+      expect(await runtime.managedProcesses.list()).toEqual([]);
+    } finally {
+      runtime.releaseProcessGroupInspection();
+      await manager.shutdown();
+      await Promise.all([observeForced, observeConcurrent]);
+    }
+  });
+
   test("startup handoff cancellation does not leave an unhandled readiness rejection", async () => {
     const controller = new AbortController();
     const { manager, runtime } = createTestManager([4488], {
