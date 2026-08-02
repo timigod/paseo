@@ -20,7 +20,10 @@ import type {
 import type { ManagedAgent } from "./agent-manager.js";
 import type { JsonValue } from "../json-utils.js";
 import { isStoredAgentProviderAvailable, toAgentPersistenceHandle } from "../persistence-hooks.js";
-import { materialProgressPayload } from "./material-progress.js";
+import {
+  MATERIAL_PROGRESS_FINGERPRINT_LIMIT,
+  materialProgressPayload,
+} from "./material-progress.js";
 export type { ManagedAgent };
 
 interface ProjectionOptions {
@@ -91,9 +94,10 @@ export function toStoredAgentRecord(
     historyPrimed: agent.historyPrimed,
     materialProgress: {
       ...agent.materialProgress,
-      seenMaterialProgressFingerprints: [
-        ...agent.materialProgress.seenMaterialProgressFingerprints,
-      ],
+      seenMaterialProgressFingerprints:
+        agent.materialProgress.seenMaterialProgressFingerprints.slice(
+          -MATERIAL_PROGRESS_FINGERPRINT_LIMIT,
+        ),
     },
     requiresAttention: agent.attention.requiresAttention,
     attentionReason: agent.attention.requiresAttention ? agent.attention.attentionReason : null,

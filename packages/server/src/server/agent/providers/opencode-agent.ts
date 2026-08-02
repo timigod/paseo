@@ -4003,6 +4003,7 @@ class OpenCodeAgentSession implements AgentSession {
   }
 
   async *streamHistory(): AsyncGenerator<AgentStreamEvent> {
+    const activeTurnId = this.activeForegroundTurnId;
     const sessionResponse = await this.client.session.get({
       sessionID: this.sessionId,
       directory: this.config.cwd,
@@ -4020,9 +4021,18 @@ class OpenCodeAgentSession implements AgentSession {
       response.data,
       sessionResponse.error ? null : sessionResponse.data?.revert,
     );
+    const activeAssistantMessageId =
+      activeTurnId && this.activeForegroundTurnId === activeTurnId
+        ? messages.findLast(
+            (message) =>
+              message.info.role === "assistant" && message.info.time?.completed === undefined,
+          )?.info.id
+        : undefined;
     for (const message of messages) {
       for (const event of buildOpenCodeReplayTimelineEvents(message)) {
-        yield event;
+        yield activeTurnId && message.info.id === activeAssistantMessageId
+          ? { ...event, turnId: activeTurnId }
+          : event;
       }
     }
   }

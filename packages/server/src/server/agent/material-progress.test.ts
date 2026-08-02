@@ -105,6 +105,61 @@ describe("material progress checkpoint", () => {
     });
   });
 
+  it("ignores successful shell output that is not verification evidence", () => {
+    const nonVerificationCommands = [
+      ["echo", "echo done", "done\n"],
+      ["printf", "printf ok", "ok"],
+      ["status", "git status --short", " M src/auth.ts\n"],
+      ["masked-test", "npm test || true", "1 test failed"],
+      ["followed-test", "npm test; echo tests complete", "1 test failed\ntests complete"],
+      ["test-help", "vitest --help", "Usage: vitest"],
+      ["make-version", "make --version", "GNU Make 4.4"],
+      ["xcode-version", "xcodebuild --version", "Xcode 26.0"],
+    ] as const;
+    const checkpoint = applyRows([
+      row(1, { type: "compaction", status: "completed" }),
+      ...nonVerificationCommands.map(([callId, command, output], index) =>
+        row(index + 2, {
+          type: "tool_call",
+          callId: `${callId}-1`,
+          name: "shell",
+          status: "completed",
+          error: null,
+          detail: { type: "shell", command, output, exitCode: 0 },
+        }),
+      ),
+    ]);
+
+    expect(materialProgressPayload(checkpoint)).toMatchObject({
+      state: "warning",
+      completedCompactionsSinceMaterialProgress: 1,
+      lastMaterialProgressKind: null,
+    });
+  });
+
+  it.each([
+    ["test", "npm test", "12 tests passed"],
+    ["build", "npm run build:server", "server build completed"],
+    ["check", "cargo check", "Finished dev profile"],
+    ["chained-test", "npm test && echo tests complete", "12 tests passed\ntests complete"],
+  ])("counts successful %s command output as verification", (_kind, command, output) => {
+    const checkpoint = applyRows([
+      row(1, {
+        type: "tool_call",
+        callId: `verification-${_kind}`,
+        name: "shell",
+        status: "completed",
+        error: null,
+        detail: { type: "shell", command, output, exitCode: 0 },
+      }),
+    ]);
+
+    expect(materialProgressPayload(checkpoint)).toMatchObject({
+      state: "progressing",
+      lastMaterialProgressKind: "verification",
+    });
+  });
+
   it("does not let repeated identical evidence reset compactions", () => {
     const read = row(1, {
       type: "tool_call",
@@ -336,5 +391,72 @@ describe("material progress checkpoint", () => {
       continuationBoundarySeq: 1,
       lastMaterialProgressKind: "write",
     });
+  });
+
+  it("bounds distinct fingerprints with deterministic oldest-first eviction", () => {
+    let checkpoint = acceptedCheckpoint();
+    let firstFingerprint: string | undefined;
+    let secondFingerprint: string | undefined;
+    for (let seq = 1; seq <= 257; seq += 1) {
+      checkpoint = advanceMaterialProgressCheckpoint(
+        checkpoint,
+        row(seq, {
+          type: "tool_call",
+          callId: `write-${seq}`,
+          name: "write",
+          status: "completed",
+          error: null,
+          detail: { type: "write", filePath: "proof.txt", content: `proof-${seq}` },
+        }),
+        "epoch-1",
+      );
+      firstFingerprint ??= checkpoint.seenMaterialProgressFingerprints[0];
+      if (seq === 2) {
+        secondFingerprint = checkpoint.seenMaterialProgressFingerprints[1];
+      }
+    }
+
+    expect(checkpoint.seenMaterialProgressFingerprints).toHaveLength(256);
+    expect(checkpoint.seenMaterialProgressFingerprints[0]).toBe(secondFingerprint);
+    expect(checkpoint.seenMaterialProgressFingerprints).not.toContain(firstFingerprint);
+
+    checkpoint = advanceMaterialProgressCheckpoint(
+      checkpoint,
+      row(258, { type: "compaction", status: "completed" }),
+      "epoch-1",
+    );
+    checkpoint = advanceMaterialProgressCheckpoint(
+      checkpoint,
+      row(259, {
+        type: "tool_call",
+        callId: "write-2-replayed",
+        name: "write",
+        status: "completed",
+        error: null,
+        detail: { type: "write", filePath: "proof.txt", content: "proof-2" },
+      }),
+      "epoch-1",
+    );
+    expect(materialProgressPayload(checkpoint)).toMatchObject({
+      state: "warning",
+      completedCompactionsSinceMaterialProgress: 1,
+    });
+  });
+
+  it("bounds fingerprint history restored from an older checkpoint", () => {
+    const restored = restoreMaterialProgressCheckpoint(
+      {
+        ...acceptedCheckpoint(),
+        seenMaterialProgressFingerprints: Array.from(
+          { length: 300 },
+          (_, index) => `write:legacy-${index}`,
+        ),
+      },
+      { timelineEpoch: "epoch-1", nextSeq: 1 },
+    );
+
+    expect(restored.seenMaterialProgressFingerprints).toHaveLength(256);
+    expect(restored.seenMaterialProgressFingerprints[0]).toBe("write:legacy-44");
+    expect(restored.seenMaterialProgressFingerprints.at(-1)).toBe("write:legacy-299");
   });
 });

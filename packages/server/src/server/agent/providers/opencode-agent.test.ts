@@ -1719,6 +1719,74 @@ describe("OpenCode adapter startTurn error handling", () => {
     ]);
   });
 
+  test("streamHistory attributes an in-progress material tool to the active OpenCode turn", async () => {
+    const openCode = new TestOpenCodeClient();
+    openCode.sessionPromptAsyncEvents = [];
+    openCode.sessionGetResponse = {
+      data: { id: "ses_unit_test", directory: "/tmp/test", revert: undefined },
+    };
+    openCode.sessionMessagesResponse = {
+      data: [
+        {
+          info: {
+            id: "msg_assistant_running",
+            sessionID: "ses_unit_test",
+            role: "assistant",
+            time: { created: 1778762475884 },
+          },
+          parts: [
+            {
+              id: "part_apply_patch_running",
+              sessionID: "ses_unit_test",
+              messageID: "msg_assistant_running",
+              type: "tool",
+              tool: "apply_patch",
+              callID: "call_apply_patch_running",
+              state: {
+                status: "completed",
+                input: {
+                  patchText:
+                    "*** Begin Patch\n*** Add File: /tmp/test/proof.txt\n+proof\n*** End Patch",
+                },
+                output: "Success. Updated the following files:\nA /tmp/test/proof.txt",
+              },
+            },
+          ],
+        },
+      ],
+    };
+    const session = new __openCodeInternals.OpenCodeAgentSession(
+      { provider: "opencode", cwd: "/tmp/test" },
+      openCode.asSdkClient(),
+      "ses_unit_test",
+      createTestLogger(),
+    );
+
+    try {
+      const { turnId } = await session.startTurn("make the change");
+      const history: AgentStreamEvent[] = [];
+      for await (const event of session.streamHistory()) {
+        history.push(event);
+      }
+
+      expect(history).toEqual([
+        expect.objectContaining({
+          type: "timeline",
+          provider: "opencode",
+          turnId,
+          item: expect.objectContaining({
+            type: "tool_call",
+            callId: "call_apply_patch_running",
+            status: "completed",
+            detail: expect.objectContaining({ type: "edit" }),
+          }),
+        }),
+      ]);
+    } finally {
+      await session.close();
+    }
+  });
+
   test("streamHistory maps persisted OpenCode tool parts through canonical detail branches", async () => {
     const patchText = [
       "*** Begin Patch",

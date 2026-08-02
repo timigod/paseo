@@ -237,6 +237,26 @@ describe("AgentStorage", () => {
     expect((await reloaded.get("agent-material-progress"))?.materialProgress).toEqual(checkpoint);
   });
 
+  test("applySnapshot bounds durable material progress fingerprints", async () => {
+    const checkpoint = {
+      ...createMaterialProgressCheckpoint({ timelineEpoch: "epoch-bounded", nextSeq: 1 }),
+      seenMaterialProgressFingerprints: Array.from(
+        { length: 300 },
+        (_, index) => `write:proof-${index}`,
+      ),
+    };
+
+    await storage.applySnapshot(
+      createManagedAgent({ id: "agent-bounded-progress", materialProgress: checkpoint }),
+    );
+
+    const reloaded = new AgentStorage(storagePath, logger);
+    const persisted = (await reloaded.get("agent-bounded-progress"))?.materialProgress;
+    expect(persisted?.seenMaterialProgressFingerprints).toHaveLength(256);
+    expect(persisted?.seenMaterialProgressFingerprints[0]).toBe("write:proof-44");
+    expect(persisted?.seenMaterialProgressFingerprints.at(-1)).toBe("write:proof-299");
+  });
+
   test("applySnapshot keeps featureValues absent when they were never set", async () => {
     await storage.applySnapshot(
       createManagedAgent({

@@ -60,6 +60,189 @@ type SearchDetail = Extract<EvidenceDetail, { type: "search" }>;
 type ShellDetail = Extract<ToolCallDetail, { type: "shell" }>;
 type PlanDetail = Extract<ToolCallDetail, { type: "plan" }>;
 
+export const MATERIAL_PROGRESS_FINGERPRINT_LIMIT = 256;
+
+// Checkpoint arrays are immutable, so their identity can cache membership across timeline rows.
+const fingerprintIndexes = new WeakMap<string[], ReadonlySet<string>>();
+const verificationNameParts = new Set(["build", "check", "lint", "test", "typecheck", "verify"]);
+const nonVerificationFlags = new Set(["--help", "--version", "-h", "-help", "-version"]);
+const xcodebuildVerificationActions = new Set([
+  "analyze",
+  "archive",
+  "build",
+  "build-for-testing",
+  "test",
+]);
+const verificationExecutables = new Set([
+  "ava",
+  "eslint",
+  "jest",
+  "mocha",
+  "mypy",
+  "oxlint",
+  "py.test",
+  "pyright",
+  "pytest",
+  "rspec",
+  "stylelint",
+  "tsc",
+  "vitest",
+  "vue-tsc",
+]);
+
+function fingerprintIndex(fingerprints: string[]): ReadonlySet<string> {
+  const existing = fingerprintIndexes.get(fingerprints);
+  if (existing) return existing;
+  const created = new Set(fingerprints);
+  fingerprintIndexes.set(fingerprints, created);
+  return created;
+}
+
+function boundedFingerprints(fingerprints: string[]): string[] {
+  return fingerprints.length > MATERIAL_PROGRESS_FINGERPRINT_LIMIT
+    ? fingerprints.slice(-MATERIAL_PROGRESS_FINGERPRINT_LIMIT)
+    : fingerprints;
+}
+
+function shellWords(command: string): string[] {
+  return (command.match(/(?:[^\s"']+|"[^"]*"|'[^']*')+/g) ?? []).map((word) =>
+    word.replace(/^(["'])(.*)\1$/, "$2"),
+  );
+}
+
+function executableName(value: string): string {
+  return (
+    value
+      .replaceAll("\\", "/")
+      .split("/")
+      .at(-1)
+      ?.replace(/\.(?:cmd|exe)$/i, "")
+      .toLowerCase() ?? ""
+  );
+}
+
+function hasVerificationName(value: string | undefined): boolean {
+  if (!value) return false;
+  const name = executableName(value).replace(/\.(?:bash|sh|zsh)$/i, "");
+  return name.split(/[:._-]+/).some((part) => verificationNameParts.has(part));
+}
+
+function firstNonOption(args: readonly string[]): string | undefined {
+  return args.find((arg) => arg !== "--" && !arg.startsWith("-"));
+}
+
+function stripCommandPrefixes(words: string[]): string[] {
+  while (words[0] && /^[A-Za-z_][A-Za-z0-9_]*=/.test(words[0])) {
+    words.shift();
+  }
+  if (words[0] === "env") {
+    words.shift();
+    while (words[0] && /^[A-Za-z_][A-Za-z0-9_]*=/.test(words[0])) {
+      words.shift();
+    }
+  }
+  if (words[0] === "sudo" || words[0] === "command" || words[0] === "time") {
+    words.shift();
+  }
+
+  return words;
+}
+
+function invokesVerificationExecutable(invoked: string | undefined): boolean {
+  return verificationExecutables.has(executableName(invoked ?? "")) || hasVerificationName(invoked);
+}
+
+function isPackageManagerVerification(args: string[]): boolean {
+  const action = args[0];
+  if (action === "run") return hasVerificationName(args[1]);
+  if (action === "exec" || action === "x") {
+    return invokesVerificationExecutable(firstNonOption(args.slice(1)));
+  }
+  return hasVerificationName(action);
+}
+
+function isToolchainVerification(args: string[]): boolean {
+  return args.some((arg) => hasVerificationName(arg) || arg === "clippy" || arg === "vet");
+}
+
+function isJvmBuildVerification(args: string[]): boolean {
+  return args.some(
+    (arg) =>
+      hasVerificationName(arg) ||
+      ["compile", "package", "verify"].includes(arg.replace(/^.*:/, "")),
+  );
+}
+
+function isPythonVerification(args: string[]): boolean {
+  const moduleIndex = args.indexOf("-m");
+  return invokesVerificationExecutable(moduleIndex >= 0 ? args[moduleIndex + 1] : undefined);
+}
+
+function isMakeVerification(args: string[]): boolean {
+  const targets = args.filter((arg) => !arg.startsWith("-"));
+  return (
+    args.length === 0 || targets.some((target) => hasVerificationName(target) || target === "all")
+  );
+}
+
+function isXcodebuildVerification(args: string[]): boolean {
+  return args.length === 0 || args.some((arg) => xcodebuildVerificationActions.has(arg));
+}
+
+type VerificationCommandDetector = (args: string[]) => boolean;
+
+const verificationCommandDetectors: Readonly<Record<string, VerificationCommandDetector>> = {
+  npm: isPackageManagerVerification,
+  pnpm: isPackageManagerVerification,
+  yarn: isPackageManagerVerification,
+  bun: isPackageManagerVerification,
+  npx: (args) => invokesVerificationExecutable(firstNonOption(args)),
+  bunx: (args) => invokesVerificationExecutable(firstNonOption(args)),
+  pnpx: (args) => invokesVerificationExecutable(firstNonOption(args)),
+  biome: (args) => args.some((arg) => arg === "check" || arg === "lint"),
+  prettier: (args) => args.includes("--check"),
+  ruff: (args) => args[0] === "check" || args.includes("--check"),
+  oxfmt: (args) => args.includes("--check"),
+  cargo: isToolchainVerification,
+  go: isToolchainVerification,
+  dotnet: isToolchainVerification,
+  swift: isToolchainVerification,
+  zig: isToolchainVerification,
+  gradle: isJvmBuildVerification,
+  gradlew: isJvmBuildVerification,
+  mvn: isJvmBuildVerification,
+  mvnw: isJvmBuildVerification,
+  python: isPythonVerification,
+  python3: isPythonVerification,
+  node: (args) => args.includes("--test"),
+  cmake: (args) => args.includes("--build"),
+  docker: (args) => args[0] === "build",
+  make: isMakeVerification,
+  xcodebuild: isXcodebuildVerification,
+  bash: (args) => hasVerificationName(firstNonOption(args)),
+  sh: (args) => hasVerificationName(firstNonOption(args)),
+  zsh: (args) => hasVerificationName(firstNonOption(args)),
+};
+
+function isVerificationCommandSegment(segment: string): boolean {
+  const words = stripCommandPrefixes(shellWords(segment.replace(/^[({\s]+/, "")));
+
+  const executable = executableName(words[0] ?? "");
+  const args = words.slice(1);
+  if (!executable) return false;
+  if (args.some((arg) => nonVerificationFlags.has(arg))) return false;
+  if (verificationExecutables.has(executable) || hasVerificationName(executable)) return true;
+  const detector = verificationCommandDetectors[executable];
+  return Object.hasOwn(verificationCommandDetectors, executable) && detector(args);
+}
+
+function runsVerificationCommand(command: string): boolean {
+  // Fallbacks, pipelines, and background jobs can hide the verification command's exit status.
+  if (/\||(?<![>&])&(?![&>])/.test(command)) return false;
+  const finalStatusSequence = command.split(/[;\n]+/).findLast((segment) => segment.trim()) ?? "";
+  return finalStatusSequence.split(/&&/).some(isVerificationCommandSegment);
+}
+
 function hasConcreteText(value: unknown): boolean {
   return typeof value === "string" && value.trim().length > 0;
 }
@@ -139,7 +322,7 @@ function evidenceEvent(detail: EvidenceDetail): MaterialProgressEvent | null {
 
 function verificationEvent(detail: ShellDetail): MaterialProgressEvent | null {
   const { command, cwd, output, exitCode } = detail;
-  return exitCode === 0 && hasConcreteText(output)
+  return exitCode === 0 && hasConcreteText(output) && runsVerificationCommand(command)
     ? progressEvent("verification", { command, cwd, output, exitCode })
     : null;
 }
@@ -228,7 +411,10 @@ export function restoreMaterialProgressCheckpoint(
         "Persisted material progress could not be proven to match the restored timeline.",
     });
   }
-  return checkpoint;
+  const restoredFingerprints = boundedFingerprints(checkpoint.seenMaterialProgressFingerprints);
+  return restoredFingerprints === checkpoint.seenMaterialProgressFingerprints
+    ? checkpoint
+    : { ...checkpoint, seenMaterialProgressFingerprints: restoredFingerprints };
 }
 
 export function invalidateMaterialProgressCheckpoint(input: {
@@ -287,18 +473,23 @@ function recordMaterialEvent(
   event: MaterialProgressEvent | null,
   timestamp: string,
 ): MaterialProgressCheckpoint {
-  if (!event || checkpoint.seenMaterialProgressFingerprints.includes(event.fingerprint)) {
+  if (
+    !event ||
+    fingerprintIndex(checkpoint.seenMaterialProgressFingerprints).has(event.fingerprint)
+  ) {
     return checkpoint;
   }
+  const retainedFingerprintCount = MATERIAL_PROGRESS_FINGERPRINT_LIMIT - 1;
+  const nextFingerprints =
+    checkpoint.seenMaterialProgressFingerprints.slice(-retainedFingerprintCount);
+  nextFingerprints.push(event.fingerprint);
+  fingerprintIndexes.set(nextFingerprints, new Set(nextFingerprints));
   return {
     ...checkpoint,
     completedCompactionsSinceMaterialProgress: 0,
     lastMaterialProgressAt: validTimestamp(timestamp),
     lastMaterialProgressKind: event.kind,
-    seenMaterialProgressFingerprints: [
-      ...checkpoint.seenMaterialProgressFingerprints,
-      event.fingerprint,
-    ],
+    seenMaterialProgressFingerprints: nextFingerprints,
   };
 }
 
