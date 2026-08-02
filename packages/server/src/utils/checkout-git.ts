@@ -743,6 +743,40 @@ export class MergeFromBaseConflictError extends Error {
   }
 }
 
+export class MergeCleanupError extends AggregateError {
+  readonly baseRef: string;
+  readonly currentBranch: string;
+  readonly conflictFiles: string[];
+  readonly diagnosticErrors: unknown[];
+  readonly cleanupErrors: unknown[];
+  readonly operationErrors: unknown[];
+
+  constructor(options: {
+    baseRef: string;
+    currentBranch: string;
+    conflictFiles: string[];
+    diagnosticErrors?: unknown[];
+    cleanupErrors: unknown[];
+    operationErrors?: unknown[];
+  }) {
+    const diagnosticErrors = options.diagnosticErrors ? [...options.diagnosticErrors] : [];
+    const cleanupErrors = [...options.cleanupErrors];
+    const operationErrors = options.operationErrors ? [...options.operationErrors] : [];
+    super(
+      [...operationErrors, ...diagnosticErrors, ...cleanupErrors],
+      `Merge cleanup failed while merging ${options.currentBranch} and ${options.baseRef}; checkout may require manual recovery`,
+      { cause: operationErrors[0] ?? cleanupErrors[0] },
+    );
+    this.name = "MergeCleanupError";
+    this.baseRef = options.baseRef;
+    this.currentBranch = options.currentBranch;
+    this.conflictFiles = [...options.conflictFiles];
+    this.diagnosticErrors = diagnosticErrors;
+    this.cleanupErrors = cleanupErrors;
+    this.operationErrors = operationErrors;
+  }
+}
+
 export interface AheadBehind {
   ahead: number;
   behind: number;
@@ -3108,6 +3142,7 @@ interface HandleFailedMergeInput {
   baseRef: string;
   currentBranch: string;
   direction: "to-base" | "from-base";
+  mode: "merge" | "squash";
 }
 
 interface MergeConflictDiagnostics {
@@ -3160,29 +3195,74 @@ async function collectMergeConflictDiagnostics(cwd: string): Promise<MergeConfli
   return { conflictFiles: [...new Set(conflictFiles)], errors };
 }
 
+async function verifyMergeCleanup(cwd: string): Promise<unknown[]> {
+  const errors: unknown[] = [];
+  try {
+    const mergeHead = await runGitCommand(["rev-parse", "-q", "--verify", "MERGE_HEAD"], {
+      cwd,
+      acceptExitCodes: [0, 1],
+      envOverlay: READ_ONLY_GIT_ENV,
+    });
+    if (mergeHead.exitCode === 0 || mergeHead.stdout.trim().length > 0) {
+      errors.push(new Error("Merge cleanup invariant failed: MERGE_HEAD still exists"));
+    }
+  } catch (error) {
+    errors.push(error);
+  }
+  try {
+    const unmerged = await runGitCommand(["ls-files", "-u"], {
+      cwd,
+      envOverlay: READ_ONLY_GIT_ENV,
+    });
+    if (unmerged.stdout.trim().length > 0) {
+      errors.push(new Error("Merge cleanup invariant failed: unmerged index entries remain"));
+    }
+  } catch (error) {
+    errors.push(error);
+  }
+  return errors;
+}
+
+async function cleanupFailedMerge(cwd: string, mode: "merge" | "squash"): Promise<unknown[]> {
+  const errors: unknown[] = [];
+  try {
+    const cleanupArgs = mode === "squash" ? ["reset", "--merge", "HEAD"] : ["merge", "--abort"];
+    await runGitCommand(cleanupArgs, { cwd, timeout: 120_000 });
+  } catch (error) {
+    errors.push(error);
+  }
+  errors.push(...(await verifyMergeCleanup(cwd)));
+  return errors;
+}
+
 async function handleFailedMerge(input: HandleFailedMergeInput): Promise<never> {
-  const { cwd, error, baseRef, currentBranch, direction } = input;
+  const { cwd, error, baseRef, currentBranch, direction, mode } = input;
   const errorDetails =
     error instanceof Error
       ? `${error.message}\n${getErrorStderr(error)}\n${getErrorStdout(error)}`
       : String(error);
   const diagnostics = await collectMergeConflictDiagnostics(cwd);
-  const relatedErrors = [...diagnostics.errors];
-  try {
-    await runGitCommand(["merge", "--abort"], { cwd, timeout: 120_000 });
-  } catch (abortError) {
-    relatedErrors.push(abortError);
-  }
+  const cleanupErrors = await cleanupFailedMerge(cwd, mode);
 
   const conflictDetected =
     diagnostics.conflictFiles.length > 0 || /CONFLICT|Automatic merge failed/i.test(errorDetails);
   if (conflictDetected) {
+    if (cleanupErrors.length > 0) {
+      throw new MergeCleanupError({
+        baseRef,
+        currentBranch,
+        conflictFiles: diagnostics.conflictFiles,
+        diagnosticErrors: diagnostics.errors,
+        cleanupErrors,
+        operationErrors: [error],
+      });
+    }
     if (direction === "to-base") {
       throw new MergeConflictError({
         baseRef,
         currentBranch,
         conflictFiles: diagnostics.conflictFiles,
-        relatedErrors,
+        relatedErrors: diagnostics.errors,
         cause: error,
       });
     }
@@ -3190,11 +3270,12 @@ async function handleFailedMerge(input: HandleFailedMergeInput): Promise<never> 
       baseRef,
       currentBranch,
       conflictFiles: diagnostics.conflictFiles,
-      relatedErrors,
+      relatedErrors: diagnostics.errors,
       cause: error,
     });
   }
 
+  const relatedErrors = [...diagnostics.errors, ...cleanupErrors];
   if (relatedErrors.length > 0) {
     throw new AggregateError(
       [error, ...relatedErrors],
@@ -3205,26 +3286,38 @@ async function handleFailedMerge(input: HandleFailedMergeInput): Promise<never> 
   throw error;
 }
 
-function appendMergeRelatedError(primary: unknown, relatedError: unknown): unknown {
-  if (primary instanceof MergeConflictError) {
-    return new MergeConflictError({
+function appendMergeCleanupError(primary: unknown, cleanupError: unknown): unknown {
+  if (primary instanceof MergeCleanupError) {
+    return new MergeCleanupError({
       baseRef: primary.baseRef,
       currentBranch: primary.currentBranch,
       conflictFiles: primary.conflictFiles,
-      relatedErrors: [...primary.relatedErrors, relatedError],
-      cause: primary,
+      diagnosticErrors: primary.diagnosticErrors,
+      cleanupErrors: [...primary.cleanupErrors, cleanupError],
+      operationErrors: primary.operationErrors,
+    });
+  }
+  if (primary instanceof MergeConflictError) {
+    return new MergeCleanupError({
+      baseRef: primary.baseRef,
+      currentBranch: primary.currentBranch,
+      conflictFiles: primary.conflictFiles,
+      diagnosticErrors: primary.relatedErrors,
+      cleanupErrors: [cleanupError],
+      operationErrors: [primary.cause ?? primary],
     });
   }
   if (primary instanceof MergeFromBaseConflictError) {
-    return new MergeFromBaseConflictError({
+    return new MergeCleanupError({
       baseRef: primary.baseRef,
       currentBranch: primary.currentBranch,
       conflictFiles: primary.conflictFiles,
-      relatedErrors: [...primary.relatedErrors, relatedError],
-      cause: primary,
+      diagnosticErrors: primary.relatedErrors,
+      cleanupErrors: [cleanupError],
+      operationErrors: [primary.cause ?? primary],
     });
   }
-  return new AggregateError([primary, relatedError], "Merge and branch restoration both failed", {
+  return new AggregateError([primary, cleanupError], "Merge and branch restoration both failed", {
     cause: primary,
   });
 }
@@ -3254,6 +3347,7 @@ async function executeMergeToBase(input: ExecuteMergeToBaseInput): Promise<void>
       baseRef,
       currentBranch,
       direction: "to-base",
+      mode,
     });
   }
   if (mode !== "squash") return;
@@ -3275,6 +3369,18 @@ async function restoreBranchAfterMerge(cwd: string, originalBranch: string): Pro
     throw new Error(
       `Failed to restore branch after merge: expected ${originalBranch}, found ${restoredBranch ?? "detached HEAD"}`,
     );
+  }
+}
+
+async function requireCleanSquashTarget(cwd: string, mode: "merge" | "squash"): Promise<void> {
+  if (mode !== "squash") return;
+
+  const { stdout } = await runGitCommand(["status", "--porcelain"], {
+    cwd,
+    envOverlay: READ_ONLY_GIT_ENV,
+  });
+  if (stdout.trim().length > 0) {
+    throw new Error("Working directory has uncommitted changes.");
   }
 }
 
@@ -3308,6 +3414,7 @@ export async function mergeToBase(
   const isSameCheckout = resolve(operationCwd) === resolve(currentWorktreeRoot);
   const originalBranch = await getCurrentBranch(operationCwd);
   const mode = options.mode ?? "merge";
+  await requireCleanSquashTarget(operationCwd, mode);
   notifyCheckoutMutation(context, operationCwd);
   let operationError: unknown;
   let operationFailed = false;
@@ -3328,9 +3435,15 @@ export async function mergeToBase(
       await restoreBranchAfterMerge(operationCwd, originalBranch);
     } catch (restorationError) {
       if (!operationFailed) {
-        throw restorationError;
+        throwIfGitCommandBackpressure(restorationError);
+        throw new MergeCleanupError({
+          baseRef: normalizedBaseRef,
+          currentBranch,
+          conflictFiles: [],
+          cleanupErrors: [restorationError],
+        });
       }
-      operationError = appendMergeRelatedError(operationError, restorationError);
+      operationError = appendMergeCleanupError(operationError, restorationError);
     }
   }
   if (operationFailed) throw operationError;
@@ -3384,6 +3497,7 @@ export async function mergeFromBase(
       baseRef: bestBaseRef,
       currentBranch,
       direction: "from-base",
+      mode: "merge",
     });
   }
 }

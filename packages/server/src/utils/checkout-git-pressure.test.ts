@@ -12,7 +12,7 @@ import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-type GitFailureMode = "diagnostic" | "abort" | "restore" | "restore-noop";
+type GitFailureMode = "none" | "diagnostic" | "abort" | "abort-noop" | "restore" | "restore-noop";
 
 function resolveRealGitPath(): string {
   for (const directory of (process.env.PATH ?? "").split(delimiter)) {
@@ -72,6 +72,9 @@ if [ "$PASEO_TEST_GIT_FAILURE" = "abort" ] && [ "$3" = "merge" ] && [ "$4" = "--
   echo "abort blocked" >&2
   exit 74
 fi
+if [ "$PASEO_TEST_GIT_FAILURE" = "abort-noop" ] && [ "$3" = "merge" ] && [ "$4" = "--abort" ]; then
+  exit 0
+fi
 if [ "$PASEO_TEST_GIT_FAILURE" = "restore" ] && [ "$3" = "checkout" ] && [ "$4" = "feature" ]; then
   echo "restore blocked" >&2
   exit 75
@@ -96,6 +99,15 @@ function readBranch(repoDir: string): string {
 
 function readStatus(repoDir: string): string {
   return execFileSync(realGitPath, ["status", "--porcelain"], { cwd: repoDir }).toString().trim();
+}
+
+function hasMergeHead(repoDir: string): boolean {
+  try {
+    execFileSync(realGitPath, ["rev-parse", "-q", "--verify", "MERGE_HEAD"], { cwd: repoDir });
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 async function captureFailure(operation: Promise<unknown>): Promise<unknown> {
@@ -329,6 +341,18 @@ describe("checkout Git pressure propagation", () => {
       ["checkout", "feature"],
       expect.objectContaining({ cwd }),
     );
+    const commands = runGitCommand.mock.calls.map(([args]) => args.join(" "));
+    expect(commands.slice(commands.indexOf("merge feature"))).toEqual([
+      "merge feature",
+      "diff --name-only --diff-filter=U",
+      "ls-files -u",
+      "status --porcelain",
+      "merge --abort",
+      "rev-parse -q --verify MERGE_HEAD",
+      "ls-files -u",
+      "checkout feature",
+      "rev-parse --abbrev-ref HEAD",
+    ]);
   });
 
   it.each(["symbolic-ref", "show-ref"])(
@@ -429,18 +453,108 @@ describe("checkout Git pressure propagation", () => {
     );
   });
 
-  it("surfaces abort and restoration failures from a bounded conflicting merge", async () => {
+  it("surfaces an aggregated cleanup failure when abort fails", async () => {
     await withBoundedMergeRepository(
       { conflicting: true, failureMode: "abort" },
       async (repoDir) => {
-        const { mergeToBase, MergeConflictError } = await import("./checkout-git.js");
+        const { mergeToBase, MergeCleanupError, MergeConflictError } =
+          await import("./checkout-git.js");
+        const { toCheckoutError } = await import("../server/checkout-git-utils.js");
 
         const failure = await captureFailure(mergeToBase(repoDir, { baseRef: "main" }));
 
-        expect(failure).toBeInstanceOf(MergeConflictError);
-        if (!(failure instanceof MergeConflictError)) throw failure;
-        expect(failure.relatedErrors).toEqual([
+        expect(failure).toBeInstanceOf(MergeCleanupError);
+        expect(failure).not.toBeInstanceOf(MergeConflictError);
+        if (!(failure instanceof MergeCleanupError)) throw failure;
+        expect(failure.cleanupErrors).toEqual([
           expect.objectContaining({ message: expect.stringContaining("abort blocked") }),
+          expect.objectContaining({ message: expect.stringContaining("MERGE_HEAD still exists") }),
+          expect.objectContaining({ message: expect.stringContaining("unmerged index entries") }),
+          expect.objectContaining({ message: expect.stringContaining("checkout feature") }),
+        ]);
+        expect(toCheckoutError(failure)).toEqual({
+          code: "UNKNOWN",
+          message: expect.stringContaining("checkout may require manual recovery"),
+        });
+        expect(readBranch(repoDir)).toBe("main");
+        expect(readStatus(repoDir)).toContain("UU conflict.txt");
+      },
+    );
+  });
+
+  it("surfaces merge-from-base abort failure instead of a recoverable conflict", async () => {
+    await withBoundedMergeRepository(
+      { conflicting: true, failureMode: "abort" },
+      async (repoDir) => {
+        const { mergeFromBase, MergeCleanupError, MergeFromBaseConflictError } =
+          await import("./checkout-git.js");
+
+        const failure = await captureFailure(mergeFromBase(repoDir, { baseRef: "main" }));
+
+        expect(failure).toBeInstanceOf(MergeCleanupError);
+        expect(failure).not.toBeInstanceOf(MergeFromBaseConflictError);
+        if (!(failure instanceof MergeCleanupError)) throw failure;
+        expect(failure.cleanupErrors).toEqual([
+          expect.objectContaining({ message: expect.stringContaining("abort blocked") }),
+          expect.objectContaining({ message: expect.stringContaining("MERGE_HEAD still exists") }),
+          expect.objectContaining({ message: expect.stringContaining("unmerged index entries") }),
+        ]);
+        expect(readBranch(repoDir)).toBe("feature");
+        expect(readStatus(repoDir)).toContain("UU conflict.txt");
+      },
+    );
+  });
+
+  it("cleans a squash conflict without relying on MERGE_HEAD", async () => {
+    await withBoundedMergeRepository(
+      { conflicting: true, failureMode: "none" },
+      async (repoDir) => {
+        const { mergeToBase, MergeConflictError } = await import("./checkout-git.js");
+
+        const failure = await captureFailure(
+          mergeToBase(repoDir, { baseRef: "main", mode: "squash" }),
+        );
+
+        expect(failure).toBeInstanceOf(MergeConflictError);
+        expect(readBranch(repoDir)).toBe("feature");
+        expect(readStatus(repoDir)).toBe("");
+        expect(hasMergeHead(repoDir)).toBe(false);
+      },
+    );
+  });
+
+  it("does not discard staged work when squash cleanup would require a reset", async () => {
+    await withBoundedMergeRepository(
+      { conflicting: true, failureMode: "none" },
+      async (repoDir) => {
+        writeFileSync(join(repoDir, "staged.txt"), "staged\n");
+        execFileSync(realGitPath, ["add", "staged.txt"], { cwd: repoDir });
+        const { mergeToBase } = await import("./checkout-git.js");
+
+        await expect(mergeToBase(repoDir, { baseRef: "main", mode: "squash" })).rejects.toThrow(
+          "Working directory has uncommitted changes.",
+        );
+        expect(readBranch(repoDir)).toBe("feature");
+        expect(readStatus(repoDir)).toBe("A  staged.txt");
+      },
+    );
+  });
+
+  it("rejects a successful abort that leaves merge state behind", async () => {
+    await withBoundedMergeRepository(
+      { conflicting: true, failureMode: "abort-noop" },
+      async (repoDir) => {
+        const { mergeToBase, MergeCleanupError, MergeConflictError } =
+          await import("./checkout-git.js");
+
+        const failure = await captureFailure(mergeToBase(repoDir, { baseRef: "main" }));
+
+        expect(failure).toBeInstanceOf(MergeCleanupError);
+        expect(failure).not.toBeInstanceOf(MergeConflictError);
+        if (!(failure instanceof MergeCleanupError)) throw failure;
+        expect(failure.cleanupErrors).toEqual([
+          expect.objectContaining({ message: expect.stringContaining("MERGE_HEAD still exists") }),
+          expect.objectContaining({ message: expect.stringContaining("unmerged index entries") }),
           expect.objectContaining({ message: expect.stringContaining("checkout feature") }),
         ]);
         expect(readBranch(repoDir)).toBe("main");
@@ -453,10 +567,37 @@ describe("checkout Git pressure propagation", () => {
     await withBoundedMergeRepository(
       { conflicting: false, failureMode: "restore" },
       async (repoDir) => {
-        const { mergeToBase } = await import("./checkout-git.js");
+        const { mergeToBase, MergeCleanupError } = await import("./checkout-git.js");
 
-        await expect(mergeToBase(repoDir, { baseRef: "main" })).rejects.toThrow("restore blocked");
+        const failure = await captureFailure(mergeToBase(repoDir, { baseRef: "main" }));
+
+        expect(failure).toBeInstanceOf(MergeCleanupError);
+        if (!(failure instanceof MergeCleanupError)) throw failure;
+        expect(failure.cleanupErrors).toEqual([
+          expect.objectContaining({ message: expect.stringContaining("restore blocked") }),
+        ]);
         expect(readBranch(repoDir)).toBe("main");
+      },
+    );
+  });
+
+  it("surfaces branch restoration failure instead of a recoverable conflict", async () => {
+    await withBoundedMergeRepository(
+      { conflicting: true, failureMode: "restore" },
+      async (repoDir) => {
+        const { mergeToBase, MergeCleanupError, MergeConflictError } =
+          await import("./checkout-git.js");
+
+        const failure = await captureFailure(mergeToBase(repoDir, { baseRef: "main" }));
+
+        expect(failure).toBeInstanceOf(MergeCleanupError);
+        expect(failure).not.toBeInstanceOf(MergeConflictError);
+        if (!(failure instanceof MergeCleanupError)) throw failure;
+        expect(failure.cleanupErrors).toEqual([
+          expect.objectContaining({ message: expect.stringContaining("restore blocked") }),
+        ]);
+        expect(readBranch(repoDir)).toBe("main");
+        expect(readStatus(repoDir)).toBe("");
       },
     );
   });
@@ -465,11 +606,17 @@ describe("checkout Git pressure propagation", () => {
     await withBoundedMergeRepository(
       { conflicting: false, failureMode: "restore-noop" },
       async (repoDir) => {
-        const { mergeToBase } = await import("./checkout-git.js");
+        const { mergeToBase, MergeCleanupError } = await import("./checkout-git.js");
 
-        await expect(mergeToBase(repoDir, { baseRef: "main" })).rejects.toThrow(
-          "expected feature, found main",
-        );
+        const failure = await captureFailure(mergeToBase(repoDir, { baseRef: "main" }));
+
+        expect(failure).toBeInstanceOf(MergeCleanupError);
+        if (!(failure instanceof MergeCleanupError)) throw failure;
+        expect(failure.cleanupErrors).toEqual([
+          expect.objectContaining({
+            message: expect.stringContaining("expected feature, found main"),
+          }),
+        ]);
         expect(readBranch(repoDir)).toBe("main");
       },
     );
