@@ -26,7 +26,6 @@ const gitRuntimeMetrics = new GitCommandRuntimeMetricsWindow(
   Date.now,
   gitMaxPending,
 );
-const admittedGitCommands = new Set<Promise<unknown>>();
 
 export interface GitCommandOptions {
   cwd: string;
@@ -61,6 +60,7 @@ interface SubmittedGitTask<T> {
 class GitCommandExecutor {
   private readonly starting: GitExecutorEntry[] = [];
   private readonly queue: GitExecutorEntry[] = [];
+  private readonly idleWaiters = new Set<() => void>();
   private runningCount = 0;
   private pumpScheduled = false;
 
@@ -76,6 +76,12 @@ class GitCommandExecutor {
 
   get admittedCount(): number {
     return this.activeCount + this.pendingCount;
+  }
+
+  async drain(): Promise<void> {
+    while (!this.isIdle()) {
+      await new Promise<void>((resolve) => this.idleWaiters.add(resolve));
+    }
   }
 
   submit<T>(run: () => Promise<T>): SubmittedGitTask<T> {
@@ -109,18 +115,21 @@ class GitCommandExecutor {
         } else {
           this.queue.splice(queueIndex, 1);
         }
+        this.schedulePump();
         entry.reject(error);
+        this.resolveIdleWaiters();
         return true;
       },
     };
   }
 
   private schedulePump(): void {
-    if (this.pumpScheduled) return;
+    if (this.pumpScheduled || this.starting.length === 0) return;
     this.pumpScheduled = true;
     queueMicrotask(() => {
       this.pumpScheduled = false;
       this.pump();
+      this.resolveIdleWaiters();
     });
   }
 
@@ -134,11 +143,22 @@ class GitCommandExecutor {
       try {
         task = entry.run();
       } catch (error) {
-        entry.reject(error);
         this.finishTask();
+        entry.reject(error);
         continue;
       }
-      void task.then(entry.resolve, entry.reject).finally(() => this.finishTask());
+      void task.then(
+        (value) => {
+          this.finishTask();
+          entry.resolve(value);
+          return undefined;
+        },
+        (error) => {
+          this.finishTask();
+          entry.reject(error);
+          return undefined;
+        },
+      );
     }
   }
 
@@ -146,6 +166,7 @@ class GitCommandExecutor {
     this.runningCount = Math.max(0, this.runningCount - 1);
     this.promotePending();
     this.schedulePump();
+    this.resolveIdleWaiters();
   }
 
   private promotePending(): void {
@@ -154,6 +175,17 @@ class GitCommandExecutor {
       if (!entry) return;
       this.starting.push(entry);
     }
+  }
+
+  private isIdle(): boolean {
+    return this.admittedCount === 0 && !this.pumpScheduled;
+  }
+
+  private resolveIdleWaiters(): void {
+    if (!this.isIdle()) return;
+    const waiters = [...this.idleWaiters];
+    this.idleWaiters.clear();
+    for (const resolve of waiters) resolve();
   }
 }
 
@@ -239,11 +271,9 @@ export function snapshotGitCommandRuntimeMetrics(): GitCommandRuntimeMetricsSnap
   });
 }
 
-/** Wait for all commands admitted before and during the drain to leave the global executor. */
+/** Wait for the global executor to release every command and scheduled pump. */
 export async function drainGitCommands(): Promise<void> {
-  while (admittedGitCommands.size > 0) {
-    await Promise.allSettled(admittedGitCommands);
-  }
+  await gitExecutor.drain();
 }
 
 function beginGitCommandMetric(): GitCommandMetricsState | null {
@@ -580,17 +610,6 @@ export function runGitCommand(
     gitRuntimeMetrics.observeLimiter(gitExecutor.activeCount, gitExecutor.pendingCount);
     return cancellationError;
   };
-  admittedGitCommands.add(promise);
-  void promise.then(
-    () => {
-      admittedGitCommands.delete(promise);
-      return undefined;
-    },
-    () => {
-      admittedGitCommands.delete(promise);
-      return undefined;
-    },
-  );
   gitRuntimeMetrics.observeLimiter(gitExecutor.activeCount, gitExecutor.pendingCount);
   return waitForGitCommand(promise, options.signal, cancelQueued);
 }

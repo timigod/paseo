@@ -22,6 +22,7 @@ import { defaultWorkspaceLifecycleCoordinator } from "./workspace-lifecycle-coor
 import { readPaseoWorktreeIncarnationId } from "../utils/worktree-metadata.js";
 import { getPaseoWorktreesRoot } from "../utils/worktree.js";
 import { createRealpathAwarePathMatcher } from "../utils/path.js";
+import { runGitCommand, snapshotGitCommandRuntimeMetrics } from "../utils/run-git-command.js";
 import { Session } from "./session.js";
 import { FileBackedProjectRegistry, FileBackedWorkspaceRegistry } from "./workspace-registry.js";
 
@@ -55,6 +56,12 @@ async function createBootstrapAgentMcpClient(port: number) {
     new URL(`http://127.0.0.1:${port}/mcp/agents`),
   );
   return experimental_createMCPClient({ transport });
+}
+
+async function waitForFile(filePath: string): Promise<void> {
+  await vi.waitFor(async () => {
+    await expect(stat(filePath)).resolves.toMatchObject({});
+  });
 }
 
 describe("paseo daemon bootstrap", () => {
@@ -1081,6 +1088,62 @@ describe("paseo daemon bootstrap", () => {
     } finally {
       releaseOperation();
       await daemonHandle.close();
+    }
+  });
+
+  test("shutdown leaves the physical Git executor quiescent before teardown continues", async () => {
+    const daemonHandle = await createTestPaseoDaemon();
+    const { repoDir, tempRoot } = await createCommittedGitRepo("shutdown-git-drain");
+    const holdScript = path.join(tempRoot, "hold-git.sh");
+    const startedPath = path.join(tempRoot, "git-started");
+    const releasePath = path.join(tempRoot, "git-release");
+    await writeFile(
+      holdScript,
+      `#!/bin/sh\ntouch "${startedPath}"\nwhile [ ! -f "${releasePath}" ]; do sleep 0.01; done\n`,
+    );
+    let notifyCommandStarted!: () => void;
+    const commandStarted = new Promise<void>((resolve) => {
+      notifyCommandStarted = resolve;
+    });
+    let command: ReturnType<typeof runGitCommand> | undefined;
+    const originalKillAll = daemonHandle.daemon.terminalManager.killAll.bind(
+      daemonHandle.daemon.terminalManager,
+    );
+    vi.spyOn(daemonHandle.daemon.terminalManager, "killAll").mockImplementation(async () => {
+      await originalKillAll();
+      command = runGitCommand(["-c", `alias.paseo-hold=!sh "${holdScript}"`, "paseo-hold"], {
+        cwd: repoDir,
+      });
+      await waitForFile(startedPath);
+      notifyCommandStarted();
+    });
+    let postDrainMetrics: ReturnType<typeof snapshotGitCommandRuntimeMetrics> | undefined;
+    const originalStopStandalone = daemonHandle.daemon.serviceProxy.stopStandalone.bind(
+      daemonHandle.daemon.serviceProxy,
+    );
+    vi.spyOn(daemonHandle.daemon.serviceProxy, "stopStandalone").mockImplementation(async () => {
+      postDrainMetrics = snapshotGitCommandRuntimeMetrics();
+      await originalStopStandalone();
+    });
+
+    try {
+      const stopping = daemonHandle.daemon.stop();
+      await commandStarted;
+      expect(snapshotGitCommandRuntimeMetrics()).toMatchObject({ active: 1, pending: 0 });
+
+      await writeFile(releasePath, "release\n");
+      await command;
+      await stopping;
+
+      expect(postDrainMetrics).toMatchObject({ active: 0, pending: 0 });
+      await expect(runGitCommand(["status", "--short"], { cwd: repoDir })).resolves.toMatchObject({
+        exitCode: 0,
+      });
+    } finally {
+      await writeFile(releasePath, "release\n").catch(() => undefined);
+      await command?.catch(() => undefined);
+      await daemonHandle.close().catch(() => undefined);
+      await rm(tempRoot, { recursive: true, force: true });
     }
   });
 

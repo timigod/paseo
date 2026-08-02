@@ -349,6 +349,26 @@ describe("runGitCommand", () => {
     expect(fakeSpawnController.activeCount).toBe(0);
   });
 
+  it("releases the physical executor before command settlement exposes a drain", async () => {
+    const { drainGitCommands, runGitCommand, snapshotGitCommandRuntimeMetrics } =
+      await loadRunGitCommand(1, 1);
+    enqueueSpawnBehaviors({ stdoutData: "completed" }, { stdoutData: "retry" });
+
+    const stateAtSettlement = await runGitCommand(["status", "completed"], {
+      cwd: process.cwd(),
+    }).then(() => ({
+      drain: drainGitCommands(),
+      metrics: snapshotGitCommandRuntimeMetrics(),
+    }));
+
+    expect(stateAtSettlement.metrics).toMatchObject({ active: 0, pending: 0 });
+    await stateAtSettlement.drain;
+    expect(snapshotGitCommandRuntimeMetrics()).toMatchObject({ active: 0, pending: 0 });
+    await expect(runGitCommand(["status", "retry"], { cwd: process.cwd() })).resolves.toMatchObject(
+      { stdout: "retry" },
+    );
+  });
+
   it("kills timed out processes and releases the limiter slot", async () => {
     const { runGitCommand } = await loadRunGitCommand(1);
 
