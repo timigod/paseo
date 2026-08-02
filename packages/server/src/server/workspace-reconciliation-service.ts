@@ -1,5 +1,6 @@
 import { statSync, watch as watchPath } from "node:fs";
 import type { ProjectCheckoutLitePayload } from "@getpaseo/protocol/messages";
+import pLimit from "p-limit";
 import type pino from "pino";
 import type {
   ProjectRegistry,
@@ -19,6 +20,7 @@ import { deriveProjectKey } from "./project-key.js";
 
 const DEFAULT_RESCAN_INTERVAL_MS = 5 * 60_000;
 const DEFAULT_DEBOUNCE_MS = 100;
+const GIT_METADATA_READ_CONCURRENCY = 4;
 
 export type ProjectUpdate =
   | { kind: "upsert"; project: PersistedProjectRecord }
@@ -295,10 +297,13 @@ export class WorkspaceReconciliationService {
     changes: ReconciliationChange[],
   ): Promise<void> {
     const checkoutReads: CachedCheckoutRead[] = [];
+    // Reconciliation can cover hundreds of retained workspaces. Queue those reads here
+    // instead of flooding WorkspaceGitService's global admission queue all at once.
+    const readCheckoutLimit = pLimit(GIT_METADATA_READ_CONCURRENCY);
     const readCheckout = (cwd: string): Promise<ProjectCheckoutLitePayload> => {
       const existing = checkoutReads.find((read) => areEquivalentPaths(read.cwd, cwd));
       if (existing) return existing.checkout;
-      const checkout = this.readCheckout(cwd);
+      const checkout = readCheckoutLimit(() => this.readCheckout(cwd));
       checkoutReads.push({ cwd, checkout });
       return checkout;
     };
@@ -314,7 +319,7 @@ export class WorkspaceReconciliationService {
       roots.map(async ({ rootPath, projects }) => {
         try {
           const rootGit = await readCheckout(rootPath);
-          await Promise.all(
+          const projectResults = await Promise.allSettled(
             projects.map((project) =>
               this.reconcileProject({
                 project,
@@ -325,6 +330,12 @@ export class WorkspaceReconciliationService {
               }),
             ),
           );
+          const failedProject = projectResults.find(
+            (result): result is PromiseRejectedResult => result.status === "rejected",
+          );
+          if (failedProject) {
+            throw failedProject.reason;
+          }
         } catch (error) {
           this.logger.warn(
             { err: error, rootPath },
@@ -337,12 +348,24 @@ export class WorkspaceReconciliationService {
 
   private async reconcileProject(input: ProjectReconciliationInput): Promise<void> {
     const { project, siblings, currentGit, readCheckout, changes } = input;
-    const workspaceCheckouts = await Promise.all(
+    // Own every queued read until settlement. Returning on the first rejection would leave
+    // this pass's limiter draining in the background while a later pass creates a new one.
+    const workspaceCheckoutResults = await Promise.allSettled(
       siblings.map(async (workspace) => ({
         workspace,
         checkout: await readCheckout(workspace.cwd),
       })),
     );
+    const failedCheckout = workspaceCheckoutResults.find(
+      (result): result is PromiseRejectedResult => result.status === "rejected",
+    );
+    if (failedCheckout) {
+      throw failedCheckout.reason;
+    }
+    const workspaceCheckouts = workspaceCheckoutResults.map((result) => {
+      if (result.status === "rejected") throw result.reason;
+      return result.value;
+    });
     const projectUpdates: Partial<Pick<PersistedProjectRecord, "kind" | "projectKey">> = {};
     const mappedKind = deriveProjectKind(currentGit);
     const projectKey = deriveProjectKey({

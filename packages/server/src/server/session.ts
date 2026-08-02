@@ -5830,7 +5830,12 @@ export class Session {
       }
 
       const payload = await this.listFetchWorkspacesEntries(request);
-      this.workspaceGitObserver.syncObservers(payload.entries);
+      // A one-shot inventory read needs the cached Git projection in the payload, but it
+      // must not retain live filesystem observers for the websocket reconnect grace period.
+      // Only clients that explicitly request workspace updates own those subscriptions.
+      if (subscriptionId) {
+        this.workspaceGitObserver.syncObservers(payload.entries);
+      }
       this.sessionLogger.debug(
         {
           requestId: request.requestId,

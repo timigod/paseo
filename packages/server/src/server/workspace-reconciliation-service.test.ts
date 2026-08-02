@@ -353,6 +353,163 @@ describe("WorkspaceReconciliationService", () => {
     expect(projects.get("p1")?.kind).toBe("git");
   });
 
+  test("bounds Git checkout reads across a large reconciliation pass", async () => {
+    const projectRoot = realpathSync(mkdtempSync(path.join(tmpdir(), "reconcile-bounded-root-")));
+    tempDirs.push(projectRoot);
+    const { projects, workspaces, projectRegistry, workspaceRegistry } = createTestRegistries();
+    const workspaceCount = 120;
+    const workspaceRoots = Array.from({ length: workspaceCount }, (_, index) => {
+      const workspaceRoot = realpathSync(
+        mkdtempSync(path.join(tmpdir(), `reconcile-bounded-workspace-${index}-`)),
+      );
+      tempDirs.push(workspaceRoot);
+      return workspaceRoot;
+    });
+
+    projects.set(
+      "p1",
+      createPersistedProjectRecord({
+        projectId: "p1",
+        rootPath: projectRoot,
+        kind: "non_git",
+        displayName: "bounded-git-reads",
+        createdAt: timestamp,
+        updatedAt: timestamp,
+      }),
+    );
+    workspaceRoots.forEach((cwd, index) => {
+      workspaces.set(
+        `w${index}`,
+        createPersistedWorkspaceRecord({
+          workspaceId: `w${index}`,
+          projectId: "p1",
+          cwd,
+          kind: "directory",
+          displayName: `workspace-${index}`,
+          createdAt: timestamp,
+          updatedAt: timestamp,
+        }),
+      );
+    });
+
+    let activeReads = 0;
+    let peakActiveReads = 0;
+    let completedReads = 0;
+    const service = new WorkspaceReconciliationService({
+      projectRegistry,
+      workspaceRegistry,
+      logger: createTestLogger(),
+      workspaceGitService: {
+        getCheckout: async (cwd) => {
+          activeReads += 1;
+          peakActiveReads = Math.max(peakActiveReads, activeReads);
+          await new Promise((resolve) => setImmediate(resolve));
+          activeReads -= 1;
+          completedReads += 1;
+          return createCheckout(cwd);
+        },
+      },
+    });
+
+    await service.reconcileGitMetadata();
+
+    expect(peakActiveReads).toBeLessThanOrEqual(4);
+    expect(completedReads).toBe(workspaceCount + 1);
+  });
+
+  test("drains bounded checkout reads before an early failure completes reconciliation", async () => {
+    const projectRoot = realpathSync(
+      mkdtempSync(path.join(tmpdir(), "reconcile-failed-read-root-")),
+    );
+    tempDirs.push(projectRoot);
+    const { projects, workspaces, projectRegistry, workspaceRegistry } = createTestRegistries();
+    const workspaceRoots = Array.from({ length: 12 }, (_, index) => {
+      const workspaceRoot = realpathSync(
+        mkdtempSync(path.join(tmpdir(), `reconcile-failed-read-workspace-${index}-`)),
+      );
+      tempDirs.push(workspaceRoot);
+      return workspaceRoot;
+    });
+
+    projects.set(
+      "p1",
+      createPersistedProjectRecord({
+        projectId: "p1",
+        rootPath: projectRoot,
+        kind: "non_git",
+        displayName: "failed-read-drain",
+        createdAt: timestamp,
+        updatedAt: timestamp,
+      }),
+    );
+    projects.set(
+      "p2",
+      createPersistedProjectRecord({
+        projectId: "p2",
+        rootPath: projectRoot,
+        kind: "non_git",
+        displayName: "failed-read-drain-duplicate",
+        createdAt: timestamp,
+        updatedAt: timestamp,
+      }),
+    );
+    workspaceRoots.forEach((cwd, index) => {
+      workspaces.set(
+        `w${index}`,
+        createPersistedWorkspaceRecord({
+          workspaceId: `w${index}`,
+          projectId: index === 0 ? "p1" : "p2",
+          cwd,
+          kind: "directory",
+          displayName: `workspace-${index}`,
+          createdAt: timestamp,
+          updatedAt: timestamp,
+        }),
+      );
+    });
+
+    let releaseReads!: () => void;
+    const readsReleased = new Promise<void>((resolve) => {
+      releaseReads = resolve;
+    });
+    let activeReads = 0;
+    let completedReads = 0;
+    const service = new WorkspaceReconciliationService({
+      projectRegistry,
+      workspaceRegistry,
+      logger: createTestLogger(),
+      workspaceGitService: {
+        getCheckout: async (cwd) => {
+          if (cwd === projectRoot) return createCheckout(cwd);
+          if (cwd === workspaceRoots[0]) throw new Error("checkout read failed");
+          activeReads += 1;
+          await readsReleased;
+          activeReads -= 1;
+          completedReads += 1;
+          return createCheckout(cwd);
+        },
+      },
+    });
+
+    let reconciliationSettled = false;
+    const reconciliation = service.reconcileGitMetadata().then((result) => {
+      reconciliationSettled = true;
+      return result;
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(reconciliationSettled).toBe(false);
+    expect(activeReads).toBeGreaterThan(0);
+    expect(activeReads).toBeLessThanOrEqual(4);
+
+    releaseReads();
+    await reconciliation;
+
+    expect(activeReads).toBe(0);
+    expect(completedReads).toBe(workspaceRoots.length - 1);
+  });
+
   test("deduplicates equivalent project and workspace paths across legacy duplicate projects", async () => {
     const projectRoot = realpathSync(mkdtempSync(path.join(tmpdir(), "reconcile-global-root-")));
     const workspaceRoot = realpathSync(
@@ -625,6 +782,7 @@ describe("WorkspaceReconciliationService", () => {
       branch: null,
       worktreeRoot: null,
       baseBranch: null,
+      cleanupPending: null,
       isPaseoOwnedWorktree: false,
       mainRepoRoot: null,
       createdAt: timestamp,
