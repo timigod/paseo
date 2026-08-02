@@ -3106,9 +3106,13 @@ export class Session {
               agentStorage: this.agentStorage,
               findWorkspaceIdForCwd: (cwd) => this.findWorkspaceIdForCwd(cwd),
               listActiveWorkspaces: () => this.listActiveWorkspaceRefs(),
+              getWorkspaceMembershipVersion: () =>
+                this.workspaceRegistry.getMembershipVersion?.() ?? 0,
+              getTerminalMembershipVersion: () => this.terminalController.getMembershipVersion(),
               archiveWorkspaceRecord: (id, archiveRecheck) =>
                 this.archiveWorkspaceRecord(id, undefined, archiveRecheck),
               workspaceRegistry: this.workspaceRegistry,
+              destructiveMembershipLease: destructiveLease,
               emitWorkspaceUpdatesForWorkspaceIds: (workspaceIds) =>
                 this.emitWorkspaceUpdatesForWorkspaceIds(workspaceIds),
               markWorkspaceArchiving: (workspaceIds, archivingAt) =>

@@ -28,6 +28,7 @@ import {
   createAgentDestructiveCaller,
   createCoordinatorDestructiveCaller,
 } from "./agent/destructive-action-authority.js";
+import { DestructiveMembershipGate } from "./destructive-membership-gate.js";
 import type {
   AgentClient,
   AgentCreateSessionOptions,
@@ -2085,7 +2086,7 @@ test("close_items_request archives agents and kills terminals in one batch", asy
     {},
   );
 
-  expect(cancelAgentRun).toHaveBeenCalledWith("agent-1");
+  expect(cancelAgentRun).toHaveBeenCalledWith("agent-1", undefined);
   expect(killTerminal).toHaveBeenCalledWith("term-1");
   expect(emitted.find((message) => message.type === "close_items_response")?.payload).toEqual({
     agents: [{ agentId: "agent-1", archivedAt }],
@@ -3722,8 +3723,11 @@ test("project.remove.request blocks an agent whose workspace is in the project b
 
 test("project.remove.request archives active workspaces and removes the project record", async () => {
   const emitted: SessionOutboundMessage[] = [];
+  const membershipGate = new DestructiveMembershipGate();
+  const acquireDestructive = vi.spyOn(membershipGate, "acquireDestructive");
   const session = createSessionForWorkspaceTests({
     onMessage: (message) => emitted.push(message),
+    agentManager: { getMembershipGate: () => membershipGate },
   });
   const project = createPersistedProjectRecord({
     projectId: "proj-remove-with-workspace",
@@ -3815,6 +3819,7 @@ test("project.remove.request archives active workspaces and removes the project 
     removedWorkspaceIds: [workspace.workspaceId],
     error: null,
   });
+  expect(acquireDestructive).toHaveBeenCalledTimes(1);
   const workspaceUpdates = filterByType(emitted, "workspace_update");
   expect(workspaceUpdates.at(-1)?.payload).toEqual({
     kind: "remove",
@@ -5991,11 +5996,14 @@ test("archive_workspace_request never fabricates success when persistence fails"
     throw new Error("workspace persistence failed");
   };
 
-  await session.handleMessage({
-    type: "archive_workspace_request",
-    workspaceId: workspace.workspaceId,
-    requestId: "req-archive-persistence-failure",
-  });
+  await session.handleMessage(
+    {
+      type: "archive_workspace_request",
+      workspaceId: workspace.workspaceId,
+      requestId: "req-archive-persistence-failure",
+    },
+    {},
+  );
 
   expect(workspace.archivedAt).toBeNull();
   const response = emitted.find((message) => message.type === "archive_workspace_response") as
@@ -6003,7 +6011,7 @@ test("archive_workspace_request never fabricates success when persistence fails"
     | undefined;
   expect(response?.payload).toMatchObject({
     archivedAt: null,
-    error: "Failed to archive one or more workspaces",
+    error: expect.stringContaining("Workspace archive teardown failed"),
   });
 });
 
@@ -6027,11 +6035,14 @@ test("archive_workspace_request requires a persisted archived timestamp", async 
   session.workspaceRegistry.list = async () => [workspace];
   session.workspaceRegistry.archive = async () => {};
 
-  await session.handleMessage({
-    type: "archive_workspace_request",
-    workspaceId: workspace.workspaceId,
-    requestId: "req-archive-no-timestamp",
-  });
+  await session.handleMessage(
+    {
+      type: "archive_workspace_request",
+      workspaceId: workspace.workspaceId,
+      requestId: "req-archive-no-timestamp",
+    },
+    {},
+  );
 
   const response = emitted.find((message) => message.type === "archive_workspace_response") as
     | { payload: Record<string, unknown> }

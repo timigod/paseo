@@ -2087,6 +2087,7 @@ describe("handlePaseoWorktreeArchiveRequest worktree scope", () => {
         workspaceId,
         scope: "workspace",
       },
+      createCoordinatorDestructiveCaller(),
     );
 
     expect(
@@ -2094,7 +2095,7 @@ describe("handlePaseoWorktreeArchiveRequest worktree scope", () => {
     ).toMatchObject({
       payload: {
         success: false,
-        error: { message: "Failed to archive one or more workspaces" },
+        error: { message: expect.stringContaining("Workspace archive teardown failed") },
       },
     });
   });
@@ -2137,6 +2138,7 @@ describe("handlePaseoWorktreeArchiveRequest worktree scope", () => {
         repoRoot: workspaceCwd,
         scope: "workspace",
       },
+      createCoordinatorDestructiveCaller(),
     );
 
     expect(
@@ -2188,6 +2190,7 @@ describe("handlePaseoWorktreeArchiveRequest worktree scope", () => {
         workspaceId: "ws-explicit-unknown",
         scope: "workspace",
       },
+      createCoordinatorDestructiveCaller(),
     );
 
     expect(archiveWorkspaceRecord).not.toHaveBeenCalled();
@@ -2247,6 +2250,7 @@ describe("handlePaseoWorktreeArchiveRequest worktree scope", () => {
         workspaceId: "ws-registry-failure",
         scope: "workspace",
       },
+      createCoordinatorDestructiveCaller(),
     );
 
     expect(

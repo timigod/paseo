@@ -92,6 +92,7 @@ export interface ArchiveDependencies {
     recheck: DestructiveActionRecheck,
   ) => Promise<void>;
   workspaceRegistry?: Pick<WorkspaceRegistry, "get" | "list" | "update">;
+  destructiveMembershipLease?: DestructiveMembershipLease | null;
   lifecycleCoordinator?: WorkspaceLifecycleCoordinator;
   sessionLogger?: Logger;
 }
@@ -256,9 +257,12 @@ export async function archiveByScope(
       const membershipGate = dependencies.agentManager.getMembershipGate?.() ?? null;
       const requestedWorkspaceId =
         request.scope.kind === "workspace" ? request.scope.workspaceId : undefined;
-      const identityLease = requestedWorkspaceId
-        ? await membershipGate?.acquireDestructive({ workspaceIds: [requestedWorkspaceId] })
-        : null;
+      const inheritedLease = dependencies.destructiveMembershipLease ?? null;
+      const identityLease =
+        inheritedLease ??
+        (requestedWorkspaceId
+          ? await membershipGate?.acquireDestructive({ workspaceIds: [requestedWorkspaceId] })
+          : null);
       try {
         const initialTarget = await resolveArchiveTarget(dependencies, request.scope);
         await identityLease?.extend(
@@ -351,7 +355,7 @@ export async function archiveByScope(
           archiveReservation.release();
         }
       } finally {
-        identityLease?.release();
+        if (identityLease && identityLease !== inheritedLease) identityLease.release();
       }
     },
     request.signal,
