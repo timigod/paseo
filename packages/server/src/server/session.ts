@@ -550,6 +550,7 @@ export interface SessionOptions {
     oldBranch: string | null,
     newBranch: string | null,
   ) => void;
+  syncServiceRouteObservers?: (workspaceIds: Iterable<string>) => Promise<void>;
   getDaemonTcpPort?: () => number | null;
   getDaemonTcpHost?: () => string | null;
   serviceProxyPublicBaseUrl?: string | null;
@@ -843,6 +844,7 @@ export class Session {
       scriptRuntimeStore,
       workspaceSetupSnapshots,
       onBranchChanged,
+      syncServiceRouteObservers,
       getDaemonTcpPort,
       getDaemonTcpHost,
       serviceProxyPublicBaseUrl,
@@ -1096,6 +1098,8 @@ export class Session {
       logger: this.sessionLogger,
       emit: (message) => this.emit(message),
       spawnWorkspaceScript,
+      onServiceRuntimeChanged: (workspaceId) =>
+        syncServiceRouteObservers?.([workspaceId]) ?? Promise.resolve(),
       globalServicePorts: loadPersistedConfig(this.paseoHome).worktrees?.servicePorts,
     });
     this.subscribeToOptionalManagers();

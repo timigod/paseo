@@ -77,6 +77,7 @@ export function createWorkspaceScriptsService(deps: {
   logger: pino.Logger;
   emit: (message: SessionOutboundMessage) => void;
   spawnWorkspaceScript: (options: SpawnWorkspaceScriptOptions) => Promise<WorktreeScriptResult>;
+  onServiceRuntimeChanged?: (workspaceId: string) => Promise<void>;
 }): WorkspaceScriptsService {
   const {
     serviceProxy,
@@ -94,6 +95,7 @@ export function createWorkspaceScriptsService(deps: {
     logger,
     emit,
     spawnWorkspaceScript,
+    onServiceRuntimeChanged,
   } = deps;
 
   function resolveGitMetadata(
@@ -198,6 +200,12 @@ export function createWorkspaceScriptsService(deps: {
       logger,
       onLifecycleChanged: () => {
         void emitStatusUpdate(workspace.workspaceId, workspace.cwd);
+        void onServiceRuntimeChanged?.(workspace.workspaceId).catch((error) => {
+          logger.warn(
+            { err: error, workspaceId: workspace.workspaceId },
+            "Failed to synchronize service-route workspace observer",
+          );
+        });
       },
     });
     return { workspace, project, terminalId: result.terminalId };

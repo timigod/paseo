@@ -1128,6 +1128,7 @@ export async function createPaseoDaemon(
     onProjectUpdate: (update) => wsServer?.publishProjectUpdate(update),
     onWorkspaceArchived: teardownArchivedWorkspaceRuntime,
     onWorkspacesChanged: async (workspaceIds) => {
+      await wsServer?.syncServiceRouteObserversForExternalWorkspaceIds(workspaceIds);
       await fanOutReconciledWorkspaceUpdates({
         sessions: wsServer?.listTrustedSessions() ?? [],
         workspaceIds,

@@ -54,6 +54,7 @@ import { createPushNotificationSender, type PushNotificationSender } from "./pus
 import type { ScriptHealthState } from "./script-health-monitor.js";
 import type { ServiceProxySubsystem } from "./service-proxy.js";
 import type { WorkspaceScriptRuntimeStore } from "./workspace-script-runtime-store.js";
+import { ServiceRouteWorkspaceObserver } from "./service-route-workspace-observer.js";
 import type { SpeechReadinessSnapshot, SpeechService } from "./speech/speech-runtime.js";
 import type { VoiceCallerContext, VoiceSpeakHandler } from "./voice-types.js";
 import {
@@ -615,6 +616,7 @@ export class VoiceAssistantWebSocketServer {
   private onBranchChanged!:
     | ((workspaceId: string, oldBranch: string | null, newBranch: string | null) => void)
     | null;
+  private readonly serviceRouteWorkspaceObserver: ServiceRouteWorkspaceObserver | null;
   private serverCapabilities: ServerCapabilities | undefined;
   private readonly runtimeMetrics = new WebSocketRuntimeMetricsWindow();
   private readonly destructiveCallers = new WeakMap<object, DestructiveCallerContext>();
@@ -733,6 +735,16 @@ export class VoiceAssistantWebSocketServer {
       serviceProxyPublicBaseUrl,
       resolveScriptHealth,
     });
+    this.serviceRouteWorkspaceObserver =
+      this.scriptRuntimeStore && this.onBranchChanged
+        ? new ServiceRouteWorkspaceObserver({
+            workspaceGitService: this.workspaceGitService,
+            workspaceRegistry: this.workspaceRegistry,
+            runtimeStore: this.scriptRuntimeStore,
+            onBranchChanged: this.onBranchChanged,
+            logger: this.logger,
+          })
+        : null;
     if (!providerSnapshotManager) {
       throw new Error("providerSnapshotManager is required");
     }
@@ -1046,6 +1058,12 @@ export class VoiceAssistantWebSocketServer {
     }
   }
 
+  public syncServiceRouteObserversForExternalWorkspaceIds(
+    workspaceIds: Iterable<string>,
+  ): Promise<void> {
+    return this.serviceRouteWorkspaceObserver?.syncWorkspaceIds(workspaceIds) ?? Promise.resolve();
+  }
+
   public async close(): Promise<void> {
     await this.prepareForShutdown();
     this.unsubscribeSpeechReadiness?.();
@@ -1119,6 +1137,7 @@ export class VoiceAssistantWebSocketServer {
     }
 
     await Promise.all(cleanupPromises);
+    this.serviceRouteWorkspaceObserver?.dispose();
     this.providerSnapshotManager.destroy();
     this.checkoutDiffManager.dispose();
     this.workspaceGitService.dispose();
@@ -1450,7 +1469,8 @@ export class VoiceAssistantWebSocketServer {
       serviceProxy: this.serviceProxy ?? undefined,
       scriptRuntimeStore: this.scriptRuntimeStore ?? undefined,
       workspaceSetupSnapshots: this.workspaceSetupSnapshots,
-      onBranchChanged: this.onBranchChanged ?? undefined,
+      syncServiceRouteObservers: (workspaceIds) =>
+        this.syncServiceRouteObserversForExternalWorkspaceIds(workspaceIds),
       getDaemonTcpPort: this.getDaemonTcpPort ?? undefined,
       getDaemonTcpHost: this.getDaemonTcpHost ?? undefined,
       serviceProxyPublicBaseUrl: this.serviceProxyPublicBaseUrl,
