@@ -52,6 +52,11 @@ describe("fleet status", () => {
       agentInventoryReady: true,
       workspaceInventoryReady: true,
       activeAgents: 1,
+      capacity: 10,
+      capacityUsed: 1,
+      capacitySource: "agent_records",
+      freeSlots: 9,
+      runtimeCapacity: null,
       pendingPermissions: 1,
       issue: null,
     });
@@ -75,6 +80,63 @@ describe("fleet status", () => {
       expect(doctorJson).not.toContain(secret);
     }
     expect(close).toHaveBeenCalledOnce();
+  });
+
+  it("prefers authoritative runtime usage and reservations over agent records", async () => {
+    const connect = vi.fn().mockResolvedValue({
+      getDaemonStatus: vi.fn().mockResolvedValue({
+        version: "0.2.5",
+        providers: [{ provider: "provider-a", available: true }],
+        runtimeCapacity: { limit: 12, live: 5, reserved: 1, free: 6 },
+      }),
+      fetchAgents: vi.fn().mockResolvedValue({
+        entries: [{ agent: { id: "agent-1", status: "idle", pendingPermissions: [] } }],
+        pageInfo: { nextCursor: null, hasMore: false },
+      }),
+      fetchWorkspaces: vi.fn().mockResolvedValue({
+        entries: [],
+        pageInfo: { nextCursor: null, hasMore: false },
+      }),
+      close: vi.fn().mockResolvedValue(undefined),
+    });
+
+    const status = await inspectFleetHost({ host, provider: "provider-a", connect });
+
+    expect(summarizeFleetHostStatus(status)).toMatchObject({
+      activeAgents: 1,
+      capacity: 10,
+      capacityUsed: 6,
+      capacitySource: "daemon_runtime",
+      freeSlots: 4,
+      runtimeCapacity: { limit: 12, live: 5, reserved: 1, free: 6 },
+    });
+  });
+
+  it("shows a lower daemon runtime limit as the effective capacity", async () => {
+    const connect = vi.fn().mockResolvedValue({
+      getDaemonStatus: vi.fn().mockResolvedValue({
+        version: "0.2.5",
+        providers: [{ provider: "provider-a", available: true }],
+        runtimeCapacity: { limit: 6, live: 5, reserved: 1, free: 0 },
+      }),
+      fetchAgents: vi.fn().mockResolvedValue({
+        entries: [{ agent: { id: "agent-1", status: "idle", pendingPermissions: [] } }],
+        pageInfo: { nextCursor: null, hasMore: false },
+      }),
+      fetchWorkspaces: vi.fn().mockResolvedValue({
+        entries: [],
+        pageInfo: { nextCursor: null, hasMore: false },
+      }),
+      close: vi.fn().mockResolvedValue(undefined),
+    });
+
+    const status = await inspectFleetHost({ host, provider: "provider-a", connect });
+
+    expect(summarizeFleetHostStatus(status)).toMatchObject({
+      capacity: 6,
+      capacityUsed: 6,
+      freeSlots: 0,
+    });
   });
 
   it("counts active agents beyond the first inventory page", async () => {

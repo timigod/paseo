@@ -30,6 +30,7 @@ function observed(
     agentInventoryReady: true,
     workspaceInventoryReady: true,
     activeAgents: 0,
+    runtimeCapacity: null,
     workspaceIds: [],
     ...overrides,
   };
@@ -55,6 +56,62 @@ describe("fleet routing", () => {
       cwd: "/opt/code/project",
       reason: "least_loaded",
     });
+  });
+
+  it("prefers authoritative runtime load over legacy agent-record load", () => {
+    const plan = selectFleetHost({
+      observations: [
+        observed(builderA, {
+          activeAgents: 4,
+          runtimeCapacity: { limit: 8, live: 1, reserved: 0, free: 7 },
+        }),
+        observed(builderB, {
+          activeAgents: 1,
+          runtimeCapacity: { limit: 12, live: 5, reserved: 0, free: 7 },
+        }),
+      ],
+      cwd: "/srv/code/project",
+      sourceHost: builderA,
+      localHost: builderA,
+      pinnedHost: null,
+      requiresLocalContext: false,
+      idempotencyKey: null,
+    });
+
+    expect(plan.host).toBe(builderA);
+  });
+
+  it("rejects a runtime-full host even when legacy agent inventory appears below target", () => {
+    expect(() =>
+      selectFleetHost({
+        observations: [
+          observed(builderA, {
+            activeAgents: 1,
+            runtimeCapacity: { limit: 6, live: 5, reserved: 1, free: 0 },
+          }),
+        ],
+        cwd: "/srv/code/project",
+        sourceHost: builderA,
+        localHost: builderA,
+        pinnedHost: null,
+        requiresLocalContext: false,
+        idempotencyKey: null,
+      }),
+    ).toThrow(expect.objectContaining({ code: "FLEET_NO_ELIGIBLE_HOST" }));
+  });
+
+  it("uses legacy agent records when an older daemon omits runtime capacity", () => {
+    expect(() =>
+      selectFleetHost({
+        observations: [observed(builderA, { activeAgents: builderA.capacity })],
+        cwd: "/srv/code/project",
+        sourceHost: builderA,
+        localHost: builderA,
+        pinnedHost: null,
+        requiresLocalContext: false,
+        idempotencyKey: null,
+      }),
+    ).toThrow(expect.objectContaining({ code: "FLEET_NO_ELIGIBLE_HOST" }));
   });
 
   it("routes the same idempotency key to the same host when fleet load changes", () => {
