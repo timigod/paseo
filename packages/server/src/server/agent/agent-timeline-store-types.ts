@@ -6,6 +6,10 @@ export interface AgentTimelineRow {
   item: AgentTimelineItem;
 }
 
+export interface AgentTimelineReplacementResult {
+  epoch: string;
+}
+
 export interface AgentTimelineCursor {
   epoch: string;
   seq: number;
@@ -57,5 +61,10 @@ export interface AgentTimelineStore {
   getLastItem(agentId: string): Promise<AgentTimelineItem | null>;
   getLastAssistantMessage(agentId: string): Promise<string | null>;
   deleteAgent(agentId: string): Promise<void>;
+  /** Atomically replaces the complete committed timeline for one agent. */
+  replaceCommitted(
+    agentId: string,
+    rows: readonly AgentTimelineRow[],
+  ): Promise<AgentTimelineReplacementResult>;
   bulkInsert(agentId: string, rows: readonly AgentTimelineRow[]): Promise<void>;
 }

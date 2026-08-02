@@ -52,6 +52,8 @@ $PASEO_HOME/
 ├── agents/
 │   └── {sanitized-cwd}/
 │       └── {agentId}.json               # One file per agent
+├── timelines/
+│   └── agent-{base64url-agentId}.json    # Canonical rows plus durable incarnation epoch
 ├── schedules/
 │   └── {scheduleId}.json                # One file per schedule
 ├── chat/
@@ -67,7 +69,7 @@ $PASEO_HOME/
 └── push-tokens.json                     # Expo push notification tokens
 ```
 
-The `agents/{sanitized-cwd}/` directory name is derived from the agent's `cwd` by stripping the filesystem root and replacing path separators with `-` (Windows drive letters become a `C-` style prefix). Persistent server stores write atomically by writing a temp file in the target directory and then renaming it into place.
+The `agents/{sanitized-cwd}/` directory name is derived from the agent's `cwd` by stripping the filesystem root and replacing path separators with `-` (Windows drive letters become a `C-` style prefix). Each timeline file stores the canonical rows and their incarnation epoch. Reopening unchanged durable rows restores that epoch; replacing or deleting the complete timeline retires it and mints a new one. Provider-history refresh stages a complete replacement, leaving the prior timeline readable when the provider read or atomic write fails. Persistent server stores write atomically by writing a temp file in the target directory and then renaming it into place.
 
 ---
 
