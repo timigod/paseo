@@ -20,7 +20,10 @@ import { PARENT_AGENT_ID_LABEL } from "@getpaseo/protocol/agent-labels";
 import { formatSystemNotificationPrompt } from "./agent-prompt.js";
 import { ensureAgentLoaded, ensureUnarchivedAgentLoaded } from "./agent-loading.js";
 import { archiveAgentCommand } from "./lifecycle-command.js";
-import { createAgentDestructiveCaller } from "./destructive-action-authority.js";
+import {
+  createAgentDestructiveCaller,
+  createCoordinatorDestructiveCaller,
+} from "./destructive-action-authority.js";
 import type { StoredAgentRecord } from "./agent-storage.js";
 import type {
   AgentClient,
@@ -502,6 +505,32 @@ class TestAgentSession implements AgentSession {
   }
 
   async close(): Promise<void> {}
+}
+
+class RegistrationCleanupSession extends TestAgentSession {
+  closeCalls = 0;
+  activeSubscriptions = 0;
+
+  constructor(
+    config: AgentSessionConfig,
+    private readonly closeFailure: Error | null = null,
+  ) {
+    super(config);
+  }
+
+  override subscribe(callback: (event: AgentStreamEvent) => void): () => void {
+    const unsubscribe = super.subscribe(callback);
+    this.activeSubscriptions += 1;
+    return () => {
+      this.activeSubscriptions -= 1;
+      unsubscribe();
+    };
+  }
+
+  override async close(): Promise<void> {
+    this.closeCalls += 1;
+    if (this.closeFailure) throw this.closeFailure;
+  }
 }
 
 class ControlledInterruptSession extends TestAgentSession {
@@ -1235,13 +1264,19 @@ test("retries failed registration cleanup before admitting a replacement runtime
   });
 
   try {
-    await expect(
-      manager.createAgent(
-        { provider: "codex", cwd: root },
-        "00000000-0000-4000-8000-000000000077",
-        { workspaceId: undefined },
-      ),
-    ).rejects.toThrow("snapshot failed");
+    const failedRegistration = await manager
+      .createAgent({ provider: "codex", cwd: root }, "00000000-0000-4000-8000-000000000077", {
+        workspaceId: undefined,
+      })
+      .then(
+        () => null,
+        (error: unknown) => error,
+      );
+    expect(failedRegistration).toBeInstanceOf(AggregateError);
+    expect((failedRegistration as AggregateError).errors).toEqual([
+      expect.objectContaining({ message: "snapshot failed" }),
+      expect.objectContaining({ message: "provider close failed" }),
+    ]);
     expect(client.firstSessionCloseCalls).toBe(1);
 
     const replacement = await manager.createAgent(
@@ -4288,6 +4323,102 @@ test("archiveAgent does not cascade to a detached former child", async () => {
   expect((await storage.get(child.id))?.archivedAt).toBeFalsy();
 });
 
+test.each([
+  { mutation: "setLabels attach" as const, initiallyAttached: false },
+  { mutation: "detachAgent" as const, initiallyAttached: true },
+  { mutation: "updateAgentMetadata attach" as const, initiallyAttached: false },
+  { mutation: "updateAgentMetadata reparent" as const, initiallyAttached: true },
+])(
+  "$mutation persistence failure keeps live and durable cascade membership aligned",
+  async (testCase) => {
+    const workdir = mkdtempSync(join(tmpdir(), "agent-manager-label-persist-failure-"));
+    const storage = new AgentStorage(join(workdir, "agents"), logger);
+    const membershipGate = new DestructiveMembershipGate();
+    const manager = new AgentManager({
+      clients: { codex: new TestAgentClient() },
+      registry: storage,
+      membershipGate,
+      logger,
+    });
+    const originalParent = await manager.createAgent(
+      { provider: "codex", cwd: workdir, title: "Original parent" },
+      undefined,
+      { workspaceId: "workspace-original-parent" },
+    );
+    const nextParent = await manager.createAgent(
+      { provider: "codex", cwd: workdir, title: "Next parent" },
+      undefined,
+      { workspaceId: "workspace-next-parent" },
+    );
+    const initialLabels = testCase.initiallyAttached
+      ? { [PARENT_AGENT_ID_LABEL]: originalParent.id, team: "infra" }
+      : { team: "infra" };
+    const child = await manager.createAgent(
+      { provider: "codex", cwd: workdir, title: "Child" },
+      undefined,
+      { labels: initialLabels, workspaceId: "workspace-child" },
+    );
+    const emittedLabels: Array<Record<string, string>> = [];
+    manager.subscribe(
+      (event) => {
+        if (event.type === "agent_state" && event.agent.id === child.id) {
+          emittedLabels.push(event.agent.labels);
+        }
+      },
+      { agentId: child.id, replayState: false },
+    );
+    const membershipVersion = manager.getMembershipVersion();
+    const persistenceFailure = new Error("injected label persistence failure");
+    const originalApplySnapshot = storage.applySnapshot.bind(storage);
+    let failedTargetSnapshot = false;
+    vi.spyOn(storage, "applySnapshot").mockImplementation(async (agent, options) => {
+      if (!failedTargetSnapshot && agent.id === child.id) {
+        failedTargetSnapshot = true;
+        throw persistenceFailure;
+      }
+      await originalApplySnapshot(agent, options);
+    });
+
+    const mutation = (() => {
+      switch (testCase.mutation) {
+        case "setLabels attach":
+          return manager.setLabels(child.id, { [PARENT_AGENT_ID_LABEL]: nextParent.id });
+        case "detachAgent":
+          return manager.detachAgent(child.id);
+        case "updateAgentMetadata attach":
+          return manager.updateAgentMetadata(child.id, {
+            labels: { [PARENT_AGENT_ID_LABEL]: nextParent.id },
+          });
+        case "updateAgentMetadata reparent":
+          return manager.updateAgentMetadata(child.id, {
+            labels: { [PARENT_AGENT_ID_LABEL]: nextParent.id },
+          });
+      }
+    })();
+
+    await expect(mutation).rejects.toBe(persistenceFailure);
+
+    expect(failedTargetSnapshot).toBe(true);
+    expect(manager.getMembershipVersion()).toBe(membershipVersion);
+    expect(manager.getAgent(child.id)?.labels).toEqual(initialLabels);
+    expect((await storage.get(child.id))?.labels).toEqual(initialLabels);
+    expect(emittedLabels).toEqual([]);
+
+    const parentWhoseArchiveTestsTheDurableGraph = testCase.initiallyAttached
+      ? originalParent
+      : nextParent;
+    await manager.archiveAgent(parentWhoseArchiveTestsTheDurableGraph.id);
+
+    if (testCase.initiallyAttached) {
+      expect((await storage.get(child.id))?.archivedAt).toEqual(expect.any(String));
+      expect(manager.getAgent(child.id)).toBeNull();
+    } else {
+      expect((await storage.get(child.id))?.archivedAt).toBeFalsy();
+      expect(manager.getAgent(child.id)).not.toBeNull();
+    }
+  },
+);
+
 test("runAgent persists finished attention and idle status without an external snapshot subscriber", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-finished-attention-"));
   const storagePath = join(workdir, "agents");
@@ -6982,6 +7113,205 @@ test("rejects a child registration after its parent is durably archived", async 
   expect(await storage.list()).toHaveLength(1);
 });
 
+test.each(["create", "resume"] as const)(
+  "%s holds child membership through registration while parent archive waits",
+  async (registrationKind) => {
+    const workdir = mkdtempSync(join(tmpdir(), `agent-manager-${registrationKind}-archive-race-`));
+    const storage = new AgentStorage(join(workdir, "agents"), logger);
+    const membershipGate = new DestructiveMembershipGate();
+    const manager = new AgentManager({
+      clients: { codex: new TestAgentClient() },
+      registry: storage,
+      membershipGate,
+      logger,
+    });
+    const parentAgentId = "00000000-0000-4000-8000-000000000141";
+    const childAgentId = "00000000-0000-4000-8000-000000000142";
+    const parent = await manager.createAgent(
+      { provider: "codex", cwd: workdir, title: "Parent" },
+      parentAgentId,
+      { workspaceId: "workspace-parent" },
+    );
+
+    const originalBeginMembershipMutation =
+      membershipGate.beginMembershipMutation.bind(membershipGate);
+    let childMembershipLeaseReleased = false;
+    vi.spyOn(membershipGate, "beginMembershipMutation").mockImplementation((scope) => {
+      const lease = originalBeginMembershipMutation(scope);
+      if (!scope.agentIds?.includes(childAgentId)) return lease;
+      return {
+        release: () => {
+          childMembershipLeaseReleased = true;
+          lease.release();
+        },
+      };
+    });
+
+    const childRegistrationSuspended = deferred<void>();
+    const continueChildRegistration = deferred<void>();
+    const originalStorageGet = storage.get.bind(storage);
+    let blockedChildRegistration = false;
+    vi.spyOn(storage, "get").mockImplementation(async (agentId) => {
+      if (agentId === childAgentId && !blockedChildRegistration) {
+        blockedChildRegistration = true;
+        childRegistrationSuspended.resolve();
+        await continueChildRegistration.promise;
+      }
+      return originalStorageGet(agentId);
+    });
+
+    const parentArchiveAcquireStarted = deferred<void>();
+    const originalAcquireDestructive = membershipGate.acquireDestructive.bind(membershipGate);
+    let parentArchiveLeaseAcquired = false;
+    vi.spyOn(membershipGate, "acquireDestructive").mockImplementation(async (scope) => {
+      const targetsParent = scope.agentIds?.includes(parentAgentId) ?? false;
+      if (targetsParent) parentArchiveAcquireStarted.resolve();
+      const lease = await originalAcquireDestructive(scope);
+      if (targetsParent) parentArchiveLeaseAcquired = true;
+      return lease;
+    });
+
+    const labels = { [PARENT_AGENT_ID_LABEL]: parent.id };
+    const childRegistration =
+      registrationKind === "create"
+        ? manager.createAgent({ provider: "codex", cwd: workdir, title: "Child" }, childAgentId, {
+            labels,
+            workspaceId: "workspace-child",
+          })
+        : manager.resumeAgentFromPersistence(
+            {
+              provider: "codex",
+              sessionId: "child-resume-session",
+              metadata: { provider: "codex", cwd: workdir },
+            },
+            { cwd: workdir, title: "Child" },
+            childAgentId,
+            { labels, workspaceId: "workspace-child" },
+          );
+    let parentArchive: Promise<{ archivedAt: string }> | undefined;
+
+    try {
+      await childRegistrationSuspended.promise;
+      expect(manager.getAgent(childAgentId)).toBeNull();
+
+      parentArchive = manager.archiveAgent(parent.id);
+      await parentArchiveAcquireStarted.promise;
+
+      expect(childMembershipLeaseReleased).toBe(false);
+      expect(parentArchiveLeaseAcquired).toBe(false);
+
+      continueChildRegistration.resolve();
+      await childRegistration;
+      await parentArchive;
+
+      expect(childMembershipLeaseReleased).toBe(true);
+      expect(parentArchiveLeaseAcquired).toBe(true);
+      expect(manager.listAgents()).toEqual([]);
+      expectArchivedAgentRecord(await storage.get(parentAgentId), "closed");
+      expectArchivedAgentRecord(await storage.get(childAgentId), "closed");
+    } finally {
+      continueChildRegistration.resolve();
+      await Promise.allSettled([childRegistration, ...(parentArchive ? [parentArchive] : [])]);
+    }
+  },
+);
+
+test.each([
+  { registrationKind: "create" as const, cleanupFails: false },
+  { registrationKind: "resume" as const, cleanupFails: true },
+])(
+  "$registrationKind rolls back an inserted registration after snapshot persistence fails",
+  async ({ registrationKind, cleanupFails }) => {
+    const workdir = mkdtempSync(join(tmpdir(), `agent-manager-${registrationKind}-rollback-`));
+    const storage = new AgentStorage(join(workdir, "agents"), logger);
+    const membershipGate = new DestructiveMembershipGate();
+    const persistenceFailure = new Error("injected registration persistence failure");
+    const cleanupFailure = cleanupFails
+      ? new Error("injected registration session cleanup failure")
+      : null;
+    const sessions: RegistrationCleanupSession[] = [];
+    const client = new (class extends TestAgentClient {
+      private makeSession(config: AgentSessionConfig): RegistrationCleanupSession {
+        const session = new RegistrationCleanupSession(config, cleanupFailure);
+        sessions.push(session);
+        return session;
+      }
+
+      override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+        return this.makeSession(config);
+      }
+
+      override async resumeSession(
+        _handle: AgentPersistenceHandle,
+        config?: Partial<AgentSessionConfig>,
+      ): Promise<AgentSession> {
+        return this.makeSession({
+          provider: "codex",
+          cwd: config?.cwd ?? workdir,
+          ...config,
+        });
+      }
+    })();
+    const manager = new AgentManager({
+      clients: { codex: client },
+      registry: storage,
+      membershipGate,
+      logger,
+    });
+    const agentId = "00000000-0000-4000-8000-000000000143";
+    const originalApplySnapshot = storage.applySnapshot.bind(storage);
+    let failedAfterLiveInsertion = false;
+    vi.spyOn(storage, "applySnapshot").mockImplementation(async (agent, options) => {
+      if (agent.id === agentId && !failedAfterLiveInsertion) {
+        failedAfterLiveInsertion = true;
+        expect(manager.getAgent(agentId)).not.toBeNull();
+        throw persistenceFailure;
+      }
+      await originalApplySnapshot(agent, options);
+    });
+
+    const registration =
+      registrationKind === "create"
+        ? manager.createAgent(
+            { provider: "codex", cwd: workdir, title: "Failed registration" },
+            agentId,
+            { workspaceId: "workspace-registration-rollback" },
+          )
+        : manager.resumeAgentFromPersistence(
+            {
+              provider: "codex",
+              sessionId: "resume-registration-rollback",
+              metadata: { provider: "codex", cwd: workdir },
+            },
+            { cwd: workdir, title: "Failed registration" },
+            agentId,
+            { workspaceId: "workspace-registration-rollback" },
+          );
+    const rejection = await registration.then(
+      () => null,
+      (error: unknown) => error,
+    );
+
+    expect(failedAfterLiveInsertion).toBe(true);
+    if (cleanupFailure) {
+      expect(rejection).toBeInstanceOf(AggregateError);
+      expect((rejection as AggregateError).errors).toEqual([persistenceFailure, cleanupFailure]);
+    } else {
+      expect(rejection).toBe(persistenceFailure);
+    }
+    expect(manager.getAgent(agentId)).toBeNull();
+    expect(manager.getAgentCallerIdentity(agentId)).toBeNull();
+    expect(manager.listAgents()).toEqual([]);
+    expect(await storage.get(agentId)).toBeNull();
+    expect(sessions).toHaveLength(1);
+    expect(sessions[0]?.closeCalls).toBe(1);
+    expect(sessions[0]?.activeSubscriptions).toBe(0);
+
+    const destructiveLease = await membershipGate.acquireDestructive({ agentIds: [agentId] });
+    destructiveLease.release();
+  },
+);
+
 test("fires onAgentArchived for stored-only snapshot archives", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-archived-hook-snapshot-"));
   const storagePath = join(workdir, "agents");
@@ -7193,11 +7523,72 @@ test("archiveAgent cascade archives in-memory children with the full archive con
   expect(storedUnrelated?.archivedAt).toBeUndefined();
 });
 
+test("archiveAgentCommand retries a child failure before committing the parent archive", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-cascade-retry-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const membershipGate = new DestructiveMembershipGate();
+  const manager = new AgentManager({
+    clients: { codex: new TestAgentClient() },
+    registry: storage,
+    membershipGate,
+    logger,
+  });
+  const parent = await manager.createAgent(
+    { provider: "codex", cwd: workdir, title: "Parent" },
+    undefined,
+    { workspaceId: "workspace-parent" },
+  );
+  const child = await manager.createAgent(
+    { provider: "codex", cwd: workdir, title: "Child" },
+    undefined,
+    {
+      labels: { [PARENT_AGENT_ID_LABEL]: parent.id },
+      workspaceId: "workspace-child",
+    },
+  );
+  const archivedCallbacks: string[] = [];
+  manager.setAgentArchivedCallback((agentId) => {
+    archivedCallbacks.push(agentId);
+  });
+  const childArchiveFailure = new Error("injected child archive failure");
+  const originalArchiveAgent = manager.archiveAgent.bind(manager);
+  let failChildArchive = true;
+  vi.spyOn(manager, "archiveAgent").mockImplementation(async (agentId, recheck, cascadePlan) => {
+    if (agentId === child.id && failChildArchive) {
+      failChildArchive = false;
+      throw childArchiveFailure;
+    }
+    return originalArchiveAgent(agentId, recheck, cascadePlan);
+  });
+
+  await expect(
+    archiveAgentCommand({ agentManager: manager, agentStorage: storage, logger }, parent.id, {
+      caller: createCoordinatorDestructiveCaller(),
+    }),
+  ).rejects.toBe(childArchiveFailure);
+
+  expect((await storage.get(parent.id))?.lastStatus).toBe("closed");
+  expect((await storage.get(parent.id))?.archivedAt).toBeUndefined();
+  expect((await storage.get(child.id))?.archivedAt).toBeUndefined();
+  expect(manager.getAgent(parent.id)).toBeNull();
+  expect(manager.getAgent(child.id)).not.toBeNull();
+  expect(archivedCallbacks).toEqual([]);
+
+  await archiveAgentCommand({ agentManager: manager, agentStorage: storage, logger }, parent.id, {
+    caller: createCoordinatorDestructiveCaller(),
+  });
+
+  expectArchivedAgentRecord(await storage.get(parent.id), "closed");
+  expectArchivedAgentRecord(await storage.get(child.id), "closed");
+  expect(manager.getAgent(child.id)).toBeNull();
+  expect(archivedCallbacks).toEqual([child.id, parent.id]);
+});
+
 test.each([
   { mutation: "detach" as const, nextParentAgentId: undefined },
   { mutation: "update" as const, nextParentAgentId: "unrelated-parent" },
 ])(
-  "archiveAgentCommand uses its authorized graph during a concurrent $mutation",
+  "archiveAgentCommand sees only the durable graph during a concurrent $mutation",
   async ({ mutation, nextParentAgentId }) => {
     const workdir = mkdtempSync(join(tmpdir(), `agent-manager-cascade-${mutation}-race-`));
     const storagePath = join(workdir, "agents");
@@ -7259,28 +7650,20 @@ test.each([
             labels: { [PARENT_AGENT_ID_LABEL]: nextParentAgentId! },
           });
     await persistenceReached.promise;
-    expect(manager.getAgent(callerAgent.id)?.labels[PARENT_AGENT_ID_LABEL]).toBe(nextParentAgentId);
+    expect(manager.getAgent(callerAgent.id)?.labels[PARENT_AGENT_ID_LABEL]).toBe(middle.id);
     expect((await storage.get(callerAgent.id))?.labels[PARENT_AGENT_ID_LABEL]).toBe(middle.id);
 
-    let archiveSettled = false;
-    const archivePromise = archiveAgentCommand(
-      { agentManager: manager, agentStorage: storage, logger },
-      root.id,
-      {
+    await expect(
+      archiveAgentCommand({ agentManager: manager, agentStorage: storage, logger }, root.id, {
         caller: createAgentDestructiveCaller(callerIdentity),
-      },
-    ).finally(() => {
-      archiveSettled = true;
-    });
-    try {
-      await Promise.resolve();
-      expect(archiveSettled).toBe(false);
-      expect((await storage.get(root.id))?.archivedAt).toBeUndefined();
-    } finally {
-      releasePersistence.resolve();
-    }
+      }),
+    ).rejects.toMatchObject({ code: "SELF_ARCHIVE_BLOCKED" });
+
+    releasePersistence.resolve();
     await mutationPromise;
-    await archivePromise;
+    await archiveAgentCommand({ agentManager: manager, agentStorage: storage, logger }, root.id, {
+      caller: createAgentDestructiveCaller(callerIdentity),
+    });
 
     expectArchivedAgentRecord(await storage.get(root.id), "closed");
     expectArchivedAgentRecord(await storage.get(middle.id), "closed");

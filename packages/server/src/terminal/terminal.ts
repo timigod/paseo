@@ -130,6 +130,20 @@ export interface CreateTerminalOptions {
   args?: string[];
 }
 
+export interface CreateTerminalDependencies {
+  spawnPty?: (file: string, args: string[], options: pty.IPtyForkOptions) => pty.IPty;
+}
+
+function resolvePtySpawner(
+  dependencies: CreateTerminalDependencies,
+): NonNullable<CreateTerminalDependencies["spawnPty"]> {
+  if (dependencies.spawnPty) {
+    return dependencies.spawnPty;
+  }
+  ensureNodePtySpawnHelperExecutableForCurrentPlatform();
+  return pty.spawn;
+}
+
 function toTerminalActivity(snapshot: {
   state: TerminalActivityState | null;
   attentionReason?: TerminalActivity["attentionReason"];
@@ -796,7 +810,10 @@ function extractLastOutputLinesFromText(text: string, limit: number): string[] {
   return lines.slice(-limit);
 }
 
-export async function createTerminal(options: CreateTerminalOptions): Promise<TerminalSession> {
+export async function createTerminal(
+  options: CreateTerminalOptions,
+  dependencies: CreateTerminalDependencies = {},
+): Promise<TerminalSession> {
   const {
     cwd,
     workspaceId,
@@ -849,13 +866,13 @@ export async function createTerminal(options: CreateTerminalOptions): Promise<Te
     allowProposedApi: true,
   });
 
-  ensureNodePtySpawnHelperExecutableForCurrentPlatform();
+  const spawnPty = resolvePtySpawner(dependencies);
 
   // Create PTY
   const { command: spawnCommand, args: spawnArgs } = command
     ? await resolveTerminalSpawnCommand(command, args)
     : { command: resolvedShell, args: [] as string[] };
-  const ptyProcess = pty.spawn(spawnCommand, spawnArgs, {
+  const ptyProcess = spawnPty(spawnCommand, spawnArgs, {
     name: "xterm-256color",
     cols,
     rows,
@@ -1432,7 +1449,12 @@ export async function createTerminal(options: CreateTerminalOptions): Promise<Te
       } catch {
         // process may already be gone
       }
-      await waitForProcessExit(forceTimeoutMs);
+      const exitedAfterForce = await waitForProcessExit(forceTimeoutMs);
+      if (!exitedAfterForce) {
+        throw new Error(
+          `Terminal process did not exit within ${forceTimeoutMs}ms after forced termination`,
+        );
+      }
     }
 
     // Finalize bookkeeping (idempotent if ptyProcess.onExit already fired).

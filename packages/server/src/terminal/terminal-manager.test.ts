@@ -1,7 +1,9 @@
 import { it, expect, afterEach } from "vitest";
 import { isPlatform } from "../test-utils/platform.js";
 import { createTerminalManager, type TerminalManager } from "./terminal-manager.js";
+import { createTerminal } from "./terminal.js";
 import type { TerminalWorkspaceContributionChangedEvent } from "./terminal-manager.js";
+import type { IPty } from "node-pty";
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -71,6 +73,49 @@ it("returns existing terminals on subsequent calls", async () => {
   expect(first.length).toBe(1);
   expect(first[0].id).toBe(created.id);
   expect(second.length).toBe(1);
+});
+
+it("retains a terminal when forced kill does not observe process exit", async () => {
+  let exitListener: ((event: { exitCode: number; signal?: number }) => void) | null = null;
+  const killSignals: Array<string | undefined> = [];
+  const fakePty = {
+    pid: 12345,
+    cols: 80,
+    rows: 24,
+    process: "/bin/sh",
+    handleFlowControl: false,
+    onData: () => ({ dispose: () => undefined }),
+    onExit: (listener: (event: { exitCode: number; signal?: number }) => void) => {
+      exitListener = listener;
+      return { dispose: () => undefined };
+    },
+    resize: () => undefined,
+    clear: () => undefined,
+    write: () => undefined,
+    kill: (signal?: string) => {
+      killSignals.push(signal);
+    },
+    pause: () => undefined,
+    resume: () => undefined,
+  } as IPty;
+  manager = createTerminalManager({
+    createTerminalSession: (options) =>
+      createTerminal({ ...options, shell: "/bin/sh" }, { spawnPty: () => fakePty }),
+  });
+  const cwd = realpathSync(tmpdir());
+  const session = await manager.createTerminal({ cwd, workspaceId: "ws-non-exiting" });
+
+  await expect(
+    manager.killTerminalAndWait(session.id, { gracefulTimeoutMs: 0, forceTimeoutMs: 0 }),
+  ).rejects.toThrow("did not exit");
+
+  expect(killSignals).toEqual([undefined, "SIGKILL"]);
+  expect(session.getExitInfo()).toBeNull();
+  expect(manager.getTerminal(session.id)).toBe(session);
+  expect(await manager.getTerminals(cwd, { workspaceId: "ws-non-exiting" })).toEqual([session]);
+
+  exitListener?.({ exitCode: 137, signal: 9 });
+  expect(manager.getTerminal(session.id)).toBeUndefined();
 });
 
 it("throws for relative paths", async () => {

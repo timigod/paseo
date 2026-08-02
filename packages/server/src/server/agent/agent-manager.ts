@@ -1250,7 +1250,7 @@ export class AgentManager {
       );
       const providerLaunchConfig = this.resolveProviderLaunchConfig(launchConfig, launchContext);
       const createOptions = this.buildCreateSessionOptions(options);
-      return this.withManagedWorktreeWriter(
+      return await this.withManagedWorktreeWriter(
         {
           agentId: resolvedAgentId,
           cwd: storedConfig.cwd,
@@ -1541,13 +1541,13 @@ export class AgentManager {
           resumeOptions,
         );
         this.trackStartedAgentRuntime(session, reservation);
-        return this.registerSession(session, storedConfig, resolvedAgentId, {
+        return await this.registerSession(session, storedConfig, resolvedAgentId, {
           ...options,
           persistence: handle,
           incarnation: agentIncarnation,
         });
       }
-      return this.withManagedWorktreeWriter(
+      return await this.withManagedWorktreeWriter(
         this.buildManagedWorktreeWriterCandidate({
           agentId: resolvedAgentId,
           cwd: storedConfig.cwd,
@@ -2002,11 +2002,11 @@ export class AgentManager {
         throw new Error(`Agent ${agentId} not found in storage after close`);
       }
 
+      await this.cascadeArchiveChildren(agentId, resolvedCascadePlan, recheck);
+
       await recheck?.();
       const { archivedAt } = await this.markRecordArchived(stored, recheck);
       this.discardRetainedAgentState(agentId);
-
-      await this.cascadeArchiveChildren(agentId, resolvedCascadePlan, recheck);
 
       return { archivedAt };
     } finally {
@@ -2233,13 +2233,17 @@ export class AgentManager {
             })
           : null;
       try {
+        const persistedAgent = { ...liveAgent, labels: nextLabels };
+        this.touchUpdatedAt(persistedAgent);
+        await this.persistSnapshot(persistedAgent);
         liveAgent.labels = nextLabels;
+        liveAgent.updatedAt = persistedAgent.updatedAt;
         if (!liveAgent.internal && nextParentAgentId !== previousParentAgentId) {
           this.membershipVersion += 1;
         }
-        this.touchUpdatedAt(liveAgent);
-        await this.persistSnapshot(liveAgent);
-        this.emitState(liveAgent, { persist: false });
+        if (this.agents.get(agentId) === liveAgent) {
+          this.emitState(liveAgent, { persist: false });
+        }
         const record = this.registry ? await this.registry.get(agentId) : null;
         return { record, live: true };
       } finally {
@@ -2380,6 +2384,8 @@ export class AgentManager {
         throw new Error(`Agent not found: ${agentId}`);
       }
 
+      await this.cascadeArchiveChildren(agentId, resolvedCascadePlan, recheck);
+
       await recheck?.();
       const nextRecord = buildArchivedAgentRecord(record, { archivedAt });
       await registry.upsert(nextRecord, { recheck });
@@ -2396,7 +2402,6 @@ export class AgentManager {
       }
 
       await this.fireAgentArchived(agentId);
-      await this.cascadeArchiveChildren(agentId, resolvedCascadePlan, recheck);
 
       return nextRecord;
     } finally {
@@ -2485,16 +2490,23 @@ export class AgentManager {
             })
           : null;
       try {
+        const persistedAgent = {
+          ...liveAgent,
+          ...(updates.labels ? { labels: nextLabels } : {}),
+        };
+        const title = updates.title?.trim();
+        this.touchUpdatedAt(persistedAgent);
+        await this.persistSnapshot(persistedAgent, title ? { title } : undefined);
         if (updates.labels) {
           liveAgent.labels = nextLabels;
         }
+        liveAgent.updatedAt = persistedAgent.updatedAt;
         if (!liveAgent.internal && nextParentAgentId !== previousParentAgentId) {
           this.membershipVersion += 1;
         }
-        const title = updates.title?.trim();
-        this.touchUpdatedAt(liveAgent);
-        await this.persistSnapshot(liveAgent, title ? { title } : undefined);
-        this.emitState(liveAgent, { persist: false });
+        if (this.agents.get(agentId) === liveAgent) {
+          this.emitState(liveAgent, { persist: false });
+        }
         return;
       } finally {
         membershipLease?.release();
@@ -3387,8 +3399,10 @@ export class AgentManager {
       incarnation: string;
     },
   ): Promise<ManagedAgent> {
-    let registered = false;
-    let resolvedAgentId = agentId;
+    let resolvedAgentId: string | null = null;
+    let managed: ActiveManagedAgent | null = null;
+    let inserted = false;
+    let timelineInitialized = false;
     try {
       this.assertAcceptingAgentRegistrations();
       resolvedAgentId = validateAgentId(agentId, "registerSession");
@@ -3407,8 +3421,9 @@ export class AgentManager {
         now,
         options,
       });
+      timelineInitialized = true;
 
-      const managed = this.buildManagedAgentForRegister({
+      managed = this.buildManagedAgentForRegister({
         resolvedAgentId,
         session,
         config,
@@ -3423,7 +3438,7 @@ export class AgentManager {
       if (!managed.internal) {
         this.membershipVersion += 1;
       }
-      registered = true;
+      inserted = true;
       if (options?.resumeRunning) {
         managed.lifecycle = "running";
         this.runs.trackAutonomousRun(managed.id, null);
@@ -3455,20 +3470,66 @@ export class AgentManager {
       this.touchUpdatedAt(managed);
       await this.persistSnapshot(managed);
       this.assertAgentRegistrationActive(managed);
-      this.emitState(managed, { persist: false });
       if (!options?.resumeRunning) {
         this.subscribeToSession(managed);
       }
+      this.emitState(managed, { persist: false });
       return { ...managed };
     } catch (error) {
-      const installedAgent = this.agents.get(resolvedAgentId);
-      if (registered && installedAgent?.session === session) {
-        this.prepareAgentForClosure(installedAgent, "agent registration failed");
-        await this.closeUnregisteredSession(session);
-      } else if (!registered) {
-        await this.closeUnregisteredSession(session);
-      }
+      await this.rollbackFailedSessionRegistration({
+        error,
+        session,
+        managed,
+        inserted,
+        timelineInitialized,
+        resolvedAgentId,
+      });
       throw error;
+    }
+  }
+
+  private async rollbackFailedSessionRegistration(input: {
+    error: unknown;
+    session: AgentSession;
+    managed: ActiveManagedAgent | null;
+    inserted: boolean;
+    timelineInitialized: boolean;
+    resolvedAgentId: string | null;
+  }): Promise<void> {
+    const cleanupErrors: unknown[] = [];
+    let ownsSessionCleanup = !input.inserted;
+
+    if (input.inserted && input.managed && this.agents.get(input.managed.id) === input.managed) {
+      ownsSessionCleanup = true;
+      try {
+        this.prepareAgentForClosure(input.managed, "agent registration failed");
+      } catch (error) {
+        cleanupErrors.push(error);
+      }
+    }
+
+    if (ownsSessionCleanup && input.timelineInitialized && input.resolvedAgentId) {
+      try {
+        this.discardRetainedAgentState(input.resolvedAgentId);
+      } catch (error) {
+        cleanupErrors.push(error);
+      }
+    }
+
+    if (ownsSessionCleanup) {
+      try {
+        await this.closeTrackedAgentRuntime(input.session);
+      } catch (error) {
+        cleanupErrors.push(error);
+      }
+    }
+
+    if (cleanupErrors.length > 0) {
+      throw new AggregateError(
+        [input.error, ...cleanupErrors],
+        "Agent registration failed and rollback also failed",
+        { cause: input.error },
+      );
     }
   }
 

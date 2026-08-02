@@ -469,10 +469,17 @@ function parseHostOfferOrNull(host: string | undefined): ConnectionOffer | null 
 
 export async function connectToDaemon(options?: ConnectOptions): Promise<DaemonClient> {
   const timeout = options?.timeout ?? DEFAULT_TIMEOUT;
+  const managedAgentContext = isManagedAgentContext(process.env);
+  const explicitHost = options?.host ?? process.env.PASEO_HOST;
+  const offer = parseHostOfferOrNull(explicitHost);
+  if (offer && managedAgentContext) {
+    throw new Error(
+      "Managed agent contexts cannot connect via pairing offers because relay ingress does not authenticate agent-bound authority",
+    );
+  }
   const clientId = await getOrCreateCliClientId();
   const nodeWebSocketFactory = createNodeWebSocketFactory();
   const callerAgent = resolveCliCallerIdentity();
-  const managedAgentContext = isManagedAgentContext(process.env);
   const configuredAgentAuthToken = process.env.PASEO_AGENT_AUTH_TOKEN?.trim() || null;
   const hasCompleteManagedIdentity = Boolean(
     callerAgent?.agentId && callerAgent.incarnation && configuredAgentAuthToken,
@@ -484,8 +491,6 @@ export async function connectToDaemon(options?: ConnectOptions): Promise<DaemonC
       ? null
       : readLocalCoordinatorRoutingCapability(resolvePaseoHome(process.env));
 
-  const explicitHost = options?.host ?? process.env.PASEO_HOST;
-  const offer = parseHostOfferOrNull(explicitHost);
   if (offer) {
     return connectViaRelayOffer(offer, clientId, timeout, nodeWebSocketFactory);
   }

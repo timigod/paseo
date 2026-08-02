@@ -13,7 +13,7 @@ import {
   type DestructiveMembershipVersionSource,
 } from "./agent/destructive-membership-fence.js";
 import type { DestructiveMembershipLease } from "./destructive-membership-gate.js";
-import type { AgentStorage, StoredAgentRecord } from "./agent/agent-storage.js";
+import type { AgentStorage } from "./agent/agent-storage.js";
 import { resolveAgentArchiveCascadeTarget } from "./agent/lifecycle-command.js";
 import type { WorkspaceGitService } from "./workspace-git-service.js";
 import type { ForgeService } from "../services/forge-service.js";
@@ -158,6 +158,23 @@ export class WorkspaceArchiveError extends Error {
   }
 }
 
+export interface WorkspaceArchiveTeardownFailure {
+  workspaceId: string;
+  operation: "agent" | "terminals" | "workspace_record";
+  agentId?: string;
+  error: unknown;
+}
+
+export class WorkspaceArchiveTeardownError extends AggregateError {
+  constructor(readonly failures: readonly WorkspaceArchiveTeardownFailure[]) {
+    super(
+      failures.map((failure) => failure.error),
+      `Workspace archive teardown failed for ${failures.length} required operation${failures.length === 1 ? "" : "s"}`,
+    );
+    this.name = "WorkspaceArchiveTeardownError";
+  }
+}
+
 export type ArchiveCallerContext = DestructiveCallerContext;
 
 export interface ArchiveByScopeRequest {
@@ -236,87 +253,105 @@ export async function archiveByScope(
   return lifecycleCoordinator.runArchive(
     operationKey,
     async () => {
-      const initialTarget = await resolveArchiveTarget(dependencies, request.scope);
       const membershipGate = dependencies.agentManager.getMembershipGate?.() ?? null;
-      const archiveReservation = lifecycleCoordinator.reserveWorkspaceArchive(
-        initialTarget.workspaceIds,
-      );
-      const archiveOperation = async () => {
-        const closureWorkspaceIds = new Set(initialTarget.workspaceIds);
-        let target = initialTarget;
-        while (true) {
-          await lifecycleCoordinator.waitForWorkspaceSetups(closureWorkspaceIds, request.signal);
-          await lifecycleCoordinator.waitForWorkspaceOwnershipMutations(
-            closureWorkspaceIds,
-            request.signal,
-          );
+      const requestedWorkspaceId =
+        request.scope.kind === "workspace" ? request.scope.workspaceId : undefined;
+      const identityLease = requestedWorkspaceId
+        ? await membershipGate?.acquireDestructive({ workspaceIds: [requestedWorkspaceId] })
+        : null;
+      try {
+        const initialTarget = await resolveArchiveTarget(dependencies, request.scope);
+        await identityLease?.extend(
+          resolveTargetMembershipScope(initialTarget, requestedWorkspaceId),
+        );
+        const archiveReservation = lifecycleCoordinator.reserveWorkspaceArchive(
+          initialTarget.workspaceIds,
+        );
+        const archiveOperation = async () => {
+          const closureWorkspaceIds = new Set(initialTarget.workspaceIds);
+          let target = initialTarget;
+          while (true) {
+            await lifecycleCoordinator.waitForWorkspaceSetups(closureWorkspaceIds, request.signal);
+            await lifecycleCoordinator.waitForWorkspaceOwnershipMutations(
+              closureWorkspaceIds,
+              request.signal,
+            );
 
-          const refreshedTarget = await resolveArchiveTarget(dependencies, request.scope);
-          archiveReservation.add(refreshedTarget.workspaceIds);
-          target = mergeArchiveTargets(target, refreshedTarget);
+            const refreshedTarget = await resolveArchiveTarget(dependencies, request.scope);
+            archiveReservation.add(refreshedTarget.workspaceIds);
+            target = mergeArchiveTargets(target, refreshedTarget);
 
-          const newlyDiscoveredWorkspaceIds = refreshedTarget.workspaceIds.filter(
-            (workspaceId) => !closureWorkspaceIds.has(workspaceId),
-          );
-          if (newlyDiscoveredWorkspaceIds.length > 0) {
-            for (const workspaceId of newlyDiscoveredWorkspaceIds) {
-              closureWorkspaceIds.add(workspaceId);
+            const newlyDiscoveredWorkspaceIds = refreshedTarget.workspaceIds.filter(
+              (workspaceId) => !closureWorkspaceIds.has(workspaceId),
+            );
+            if (newlyDiscoveredWorkspaceIds.length > 0) {
+              for (const workspaceId of newlyDiscoveredWorkspaceIds) {
+                closureWorkspaceIds.add(workspaceId);
+              }
+              continue;
             }
-            continue;
-          }
 
-          const destructiveLease = await membershipGate?.acquireDestructive(
-            resolveTargetMembershipScope(target),
-          );
-          try {
-            if (!destructiveLease) {
+            const destructiveLease =
+              identityLease ??
+              (await membershipGate?.acquireDestructive(
+                resolveTargetMembershipScope(target, requestedWorkspaceId),
+              ));
+            const ownsDestructiveLease =
+              destructiveLease !== null && destructiveLease !== identityLease;
+            try {
+              if (!destructiveLease) {
+                return await archiveResolvedTarget(
+                  dependencies,
+                  lifecycleCoordinator,
+                  request,
+                  target,
+                  null,
+                );
+              }
+              let gatedTarget = await resolveArchiveTarget(dependencies, request.scope);
+              await destructiveLease.extend(
+                resolveTargetMembershipScope(gatedTarget, requestedWorkspaceId),
+              );
+              gatedTarget = await resolveArchiveTarget(dependencies, request.scope);
+              archiveReservation.add(gatedTarget.workspaceIds);
+              target = mergeArchiveTargets(target, gatedTarget);
+              const gatedWorkspaceIds = gatedTarget.workspaceIds.filter(
+                (workspaceId) => !closureWorkspaceIds.has(workspaceId),
+              );
+              if (gatedWorkspaceIds.length > 0) {
+                for (const workspaceId of gatedWorkspaceIds) {
+                  closureWorkspaceIds.add(workspaceId);
+                }
+                continue;
+              }
               return await archiveResolvedTarget(
                 dependencies,
                 lifecycleCoordinator,
                 request,
                 target,
-                null,
+                destructiveLease,
               );
+            } finally {
+              if (ownsDestructiveLease) destructiveLease?.release();
             }
-            let gatedTarget = await resolveArchiveTarget(dependencies, request.scope);
-            await destructiveLease.extend(resolveTargetMembershipScope(gatedTarget));
-            gatedTarget = await resolveArchiveTarget(dependencies, request.scope);
-            archiveReservation.add(gatedTarget.workspaceIds);
-            target = mergeArchiveTargets(target, gatedTarget);
-            const gatedWorkspaceIds = gatedTarget.workspaceIds.filter(
-              (workspaceId) => !closureWorkspaceIds.has(workspaceId),
-            );
-            if (gatedWorkspaceIds.length > 0) {
-              for (const workspaceId of gatedWorkspaceIds) {
-                closureWorkspaceIds.add(workspaceId);
-              }
-              continue;
-            }
-            return await archiveResolvedTarget(
-              dependencies,
-              lifecycleCoordinator,
-              request,
-              target,
-              destructiveLease,
-            );
-          } finally {
-            destructiveLease?.release();
           }
+        };
+        try {
+          const mutationRoot =
+            (await resolveWorktreeMutationRoot(dependencies, initialTarget.backing)) ??
+            (request.scope.kind === "worktree" ? dirname(resolve(request.scope.targetPath)) : null);
+          return await (mutationRoot
+            ? lifecycleCoordinator.runWorktreeMutationExclusive(
+                mutationRoot,
+                archiveOperation,
+                request.signal,
+              )
+            : archiveOperation());
+        } finally {
+          archiveReservation.release();
         }
-      };
-      try {
-        const mutationRoot =
-          (await resolveWorktreeMutationRoot(dependencies, initialTarget.backing)) ??
-          (request.scope.kind === "worktree" ? dirname(resolve(request.scope.targetPath)) : null);
-        return await (mutationRoot
-          ? lifecycleCoordinator.runWorktreeMutationExclusive(
-              mutationRoot,
-              archiveOperation,
-              request.signal,
-            )
-          : archiveOperation());
       } finally {
-        archiveReservation.release();
+        identityLease?.release();
       }
     },
     request.signal,
@@ -502,7 +537,7 @@ async function archiveResolvedTarget(
     await recheckCaller();
     await persistTargetCleanupPending(dependencies, target);
 
-    const { archivedAgents, archivedWorkspaceIds, failures } = await archiveTargetRecords(
+    const { archivedAgents, archivedWorkspaceIds } = await archiveTargetRecords(
       dependencies,
       targetWorkspaceIds,
       request.requestId,
@@ -510,15 +545,6 @@ async function archiveResolvedTarget(
       cascadePlan,
     );
     await clearCleanupPendingForUnarchivedTargets(dependencies, target, archivedWorkspaceIds);
-    if (failures.length > 0) {
-      const authorityFailure = failures.find(
-        (failure): failure is WorkspaceArchiveError => failure instanceof WorkspaceArchiveError,
-      );
-      if (authorityFailure) {
-        throw authorityFailure;
-      }
-      throw new AggregateError(failures, "Failed to archive one or more workspaces");
-    }
 
     if (target.backing?.mainRepoRoot) {
       try {
@@ -561,9 +587,11 @@ async function archiveResolvedTarget(
     }
   }
 }
-function resolveTargetMembershipScope(target: ArchiveTarget) {
+function resolveTargetMembershipScope(target: ArchiveTarget, requestedWorkspaceId?: string) {
   return {
-    workspaceIds: target.workspaceIds,
+    workspaceIds: Array.from(
+      new Set([...target.workspaceIds, ...(requestedWorkspaceId ? [requestedWorkspaceId] : [])]),
+    ),
     paths: Array.from(
       new Set([
         ...(target.backing ? [target.backing.path] : []),
@@ -874,49 +902,77 @@ async function archiveTargetRecords(
   requestId: string,
   recheckCaller: DestructiveActionRecheck,
   cascadePlan?: AgentArchiveCascadePlan,
-): Promise<{
-  archivedAgents: Set<string>;
-  archivedWorkspaceIds: string[];
-  failures: unknown[];
-}> {
-  const archivedAgents = new Set<string>();
-  const archivedWorkspaceIds: string[] = [];
-
-  const results = await Promise.allSettled(
-    targetWorkspaceIds.map(async (workspaceId) => {
-      const agents = await archiveWorkspaceContents(
-        dependencies,
-        workspaceId,
-        recheckCaller,
-        cascadePlan,
-      );
-      await recheckCaller();
-      await dependencies.archiveWorkspaceRecord(workspaceId, recheckCaller);
-      return { workspaceId, agents };
-    }),
+): Promise<{ archivedAgents: Set<string>; archivedWorkspaceIds: string[] }> {
+  const teardownResults = await Promise.allSettled(
+    targetWorkspaceIds.map((workspaceId) =>
+      archiveWorkspaceContents(dependencies, workspaceId, recheckCaller, cascadePlan),
+    ),
   );
-
-  for (const result of results) {
-    if (result.status === "fulfilled") {
-      archivedWorkspaceIds.push(result.value.workspaceId);
-      for (const agentId of result.value.agents) {
-        archivedAgents.add(agentId);
-      }
-    } else {
-      if (result.reason instanceof DestructiveMembershipChangedError) {
-        throw result.reason;
-      }
-      dependencies.sessionLogger?.warn(
-        { err: result.reason, requestId },
-        "archiveByScope workspace teardown failed",
-      );
+  const teardownFailures = teardownResults.flatMap((result, index) => {
+    if (result.status === "fulfilled") return [];
+    if (
+      result.reason instanceof DestructiveMembershipChangedError ||
+      result.reason instanceof WorkspaceArchiveError
+    ) {
+      throw result.reason;
     }
+    if (result.reason instanceof WorkspaceArchiveTeardownError) {
+      return [...result.reason.failures];
+    }
+    return [
+      {
+        workspaceId: targetWorkspaceIds[index]!,
+        operation: "workspace_record" as const,
+        error: result.reason,
+      },
+    ];
+  });
+  if (teardownFailures.length > 0) {
+    dependencies.sessionLogger?.warn(
+      { failures: teardownFailures, requestId },
+      "archiveByScope required teardown failed",
+    );
+    throw new WorkspaceArchiveTeardownError(teardownFailures);
   }
 
-  const failures = results.flatMap((result) =>
-    result.status === "rejected" ? [result.reason] : [],
+  const archiveRecordResults = await Promise.allSettled(
+    targetWorkspaceIds.map(async (workspaceId) => {
+      await recheckCaller();
+      await dependencies.archiveWorkspaceRecord(workspaceId, recheckCaller);
+      return workspaceId;
+    }),
   );
-  return { archivedAgents, archivedWorkspaceIds, failures };
+  const archiveRecordFailures = archiveRecordResults.flatMap((result, index) =>
+    result.status === "rejected"
+      ? [
+          {
+            workspaceId: targetWorkspaceIds[index]!,
+            operation: "workspace_record" as const,
+            error: result.reason,
+          },
+        ]
+      : [],
+  );
+  const archiveRecordControlFailure = archiveRecordResults.find(
+    (result): result is PromiseRejectedResult =>
+      result.status === "rejected" &&
+      (result.reason instanceof DestructiveMembershipChangedError ||
+        result.reason instanceof WorkspaceArchiveError),
+  );
+  if (archiveRecordControlFailure) throw archiveRecordControlFailure.reason;
+  if (archiveRecordFailures.length > 0) {
+    throw new WorkspaceArchiveTeardownError(archiveRecordFailures);
+  }
+
+  const archivedAgents = new Set<string>();
+  for (const result of teardownResults) {
+    if (result.status !== "fulfilled") continue;
+    for (const agentId of result.value) archivedAgents.add(agentId);
+  }
+  const archivedWorkspaceIds = archiveRecordResults.flatMap((result) =>
+    result.status === "fulfilled" ? [result.value] : [],
+  );
+  return { archivedAgents, archivedWorkspaceIds };
 }
 
 async function maybeRemoveDirectory(
@@ -1508,66 +1564,81 @@ export async function archiveWorkspaceContents(
   const liveAgents = dependencies.agentManager
     .listAgents()
     .filter((agent) => agent.workspaceId === workspaceId);
-  for (const agent of liveAgents) {
-    archivedAgents.add(agent.id);
-  }
-
-  const storedRecords: StoredAgentRecord[] = await dependencies.agentStorage.list();
+  const storedRecords = await dependencies.agentStorage.list();
   const liveAgentIds = new Set(liveAgents.map((agent) => agent.id));
   const matchingStoredRecords = storedRecords.filter(
     (record) => record.workspaceId === workspaceId,
   );
-  for (const record of matchingStoredRecords) {
-    archivedAgents.add(record.id);
-  }
-
   await recheckCaller();
   const archivedAt = new Date().toISOString();
-  const archiveResults = await Promise.allSettled([
-    ...liveAgents.map((agent) =>
-      dependencies.agentManager.archiveAgent(agent.id, recheckCaller, cascadePlan),
-    ),
+  const archiveOperations = [
+    ...liveAgents.map((agent) => ({
+      operation: "agent" as const,
+      agentId: agent.id,
+      run: () => dependencies.agentManager.archiveAgent(agent.id, recheckCaller, cascadePlan),
+    })),
     ...matchingStoredRecords
       .filter((record) => !liveAgentIds.has(record.id) && !record.archivedAt)
-      .map((record) =>
-        dependencies.agentManager.archiveSnapshot(
-          record.id,
-          archivedAt,
-          recheckCaller,
-          cascadePlan,
-        ),
-      ),
-    dependencies.killTerminalsForWorkspace(workspaceId, recheckCaller),
-  ]);
+      .map((record) => ({
+        operation: "agent" as const,
+        agentId: record.id,
+        run: () =>
+          dependencies.agentManager.archiveSnapshot(
+            record.id,
+            archivedAt,
+            recheckCaller,
+            cascadePlan,
+          ),
+      })),
+    {
+      operation: "terminals" as const,
+      run: () => dependencies.killTerminalsForWorkspace(workspaceId, recheckCaller),
+    },
+  ];
+  const archiveResults = await Promise.allSettled(
+    archiveOperations.map((operation) => operation.run()),
+  );
+  const failures: WorkspaceArchiveTeardownFailure[] = [];
+  for (const [index, result] of archiveResults.entries()) {
+    const operation = archiveOperations[index]!;
+    if (result.status === "fulfilled") {
+      if (operation.operation === "agent") archivedAgents.add(operation.agentId);
+      continue;
+    }
+    if (
+      result.reason instanceof DestructiveMembershipChangedError ||
+      result.reason instanceof WorkspaceArchiveError
+    ) {
+      throw result.reason;
+    }
+    failures.push({
+      workspaceId,
+      operation: operation.operation,
+      ...(operation.operation === "agent" ? { agentId: operation.agentId } : {}),
+      error: result.reason,
+    });
+  }
 
-  const remainingLiveAgents = dependencies.agentManager
-    .listAgents()
-    .filter((agent) => agent.workspaceId === workspaceId);
-  const remainingStoredAgents = (await dependencies.agentStorage.list()).filter(
-    (record) => record.workspaceId === workspaceId && !record.archivedAt,
-  );
-  const failures = archiveResults.flatMap((result) =>
-    result.status === "rejected" ? [result.reason] : [],
-  );
-  const authorityFailure = failures.find(
-    (failure): failure is WorkspaceArchiveError => failure instanceof WorkspaceArchiveError,
-  );
-  const membershipFailure = failures.find(
-    (failure): failure is DestructiveMembershipChangedError =>
-      failure instanceof DestructiveMembershipChangedError,
-  );
-  if (membershipFailure) {
-    throw membershipFailure;
+  const remainingAgentIds = new Set([
+    ...dependencies.agentManager
+      .listAgents()
+      .filter((agent) => agent.workspaceId === workspaceId)
+      .map((agent) => agent.id),
+    ...(await dependencies.agentStorage.list())
+      .filter((record) => record.workspaceId === workspaceId && !record.archivedAt)
+      .map((record) => record.id),
+  ]);
+  if (failures.length === 0) {
+    for (const agentId of remainingAgentIds) {
+      failures.push({
+        workspaceId,
+        operation: "agent",
+        agentId,
+        error: new Error(`Workspace ownership remains after archive: ${workspaceId}`),
+      });
+    }
   }
-  if (authorityFailure) {
-    throw authorityFailure;
-  }
-  if (remainingLiveAgents.length > 0 || remainingStoredAgents.length > 0) {
-    throw new AggregateError(failures, `Workspace ownership remains after archive: ${workspaceId}`);
-  }
-  if (failures.length > 0) {
-    throw new AggregateError(failures, `Workspace archive teardown failed: ${workspaceId}`);
-  }
+  if (failures.length > 0) throw new WorkspaceArchiveTeardownError(failures);
 
   return archivedAgents;
 }
@@ -1648,12 +1719,18 @@ export async function killTerminalsForWorkspace(
       dependencies.detachTerminalStream?.(terminalId, { emitExit: true });
     }),
   );
-  const membershipFailure = results.find(
-    (result): result is PromiseRejectedResult =>
-      result.status === "rejected" && result.reason instanceof DestructiveMembershipChangedError,
+  const failures = results.flatMap((result) =>
+    result.status === "rejected" ? [result.reason] : [],
   );
-  if (membershipFailure) {
-    throw membershipFailure.reason;
+  if (failures.length > 0) {
+    const membershipFailure = failures.find(
+      (error) => error instanceof DestructiveMembershipChangedError,
+    );
+    if (membershipFailure) throw membershipFailure;
+    throw new AggregateError(
+      failures,
+      `Failed to terminate ${failures.length} workspace terminal${failures.length === 1 ? "" : "s"}`,
+    );
   }
   if ((await listWorkspaceTerminals()).length > 0) {
     throw new Error(`Workspace terminals remain after archive: ${workspaceId}`);

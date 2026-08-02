@@ -1,3 +1,5 @@
+import { parseConnectionOfferFromUrl } from "@getpaseo/protocol/connection-offer";
+
 const PASEO_NODE_ENV = "PASEO_NODE_ENV";
 const ELECTRON_RUN_AS_NODE = "ELECTRON_RUN_AS_NODE";
 
@@ -44,12 +46,24 @@ function buildExternalProcessEnv(
   for (const key of MANAGED_CHILD_COORDINATOR_ENV_KEYS) {
     delete sanitized[key];
   }
+  if (isPairingOfferHost(sanitized.PASEO_HOST)) {
+    delete sanitized.PASEO_HOST;
+  }
   for (const [key, value] of Object.entries(sanitized)) {
     if (value === undefined) {
       delete sanitized[key];
     }
   }
   return sanitized as ExternalProcessEnv;
+}
+
+function isPairingOfferHost(host: string | undefined): boolean {
+  if (!host) return false;
+  try {
+    return parseConnectionOfferFromUrl(host) !== null;
+  } catch {
+    return false;
+  }
 }
 
 export function createPaseoInternalEnv(baseEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {

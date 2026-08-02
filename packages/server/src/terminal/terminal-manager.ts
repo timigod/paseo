@@ -1,5 +1,6 @@
 import {
   createTerminal,
+  type CreateTerminalOptions,
   type TerminalActivityTransition,
   type TerminalSession,
   type TerminalStateSnapshot,
@@ -98,6 +99,7 @@ export interface TerminalManager {
 export interface TerminalManagerOptions {
   getTerminalActivityUrl?: () => string | null;
   membershipGate?: DestructiveMembershipGate;
+  createTerminalSession?: (options: CreateTerminalOptions) => Promise<TerminalSession>;
 }
 
 function createActivityToken(): string {
@@ -118,6 +120,7 @@ export function createTerminalManager(
   const terminalWorkspaceContributionChangedListeners =
     new Set<TerminalWorkspaceContributionChangedListener>();
   const defaultEnvByRootCwd = new Map<string, Record<string, string>>();
+  const createTerminalSession = managerOptions.createTerminalSession ?? createTerminal;
   let membershipVersion = 0;
 
   function removeSessionById(id: string, options: { kill: boolean }): void {
@@ -358,7 +361,7 @@ export function createTerminalManager(
         let session: TerminalSession;
         try {
           session = registerSession(
-            await createTerminal({
+            await createTerminalSession({
               id: terminalId,
               cwd: options.cwd,
               workspaceId: options.workspaceId,
@@ -455,11 +458,8 @@ export function createTerminalManager(
       if (!session) {
         return;
       }
-      try {
-        await session.killAndWait(options);
-      } finally {
-        removeSessionById(id, { kill: false });
-      }
+      await session.killAndWait(options);
+      removeSessionById(id, { kill: false });
     },
 
     async captureTerminal(

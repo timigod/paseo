@@ -4,6 +4,7 @@ import {
   lstatSync,
   mkdirSync,
   mkdtempSync,
+  promises as fs,
   readFileSync,
   renameSync,
   rmSync,
@@ -57,6 +58,7 @@ import {
   WorkspaceArchiveTargetNotFoundError,
   WORKSPACE_ARCHIVE_ERROR_CODES,
   WorkspaceArchiveError,
+  WorkspaceArchiveTeardownError,
 } from "./workspace-archive-service.js";
 import { WorkspaceCleanupRetryService } from "./workspace-cleanup-retry-service.js";
 import { WorkspaceLifecycleCoordinator } from "./workspace-lifecycle-coordinator.js";
@@ -68,6 +70,22 @@ import {
 import { createWorkspaceProvisioningService } from "./session/workspace-provisioning/workspace-provisioning-service.js";
 
 const cleanupPaths: string[] = [];
+
+interface Deferred<T> {
+  promise: Promise<T>;
+  resolve: (value: T) => void;
+  reject: (reason?: unknown) => void;
+}
+
+function deferred<T>(): Deferred<T> {
+  let resolve!: (value: T) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
 
 afterEach(() => {
   for (const target of cleanupPaths.splice(0)) {
@@ -1433,7 +1451,7 @@ describe("archiveByScope", () => {
         requestId: "req-partial-failure",
         caller: createCoordinatorDestructiveCaller(),
       }),
-    ).rejects.toThrow("Failed to archive one or more workspaces");
+    ).rejects.toBeInstanceOf(WorkspaceArchiveTeardownError);
 
     expect((await deps.listActiveWorkspaces()).map((workspace) => workspace.workspaceId)).toEqual([
       workspaceA,
@@ -1711,7 +1729,7 @@ describe("archiveByScope", () => {
         scope: { kind: "worktree", targetPath: worktree.worktreePath },
         requestId: "req-partial-retry-first",
       }),
-    ).rejects.toThrow("Failed to archive one or more workspaces");
+    ).rejects.toBeInstanceOf(WorkspaceArchiveTeardownError);
     expect((await registry.get(workspaceA))?.cleanupPending).not.toBeNull();
     expect((await registry.get(workspaceB))?.archivedAt).toBeNull();
     expect(existsSync(worktree.worktreePath)).toBe(true);
@@ -2397,11 +2415,91 @@ describe("archiveByScope", () => {
         scope: { kind: "workspace", workspaceId },
         requestId: "req-strict-teardown",
       }),
-    ).rejects.toThrow("Failed to archive one or more workspaces");
+    ).rejects.toBeInstanceOf(WorkspaceArchiveTeardownError);
 
     expect(deps.archiveWorkspaceRecord).not.toHaveBeenCalled();
     expect(existsSync(worktree.worktreePath)).toBe(true);
   });
+
+  test.each(["agent", "terminal"] as const)(
+    "%s teardown failure keeps the workspace and directory retryable",
+    async (failureKind) => {
+      const { tempDir, repoDir } = createGitRepo();
+      const paseoHome = path.join(tempDir, ".paseo");
+      const worktree = await createPaseoOwnedWorktree(
+        repoDir,
+        paseoHome,
+        `retry-${failureKind}-failure`,
+      );
+      const workspaceId = `workspace-retry-${failureKind}-failure`;
+      const agentId = `agent-retry-${failureKind}-failure`;
+      const deps = createArchiveDeps({
+        paseoHome,
+        activeWorkspaces: [
+          {
+            workspaceId,
+            cwd: worktree.worktreePath,
+            kind: "worktree",
+            worktreeRoot: worktree.worktreePath,
+            isPaseoOwnedWorktree: true,
+            mainRepoRoot: repoDir,
+          },
+        ],
+        liveAgents:
+          failureKind === "agent" ? [{ id: agentId, workspaceId, cwd: worktree.worktreePath }] : [],
+      });
+      deps.archiveWorkspaceRecord = vi.fn(deps.archiveWorkspaceRecord);
+      let failRequiredTeardown = true;
+      if (failureKind === "agent") {
+        const archiveAgent = deps.agentManager.archiveAgent.bind(deps.agentManager);
+        deps.agentManager.archiveAgent = vi.fn(async (...args) => {
+          if (failRequiredTeardown) throw new Error("injected agent archive failure");
+          return archiveAgent(...args);
+        });
+      } else {
+        deps.killTerminalsForWorkspace = vi.fn(async () => {
+          if (failRequiredTeardown) throw new Error("injected terminal kill failure");
+        });
+      }
+
+      const firstArchive = archiveByScope(deps, {
+        scope: { kind: "workspace", workspaceId },
+        requestId: `req-retry-${failureKind}-failure`,
+        caller: createCoordinatorDestructiveCaller(),
+      });
+      const failure = await firstArchive.then(
+        () => null,
+        (error: unknown) => error,
+      );
+
+      expect(failure).toBeInstanceOf(WorkspaceArchiveTeardownError);
+      expect((failure as WorkspaceArchiveTeardownError).failures).toEqual([
+        expect.objectContaining({
+          workspaceId,
+          operation: failureKind === "agent" ? "agent" : "terminals",
+          ...(failureKind === "agent" ? { agentId } : {}),
+        }),
+      ]);
+      expect(deps.archivedAgentIds).toEqual([]);
+      expect(deps.archiveWorkspaceRecord).not.toHaveBeenCalled();
+      expect(deps.activeWorkspaces.map((workspace) => workspace.workspaceId)).toContain(
+        workspaceId,
+      );
+      expect(existsSync(worktree.worktreePath)).toBe(true);
+
+      failRequiredTeardown = false;
+      const retried = await archiveByScope(deps, {
+        scope: { kind: "workspace", workspaceId },
+        requestId: `req-retry-${failureKind}-success`,
+        caller: createCoordinatorDestructiveCaller(),
+      });
+
+      expect(retried.archivedWorkspaceIds).toEqual([workspaceId]);
+      expect(retried.archivedAgentIds).toEqual(failureKind === "agent" ? [agentId] : []);
+      expect(deps.activeWorkspaces).toEqual([]);
+      expect(existsSync(worktree.worktreePath)).toBe(false);
+    },
+  );
 
   test("workspace scope rejects an unknown explicit workspace id", async () => {
     const { tempDir } = createGitRepo();
@@ -2426,6 +2524,108 @@ describe("archiveByScope", () => {
     expect(deps.markWorkspaceArchiving).not.toHaveBeenCalled();
     expect(deps.archiveWorkspaceRecord).not.toHaveBeenCalled();
     expect(deps.emitWorkspaceUpdatesForWorkspaceIds).not.toHaveBeenCalled();
+  });
+
+  test("workspace archive fences a missing record through an in-flight first upsert", async () => {
+    const { tempDir } = createGitRepo();
+    const membershipGate = new DestructiveMembershipGate();
+    const workspaceId = "workspace-in-flight-first-upsert";
+    const registryPath = path.join(tempDir, "registry", "workspaces.json");
+    const registry = new FileBackedWorkspaceRegistry(registryPath, createLogger(), {
+      membershipGate,
+    });
+    const workspace = createPersistedWorkspaceRecord({
+      workspaceId,
+      projectId: "project-in-flight-first-upsert",
+      cwd: tempDir,
+      kind: "local_checkout",
+      displayName: "main",
+      createdAt: "2026-08-02T00:00:00.000Z",
+      updatedAt: "2026-08-02T00:00:00.000Z",
+    });
+    const deps = createArchiveDeps({
+      paseoHome: path.join(tempDir, ".paseo"),
+      activeWorkspaces: [],
+      membershipGate,
+    });
+    deps.listActiveWorkspaces = async () =>
+      (await registry.list()).filter((record) => !record.archivedAt);
+    deps.getWorkspaceMembershipVersion = () => registry.getMembershipVersion();
+    deps.archiveWorkspaceRecord = async (id, recheck) => {
+      await registry.archive(id, new Date().toISOString(), { recheck });
+    };
+
+    const firstWriteBeforeCommit = deferred<void>();
+    const allowFirstWriteCommit = deferred<void>();
+    const originalRename = fs.rename.bind(fs);
+    let pausedFirstWrite = false;
+    const renameSpy = vi.spyOn(fs, "rename").mockImplementation(async (oldPath, newPath) => {
+      if (!pausedFirstWrite && path.resolve(String(newPath)) === path.resolve(registryPath)) {
+        pausedFirstWrite = true;
+        firstWriteBeforeCommit.resolve();
+        await allowFirstWriteCommit.promise;
+      }
+      await originalRename(oldPath, newPath);
+    });
+
+    const archiveAcquireStarted =
+      deferred<Parameters<DestructiveMembershipGate["acquireDestructive"]>[0]>();
+    const originalAcquireDestructive = membershipGate.acquireDestructive.bind(membershipGate);
+    let archiveLeaseAcquired = false;
+    vi.spyOn(membershipGate, "acquireDestructive").mockImplementation(async (scope) => {
+      archiveAcquireStarted.resolve(scope);
+      const lease = await originalAcquireDestructive(scope);
+      archiveLeaseAcquired = true;
+      return lease;
+    });
+
+    const firstUpsert = registry.upsert(workspace);
+    let archive: Promise<ArchiveResult> | undefined;
+    let lateUpsert: Promise<void> | undefined;
+    try {
+      await firstWriteBeforeCommit.promise;
+
+      archive = archiveByScope(deps, {
+        scope: { kind: "workspace", workspaceId },
+        requestId: "req-in-flight-first-upsert",
+        caller: createCoordinatorDestructiveCaller(),
+      });
+      const initialArchiveScope = await archiveAcquireStarted.promise;
+
+      expect(initialArchiveScope.workspaceIds).toContain(workspaceId);
+      expect(archiveLeaseAcquired).toBe(false);
+
+      lateUpsert = registry.upsert({
+        ...workspace,
+        projectId: "project-too-late",
+        cwd: path.join(tempDir, "too-late"),
+        updatedAt: "2026-08-02T00:00:01.000Z",
+      });
+      const lateUpsertRejection = expect(lateUpsert).rejects.toBeInstanceOf(
+        DestructiveMembershipExcludedError,
+      );
+      allowFirstWriteCommit.resolve();
+
+      await firstUpsert;
+      await lateUpsertRejection;
+      const result = await archive;
+
+      expect(archiveLeaseAcquired).toBe(true);
+      expect(result.archivedWorkspaceIds).toEqual([workspaceId]);
+      expect(await deps.listActiveWorkspaces()).toEqual([]);
+      expect(await registry.get(workspaceId)).toMatchObject({
+        workspaceId,
+        archivedAt: expect.any(String),
+      });
+    } finally {
+      allowFirstWriteCommit.resolve();
+      await Promise.allSettled([
+        firstUpsert,
+        ...(lateUpsert ? [lateUpsert] : []),
+        ...(archive ? [archive] : []),
+      ]);
+      renameSpy.mockRestore();
+    }
   });
 
   test("rejects a terminal registration after the workspace record is durably archived", async () => {

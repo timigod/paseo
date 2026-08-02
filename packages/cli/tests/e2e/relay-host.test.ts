@@ -9,6 +9,10 @@ import { parseConnectionOfferFromUrl } from "@getpaseo/protocol/connection-offer
 import { generateLocalPairingOffer } from "@getpaseo/server";
 import { DaemonClient } from "@getpaseo/client/internal/daemon-client";
 import { WebSocket } from "ws";
+import {
+  createTestPaseoDaemon,
+  type TestPaseoDaemon,
+} from "../../../server/src/server/test-utils/paseo-daemon.ts";
 import { getAvailablePort } from "../helpers/network.ts";
 import { createE2ETestContext } from "../helpers/test-daemon.ts";
 
@@ -160,7 +164,9 @@ async function waitForDaemonRelayRegistered(offerUrl: string, timeoutMs = 30_000
   let relayPort: number;
   let relayProcess: ChildProcess | null = null;
   let ctx: Awaited<ReturnType<typeof createE2ETestContext>> | null = null;
+  let authorityDaemon: TestPaseoDaemon | null = null;
   let offerUrl: string;
+  let authorityOfferUrl: string;
 
   beforeAll(async () => {
     relayPort = await getAvailablePort();
@@ -197,9 +203,31 @@ async function waitForDaemonRelayRegistered(offerUrl: string, timeoutMs = 30_000
     offerUrl = offer.url;
 
     await waitForDaemonRelayRegistered(offerUrl, 30_000);
+
+    authorityDaemon = await createTestPaseoDaemon({
+      listen: "127.0.0.1",
+      relayEnabled: true,
+      relayEndpoint,
+      relayUseTls: false,
+      relayPublicUseTls: false,
+    });
+    const authorityOffer = await generateLocalPairingOffer({
+      paseoHome: authorityDaemon.paseoHome,
+      relayEnabled: true,
+      relayEndpoint,
+      relayPublicEndpoint: relayEndpoint,
+      includeQr: false,
+    });
+    if (!authorityOffer.url) throw new Error("generateLocalPairingOffer returned no URL");
+    authorityOfferUrl = authorityOffer.url;
+    await waitForDaemonRelayRegistered(authorityOfferUrl, 30_000);
   }, STARTUP_HOOK_TIMEOUT_MS);
 
   afterAll(async () => {
+    if (authorityDaemon) {
+      await authorityDaemon.close();
+      authorityDaemon = null;
+    }
     if (ctx) {
       await ctx.stop();
       ctx = null;
@@ -226,5 +254,97 @@ async function waitForDaemonRelayRegistered(offerUrl: string, timeoutMs = 30_000
     const relayAgents = JSON.parse(relay.stdout.trim() || "[]");
     expect(Array.isArray(relayAgents)).toBe(true);
     expect(relayAgents.length).toBe(directAgents.length);
+  }, 60_000);
+
+  it("refuses every managed identity over an offer while preserving trusted offer access", async () => {
+    if (!ctx || !authorityDaemon) throw new Error("test context not initialized");
+
+    const createAgent = () =>
+      authorityDaemon!.daemon.agentManager.createAgent(
+        {
+          provider: "codex",
+          model: "gpt-5.4-mini",
+          modeId: "full-access",
+          cwd: ctx!.workDir,
+        },
+        undefined,
+        { workspaceId: undefined },
+      );
+
+    const caller = await createAgent();
+    const callerIdentity = authorityDaemon.daemon.agentManager.getAgentCallerIdentity(caller.id);
+    const validAgentToken = authorityDaemon.daemon.agentManager.getAgentIngressAuthToken(caller.id);
+    if (!callerIdentity || !validAgentToken) {
+      throw new Error("expected current managed caller credentials");
+    }
+
+    const managedVariants: Array<{
+      name: string;
+      identity: NodeJS.ProcessEnv;
+    }> = [
+      {
+        name: "omitted",
+        identity: {
+          PASEO_AGENT_ID: "",
+          PASEO_AGENT_INCARNATION: "",
+          PASEO_AGENT_AUTH_TOKEN: "",
+        },
+      },
+      {
+        name: "invalid",
+        identity: {
+          PASEO_AGENT_ID: callerIdentity.agentId,
+          PASEO_AGENT_INCARNATION: callerIdentity.incarnation,
+          PASEO_AGENT_AUTH_TOKEN: "invalid-agent-token",
+        },
+      },
+      {
+        name: "valid",
+        identity: {
+          PASEO_AGENT_ID: callerIdentity.agentId,
+          PASEO_AGENT_INCARNATION: callerIdentity.incarnation,
+          PASEO_AGENT_AUTH_TOKEN: validAgentToken,
+        },
+      },
+    ];
+
+    for (const variant of managedVariants) {
+      const target = await createAgent();
+      const result = await ctx.paseo(
+        ["agent", "delete", target.id, "--json", "--host", authorityOfferUrl],
+        {
+          timeout: 30_000,
+          env: {
+            PASEO_HOME: authorityDaemon.paseoHome,
+            PASEO_HOST: authorityOfferUrl,
+            PASEO_MANAGED_AGENT_CONTEXT: "1",
+            ...variant.identity,
+          },
+        },
+      );
+      expect(result.exitCode, `${variant.name}: ${result.stderr}\n${result.stdout}`).not.toBe(0);
+      expect(`${result.stderr}\n${result.stdout}`).toContain(
+        "Managed agent contexts cannot connect via pairing offers",
+      );
+      expect(authorityDaemon.daemon.agentManager.getAgent(target.id)?.id).toBe(target.id);
+    }
+
+    const trustedTarget = await createAgent();
+    const trusted = await ctx.paseo(
+      ["agent", "delete", trustedTarget.id, "--json", "--host", authorityOfferUrl],
+      {
+        timeout: 30_000,
+        env: {
+          PASEO_HOME: authorityDaemon.paseoHome,
+          PASEO_HOST: authorityOfferUrl,
+          PASEO_MANAGED_AGENT_CONTEXT: "",
+          PASEO_AGENT_ID: "",
+          PASEO_AGENT_INCARNATION: "",
+          PASEO_AGENT_AUTH_TOKEN: "",
+        },
+      },
+    );
+    expect(trusted.exitCode, `${trusted.stderr}\n${trusted.stdout}`).toBe(0);
+    expect(authorityDaemon.daemon.agentManager.getAgent(trustedTarget.id)).toBeNull();
   }, 60_000);
 });

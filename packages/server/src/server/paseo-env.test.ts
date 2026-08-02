@@ -37,6 +37,14 @@ describe("paseo env contract", () => {
     "PASEO_SUPERVISOR_WORKER_TOKEN",
     "ELECTRON_NO_ATTACH_CONSOLE",
   ] as const;
+  const pairingOffer = `https://app.paseo.sh/#offer=${Buffer.from(
+    JSON.stringify({
+      v: 2,
+      serverId: "server-managed-child-test",
+      daemonPublicKeyB64: "daemon-public-key",
+      relay: { endpoint: "relay.example.com:443", useTls: true },
+    }),
+  ).toString("base64url")}`;
 
   test("builds internal daemon child env by preserving pass-through and control vars", () => {
     const env = createPaseoInternalEnv(baseEnv);
@@ -87,6 +95,14 @@ describe("paseo env contract", () => {
     expect(env.CUSTOM).toBe("value");
     expect(env.NODE_ENV).toBe("development");
     expect(env.PATH).toBe("/custom/bin");
+  });
+
+  test("strips an inherited pairing offer but preserves a normal daemon host", () => {
+    const paired = createExternalProcessEnv(baseEnv, { PASEO_HOST: pairingOffer });
+    const direct = createExternalProcessEnv(baseEnv, { PASEO_HOST: "127.0.0.1:6767" });
+
+    expect(paired.PASEO_HOST).toBeUndefined();
+    expect(direct.PASEO_HOST).toBe("127.0.0.1:6767");
   });
 
   test("builds provider-style overlays that cannot reintroduce coordinator authority", () => {
