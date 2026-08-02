@@ -168,6 +168,7 @@ const PROJECT_GITHUB_CLONE_TIMEOUT_MS = 5 * 60 * 1000;
 interface ImportAgentInputBase {
   cwd?: string;
   workspaceId?: string;
+  workspaceSource?: CreateAgentRequestMessage["workspaceSource"];
   labels?: Record<string, string>;
 }
 
@@ -342,6 +343,7 @@ export interface CreateAgentRequestOptions extends AgentConfigOverrides {
   cwd?: string;
   env?: CreateAgentRequestMessage["env"];
   workspaceId?: string;
+  workspaceSource?: CreateAgentRequestMessage["workspaceSource"];
   callerAgentId?: string;
   initialPrompt?: string;
   clientMessageId?: string;
@@ -2369,6 +2371,7 @@ export class DaemonClient {
   // ============================================================================
 
   async createAgent(options: CreateAgentRequestOptions): Promise<AgentSnapshotPayload> {
+    this.requireCreateAgentOptionsSupport(options);
     const requestId = this.createRequestId(options.requestId);
     const config = resolveAgentConfig(options);
 
@@ -2378,6 +2381,9 @@ export class DaemonClient {
       config,
       ...(options.env ? { env: options.env } : {}),
       ...(options.workspaceId !== undefined ? { workspaceId: options.workspaceId } : {}),
+      ...(options.workspaceSource !== undefined
+        ? { workspaceSource: options.workspaceSource }
+        : {}),
       ...(options.callerAgentId !== undefined ? { callerAgentId: options.callerAgentId } : {}),
       ...(options.initialPrompt ? { initialPrompt: options.initialPrompt } : {}),
       ...(options.clientMessageId ? { clientMessageId: options.clientMessageId } : {}),
@@ -5273,6 +5279,15 @@ export class DaemonClient {
 
   getLastServerInfoMessage(): ServerInfoStatusPayload | null {
     return this.lastServerInfoMessage;
+  }
+
+  private requireCreateAgentOptionsSupport(options: CreateAgentRequestOptions): void {
+    // COMPAT(createAgentIdempotency): added in v0.2.6, remove gate after 2027-02-02.
+    const requiresSupport =
+      options.idempotencyKey !== undefined || options.workspaceSource !== undefined;
+    if (requiresSupport && this.lastServerInfoMessage?.features?.createAgentIdempotency !== true) {
+      throw new Error("Update the host to use retry-safe agent creation.");
+    }
   }
 
   private requireHubRelationshipSupport(): void {

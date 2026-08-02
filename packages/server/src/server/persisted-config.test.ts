@@ -37,10 +37,25 @@ describe("PersistedConfigSchema daemon auth config", () => {
 });
 
 describe("PersistedConfigSchema daemon maxActiveAgents compatibility", () => {
-  test("accepts a formerly supported positive agent limit", () => {
+  test("accepts and removes a formerly supported positive agent limit", () => {
     const parsed = PersistedConfigSchema.parse({ daemon: { maxActiveAgents: 4 } });
 
-    expect(parsed.daemon?.maxActiveAgents).toBe(4);
+    expect(parsed.daemon).not.toHaveProperty("maxActiveAgents");
+  });
+
+  test("does not serialize the removed agent limit", () => {
+    const paseoHome = createTempHome();
+    try {
+      savePersistedConfig(paseoHome, { daemon: { maxActiveAgents: 4 } } as Parameters<
+        typeof savePersistedConfig
+      >[1]);
+
+      const serialized = JSON.parse(readFileSync(path.join(paseoHome, "config.json"), "utf8"));
+      expect(serialized.daemon).not.toHaveProperty("maxActiveAgents");
+      expect(PersistedConfigSchema.parse(serialized)).toEqual(serialized);
+    } finally {
+      rmSync(paseoHome, { recursive: true, force: true });
+    }
   });
 
   test.each([0, -1, 1.5])("rejects invalid agent limit %s", (maxActiveAgents) => {

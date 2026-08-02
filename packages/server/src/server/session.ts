@@ -45,6 +45,7 @@ import { ensureAgentLoaded, ensureUnarchivedAgentLoaded } from "./agent/agent-lo
 import {
   formatSystemNotificationPrompt,
   sendPromptToAgent,
+  startCreatedAgentInitialPrompt,
   waitForAgentRunStartWithTimeout,
   unarchiveAgentState,
 } from "./agent/agent-prompt.js";
@@ -87,6 +88,7 @@ import { createAgentCommand } from "./agent/create-agent/create.js";
 import {
   CreateAgentRequestStore,
   fingerprintCreateAgentRequest,
+  type CreateAgentRequestContext,
 } from "./agent/create-agent-request-store.js";
 import { resolveCreateAgentIntent, type CreateAgentIntent } from "./agent/create-agent/intent.js";
 import {
@@ -120,6 +122,7 @@ import {
 } from "./agent/timeline-projection.js";
 import { buildAgentForkContextAttachment } from "./agent/activity-curator.js";
 import { buildAgentPrompt } from "./agent/prompt-attachments.js";
+import { normalizeClientMessageId } from "./client-message-id.js";
 import type { StructuredGenerationDaemonConfig } from "./agent/structured-generation-providers.js";
 import {
   getAgentStreamEventTurnId,
@@ -548,6 +551,7 @@ function resolveCreateAgentRequestStore(options: SessionOptions): CreateAgentReq
   }
   return new CreateAgentRequestStore({
     paseoHome: options.paseoHome,
+    daemonId: options.serverId,
     hasAgent: async (agentId) =>
       options.agentManager.getAgent(agentId) !== null ||
       (await options.agentStorage.get(agentId)) !== null,
@@ -3200,9 +3204,11 @@ export class Session {
       const agentId = msg.idempotencyKey
         ? await this.createAgentRequestStore.run({
             key: msg.idempotencyKey,
+            callerId: msg.callerAgentId ?? this.clientId,
+            action: "create_agent",
             fingerprint: fingerprintCreateAgentRequest(msg),
-            create: async (reservedAgentId) => {
-              await this.createAgentForRequest(msg, reservedAgentId);
+            create: async (context) => {
+              await this.createAgentForRequest(msg, context);
             },
           })
         : await this.createAgentForRequest(msg);
@@ -3248,13 +3254,79 @@ export class Session {
 
   private async createAgentForRequest(
     msg: CreateAgentRequestMessage,
-    reservedAgentId?: string,
+    requestContext?: CreateAgentRequestContext,
+  ): Promise<string> {
+    const resolvedClientMessageId =
+      normalizeClientMessageId(msg.clientMessageId) ??
+      (requestContext ? `create-agent-${requestContext.agentId}` : undefined);
+
+    if (
+      requestContext &&
+      (requestContext.phase === "agent_registered" || requestContext.phase === "prompt_dispatched")
+    ) {
+      return this.resumeCreateAgentRequest(msg, requestContext, resolvedClientMessageId);
+    }
+
+    return this.createFreshAgentForRequest(msg, requestContext, resolvedClientMessageId);
+  }
+
+  private async resumeCreateAgentRequest(
+    msg: CreateAgentRequestMessage,
+    requestContext: CreateAgentRequestContext,
+    clientMessageId: string | undefined,
+  ): Promise<string> {
+    const snapshot = await ensureAgentLoaded(requestContext.agentId, {
+      agentManager: this.agentManager,
+      agentStorage: this.agentStorage,
+      logger: this.sessionLogger,
+    });
+    if (requestContext.phase === "prompt_dispatched") {
+      return requestContext.agentId;
+    }
+
+    const trimmedPrompt = msg.initialPrompt?.trim();
+    const prompt = buildAgentPrompt(trimmedPrompt ?? "", msg.images, msg.attachments);
+    const hasPromptContent = Array.isArray(prompt) ? prompt.length > 0 : prompt.length > 0;
+    if (hasPromptContent) {
+      const timeline = [
+        ...this.agentManager.getTimeline(requestContext.agentId),
+        ...(await this.agentManager.getTimelineRows(requestContext.agentId)).map(
+          ({ item }) => item,
+        ),
+      ];
+      const alreadyDispatched = timeline.some(
+        (item) => item.type === "user_message" && item.clientMessageId === clientMessageId,
+      );
+      if (!alreadyDispatched) {
+        await startCreatedAgentInitialPrompt({
+          agentManager: this.agentManager,
+          agentId: requestContext.agentId,
+          snapshot,
+          prompt,
+          runOptions:
+            msg.outputSchema || clientMessageId
+              ? {
+                  ...(msg.outputSchema ? { outputSchema: msg.outputSchema } : {}),
+                  ...(clientMessageId ? { clientMessageId } : {}),
+                }
+              : undefined,
+          logger: this.sessionLogger,
+        });
+      }
+    }
+    await requestContext.checkpoint("prompt_dispatched");
+    return requestContext.agentId;
+  }
+
+  private async createFreshAgentForRequest(
+    msg: CreateAgentRequestMessage,
+    requestContext: CreateAgentRequestContext | undefined,
+    resolvedClientMessageId: string | undefined,
   ): Promise<string> {
     const {
       config,
       worktreeName,
       initialPrompt,
-      clientMessageId,
       outputSchema,
       git,
       worktree,
@@ -3267,12 +3339,7 @@ export class Session {
     let createdAgentId: string | null = null;
     let pendingCreationAgentId: string | undefined;
     try {
-      const requestedCwd = resolve(config.cwd);
-      const needsRequestedDirectory =
-        Boolean(worktreeName || git || worktree) || (!msg.workspaceId && !msg.callerAgentId);
-      if (needsRequestedDirectory && !(await this.filesystem.isDirectory(requestedCwd))) {
-        throw new Error(`Working directory does not exist or is not a directory: ${requestedCwd}`);
-      }
+      const placedRequest = await this.prepareAgentRequest(msg, requestContext);
       const trimmedPrompt = initialPrompt?.trim();
       const { provisionalTitle } = resolveCreateAgentTitles({
         configTitle: config.title,
@@ -3285,7 +3352,7 @@ export class Session {
       const workspacePromptTitle = resolveFirstAgentPromptTitle(firstAgentContext);
       const pendingCreation = await this.reservePendingAgentCreation(
         shouldJournalAgentCreation(msg),
-        reservedAgentId,
+        requestContext?.agentId,
       );
       pendingCreationAgentId = pendingCreation.agentId;
       const createdWorktree = await this.createWorktreeForCreateAgentRequest({
@@ -3297,7 +3364,7 @@ export class Session {
       });
       createdWorktreeForCleanup = createdWorktree;
       const resolvedIntent = await this.resolveSessionCreateAgentIntent({
-        request: msg,
+        request: placedRequest,
         createdWorktree,
         workspacePromptTitle,
       });
@@ -3337,7 +3404,7 @@ export class Session {
           workspaceId: resolvedIntent.intent.workspaceId,
           worktreeName,
           initialPrompt,
-          clientMessageId,
+          clientMessageId: resolvedClientMessageId,
           outputSchema,
           images,
           attachments,
@@ -3351,6 +3418,13 @@ export class Session {
           onCreated: ({ agentId, autoArchiveObligation: persistedObligation }) => {
             createdAgentId = agentId;
             this.registerCreatedAgentAutoArchive(agentId, persistedObligation);
+          },
+          onAgentRegistered: async (registeredAgent) => {
+            createdAgentId = registeredAgent.id;
+            await requestContext?.checkpoint("agent_registered");
+          },
+          onInitialPromptDispatched: async () => {
+            await requestContext?.checkpoint("prompt_dispatched");
           },
           buildSessionConfig: (sessionConfig, gitOptions, legacyWorktreeName, ctx, onPath) =>
             this.buildAgentSessionConfig(
@@ -3383,6 +3457,90 @@ export class Session {
       await this.recoverPendingAgentCreation(pendingCreationAgentId);
       throw error;
     }
+  }
+
+  private async prepareAgentRequest(
+    msg: CreateAgentRequestMessage,
+    requestContext: CreateAgentRequestContext | undefined,
+  ): Promise<CreateAgentRequestMessage> {
+    let placement = requestContext?.placement;
+    if (msg.workspaceSource && !placement) {
+      placement = await this.createWorkspacePlacementForAgentRequest(msg);
+      await requestContext?.checkpoint("placement_created", placement);
+    }
+    if (requestContext?.phase === "placement_created" && !placement) {
+      throw new Error("Create receipt is missing its durable workspace placement");
+    }
+
+    const placedRequest: CreateAgentRequestMessage = placement
+      ? {
+          ...msg,
+          config: { ...msg.config, cwd: placement.cwd },
+          workspaceId: placement.workspaceId,
+        }
+      : msg;
+    const requestedCwd = resolve(placedRequest.config.cwd);
+    const needsRequestedDirectory =
+      Boolean(msg.worktreeName || msg.git || msg.worktree) ||
+      (!msg.workspaceId && !msg.callerAgentId);
+    if (needsRequestedDirectory && !(await this.filesystem.isDirectory(requestedCwd))) {
+      throw new Error(`Working directory does not exist or is not a directory: ${requestedCwd}`);
+    }
+    return placedRequest;
+  }
+
+  private async createWorkspacePlacementForAgentRequest(
+    request: CreateAgentRequestMessage,
+  ): Promise<{ workspaceId: string; cwd: string }> {
+    const source = request.workspaceSource;
+    if (!source) {
+      throw new Error("Create request is missing workspace source intent");
+    }
+    const firstAgentContext: FirstAgentContext = {
+      ...(request.initialPrompt?.trim() ? { prompt: request.initialPrompt.trim() } : {}),
+      ...(request.attachments && request.attachments.length > 0
+        ? { attachments: request.attachments }
+        : {}),
+    };
+    const title = resolveFirstAgentPromptTitle(firstAgentContext);
+
+    if (source.kind === "directory") {
+      const cwd = expandTilde(source.path);
+      if (!(await this.filesystem.isDirectory(cwd).catch(() => false))) {
+        throw new Error(`Directory not found: ${cwd}`);
+      }
+      const workspace = await this.workspaceProvisioning.createWorkspaceForDirectory(
+        cwd,
+        title,
+        source.projectId,
+        { expectsInitialAgent: true },
+      );
+      await this.syncWorkspaceGitObserverForWorkspace(workspace);
+      return { workspaceId: workspace.workspaceId, cwd: workspace.cwd };
+    }
+
+    if (!source.cwd && !source.projectId) {
+      throw new Error("cwd or projectId is required for a worktree-backed workspace");
+    }
+    const sourceCwd = await resolveWorktreeSourceCwd(source, this.projectRegistry);
+    const result = await this.createPaseoWorktreeWorkflow(
+      {
+        cwd: sourceCwd,
+        projectId: source.projectId,
+        worktreeSlug: source.worktreeSlug,
+        action: source.action,
+        refName: source.refName,
+        branchName: source.branchName,
+        checkoutSource: source.checkoutSource,
+        githubPrNumber: source.githubPrNumber,
+        firstAgentContext,
+        title: title ?? undefined,
+      },
+      source.baseBranch
+        ? { resolveDefaultBranch: async () => source.baseBranch as string }
+        : undefined,
+    );
+    return { workspaceId: result.workspace.workspaceId, cwd: result.workspace.cwd };
   }
 
   private async buildCreatedAgentPayload(agentId: string): Promise<AgentSnapshotPayload> {

@@ -41,7 +41,7 @@ const builderB = {
 };
 
 describe("fleet finish", () => {
-  it("proves ownership across every host before applying a host pin to the mutation", async () => {
+  it("rejects a host pin that contradicts the globally proven owner", async () => {
     mocks.loadFleetConfig.mockReturnValue({
       hosts: [builderA, builderB],
       defaults: { provider: "codex" },
@@ -61,19 +61,17 @@ describe("fleet finish", () => {
       schema: { idField: "agentId", columns: [] },
     });
 
-    await runFleetFinishCommand(
-      "agent-123",
-      { host: "builder-a" },
-      {} as Parameters<typeof runFleetFinishCommand>[2],
-    );
+    await expect(
+      runFleetFinishCommand(
+        "agent-123",
+        { host: "builder-a" },
+        {} as Parameters<typeof runFleetFinishCommand>[2],
+      ),
+    ).rejects.toMatchObject({ code: "FLEET_AGENT_ON_OTHER_HOST" });
 
     expect(mocks.connectToDaemon).toHaveBeenCalledTimes(2);
     expect(mocks.connectToDaemon).toHaveBeenCalledWith({ host: builderA.endpoint });
     expect(mocks.connectToDaemon).toHaveBeenCalledWith({ host: builderB.endpoint });
-    expect(mocks.runFinishCommand).toHaveBeenCalledWith(
-      "agent-123456",
-      { host: builderA.endpoint },
-      expect.anything(),
-    );
+    expect(mocks.runFinishCommand).not.toHaveBeenCalled();
   });
 });

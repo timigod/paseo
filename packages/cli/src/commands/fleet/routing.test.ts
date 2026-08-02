@@ -47,6 +47,7 @@ describe("fleet routing", () => {
       localHost: builderA,
       pinnedHost: null,
       requiresLocalContext: false,
+      idempotencyKey: null,
     });
 
     expect(plan).toEqual({
@@ -54,6 +55,62 @@ describe("fleet routing", () => {
       cwd: "/opt/code/project",
       reason: "least_loaded",
     });
+  });
+
+  it("routes the same idempotency key to the same host when fleet load changes", () => {
+    const first = selectFleetHost({
+      observations: [
+        observed(builderA, { activeAgents: 0 }),
+        observed(builderB, { activeAgents: 4 }),
+      ],
+      cwd: "/srv/code/project",
+      sourceHost: builderA,
+      localHost: builderA,
+      pinnedHost: null,
+      requiresLocalContext: false,
+      idempotencyKey: "fleet-create-1",
+    });
+    const retry = selectFleetHost({
+      observations: [
+        observed(builderA, { activeAgents: 4 }),
+        observed(builderB, { activeAgents: 0 }),
+      ],
+      cwd: "/srv/code/project",
+      sourceHost: builderA,
+      localHost: builderA,
+      pinnedHost: null,
+      requiresLocalContext: false,
+      idempotencyKey: "fleet-create-1",
+    });
+
+    expect(retry.host.id).toBe(first.host.id);
+    expect(first.reason).toBe("idempotency_key");
+    expect(retry.reason).toBe("idempotency_key");
+  });
+
+  it("rejects a host pin that contradicts deterministic keyed routing", () => {
+    const unpinned = selectFleetHost({
+      observations: [observed(builderA), observed(builderB)],
+      cwd: "/srv/code/project",
+      sourceHost: builderA,
+      localHost: builderA,
+      pinnedHost: null,
+      requiresLocalContext: false,
+      idempotencyKey: "fleet-create-1",
+    });
+    const contradictoryHost = unpinned.host.id === builderA.id ? builderB : builderA;
+
+    expect(() =>
+      selectFleetHost({
+        observations: [observed(builderA), observed(builderB)],
+        cwd: "/srv/code/project",
+        sourceHost: builderA,
+        localHost: builderA,
+        pinnedHost: contradictoryHost,
+        requiresLocalContext: false,
+        idempotencyKey: "fleet-create-1",
+      }),
+    ).toThrow(expect.objectContaining({ code: "FLEET_KEY_HOST_CONFLICT" }));
   });
 
   it("routes an existing workspace to its inventory-proved owner even when full", () => {

@@ -100,6 +100,10 @@ describe("runRunCommand option validation", () => {
     await expectInvalidOptions({ idempotencyKey: "x".repeat(201) }, /--idempotency-key/);
   });
 
+  it("rejects a create idempotency key outside the daemon-supported character set", async () => {
+    await expectInvalidOptions({ idempotencyKey: "fleet key!" }, /--idempotency-key/);
+  });
+
   it("rejects two workspace creation flags", async () => {
     await expectInvalidOptions(
       { newWorkspace: "local", worktree: "legacy-slug" },

@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type { CommandError } from "../../output/index.js";
 import type { FleetHost } from "./topology.js";
 import { translateFleetCwd } from "./topology.js";
@@ -12,7 +13,12 @@ export interface FleetHostObservation {
   workspaceIds: readonly string[];
 }
 
-export type FleetRouteReason = "pinned" | "least_loaded" | "local_context" | "workspace_owner";
+export type FleetRouteReason =
+  | "pinned"
+  | "least_loaded"
+  | "local_context"
+  | "workspace_owner"
+  | "idempotency_key";
 
 export interface FleetRunPlan {
   host: FleetHost;
@@ -31,18 +37,60 @@ export function selectFleetHost(input: {
   localHost: FleetHost | null;
   pinnedHost: FleetHost | null;
   requiresLocalContext: boolean;
+  idempotencyKey: string | null;
 }): FleetRunPlan {
-  const { observations, cwd, sourceHost, localHost, pinnedHost, requiresLocalContext } = input;
-  const candidates = observations.filter(
-    ({ host, reachable, providerReady, agentInventoryReady, activeAgents }) => {
-      if (!reachable || !providerReady || !agentInventoryReady || activeAgents >= host.capacity) {
-        return false;
-      }
-      if (requiresLocalContext && localHost && host.id !== localHost.id) return false;
-      if (!sourceHost && localHost && host.id !== localHost.id) return false;
-      return true;
-    },
-  );
+  const {
+    observations,
+    cwd,
+    sourceHost,
+    localHost,
+    pinnedHost,
+    requiresLocalContext,
+    idempotencyKey,
+  } = input;
+  const routeDomain = observations.filter(({ host }) => {
+    if (requiresLocalContext && localHost && host.id !== localHost.id) return false;
+    if (!sourceHost && localHost && host.id !== localHost.id) return false;
+    return true;
+  });
+  const isEligible = ({
+    reachable,
+    providerReady,
+    agentInventoryReady,
+    activeAgents,
+    host,
+  }: FleetHostObservation): boolean =>
+    reachable && providerReady && agentInventoryReady && activeAgents < host.capacity;
+  const candidates = routeDomain.filter(isEligible);
+
+  if (idempotencyKey) {
+    const ordered = [...routeDomain].sort((left, right) =>
+      left.host.id.localeCompare(right.host.id),
+    );
+    if (ordered.length === 0) {
+      throw commandError("FLEET_NO_ELIGIBLE_HOST", "No fleet host can route this keyed run");
+    }
+    const digest = createHash("sha256").update(idempotencyKey).digest();
+    const keyed = ordered[digest.readUInt32BE(0) % ordered.length]!;
+    if (pinnedHost && pinnedHost.id !== keyed.host.id) {
+      throw commandError(
+        "FLEET_KEY_HOST_CONFLICT",
+        `Idempotency key routes to ${keyed.host.id}, not pinned host ${pinnedHost.id}`,
+      );
+    }
+    if (!isEligible(keyed)) {
+      throw commandError(
+        "FLEET_KEY_HOST_INELIGIBLE",
+        `Fleet host ${keyed.host.id} for this idempotency key is not eligible for the run`,
+        "Retry after that host is healthy and has capacity; choosing another host could duplicate the agent.",
+      );
+    }
+    return {
+      host: keyed.host,
+      cwd: sourceHost ? translateFleetCwd(cwd, sourceHost, keyed.host) : cwd,
+      reason: "idempotency_key",
+    };
+  }
 
   if (pinnedHost) {
     const match = candidates.find(({ host }) => host.id === pinnedHost.id);

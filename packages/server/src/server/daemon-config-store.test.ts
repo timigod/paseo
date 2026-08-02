@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, test } from "vitest";
@@ -357,6 +357,30 @@ describe("DaemonConfigStore", () => {
 
     const persisted = loadPersistedConfig(paseoHome);
     expect(persisted.daemon?.appendSystemPrompt).toBe("Prefer terse replies.");
+  });
+
+  test("ordinary patches remove the legacy daemon agent limit", () => {
+    const paseoHome = mkdtempSync(path.join(tmpdir(), "paseo-daemon-config-store-"));
+    tempDirs.push(paseoHome);
+    writeFileSync(
+      path.join(paseoHome, "config.json"),
+      `${JSON.stringify({ version: 1, daemon: { maxActiveAgents: 4 } }, null, 2)}\n`,
+    );
+    const store = new DaemonConfigStore(paseoHome, {
+      mcp: { injectIntoAgents: false },
+      browserTools: { enabled: false },
+      providers: {},
+      metadataGeneration: { providers: [] },
+      autoArchiveAfterMerge: false,
+      enableTerminalAgentHooks: false,
+      appendSystemPrompt: "",
+    });
+
+    store.patch({ appendSystemPrompt: "Persist a current setting." });
+
+    const serialized = JSON.parse(readFileSync(path.join(paseoHome, "config.json"), "utf8"));
+    expect(serialized.daemon).not.toHaveProperty("maxActiveAgents");
+    expect(loadPersistedConfig(paseoHome).daemon).not.toHaveProperty("maxActiveAgents");
   });
 
   test("patch persists browser tools opt-in into config.json", () => {

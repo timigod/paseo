@@ -1253,11 +1253,32 @@ export const CreateAgentWorktreeTargetSchema = z.discriminatedUnion("mode", [
 
 export type CreateAgentWorktreeTarget = z.infer<typeof CreateAgentWorktreeTargetSchema>;
 
+export const WorkspaceCreateSourceSchema = z.discriminatedUnion("kind", [
+  z.object({
+    kind: z.literal("directory"),
+    path: z.string(),
+    projectId: z.string().optional(),
+  }),
+  z.object({
+    kind: z.literal("worktree"),
+    cwd: z.string().optional(),
+    projectId: z.string().optional(),
+    action: z.enum(["branch-off", "checkout"]).optional(),
+    refName: z.string().min(1).optional(),
+    baseBranch: z.string().optional(),
+    branchName: z.string().min(1).optional(),
+    checkoutSource: ChangeRequestCheckoutSourceSchema.optional(),
+    githubPrNumber: z.number().int().positive().optional(),
+    worktreeSlug: z.string().optional(),
+  }),
+]);
+
 export const CreateAgentRequestMessageSchema = z.object({
   type: z.literal("create_agent_request"),
   config: AgentSessionConfigSchema,
   env: z.record(z.string(), z.string()).optional(),
   workspaceId: z.string().optional(),
+  workspaceSource: WorkspaceCreateSourceSchema.optional(),
   // Optional caller context lets managed CLI invocations use the same daemon-owned
   // workspace and parentage policy as agent-scoped MCP creation.
   callerAgentId: z.string().optional(),
@@ -2073,31 +2094,7 @@ export const WorkspaceCreateRequestSchema = z.object({
   title: z.string().optional(),
   // Optional prompt context for workspace-level name/branch generation.
   firstAgentContext: FirstAgentContextSchema.optional(),
-  source: z.discriminatedUnion("kind", [
-    z.object({
-      kind: z.literal("directory"),
-      // Path of the existing checkout/directory to back the workspace.
-      path: z.string(),
-      projectId: z.string().optional(),
-    }),
-    z.object({
-      kind: z.literal("worktree"),
-      // The project whose repo the worktree is cut from.
-      cwd: z.string().optional(),
-      projectId: z.string().optional(),
-      action: z.enum(["branch-off", "checkout"]).optional(),
-      // Target branch for checkout, or base ref for branch-off.
-      refName: z.string().min(1).optional(),
-      baseBranch: z.string().optional(),
-      // New branch name for branch-off. The worktree path may use a different slug.
-      branchName: z.string().min(1).optional(),
-      checkoutSource: ChangeRequestCheckoutSourceSchema.optional(),
-      // COMPAT(githubPrNumber): added in v0.1.106, remove after 2026-12-28 once
-      // clients send checkoutSource.
-      githubPrNumber: z.number().int().positive().optional(),
-      worktreeSlug: z.string().optional(),
-    }),
-  ]),
+  source: WorkspaceCreateSourceSchema,
 });
 
 export const WorkspaceClearAttentionRequestSchema = z.object({
@@ -2856,6 +2853,8 @@ export const ServerInfoStatusPayloadSchema = z
         // COMPAT(agentArchiveCaller): added after v0.2.5; remove after 2027-02-02.
         // Optional for old daemons.
         agentArchiveCaller: z.boolean().optional(),
+        // COMPAT(createAgentIdempotency): added in v0.2.6, remove gate after 2027-02-02.
+        createAgentIdempotency: z.boolean().optional(),
       })
       .optional(),
   })

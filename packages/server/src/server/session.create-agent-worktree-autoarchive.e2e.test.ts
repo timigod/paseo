@@ -55,6 +55,37 @@ function createGitRepoWithNestedDirectory(): string {
   return repoDir;
 }
 
+test("keyed create provisions one worktree workspace and replays the same agent", async () => {
+  const repoDir = createGitRepo();
+  const request: CreateAgentOptions = {
+    config: {
+      ...getFullAccessConfig("codex"),
+      cwd: repoDir,
+    },
+    idempotencyKey: "workspace-placement-retry",
+    workspaceSource: {
+      kind: "worktree",
+      cwd: repoDir,
+      action: "branch-off",
+      branchName: "workspace-placement-retry",
+      baseBranch: "main",
+    },
+  };
+
+  const created = await ctx.client.createAgent(request);
+  const replayed = await ctx.client.createAgent(request);
+  const listed = await ctx.client.getPaseoWorktreeList({ cwd: repoDir });
+
+  expect(replayed.id).toBe(created.id);
+  expect(replayed.cwd).toBe(created.cwd);
+  expect(listed.worktrees).toEqual([
+    expect.objectContaining({
+      worktreePath: created.cwd,
+      branchName: "workspace-placement-retry",
+    }),
+  ]);
+});
+
 async function expectAgentAbsentFromActiveList(agentId: string): Promise<void> {
   await expect
     .poll(

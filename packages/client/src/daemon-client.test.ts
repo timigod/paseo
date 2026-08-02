@@ -2089,13 +2089,17 @@ test("sends create_agent_request with workspace and caller identity", async () =
   clients.push(client);
 
   const connectPromise = client.connect();
-  mock.triggerOpen();
+  mock.triggerOpen({ features: { createAgentIdempotency: true } });
   await connectPromise;
 
   const createPromise = client.createAgent({
     provider: "codex",
     cwd: "/tmp/project/.paseo/worktrees/feature-a",
     workspaceId: "ws-feature-a",
+    workspaceSource: {
+      kind: "directory",
+      path: "/tmp/project",
+    },
     callerAgentId: "parent-agent",
     idempotencyKey: "fleet-create-1",
     title: "Compat agent",
@@ -2108,6 +2112,10 @@ test("sends create_agent_request with workspace and caller identity", async () =
     expect.objectContaining({
       type: "create_agent_request",
       workspaceId: "ws-feature-a",
+      workspaceSource: {
+        kind: "directory",
+        path: "/tmp/project",
+      },
       callerAgentId: "parent-agent",
       idempotencyKey: "fleet-create-1",
     }),
@@ -2131,6 +2139,32 @@ test("sends create_agent_request with workspace and caller identity", async () =
     requestType: "create_agent_request",
     code: "managed_worktree_writer_conflict",
   });
+});
+
+test("rejects retry-safe agent creation when the daemon lacks support", async () => {
+  const logger = createMockLogger();
+  const mock = createMockTransport();
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "clsk_unit_test",
+    logger,
+    reconnect: { enabled: false },
+    transportFactory: () => mock.transport,
+  });
+  clients.push(client);
+
+  const connectPromise = client.connect();
+  mock.triggerOpen();
+  await connectPromise;
+
+  await expect(
+    client.createAgent({
+      provider: "codex",
+      cwd: "/tmp/project",
+      idempotencyKey: "fleet-create-1",
+    }),
+  ).rejects.toThrow("Update the host to use retry-safe agent creation.");
+  expect(mock.sent).toHaveLength(0);
 });
 
 test("sends worktree target and autoArchive in create_agent_request", async () => {

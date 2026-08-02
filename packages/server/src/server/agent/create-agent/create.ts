@@ -78,6 +78,8 @@ export interface CreateAgentFromSessionInput {
   autoArchiveObligation?: AutoArchiveObligation;
   agentId?: string;
   onCreated?: (created: { agentId: string; autoArchiveObligation?: AutoArchiveObligation }) => void;
+  onAgentRegistered?: (snapshot: ManagedAgent) => Promise<void>;
+  onInitialPromptDispatched?: () => Promise<void>;
   buildSessionConfig: (
     config: AgentSessionConfig,
     gitOptions?: GitSetupOptions,
@@ -214,6 +216,10 @@ export async function createAgentCommand(
     throw error;
   }
 
+  if (input.kind === "session") {
+    await input.onAgentRegistered?.(snapshot);
+  }
+
   resolved.setupContinuation?.startAfterAgentCreate({
     agentId: snapshot.id,
   });
@@ -228,6 +234,9 @@ export async function createAgentCommand(
     initialPromptStarted = sendResult.started;
     liveSnapshot = sendResult.liveSnapshot;
     initialPromptError = sendResult.error ?? null;
+    if (input.kind === "session" && sendResult.started) {
+      await input.onInitialPromptDispatched?.();
+    }
   }
 
   if (input.kind === "mcp" && input.notifyOnFinish && input.callerAgentId && initialPromptStarted) {

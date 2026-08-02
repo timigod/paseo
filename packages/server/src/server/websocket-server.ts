@@ -687,6 +687,7 @@ export class VoiceAssistantWebSocketServer {
     this.createAgentLifecycleDispatch = createAgentLifecycleDispatch;
     this.createAgentRequestStore = new CreateAgentRequestStore({
       paseoHome,
+      daemonId: this.serverId,
       hasAgent: async (agentId) =>
         this.agentManager.getAgent(agentId) !== null ||
         (await this.agentStorage.get(agentId)) !== null,
@@ -1686,6 +1687,8 @@ export class VoiceAssistantWebSocketServer {
         workspaceScriptManagement: true,
         // COMPAT(agentArchiveCaller): added after v0.2.5; remove after 2027-02-02.
         agentArchiveCaller: true,
+        // COMPAT(createAgentIdempotency): added in v0.2.6, remove gate after 2027-02-02.
+        createAgentIdempotency: true,
       },
     };
   }

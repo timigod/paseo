@@ -286,7 +286,7 @@ export const PersistedConfigSchema = z
         auth: DaemonAuthSchema.optional(),
       })
       .strict()
-      .transform(({ allowedHosts, ...daemon }) => {
+      .transform(({ allowedHosts, maxActiveAgents: _maxActiveAgents, ...daemon }) => {
         const hostnames = daemon.hostnames ?? allowedHosts;
         return hostnames === undefined ? daemon : { ...daemon, hostnames };
       })

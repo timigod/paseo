@@ -148,6 +148,7 @@ async function runFleetRunCommand(
         localHost,
         pinnedHost,
         requiresLocalContext: Boolean(process.env.PASEO_AGENT_ID),
+        idempotencyKey: options.idempotencyKey?.trim() || null,
       });
   const model = resolveFleetProviderModelOptions(options, config.defaults);
   const thinking = options.thinking ?? config.defaults.thinking;
@@ -203,11 +204,13 @@ export async function runFleetFinishCommand(
     results.flatMap((result) => result.matches ?? []),
     results.flatMap((result) => (result.failure ? [result.failure] : [])),
   );
-  return runFinishCommand(
-    location.agentId,
-    { ...options, host: (pinnedHost ?? location.host).endpoint },
-    command,
-  );
+  if (pinnedHost && pinnedHost.id !== location.host.id) {
+    throw {
+      code: "FLEET_AGENT_ON_OTHER_HOST",
+      message: `Agent ${location.agentId} is owned by ${location.host.id}, not pinned host ${pinnedHost.id}`,
+    } satisfies CommandError;
+  }
+  return runFinishCommand(location.agentId, { ...options, host: location.host.endpoint }, command);
 }
 
 export function createFleetCommand(): Command {

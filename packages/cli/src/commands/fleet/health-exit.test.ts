@@ -1,3 +1,7 @@
+import { spawnSync } from "node:child_process";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 const mocks = vi.hoisted(() => ({
@@ -28,11 +32,45 @@ vi.mock("./topology.js", () => ({
 import { runCli } from "../../run.js";
 
 const originalExitCode = process.exitCode;
+const tempDirs: string[] = [];
 
 afterEach(() => {
   process.exitCode = originalExitCode;
   vi.restoreAllMocks();
+  for (const tempDir of tempDirs.splice(0)) {
+    rmSync(tempDir, { recursive: true, force: true });
+  }
 });
+
+function runFleetHealthProcess(args: string[]) {
+  const tempDir = mkdtempSync(path.join(tmpdir(), "paseo-fleet-health-"));
+  tempDirs.push(tempDir);
+  const fleetConfigPath = path.join(tempDir, "fleet.json");
+  writeFileSync(
+    fleetConfigPath,
+    `${JSON.stringify({
+      version: 1,
+      hosts: [
+        {
+          id: "unreachable",
+          name: "Unreachable test host",
+          endpoint: "127.0.0.1:1",
+          codeRoot: tempDir,
+          hostnamePrefixes: ["never-matches"],
+          capacity: 1,
+        },
+      ],
+      defaults: { provider: "codex" },
+    })}\n`,
+  );
+
+  return spawnSync(process.execPath, ["--import", "tsx", "src/index.ts", ...args], {
+    cwd: path.resolve(import.meta.dirname, "../../.."),
+    env: { ...process.env, PASEO_FLEET_CONFIG: fleetConfigPath },
+    encoding: "utf8",
+    timeout: 10_000,
+  });
+}
 
 describe("fleet health exit status", () => {
   it("renders degraded status diagnostics and returns a failing exit code", async () => {
@@ -64,4 +102,25 @@ describe("fleet health exit status", () => {
     await expect(runCli(["fleet", "doctor", "--json"])).resolves.toBe(1);
     expect(stdout).toHaveBeenCalledWith(expect.stringContaining('"state": "needs_permission"'));
   });
+
+  it("exits nonzero from the executable human status command", () => {
+    const result = runFleetHealthProcess(["fleet", "status"]);
+
+    expect(result.error).toBeUndefined();
+    expect(result.status).toBe(1);
+    expect(result.stdout).toContain("degraded");
+    expect(result.stdout).toContain("connection failed");
+  }, 15_000);
+
+  it("exits nonzero from the executable JSON doctor command", () => {
+    const result = runFleetHealthProcess(["fleet", "doctor", "--json"]);
+
+    expect(result.error).toBeUndefined();
+    expect(result.status).toBe(1);
+    expect(JSON.parse(result.stdout)).toEqual(
+      expect.objectContaining({
+        state: "degraded",
+      }),
+    );
+  }, 15_000);
 });

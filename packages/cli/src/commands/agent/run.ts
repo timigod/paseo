@@ -1,6 +1,6 @@
 import { Command, Option } from "commander";
 import { getStructuredAgentResponse, StructuredAgentResponseError } from "@getpaseo/server";
-import type { AgentSnapshotPayload } from "@getpaseo/protocol/messages";
+import type { AgentSnapshotPayload, WorkspaceCreateRequest } from "@getpaseo/protocol/messages";
 import { connectToDaemon, getDaemonHost } from "../../utils/client.js";
 import type {
   CommandOptions,
@@ -389,11 +389,12 @@ function validateRunOptions(prompt: string, options: AgentRunOptions, outputSche
   const idempotencyKey = options.idempotencyKey?.trim();
   if (
     idempotencyKey !== undefined &&
-    (idempotencyKey.length === 0 || idempotencyKey.length > 200)
+    !/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$/.test(idempotencyKey)
   ) {
     throw {
       code: "INVALID_OPTIONS",
-      message: "--idempotency-key must contain 1 to 200 characters",
+      message:
+        "--idempotency-key must contain 1 to 200 letters, numbers, periods, underscores, colons, slashes, or hyphens",
     } satisfies CommandError;
   }
 
@@ -517,6 +518,7 @@ async function connectToDaemonOrThrow(
 interface RunWorkspace {
   id?: string;
   cwd: string;
+  source?: WorkspaceCreateRequest["source"];
 }
 
 export interface RunWorkspaceLookupClient {
@@ -576,6 +578,9 @@ async function resolveRunWorkspace(
   // TODO: thread the run `prompt` as firstAgentContext so workspace-level
   // title/branch generation picks up the task description (U8/U6 deferred).
   const source = buildRunWorkspaceSource(options, cwd);
+  if (options.idempotencyKey) {
+    return { cwd, source };
+  }
   const result = await client.createWorkspace({ source });
 
   if (!result.workspace) {
@@ -644,6 +649,7 @@ export async function runRunCommand(
             provider: resolvedProviderModel.provider,
             cwd: runCwd,
             workspaceId,
+            workspaceSource: workspace.source,
             callerAgentId,
             title: resolvedTitle,
             idempotencyKey: options.idempotencyKey?.trim(),
@@ -716,6 +722,7 @@ export async function runRunCommand(
       provider: resolvedProviderModel.provider,
       cwd: runCwd,
       workspaceId,
+      workspaceSource: workspace.source,
       callerAgentId,
       title: resolvedTitle,
       idempotencyKey: options.idempotencyKey?.trim(),
