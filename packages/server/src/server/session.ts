@@ -3441,7 +3441,7 @@ export class Session {
           firstAgentContext,
           autoArchiveObligation,
           agentId: requestContext?.agentId ?? pendingCreationAgentId,
-          skipPendingCreationJournal: Boolean(requestContext),
+          pendingCreationJournaled: Boolean(pendingCreationAgentId),
           onCreated: ({ agentId, autoArchiveObligation: persistedObligation }) => {
             createdAgentId = agentId;
             this.registerCreatedAgentAutoArchive(agentId, persistedObligation);

@@ -6,6 +6,7 @@ import {
   AgentCreatedStatusPayloadSchema,
   AgentRefreshedStatusPayloadSchema,
   AgentResumedStatusPayloadSchema,
+  CreateAgentRequestMessageSchema,
   CheckoutRenameBranchResponseSchema,
   parseServerInfoStatusPayload,
   RenameTerminalResponseSchema,
@@ -2374,33 +2375,7 @@ export class DaemonClient {
     this.requireCreateAgentOptionsSupport(options);
     const requestId = this.createRequestId(options.requestId);
     const config = resolveAgentConfig(options);
-
-    const message = SessionInboundMessageSchema.parse({
-      type: "create_agent_request",
-      requestId,
-      config,
-      ...(options.env ? { env: options.env } : {}),
-      ...(options.workspaceId !== undefined ? { workspaceId: options.workspaceId } : {}),
-      ...(options.workspaceSource !== undefined
-        ? { workspaceSource: options.workspaceSource }
-        : {}),
-      ...(options.callerAgentId !== undefined ? { callerAgentId: options.callerAgentId } : {}),
-      ...(options.initialPrompt ? { initialPrompt: options.initialPrompt } : {}),
-      ...(options.clientMessageId ? { clientMessageId: options.clientMessageId } : {}),
-      ...(options.idempotencyKey ? { idempotencyKey: options.idempotencyKey } : {}),
-      ...(options.outputSchema ? { outputSchema: options.outputSchema } : {}),
-      ...(options.images && options.images.length > 0 ? { images: options.images } : {}),
-      ...(options.attachments && options.attachments.length > 0
-        ? { attachments: options.attachments }
-        : {}),
-      ...(options.git ? { git: options.git } : {}),
-      ...(options.worktree ? { worktree: options.worktree } : {}),
-      ...(options.autoArchive !== undefined ? { autoArchive: options.autoArchive } : {}),
-      ...(options.worktreeName ? { worktreeName: options.worktreeName } : {}),
-      ...(options.labels && Object.keys(options.labels).length > 0
-        ? { labels: options.labels }
-        : {}),
-    });
+    const message = buildCreateAgentRequestMessage(options, requestId, config);
 
     const status = await this.sendRequest({
       requestId,
@@ -5920,6 +5895,35 @@ export class DaemonClient {
 
     return { promise, cancel };
   }
+}
+
+function buildCreateAgentRequestMessage(
+  options: CreateAgentRequestOptions,
+  requestId: string,
+  config: AgentSessionConfig,
+): CreateAgentRequestMessage {
+  return CreateAgentRequestMessageSchema.parse({
+    type: "create_agent_request",
+    requestId,
+    config,
+    ...(options.env ? { env: options.env } : {}),
+    ...(options.workspaceId !== undefined ? { workspaceId: options.workspaceId } : {}),
+    ...(options.workspaceSource !== undefined ? { workspaceSource: options.workspaceSource } : {}),
+    ...(options.callerAgentId !== undefined ? { callerAgentId: options.callerAgentId } : {}),
+    ...(options.initialPrompt ? { initialPrompt: options.initialPrompt } : {}),
+    ...(options.clientMessageId ? { clientMessageId: options.clientMessageId } : {}),
+    ...(options.idempotencyKey ? { idempotencyKey: options.idempotencyKey } : {}),
+    ...(options.outputSchema ? { outputSchema: options.outputSchema } : {}),
+    ...(options.images && options.images.length > 0 ? { images: options.images } : {}),
+    ...(options.attachments && options.attachments.length > 0
+      ? { attachments: options.attachments }
+      : {}),
+    ...(options.git ? { git: options.git } : {}),
+    ...(options.worktree ? { worktree: options.worktree } : {}),
+    ...(options.autoArchive !== undefined ? { autoArchive: options.autoArchive } : {}),
+    ...(options.worktreeName ? { worktreeName: options.worktreeName } : {}),
+    ...(options.labels && Object.keys(options.labels).length > 0 ? { labels: options.labels } : {}),
+  });
 }
 
 function resolveAgentConfig(options: CreateAgentRequestOptions): AgentSessionConfig {

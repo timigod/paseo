@@ -77,7 +77,7 @@ export interface CreateAgentFromSessionInput {
   firstAgentContext: FirstAgentContext;
   autoArchiveObligation?: AutoArchiveObligation;
   agentId?: string;
-  skipPendingCreationJournal?: boolean;
+  pendingCreationJournaled?: boolean;
   onCreated?: (created: { agentId: string; autoArchiveObligation?: AutoArchiveObligation }) => void;
   onAgentRegistered?: (snapshot: ManagedAgent) => Promise<void>;
   onPlacementCreated?: (placement: { workspaceId: string; cwd: string }) => Promise<void>;
@@ -259,7 +259,7 @@ async function reservePendingAgentId(
   input: CreateAgentCommandInput,
 ): Promise<string | undefined> {
   if (input.kind === "session") {
-    return input.skipPendingCreationJournal ? undefined : input.agentId;
+    return input.pendingCreationJournaled ? input.agentId : undefined;
   }
   if (!shouldCreateMcpWorktree(input.worktree)) return undefined;
 
@@ -378,7 +378,7 @@ async function resolveSessionCreateAgent(
     input.git,
     input.worktreeName,
     input.firstAgentContext,
-    !input.skipPendingCreationJournal && pendingAgentId
+    input.pendingCreationJournaled && pendingAgentId
       ? pendingWorktreeCreationJournal(dependencies.agentStorage, pendingAgentId)
       : undefined,
     input.agentId ? deterministicPlacementIdentity(input.agentId) : undefined,

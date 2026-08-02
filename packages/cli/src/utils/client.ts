@@ -361,8 +361,6 @@ async function tryConnectHost(
   const client = createCliDaemonClient({
     url: target.url,
     clientId,
-    clientType: "cli",
-    appVersion: resolveCliVersion(),
     callerAgent: resolveCliCallerIdentity(),
     password,
     connectTimeoutMs: timeout,
@@ -403,8 +401,6 @@ async function connectViaRelayOffer(
   const client = createCliDaemonClient({
     url,
     clientId,
-    clientType: "cli",
-    appVersion: resolveCliVersion(),
     callerAgent: resolveCliCallerIdentity(),
     connectTimeoutMs: timeout,
     webSocketFactory: (

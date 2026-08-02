@@ -47,7 +47,13 @@ test("CLI clients explicitly opt out of provider child streams", async () => {
   );
   await connecting;
 
-  const hello = JSON.parse(sent[0]) as { capabilities: Record<string, unknown> };
+  const hello = JSON.parse(sent[0]) as {
+    clientType: string;
+    appVersion: string;
+    capabilities: Record<string, unknown>;
+  };
+  expect(hello.clientType).toBe("cli");
+  expect(hello.appVersion).toMatch(/^\d+\.\d+\.\d+/);
   expect(hello.capabilities[CLIENT_CAPS.providerSubagents]).toBe(false);
   await client.close();
 });

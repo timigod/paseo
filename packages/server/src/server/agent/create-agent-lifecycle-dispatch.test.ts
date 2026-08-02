@@ -1110,6 +1110,7 @@ test.each([
     expect(retryArchive).toHaveBeenCalledWith("ws-restart", expect.any(AbortSignal)),
   );
   await vi.waitFor(() => expect(records.get(agentId)?.autoArchiveObligation).toBeUndefined());
+});
 
 test("auto-archive participates in the agent lifecycle shutdown drain", async () => {
   const agentId = "4a7e2521-286d-4ad5-af35-e091c55302e3";

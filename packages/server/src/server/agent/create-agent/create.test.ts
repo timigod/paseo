@@ -183,6 +183,7 @@ test("session create reports a durable agent when initial prompt start is not co
     {
       kind: "session",
       agentId,
+      pendingCreationJournaled: true,
       config: { provider: "codex", cwd: "/tmp/paseo-create-test" },
       workspaceId: "ws-create-test",
       initialPrompt: "start the work",
@@ -242,6 +243,7 @@ test("legacy worktree create keeps its journal through durable agent registratio
       {
         kind: "session",
         agentId,
+        pendingCreationJournaled: true,
         config: { provider: "codex", cwd: workdir },
         workspaceId: "ws-source",
         labels: {},
