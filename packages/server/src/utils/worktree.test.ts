@@ -3,6 +3,7 @@ import {
   createWorktree as createWorktreePrimitive,
   deriveWorktreeProjectHash,
   deletePaseoWorktree,
+  getPaseoWorktreeCleanupMarkerPath,
   isPaseoOwnedWorktreeCwd,
   mapWorkspaceCwdToWorktree,
   slugify,
@@ -193,7 +194,13 @@ describe("paseo worktree manager", () => {
     });
   });
 
-  it("deletes a worktree whose .git admin dir has already been removed", async () => {
+  it("rejects malformed cleanup quarantine markers", () => {
+    expect(() => getPaseoWorktreeCleanupMarkerPath(repoDir, "../../outside")).toThrow(
+      "Invalid cleanup quarantine marker",
+    );
+  });
+
+  it("refuses to delete a worktree whose durable metadata is no longer readable", async () => {
     const created = await createLegacyWorktreeForTest({
       branchName: "orphan-delete-branch",
       cwd: repoDir,
@@ -208,13 +215,15 @@ describe("paseo worktree manager", () => {
     });
     expect(existsSync(created.worktreePath)).toBe(true);
 
-    await deletePaseoWorktree({
-      cwd: repoDir,
-      worktreePath: created.worktreePath,
-      paseoHome,
-    });
+    await expect(
+      deletePaseoWorktree({
+        cwd: repoDir,
+        worktreePath: created.worktreePath,
+        paseoHome,
+      }),
+    ).rejects.toThrow("Cannot persist worktree incarnation");
 
-    expect(existsSync(created.worktreePath)).toBe(false);
+    expect(existsSync(created.worktreePath)).toBe(true);
   });
 
   it("is idempotent: deleting an already-absent worktree succeeds", async () => {

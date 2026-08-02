@@ -1,4 +1,5 @@
 import { existsSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { dirname, resolve } from "node:path";
 
 import type { Logger } from "pino";
@@ -9,9 +10,14 @@ import type { WorkspaceGitService } from "./workspace-git-service.js";
 import type { ForgeService } from "../services/forge-service.js";
 import {
   deletePaseoWorktree,
+  getPaseoWorktreeCleanupQuarantinePath,
   getPaseoWorktreesRoot,
+  hasPaseoWorktreeCleanupQuarantine,
+  isPaseoWorktreeCleanupQuarantinePath,
   isPaseoOwnedWorktreeCwd,
+  mapWorkspaceCwdToWorktree,
   runWorktreeTeardownCommands,
+  WorktreeCleanupRelocatedError,
   WorktreeTeardownError,
 } from "../utils/worktree.js";
 import {
@@ -115,6 +121,7 @@ export interface ArchiveByScopeRequest {
 export interface PendingWorkspaceCleanupRetryRequest {
   directoryPath: string;
   worktreeIncarnationId: string;
+  quarantineMarker?: string | null;
   requestId: string;
   signal?: AbortSignal;
 }
@@ -247,18 +254,34 @@ export async function retryPendingWorkspaceCleanup(
   const lifecycleCoordinator =
     dependencies.lifecycleCoordinator ?? defaultWorkspaceLifecycleCoordinator;
   const directoryPath = resolve(request.directoryPath);
-  const operationKey = `cleanup:${directoryPath}:${request.worktreeIncarnationId}`;
+  const operationKey = `cleanup:${directoryPath}:${request.worktreeIncarnationId}:${request.quarantineMarker ?? "unmarked"}`;
 
   return lifecycleCoordinator.runArchive(
     operationKey,
     async () => {
       const matchesDirectory = createRealpathAwarePathMatcher(directoryPath);
-      const pendingRecords = (await workspaceRegistry.list()).filter(
+      const candidates = (await workspaceRegistry.list()).filter(
         (workspace) =>
           workspace.archivedAt !== null &&
           workspace.cleanupPending !== null &&
           workspace.cleanupPending.worktreeIncarnationId === request.worktreeIncarnationId &&
           matchesDirectory(workspace.cleanupPending.directoryPath),
+      );
+      const markers = new Set(
+        candidates.map((workspace) => workspace.cleanupPending?.quarantineMarker ?? null),
+      );
+      if (request.quarantineMarker === undefined && markers.size !== 1) {
+        return {
+          archivedAgentIds: [],
+          archivedWorkspaceIds: [],
+          removedDirectory: false,
+          cleanupPendingWorkspaceIds: candidates.map((workspace) => workspace.workspaceId),
+        };
+      }
+      const quarantineMarker =
+        request.quarantineMarker === undefined ? [...markers][0] : request.quarantineMarker;
+      const pendingRecords = candidates.filter(
+        (workspace) => (workspace.cleanupPending?.quarantineMarker ?? null) === quarantineMarker,
       );
       const firstPending = pendingRecords[0]?.cleanupPending ?? null;
       if (!firstPending) {
@@ -643,10 +666,23 @@ async function maybeRemoveDirectoryExclusive(
     return false;
   }
 
-  if (!existsSync(backing.path)) {
-    await clearPendingCleanup(dependencies, pendingCleanupTargets);
-    return false;
+  const authenticatedQuarantinePath = await findAuthenticatedCleanupQuarantine(
+    backing,
+    pendingCleanupTargets,
+  );
+  if (authenticatedQuarantinePath && authenticatedQuarantinePath !== backing.path) {
+    const authority = pendingCleanupTargets[0]!;
+    await updatePendingCleanupAfterRelocation(dependencies, pendingCleanupTargets, {
+      remainingPath: authenticatedQuarantinePath,
+      worktreeIncarnationId: authority.worktreeIncarnationId!,
+      quarantineMarker: authority.quarantineMarker ?? undefined,
+    });
+    backing.path = authenticatedQuarantinePath;
   }
+  const cleanupAlreadyQuarantined = isPaseoWorktreeCleanupQuarantinePath(
+    backing.path,
+    pendingCleanupTargets[0]?.worktreeIncarnationId ?? "",
+  );
 
   const initialIncarnationState = await compareCleanupIncarnation(
     dependencies,
@@ -654,7 +690,7 @@ async function maybeRemoveDirectoryExclusive(
     pendingCleanupTargets,
   );
   if (initialIncarnationState !== "match") {
-    if (initialIncarnationState === "mismatch") {
+    if (initialIncarnationState === "missing") {
       await clearPendingCleanup(dependencies, pendingCleanupTargets);
     }
     return false;
@@ -673,28 +709,8 @@ async function maybeRemoveDirectoryExclusive(
     return false;
   }
 
-  const teardownCwds = uniqueFilesystemPaths(
-    pendingCleanupTargets.map((pendingCleanupTarget) => pendingCleanupTarget.teardownCwd),
-  );
-
-  try {
-    for (const teardownCwd of teardownCwds) {
-      await runWorktreeTeardownCommands({
-        worktreePath: backing.path,
-        teardownCwd,
-        repoRootPath: backing.mainRepoRoot ?? undefined,
-        signal,
-      });
-    }
-  } catch (error) {
-    if (error instanceof WorktreeTeardownError) {
-      dependencies.sessionLogger?.warn(
-        { err: error, targetPath: backing.path, requestId: request.requestId },
-        "Worktree teardown failed during archive; workspace already archived",
-      );
-      throw error;
-    }
-    throw error;
+  if (!cleanupAlreadyQuarantined) {
+    await runPendingCleanupTeardown(dependencies, request, backing, pendingCleanupTargets, signal);
   }
 
   const finalIncarnationState = await compareCleanupIncarnation(
@@ -703,7 +719,7 @@ async function maybeRemoveDirectoryExclusive(
     pendingCleanupTargets,
   );
   if (finalIncarnationState !== "match") {
-    if (finalIncarnationState === "mismatch") {
+    if (finalIncarnationState === "missing") {
       await clearPendingCleanup(dependencies, pendingCleanupTargets);
     }
     return false;
@@ -722,7 +738,55 @@ async function maybeRemoveDirectoryExclusive(
     return false;
   }
 
+  return removePendingCleanupDirectory(
+    dependencies,
+    request,
+    backing,
+    pendingCleanupTargets,
+    signal,
+  );
+}
+
+async function runPendingCleanupTeardown(
+  dependencies: ArchiveDependencies,
+  request: Pick<ArchiveByScopeRequest, "requestId">,
+  backing: BackingDirectory,
+  pendingCleanupTargets: PendingCleanupTarget[],
+  signal?: AbortSignal,
+): Promise<void> {
+  const teardownCwds = uniqueFilesystemPaths(
+    pendingCleanupTargets.map((pendingCleanupTarget) => pendingCleanupTarget.teardownCwd),
+  );
   try {
+    for (const teardownCwd of teardownCwds) {
+      await runWorktreeTeardownCommands({
+        worktreePath: backing.path,
+        teardownCwd,
+        repoRootPath: backing.mainRepoRoot ?? undefined,
+        signal,
+      });
+    }
+  } catch (error) {
+    if (error instanceof WorktreeTeardownError) {
+      dependencies.sessionLogger?.warn(
+        { err: error, targetPath: backing.path, requestId: request.requestId },
+        "Worktree teardown failed during archive; workspace already archived",
+      );
+    }
+    throw error;
+  }
+}
+
+async function removePendingCleanupDirectory(
+  dependencies: ArchiveDependencies,
+  request: Pick<ArchiveByScopeRequest, "requestId">,
+  backing: BackingDirectory,
+  pendingCleanupTargets: PendingCleanupTarget[],
+  signal?: AbortSignal,
+): Promise<boolean> {
+  try {
+    const expectedWorktreeIncarnationId = pendingCleanupTargets[0]!.worktreeIncarnationId;
+    const expectedQuarantineMarker = pendingCleanupTargets[0]!.quarantineMarker;
     await deletePaseoWorktree({
       cwd: backing.mainRepoRoot,
       worktreePath: backing.path,
@@ -730,12 +794,18 @@ async function maybeRemoveDirectoryExclusive(
       worktreesRoot: backing.paseoWorktreesRoot ?? undefined,
       paseoHome: dependencies.paseoHome,
       worktreesBaseRoot: dependencies.paseoWorktreesBaseRoot,
+      expectedWorktreeIncarnationId,
+      expectedQuarantineMarker,
       signal,
     });
     dependencies.github.invalidate({ cwd: backing.path });
     await clearPendingCleanup(dependencies, pendingCleanupTargets);
     return true;
   } catch (error) {
+    if (error instanceof WorktreeCleanupRelocatedError) {
+      await updatePendingCleanupAfterRelocation(dependencies, pendingCleanupTargets, error);
+      backing.path = error.remainingPath;
+    }
     if (error instanceof WorktreeTeardownError) {
       dependencies.sessionLogger?.warn(
         { err: error, targetPath: backing.path, requestId: request.requestId },
@@ -743,7 +813,11 @@ async function maybeRemoveDirectoryExclusive(
       );
       throw error;
     }
-    throw error;
+    dependencies.sessionLogger?.warn(
+      { err: error, targetPath: backing.path, requestId: request.requestId },
+      "Worktree disk removal failed during archive; cleanup remains pending",
+    );
+    return false;
   }
 }
 
@@ -751,7 +825,10 @@ async function compareCleanupIncarnation(
   dependencies: Pick<ArchiveDependencies, "sessionLogger">,
   backing: BackingDirectory,
   pendingCleanupTargets: PendingCleanupTarget[],
-): Promise<"match" | "mismatch" | "unverifiable"> {
+): Promise<"match" | "missing" | "mismatch" | "unverifiable"> {
+  if (isAbsentUnidentifiedCleanup(backing, pendingCleanupTargets)) {
+    return "missing";
+  }
   const expectedIncarnations = new Set(
     pendingCleanupTargets
       .map((target) => target.worktreeIncarnationId)
@@ -767,7 +844,33 @@ async function compareCleanupIncarnation(
     );
     return "unverifiable";
   }
+  const expectedIncarnation = [...expectedIncarnations][0]!;
+  const expectedMarkers = new Set(
+    pendingCleanupTargets.map((target) => target.quarantineMarker ?? null),
+  );
+  if (expectedMarkers.size !== 1) {
+    dependencies.sessionLogger?.warn(
+      { targetPath: backing.path },
+      "Refusing cleanup with conflicting quarantine markers",
+    );
+    return "unverifiable";
+  }
+  const expectedMarker = [...expectedMarkers][0]!;
+  const requestedQuarantine = isPaseoWorktreeCleanupQuarantinePath(
+    backing.path,
+    expectedIncarnation,
+  );
+  if (requestedQuarantine) {
+    if (!existsSync(backing.path)) return "missing";
+    return compareAuthenticatedQuarantine(backing.path, expectedIncarnation, expectedMarker);
+  }
+  const quarantinePath = getPaseoWorktreeCleanupQuarantinePath(backing.path, expectedIncarnation);
+  const quarantineExists = existsSync(quarantinePath);
   let currentIncarnationId: string | null = null;
+  if (!existsSync(backing.path)) {
+    if (!quarantineExists) return "missing";
+    return compareAuthenticatedQuarantine(backing.path, expectedIncarnation, expectedMarker);
+  }
   try {
     currentIncarnationId = readPaseoWorktreeIncarnationId(backing.path);
   } catch (error) {
@@ -778,7 +881,65 @@ async function compareCleanupIncarnation(
     return "unverifiable";
   }
   if (currentIncarnationId === null) return "unverifiable";
-  return expectedIncarnations.has(currentIncarnationId) ? "match" : "mismatch";
+  if (currentIncarnationId === expectedIncarnation) return "match";
+  return compareAuthenticatedQuarantine(backing.path, expectedIncarnation, expectedMarker);
+}
+
+async function compareAuthenticatedQuarantine(
+  directoryPath: string,
+  worktreeIncarnationId: string,
+  quarantineMarker: string | null,
+): Promise<"match" | "mismatch"> {
+  if (!quarantineMarker) return "mismatch";
+  return (await hasPaseoWorktreeCleanupQuarantine(
+    directoryPath,
+    worktreeIncarnationId,
+    quarantineMarker,
+  ))
+    ? "match"
+    : "mismatch";
+}
+
+function isAbsentUnidentifiedCleanup(
+  backing: BackingDirectory,
+  pendingCleanupTargets: PendingCleanupTarget[],
+): boolean {
+  return (
+    !existsSync(backing.path) &&
+    pendingCleanupTargets.every((target) => target.worktreeIncarnationId === null)
+  );
+}
+
+async function findAuthenticatedCleanupQuarantine(
+  backing: BackingDirectory,
+  pendingCleanupTargets: PendingCleanupTarget[],
+): Promise<string | null> {
+  const expectedIncarnations = new Set(
+    pendingCleanupTargets.map((target) => target.worktreeIncarnationId),
+  );
+  const expectedMarkers = new Set(
+    pendingCleanupTargets.map((target) => target.quarantineMarker ?? null),
+  );
+  if (
+    expectedIncarnations.size !== 1 ||
+    expectedIncarnations.has(null) ||
+    expectedMarkers.size !== 1 ||
+    expectedMarkers.has(null)
+  ) {
+    return null;
+  }
+  const worktreeIncarnationId = [...expectedIncarnations][0]!;
+  const quarantineMarker = [...expectedMarkers][0]!;
+  const quarantinePath = isPaseoWorktreeCleanupQuarantinePath(backing.path, worktreeIncarnationId)
+    ? backing.path
+    : getPaseoWorktreeCleanupQuarantinePath(backing.path, worktreeIncarnationId);
+  return (await hasPaseoWorktreeCleanupQuarantine(
+    quarantinePath,
+    worktreeIncarnationId,
+    quarantineMarker,
+  ))
+    ? quarantinePath
+    : null;
 }
 
 interface PendingCleanupTarget extends PersistedWorkspaceCleanupPending {
@@ -796,6 +957,12 @@ async function persistTargetCleanupPending(
   // no active workspace ids. Its incarnation is the authority for this retry:
   // never rebind that stale cleanup intent to whatever now occupies the path.
   const activeTargetWorkspaceIds = new Set(target.workspaceIds);
+  const matchesBacking = createRealpathAwarePathMatcher(backing.path);
+  const existingMarker = (await workspaceRegistry.list()).find(
+    (workspace) =>
+      workspace.cleanupPending && matchesBacking(workspace.cleanupPending.directoryPath),
+  )?.cleanupPending?.quarantineMarker;
+  const quarantineMarker = existingMarker ?? randomUUID();
 
   const worktreeIncarnationId = existsSync(backing.path)
     ? ensurePaseoWorktreeIncarnationId(backing.path)
@@ -813,6 +980,7 @@ async function persistTargetCleanupPending(
                 mainRepoRoot: backing.mainRepoRoot,
                 paseoWorktreesRoot: backing.paseoWorktreesRoot,
                 worktreeIncarnationId,
+                quarantineMarker,
               },
             })),
           ]
@@ -852,6 +1020,7 @@ async function listPendingCleanupTargets(
 
   const archivedWorkspaceIdSet = new Set(archivedWorkspaceIds);
   let fallbackIncarnationId: string | null = null;
+  const fallbackQuarantineMarker = randomUUID();
   if (target.backing && existsSync(target.backing.path)) {
     try {
       fallbackIncarnationId = readPaseoWorktreeIncarnationId(target.backing.path);
@@ -872,7 +1041,57 @@ async function listPendingCleanupTargets(
       mainRepoRoot: target.backing?.mainRepoRoot ?? null,
       paseoWorktreesRoot: target.backing?.paseoWorktreesRoot ?? null,
       worktreeIncarnationId: fallbackIncarnationId,
+      quarantineMarker: fallbackQuarantineMarker,
     }));
+}
+
+async function updatePendingCleanupAfterRelocation(
+  dependencies: ArchiveDependencies,
+  cleanupTargets: PendingCleanupTarget[],
+  relocation: {
+    remainingPath: string;
+    worktreeIncarnationId: string;
+    quarantineMarker?: string;
+  },
+): Promise<void> {
+  const workspaceRegistry = dependencies.workspaceRegistry;
+  const relocatedTargets = cleanupTargets.map((cleanupTarget) => ({
+    cleanupTarget,
+    teardownCwd: mapWorkspaceCwdToWorktree({
+      sourceWorktreePath: cleanupTarget.directoryPath,
+      workspaceCwd: cleanupTarget.teardownCwd,
+      targetWorktreePath: relocation.remainingPath,
+    }),
+  }));
+  if (workspaceRegistry) {
+    await Promise.all(
+      relocatedTargets.flatMap(({ cleanupTarget, teardownCwd }) =>
+        cleanupTarget.workspaceId
+          ? [
+              workspaceRegistry.update(cleanupTarget.workspaceId, (workspace) => ({
+                ...workspace,
+                cleanupPending: workspace.cleanupPending
+                  ? {
+                      ...workspace.cleanupPending,
+                      directoryPath: relocation.remainingPath,
+                      teardownCwd,
+                      worktreeIncarnationId: relocation.worktreeIncarnationId,
+                      quarantineMarker:
+                        relocation.quarantineMarker ?? workspace.cleanupPending.quarantineMarker,
+                    }
+                  : null,
+              })),
+            ]
+          : [],
+      ),
+    );
+  }
+  for (const { cleanupTarget, teardownCwd } of relocatedTargets) {
+    cleanupTarget.directoryPath = relocation.remainingPath;
+    cleanupTarget.teardownCwd = teardownCwd;
+    cleanupTarget.worktreeIncarnationId = relocation.worktreeIncarnationId;
+    cleanupTarget.quarantineMarker = relocation.quarantineMarker ?? cleanupTarget.quarantineMarker;
+  }
 }
 
 async function clearPendingCleanup(
@@ -916,6 +1135,7 @@ async function clearCleanupPendingForUnarchivedTargets(
               mainRepoRoot: target.backing?.mainRepoRoot ?? null,
               paseoWorktreesRoot: target.backing?.paseoWorktreesRoot ?? null,
               worktreeIncarnationId: null,
+              quarantineMarker: null,
             },
           ]
         : [],

@@ -4,6 +4,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  renameSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -15,7 +16,12 @@ import { afterEach, describe, expect, test, vi } from "vitest";
 
 import type { ForgeService } from "../services/forge-service.js";
 import { createRealpathAwarePathMatcher } from "../utils/path.js";
-import { createWorktree, type WorktreeConfig } from "../utils/worktree.js";
+import {
+  createWorktree,
+  getPaseoWorktreeCleanupMarkerPath,
+  getPaseoWorktreeCleanupQuarantinePath,
+  type WorktreeConfig,
+} from "../utils/worktree.js";
 import { readPaseoWorktreeIncarnationId } from "../utils/worktree-metadata.js";
 import type { ManagedAgent } from "./agent/agent-manager.js";
 import type { AgentStorage, StoredAgentRecord } from "./agent/agent-storage.js";
@@ -980,6 +986,7 @@ describe("archiveByScope", () => {
     expect((await registry.get(workspaceId))?.cleanupPending).toMatchObject({
       directoryPath: worktree.worktreePath,
       teardownCwd: worktree.worktreePath,
+      quarantineMarker: expect.any(String),
     });
     expect(existsSync(worktree.worktreePath)).toBe(true);
 
@@ -1231,6 +1238,7 @@ describe("archiveByScope", () => {
     const nestedCwd = path.join(worktree.worktreePath, nestedRelative);
     const incarnationId = readPaseoWorktreeIncarnationId(worktree.worktreePath);
     expect(incarnationId).toBeTruthy();
+    const quarantineMarker = "00000000-0000-4000-8000-000000000045";
     const registry = new FileBackedWorkspaceRegistry(
       path.join(tempDir, "workspaces.json"),
       createLogger(),
@@ -1260,6 +1268,7 @@ describe("archiveByScope", () => {
             mainRepoRoot: repoDir,
             paseoWorktreesRoot: null,
             worktreeIncarnationId: incarnationId,
+            quarantineMarker,
           },
         }),
       );
@@ -1274,6 +1283,7 @@ describe("archiveByScope", () => {
           await retryPendingWorkspaceCleanup(deps, {
             directoryPath: target.directoryPath,
             worktreeIncarnationId: target.worktreeIncarnationId,
+            quarantineMarker: target.quarantineMarker,
             requestId: "startup-schedule-cleanup-retry",
             signal,
           }),
@@ -1376,7 +1386,208 @@ describe("archiveByScope", () => {
     expect(deps.killTerminalsForWorkspace).not.toHaveBeenCalled();
     expect(existsSync(replacement.worktreePath)).toBe(true);
     expect((await registry.get(replacementWorkspaceId))?.archivedAt).toBeNull();
+    expect((await registry.get(staleWorkspaceId))?.cleanupPending).not.toBeNull();
+  });
+
+  test("startup retry recovers an authenticated quarantine without touching a live replacement", async () => {
+    const { tempDir, repoDir } = createGitRepo();
+    const paseoHome = path.join(tempDir, ".paseo");
+    const slug = "authenticated-quarantine-recovery";
+    const original = await createPaseoOwnedWorktree(repoDir, paseoHome, slug);
+    const incarnationId = readPaseoWorktreeIncarnationId(original.worktreePath)!;
+    const quarantineMarker = "00000000-0000-4000-8000-000000000046";
+    const quarantinePath = getPaseoWorktreeCleanupQuarantinePath(
+      original.worktreePath,
+      incarnationId,
+    );
+    writeFileSync(getPaseoWorktreeCleanupMarkerPath(original.worktreePath, quarantineMarker), "", {
+      mode: 0o600,
+    });
+    renameSync(original.worktreePath, quarantinePath);
+    execFileSync("git", ["worktree", "prune", "--expire=now"], { cwd: repoDir, stdio: "pipe" });
+    execFileSync("git", ["branch", "-D", slug], { cwd: repoDir, stdio: "pipe" });
+    const replacement = await createPaseoOwnedWorktree(repoDir, paseoHome, slug);
+
+    const staleWorkspaceId = "ws-authenticated-quarantine";
+    const replacementWorkspaceId = "ws-authenticated-quarantine-replacement";
+    const registry = new FileBackedWorkspaceRegistry(
+      path.join(tempDir, "workspaces.json"),
+      createLogger(),
+    );
+    await registry.initialize();
+    const timestamp = new Date().toISOString();
+    await registry.upsert(
+      createPersistedWorkspaceRecord({
+        workspaceId: staleWorkspaceId,
+        projectId: "project-authenticated-quarantine",
+        cwd: original.worktreePath,
+        kind: "worktree",
+        displayName: "Authenticated quarantine",
+        worktreeRoot: original.worktreePath,
+        isPaseoOwnedWorktree: true,
+        mainRepoRoot: repoDir,
+        createdAt: timestamp,
+        updatedAt: timestamp,
+        archivedAt: timestamp,
+        cleanupPending: {
+          directoryPath: original.worktreePath,
+          teardownCwd: original.worktreePath,
+          mainRepoRoot: repoDir,
+          paseoWorktreesRoot: null,
+          worktreeIncarnationId: incarnationId,
+          quarantineMarker,
+        },
+      }),
+    );
+    await registry.upsert(
+      createPersistedWorkspaceRecord({
+        workspaceId: replacementWorkspaceId,
+        projectId: "project-authenticated-quarantine",
+        cwd: replacement.worktreePath,
+        kind: "worktree",
+        displayName: "Live replacement",
+        worktreeRoot: replacement.worktreePath,
+        isPaseoOwnedWorktree: true,
+        mainRepoRoot: repoDir,
+        createdAt: timestamp,
+        updatedAt: timestamp,
+      }),
+    );
+    const deps = createArchiveDeps({
+      paseoHome,
+      activeWorkspaces: [
+        {
+          workspaceId: replacementWorkspaceId,
+          cwd: replacement.worktreePath,
+          kind: "worktree",
+          worktreeRoot: replacement.worktreePath,
+          isPaseoOwnedWorktree: true,
+          mainRepoRoot: repoDir,
+        },
+      ],
+    });
+    deps.workspaceRegistry = registry;
+
+    const result = await retryPendingWorkspaceCleanup(deps, {
+      directoryPath: original.worktreePath,
+      worktreeIncarnationId: incarnationId,
+      quarantineMarker,
+      requestId: "authenticated-quarantine-recovery",
+    });
+
+    expect(result.removedDirectory).toBe(true);
+    expect(existsSync(quarantinePath)).toBe(false);
+    expect(existsSync(replacement.worktreePath)).toBe(true);
     expect((await registry.get(staleWorkspaceId))?.cleanupPending).toBeNull();
+    expect((await registry.get(replacementWorkspaceId))?.archivedAt).toBeNull();
+  });
+
+  test("startup retry skips stale teardown state after cleanup relocation", async () => {
+    const { tempDir, repoDir } = createGitRepo();
+    const paseoHome = path.join(tempDir, ".paseo");
+    const worktree = await createPaseoOwnedWorktree(repoDir, paseoHome, "relocated-cleanup-retry");
+    const incarnationId = readPaseoWorktreeIncarnationId(worktree.worktreePath)!;
+    const quarantineMarker = "00000000-0000-4000-8000-000000000047";
+    const quarantinePath = getPaseoWorktreeCleanupQuarantinePath(
+      worktree.worktreePath,
+      incarnationId,
+    );
+    writeFileSync(getPaseoWorktreeCleanupMarkerPath(worktree.worktreePath, quarantineMarker), "", {
+      mode: 0o600,
+    });
+    renameSync(worktree.worktreePath, quarantinePath);
+
+    const workspaceId = "ws-relocated-cleanup-retry";
+    const registry = new FileBackedWorkspaceRegistry(
+      path.join(tempDir, "workspaces.json"),
+      createLogger(),
+    );
+    await registry.initialize();
+    const timestamp = new Date().toISOString();
+    await registry.upsert(
+      createPersistedWorkspaceRecord({
+        workspaceId,
+        projectId: "project-relocated-cleanup-retry",
+        cwd: worktree.worktreePath,
+        kind: "worktree",
+        displayName: "Relocated cleanup retry",
+        worktreeRoot: worktree.worktreePath,
+        isPaseoOwnedWorktree: true,
+        mainRepoRoot: repoDir,
+        createdAt: timestamp,
+        updatedAt: timestamp,
+        archivedAt: timestamp,
+        cleanupPending: {
+          directoryPath: quarantinePath,
+          teardownCwd: worktree.worktreePath,
+          mainRepoRoot: repoDir,
+          paseoWorktreesRoot: null,
+          worktreeIncarnationId: incarnationId,
+          quarantineMarker,
+        },
+      }),
+    );
+    const deps = createArchiveDeps({ paseoHome, activeWorkspaces: [] });
+    deps.workspaceRegistry = registry;
+
+    const result = await retryPendingWorkspaceCleanup(deps, {
+      directoryPath: quarantinePath,
+      worktreeIncarnationId: incarnationId,
+      quarantineMarker,
+      requestId: "relocated-cleanup-retry",
+    });
+
+    expect(result.removedDirectory).toBe(true);
+    expect(existsSync(quarantinePath)).toBe(false);
+    expect((await registry.get(workspaceId))?.cleanupPending).toBeNull();
+  });
+
+  test("an absent cleanup receipt without an incarnation settles as complete", async () => {
+    const { tempDir } = createGitRepo();
+    const absentPath = path.join(tempDir, ".paseo", "worktrees", "missing", "absent-worktree");
+    const workspaceId = "ws-absent-null-incarnation";
+    const registry = new FileBackedWorkspaceRegistry(
+      path.join(tempDir, "workspaces.json"),
+      createLogger(),
+    );
+    await registry.initialize();
+    const timestamp = new Date().toISOString();
+    await registry.upsert(
+      createPersistedWorkspaceRecord({
+        workspaceId,
+        projectId: "project-absent-null-incarnation",
+        cwd: absentPath,
+        kind: "worktree",
+        displayName: "Absent cleanup",
+        worktreeRoot: absentPath,
+        isPaseoOwnedWorktree: true,
+        mainRepoRoot: null,
+        createdAt: timestamp,
+        updatedAt: timestamp,
+        archivedAt: timestamp,
+        cleanupPending: {
+          directoryPath: absentPath,
+          teardownCwd: absentPath,
+          mainRepoRoot: null,
+          paseoWorktreesRoot: path.dirname(absentPath),
+          worktreeIncarnationId: null,
+          quarantineMarker: null,
+        },
+      }),
+    );
+    const deps = createArchiveDeps({
+      paseoHome: path.join(tempDir, ".paseo"),
+      activeWorkspaces: [],
+    });
+    deps.workspaceRegistry = registry;
+
+    const result = await archiveByScope(deps, {
+      scope: { kind: "workspace", workspaceId },
+      requestId: "absent-null-incarnation",
+    });
+
+    expect(result.removedDirectory).toBe(false);
+    expect((await registry.get(workspaceId))?.cleanupPending).toBeNull();
   });
 
   test("directory workspace creation waits for cleanup and revalidates after final owner read", async () => {

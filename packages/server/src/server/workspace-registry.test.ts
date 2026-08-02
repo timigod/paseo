@@ -99,6 +99,50 @@ describe("workspace registries", () => {
     expect(await projectRegistry.list()).toEqual([]);
   });
 
+  test("persists cleanup quarantine markers and accepts legacy unmarked cleanup", async () => {
+    await workspaceRegistry.initialize();
+    const timestamp = "2026-08-01T00:00:00.000Z";
+    const marker = "00000000-0000-4000-8000-000000000043";
+    for (const [workspaceId, quarantineMarker] of [
+      ["workspace-marked-cleanup", marker],
+      ["workspace-legacy-cleanup", undefined],
+    ] as const) {
+      await workspaceRegistry.upsert(
+        createPersistedWorkspaceRecord({
+          workspaceId,
+          projectId: "project-cleanup",
+          cwd: `/tmp/${workspaceId}`,
+          kind: "worktree",
+          displayName: workspaceId,
+          createdAt: timestamp,
+          updatedAt: timestamp,
+          archivedAt: timestamp,
+          cleanupPending: {
+            directoryPath: `/tmp/${workspaceId}`,
+            teardownCwd: `/tmp/${workspaceId}`,
+            mainRepoRoot: "/tmp/repo",
+            paseoWorktreesRoot: "/tmp/worktrees",
+            worktreeIncarnationId: "incarnation-cleanup",
+            quarantineMarker,
+          },
+        }),
+      );
+    }
+
+    const reloaded = new FileBackedWorkspaceRegistry(
+      path.join(tmpDir, "projects", "workspaces.json"),
+      logger,
+    );
+    await reloaded.initialize();
+
+    expect((await reloaded.get("workspace-marked-cleanup"))?.cleanupPending?.quarantineMarker).toBe(
+      marker,
+    );
+    expect(
+      (await reloaded.get("workspace-legacy-cleanup"))?.cleanupPending?.quarantineMarker,
+    ).toBeUndefined();
+  });
+
   test("publishes only project mutations that change the persisted lifecycle", async () => {
     await projectRegistry.initialize();
     const mutations: Array<{

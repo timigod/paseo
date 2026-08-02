@@ -12,6 +12,7 @@ const DEFAULT_MAX_TARGETS_PER_CYCLE = 8;
 export interface WorkspaceCleanupRetryTarget {
   directoryPath: string;
   worktreeIncarnationId: string;
+  quarantineMarker: string | null;
   workspaceIds: string[];
 }
 
@@ -38,7 +39,7 @@ export class WorkspaceCleanupRetryService {
   private stopped = false;
   private consecutiveFailedCycles = 0;
   private wakeRequested = false;
-  private nextTargetDirectoryPath: string | null = null;
+  private nextTargetAuthority: string | null = null;
   private activeAbortController: AbortController | null = null;
 
   constructor(private readonly options: WorkspaceCleanupRetryServiceOptions) {
@@ -133,10 +134,10 @@ export class WorkspaceCleanupRetryService {
       return;
     }
 
-    const rotatedTargets = rotateCleanupTargets(targets, this.nextTargetDirectoryPath);
+    const rotatedTargets = rotateCleanupTargets(targets, this.nextTargetAuthority);
     const batch = rotatedTargets.slice(0, this.maxTargetsPerCycle);
     const nextTarget = rotatedTargets[batch.length] ?? null;
-    this.nextTargetDirectoryPath = nextTarget?.directoryPath ?? null;
+    this.nextTargetAuthority = nextTarget ? cleanupTargetAuthority(nextTarget) : null;
     const abortController = new AbortController();
     this.activeAbortController = abortController;
 
@@ -155,6 +156,7 @@ export class WorkspaceCleanupRetryService {
                 directoryPath: target.directoryPath,
                 workspaceIds: target.workspaceIds,
                 worktreeIncarnationId: target.worktreeIncarnationId,
+                quarantineMarker: target.quarantineMarker,
               },
               "Pending workspace cleanup retry failed",
             );
@@ -173,10 +175,12 @@ export class WorkspaceCleanupRetryService {
 
 function rotateCleanupTargets(
   targets: readonly WorkspaceCleanupRetryTarget[],
-  nextDirectoryPath: string | null,
+  nextTargetAuthority: string | null,
 ): WorkspaceCleanupRetryTarget[] {
-  if (!nextDirectoryPath) return [...targets];
-  const index = targets.findIndex((target) => target.directoryPath === nextDirectoryPath);
+  if (!nextTargetAuthority) return [...targets];
+  const index = targets.findIndex(
+    (target) => cleanupTargetAuthority(target) === nextTargetAuthority,
+  );
   if (index <= 0) return [...targets];
   return [...targets.slice(index), ...targets.slice(0, index)];
 }
@@ -184,26 +188,39 @@ function rotateCleanupTargets(
 export function findWorkspaceCleanupRetryTargets(
   workspaces: readonly PersistedWorkspaceRecord[],
 ): WorkspaceCleanupRetryTarget[] {
-  const byDirectory = new Map<string, PersistedWorkspaceRecord[]>();
+  const byCleanupAuthority = new Map<string, PersistedWorkspaceRecord[]>();
   for (const workspace of workspaces) {
     if (!workspace.archivedAt || !workspace.cleanupPending) continue;
     const directoryPath = resolve(workspace.cleanupPending.directoryPath);
-    const group = byDirectory.get(directoryPath) ?? [];
+    const key = `${directoryPath}\0${workspace.cleanupPending.worktreeIncarnationId ?? "legacy"}\0${workspace.cleanupPending.quarantineMarker ?? "unmarked"}`;
+    const group = byCleanupAuthority.get(key) ?? [];
     group.push(workspace);
-    byDirectory.set(directoryPath, group);
+    byCleanupAuthority.set(key, group);
   }
 
   const targets: WorkspaceCleanupRetryTarget[] = [];
-  for (const [directoryPath, group] of byDirectory) {
+  for (const group of byCleanupAuthority.values()) {
+    const directoryPath = resolve(group[0]!.cleanupPending!.directoryPath);
     const incarnationIds = new Set(
       group.map((workspace) => workspace.cleanupPending?.worktreeIncarnationId ?? null),
     );
     if (incarnationIds.size !== 1 || incarnationIds.has(null)) continue;
+    const quarantineMarkers = new Set(
+      group.map((workspace) => workspace.cleanupPending?.quarantineMarker ?? null),
+    );
+    if (quarantineMarkers.size !== 1) continue;
     targets.push({
       directoryPath,
       worktreeIncarnationId: [...incarnationIds][0]!,
+      quarantineMarker: [...quarantineMarkers][0] ?? null,
       workspaceIds: group.map((workspace) => workspace.workspaceId).sort(),
     });
   }
-  return targets.sort((left, right) => left.directoryPath.localeCompare(right.directoryPath));
+  return targets.sort((left, right) =>
+    cleanupTargetAuthority(left).localeCompare(cleanupTargetAuthority(right)),
+  );
+}
+
+function cleanupTargetAuthority(target: WorkspaceCleanupRetryTarget): string {
+  return `${target.directoryPath}\0${target.worktreeIncarnationId}\0${target.quarantineMarker ?? "unmarked"}`;
 }

@@ -15,6 +15,7 @@ function pendingWorkspace(input: {
   workspaceId: string;
   directoryPath: string;
   incarnationId: string | null;
+  quarantineMarker?: string | null;
   archived?: boolean;
 }) {
   const timestamp = "2026-07-31T00:00:00.000Z";
@@ -33,11 +34,12 @@ function pendingWorkspace(input: {
       mainRepoRoot: "/repo",
       paseoWorktreesRoot: "/worktrees",
       worktreeIncarnationId: input.incarnationId,
+      quarantineMarker: input.quarantineMarker,
     },
   });
 }
 
-test("groups archived cleanup by directory and requires one verified incarnation", () => {
+test("groups archived cleanup by directory, incarnation, and marker", () => {
   const targets = findWorkspaceCleanupRetryTargets([
     pendingWorkspace({
       workspaceId: "ws-a",
@@ -74,9 +76,54 @@ test("groups archived cleanup by directory and requires one verified incarnation
 
   expect(targets).toEqual([
     {
+      directoryPath: "/worktrees/conflict",
+      worktreeIncarnationId: "inc-a",
+      quarantineMarker: null,
+      workspaceIds: ["ws-conflict-a"],
+    },
+    {
+      directoryPath: "/worktrees/conflict",
+      worktreeIncarnationId: "inc-b",
+      quarantineMarker: null,
+      workspaceIds: ["ws-conflict-b"],
+    },
+    {
       directoryPath: "/worktrees/shared",
       worktreeIncarnationId: "inc-shared",
+      quarantineMarker: null,
       workspaceIds: ["ws-a", "ws-b"],
+    },
+  ]);
+});
+
+test("keeps different quarantine markers in separate retry groups", () => {
+  const targets = findWorkspaceCleanupRetryTargets([
+    pendingWorkspace({
+      workspaceId: "ws-marker-a",
+      directoryPath: "/worktrees/shared",
+      incarnationId: "inc-shared",
+      quarantineMarker: "00000000-0000-4000-8000-000000000043",
+    }),
+    pendingWorkspace({
+      workspaceId: "ws-marker-b",
+      directoryPath: "/worktrees/shared",
+      incarnationId: "inc-shared",
+      quarantineMarker: "00000000-0000-4000-8000-000000000044",
+    }),
+  ]);
+
+  expect(targets).toEqual([
+    {
+      directoryPath: "/worktrees/shared",
+      worktreeIncarnationId: "inc-shared",
+      quarantineMarker: "00000000-0000-4000-8000-000000000043",
+      workspaceIds: ["ws-marker-a"],
+    },
+    {
+      directoryPath: "/worktrees/shared",
+      worktreeIncarnationId: "inc-shared",
+      quarantineMarker: "00000000-0000-4000-8000-000000000044",
+      workspaceIds: ["ws-marker-b"],
     },
   ]);
 });

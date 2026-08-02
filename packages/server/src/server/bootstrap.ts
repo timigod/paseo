@@ -1325,6 +1325,7 @@ export async function createPaseoDaemon(
         {
           directoryPath: target.directoryPath,
           worktreeIncarnationId: target.worktreeIncarnationId,
+          quarantineMarker: target.quarantineMarker,
           requestId: `cleanup-retry:${randomUUID()}`,
           signal,
         },

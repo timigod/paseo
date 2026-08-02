@@ -6,6 +6,8 @@ import {
   createWorktree as createWorktreePrimitive,
   deriveWorktreeProjectHash,
   deletePaseoWorktree,
+  getPaseoWorktreeCleanupMarkerPath,
+  getPaseoWorktreeCleanupQuarantinePath,
   InvalidGitBranchNameError,
   getScriptConfigs,
   getWorktreeSetupCommands,
@@ -23,7 +25,10 @@ import {
 } from "./worktree";
 import { MAX_WORKTREE_SETUP_TOTAL_OUTPUT_BYTES } from "./worktree-setup-output.js";
 import type { PaseoConfig } from "@getpaseo/protocol/paseo-config-schema";
-import { getPaseoWorktreeMetadataPath } from "./worktree-metadata.js";
+import {
+  getPaseoWorktreeMetadataPath,
+  readPaseoWorktreeIncarnationId,
+} from "./worktree-metadata.js";
 import { execFileSync } from "child_process";
 import { isPlatform } from "../test-utils/platform.js";
 import {
@@ -32,6 +37,9 @@ import {
   rmSync,
   existsSync,
   realpathSync,
+  renameSync,
+  symlinkSync,
+  statSync,
   writeFileSync,
   readFileSync,
   chmodSync,
@@ -1391,6 +1399,156 @@ describe.skipIf(isPlatform("win32"))("worktree POSIX-only", () => {
         clearTimeout(abortTimer);
       }
       expect(existsSync(created.worktreePath)).toBe(true);
+    });
+
+    it("removes only an existing quarantine authenticated by incarnation and marker", async () => {
+      const created = await createLegacyWorktreeForTest({
+        branchName: "authenticated-quarantine-branch",
+        cwd: repoDir,
+        baseBranch: "main",
+        worktreeSlug: "authenticated-quarantine",
+        paseoHome,
+      });
+      const incarnationId = readPaseoWorktreeIncarnationId(created.worktreePath)!;
+      const quarantineMarker = "00000000-0000-4000-8000-000000000043";
+      const quarantinePath = getPaseoWorktreeCleanupQuarantinePath(
+        created.worktreePath,
+        incarnationId,
+      );
+      writeFileSync(getPaseoWorktreeCleanupMarkerPath(created.worktreePath, quarantineMarker), "", {
+        mode: 0o600,
+      });
+      expect(
+        statSync(getPaseoWorktreeCleanupMarkerPath(created.worktreePath, quarantineMarker)).mode &
+          0o777,
+      ).toBe(0o600);
+      renameSync(created.worktreePath, quarantinePath);
+
+      await deletePaseoWorktree({
+        cwd: repoDir,
+        worktreePath: created.worktreePath,
+        teardownCwds: [],
+        paseoHome,
+        expectedWorktreeIncarnationId: incarnationId,
+        expectedQuarantineMarker: quarantineMarker,
+      });
+
+      expect(existsSync(quarantinePath)).toBe(false);
+    });
+
+    it("refuses a same-name quarantine whose marker does not match", async () => {
+      const created = await createLegacyWorktreeForTest({
+        branchName: "forged-quarantine-branch",
+        cwd: repoDir,
+        baseBranch: "main",
+        worktreeSlug: "forged-quarantine",
+        paseoHome,
+      });
+      const incarnationId = readPaseoWorktreeIncarnationId(created.worktreePath)!;
+      const quarantinePath = getPaseoWorktreeCleanupQuarantinePath(
+        created.worktreePath,
+        incarnationId,
+      );
+      renameSync(created.worktreePath, quarantinePath);
+      writeFileSync(join(quarantinePath, "keep.txt"), "keep");
+
+      await expect(
+        deletePaseoWorktree({
+          cwd: repoDir,
+          worktreePath: created.worktreePath,
+          teardownCwds: [],
+          paseoHome,
+          expectedWorktreeIncarnationId: incarnationId,
+          expectedQuarantineMarker: "00000000-0000-4000-8000-000000000044",
+        }),
+      ).rejects.toThrow("Cleanup quarantine marker changed");
+
+      expect(readFileSync(join(quarantinePath, "keep.txt"), "utf8")).toBe("keep");
+    });
+
+    it("refuses a quarantine path swapped for a symlink at the removal boundary", async () => {
+      const created = await createLegacyWorktreeForTest({
+        branchName: "swapped-quarantine-branch",
+        cwd: repoDir,
+        baseBranch: "main",
+        worktreeSlug: "swapped-quarantine",
+        paseoHome,
+      });
+      const incarnationId = readPaseoWorktreeIncarnationId(created.worktreePath)!;
+      const quarantineMarker = "00000000-0000-4000-8000-000000000048";
+      const quarantinePath = getPaseoWorktreeCleanupQuarantinePath(
+        created.worktreePath,
+        incarnationId,
+      );
+      const protectedPath = `${quarantinePath}-protected`;
+      writeFileSync(getPaseoWorktreeCleanupMarkerPath(created.worktreePath, quarantineMarker), "", {
+        mode: 0o600,
+      });
+      renameSync(created.worktreePath, quarantinePath);
+      writeFileSync(join(quarantinePath, "keep.txt"), "keep");
+      renameSync(quarantinePath, protectedPath);
+      symlinkSync(protectedPath, quarantinePath, "dir");
+
+      await expect(
+        deletePaseoWorktree({
+          cwd: repoDir,
+          worktreePath: created.worktreePath,
+          teardownCwds: [],
+          paseoHome,
+          expectedWorktreeIncarnationId: incarnationId,
+          expectedQuarantineMarker: quarantineMarker,
+        }),
+      ).rejects.toThrow("Cleanup path is not a directory");
+
+      expect(readFileSync(join(protectedPath, "keep.txt"), "utf8")).toBe("keep");
+      expect(existsSync(quarantinePath)).toBe(true);
+    });
+
+    it("lets a legacy receipt quarantine its original path but not claim a quarantine", async () => {
+      const original = await createLegacyWorktreeForTest({
+        branchName: "legacy-original-branch",
+        cwd: repoDir,
+        baseBranch: "main",
+        worktreeSlug: "legacy-original",
+        paseoHome,
+      });
+      const originalIncarnation = readPaseoWorktreeIncarnationId(original.worktreePath)!;
+      await expect(
+        deletePaseoWorktree({
+          cwd: repoDir,
+          worktreePath: original.worktreePath,
+          teardownCwds: [],
+          paseoHome,
+          expectedWorktreeIncarnationId: originalIncarnation,
+          expectedQuarantineMarker: null,
+        }),
+      ).resolves.toBeUndefined();
+
+      const quarantined = await createLegacyWorktreeForTest({
+        branchName: "legacy-quarantine-branch",
+        cwd: repoDir,
+        baseBranch: "main",
+        worktreeSlug: "legacy-quarantine",
+        paseoHome,
+      });
+      const quarantinedIncarnation = readPaseoWorktreeIncarnationId(quarantined.worktreePath)!;
+      const quarantinePath = getPaseoWorktreeCleanupQuarantinePath(
+        quarantined.worktreePath,
+        quarantinedIncarnation,
+      );
+      renameSync(quarantined.worktreePath, quarantinePath);
+
+      await expect(
+        deletePaseoWorktree({
+          cwd: repoDir,
+          worktreePath: quarantined.worktreePath,
+          teardownCwds: [],
+          paseoHome,
+          expectedWorktreeIncarnationId: quarantinedIncarnation,
+          expectedQuarantineMarker: null,
+        }),
+      ).rejects.toThrow("Cleanup quarantine marker changed");
+      expect(existsSync(quarantinePath)).toBe(true);
     });
   });
 });

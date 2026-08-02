@@ -45,6 +45,9 @@ const PersistedWorkspaceCleanupPendingSchema = z.object({
     .nullable()
     .optional()
     .transform((value) => value ?? null),
+  // COMPAT(cleanupQuarantineMarker): added in v0.2.6; unmarked records may
+  // quarantine an authenticated original path but cannot claim a quarantine.
+  quarantineMarker: z.string().uuid().nullable().optional(),
 });
 
 const PersistedWorkspaceRecordSchema = z.object({
