@@ -405,10 +405,11 @@ type AgentUpdatesFilter = FetchAgentsRequestFilter;
 type CreateAgentRequestMessage = Extract<SessionInboundMessage, { type: "create_agent_request" }>;
 
 type RequestCreatedPlacement =
-  | { kind: "directory"; workspaceId: string }
+  | { kind: "directory"; workspaceId: string; cwd: string }
   | {
       kind: "worktree";
       workspaceId: string;
+      cwd: string;
       createdWorktree: CreatePaseoWorktreeWorkflowResult;
     };
 
@@ -464,6 +465,21 @@ class SessionRequestError extends Error {
   ) {
     super(message);
     this.name = "SessionRequestError";
+  }
+}
+
+class WorkspaceCleanupUnconfirmedError extends Error {
+  readonly code = "workspace_cleanup_unconfirmed";
+
+  constructor(
+    readonly placement: RequestCreatedPlacement,
+    options?: { cause?: unknown },
+  ) {
+    super(
+      `Cleanup was not confirmed for request-owned workspace ${placement.workspaceId} at ${placement.cwd}. Inspect it with 'paseo workspace ls --json' and retry 'paseo workspace archive ${placement.workspaceId}' before creating another workspace.`,
+      options,
+    );
+    this.name = "WorkspaceCleanupUnconfirmedError";
   }
 }
 
@@ -3698,17 +3714,22 @@ export class Session {
       this.reportInitialPromptStartFailure(snapshot.id, initialPromptError);
       return snapshot.id;
     } catch (error) {
-      await this.createAgentLifecycleDispatch.cleanupCreatedWorktreeAfterFailedAgentCreate({
-        createdWorktree: requestContext ? null : createdWorktreeForCleanup,
-        createdAgentId,
-      });
-      await this.cleanupRequestCreatedPlacementAfterFailedAgentCreate({
-        createdPlacement: createdPlacementForCleanup,
-        preserveForRetry: Boolean(requestContext),
-        createdAgentId,
-      });
+      let reportedError = error;
+      try {
+        await this.createAgentLifecycleDispatch.cleanupCreatedWorktreeAfterFailedAgentCreate({
+          createdWorktree: requestContext ? null : createdWorktreeForCleanup,
+          createdAgentId,
+        });
+        await this.cleanupRequestCreatedPlacementAfterFailedAgentCreate({
+          createdPlacement: createdPlacementForCleanup,
+          preserveForRetry: Boolean(requestContext),
+          createdAgentId,
+        });
+      } catch (cleanupError) {
+        reportedError = cleanupError;
+      }
       await this.recoverPendingAgentCreation(pendingCreationAgentId);
-      throw error;
+      throw reportedError;
     }
   }
 
@@ -3721,20 +3742,35 @@ export class Session {
     if (!createdPlacement || input.preserveForRetry || input.createdAgentId) return;
 
     if (createdPlacement.kind === "worktree") {
-      await this.createAgentLifecycleDispatch.cleanupCreatedWorktreeAfterFailedAgentCreate({
-        createdWorktree: createdPlacement.createdWorktree,
-        createdAgentId: null,
-      });
+      try {
+        await this.createAgentLifecycleDispatch.cleanupCreatedWorktreeAfterFailedAgentCreate({
+          createdWorktree: createdPlacement.createdWorktree,
+          createdAgentId: null,
+        });
+        const workspace = await this.workspaceRegistry.get(createdPlacement.workspaceId);
+        if (workspace && (!workspace.archivedAt || workspace.cleanupPending)) {
+          throw new WorkspaceCleanupUnconfirmedError(createdPlacement);
+        }
+      } catch (cleanupError) {
+        if (cleanupError instanceof WorkspaceCleanupUnconfirmedError) throw cleanupError;
+        throw new WorkspaceCleanupUnconfirmedError(createdPlacement, { cause: cleanupError });
+      }
       return;
     }
 
     try {
       await this.archiveWorkspaceRecord(createdPlacement.workspaceId);
+      const workspace = await this.workspaceRegistry.get(createdPlacement.workspaceId);
+      if (workspace && !workspace.archivedAt) {
+        throw new WorkspaceCleanupUnconfirmedError(createdPlacement);
+      }
     } catch (cleanupError) {
+      if (cleanupError instanceof WorkspaceCleanupUnconfirmedError) throw cleanupError;
       this.sessionLogger.warn(
         { err: cleanupError, workspaceId: createdPlacement.workspaceId },
         "Failed to archive request-owned workspace after agent creation failed",
       );
+      throw new WorkspaceCleanupUnconfirmedError(createdPlacement, { cause: cleanupError });
     }
   }
 
@@ -3826,7 +3862,11 @@ export class Session {
       return {
         workspaceId: workspace.workspaceId,
         cwd: workspace.cwd,
-        createdPlacement: { kind: "directory", workspaceId: workspace.workspaceId },
+        createdPlacement: {
+          kind: "directory",
+          workspaceId: workspace.workspaceId,
+          cwd: workspace.cwd,
+        },
       };
     }
 
@@ -3864,6 +3904,7 @@ export class Session {
       createdPlacement: {
         kind: "worktree",
         workspaceId: result.workspace.workspaceId,
+        cwd: result.workspace.cwd,
         createdWorktree: result,
       },
     };

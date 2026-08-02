@@ -7,6 +7,8 @@ export type WorktreeWireErrorCode =
   | typeof MANAGED_WORKTREE_WRITER_CONFLICT_ERROR_CODE
   | "missing_checkout_target"
   | "unknown_branch"
+  | "agent_create_retryable"
+  | "workspace_cleanup_unconfirmed"
   | "unknown";
 
 export interface WorktreeWireError {
@@ -25,6 +27,20 @@ export class WorktreeRequestError extends Error {
 }
 
 export function toWorktreeWireError(error: unknown): WorktreeWireError {
+  if (
+    error instanceof Error &&
+    ((error as Error & { code?: unknown }).code === "agent_create_retryable" ||
+      (error as Error & { code?: unknown }).code === "workspace_cleanup_unconfirmed")
+  ) {
+    return {
+      code: (
+        error as Error & {
+          code: "agent_create_retryable" | "workspace_cleanup_unconfirmed";
+        }
+      ).code,
+      message: error.message,
+    };
+  }
   if (
     error instanceof Error &&
     (error as Error & { code?: unknown }).code === MANAGED_WORKTREE_WRITER_CONFLICT_ERROR_CODE

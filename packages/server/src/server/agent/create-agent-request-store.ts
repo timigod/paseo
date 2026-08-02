@@ -137,6 +137,24 @@ interface CreateAgentRequestStoreOptions {
   retentionMs?: number;
   maxReceipts?: number;
   maxFileBytes?: number;
+  writeReceiptFile?: typeof writeJsonFileAtomic;
+}
+
+export class CreateAgentRetryableReceiptError extends Error {
+  readonly code = "agent_create_retryable";
+
+  constructor(
+    message: string,
+    readonly receipt: {
+      agentId: string;
+      idempotencyKey: string;
+      placement?: { workspaceId: string; cwd: string };
+    },
+    options?: { cause?: unknown },
+  ) {
+    super(message, options);
+    this.name = "CreateAgentRetryableReceiptError";
+  }
 }
 
 interface RunCreateAgentRequestInput {
@@ -168,6 +186,7 @@ export class CreateAgentRequestStore {
   private readonly retentionMs: number;
   private readonly maxReceipts: number;
   private readonly maxFileBytes: number;
+  private readonly writeReceiptFile: typeof writeJsonFileAtomic;
   private readonly receipts = new Map<string, CreateAgentRequestReceipt>();
   private readonly inflight = new Map<string, InflightCreateAgentRequest>();
   private loadPromise: Promise<void> | null = null;
@@ -182,6 +201,7 @@ export class CreateAgentRequestStore {
     this.retentionMs = options.retentionMs ?? CREATE_AGENT_REQUEST_RETENTION_MS;
     this.maxReceipts = options.maxReceipts ?? CREATE_AGENT_REQUEST_MAX_RECEIPTS;
     this.maxFileBytes = options.maxFileBytes ?? CREATE_AGENT_REQUEST_MAX_FILE_BYTES;
+    this.writeReceiptFile = options.writeReceiptFile ?? writeJsonFileAtomic;
   }
 
   async run(input: RunCreateAgentRequestInput): Promise<string> {
@@ -238,11 +258,20 @@ export class CreateAgentRequestStore {
         placement: pending.placement,
         checkpoint: async (phase, placement) => {
           assertPhaseTransition(pending.phase, phase);
-          pending = await this.updateReceipt(scopedKey, {
+          const next = {
             ...pending,
             phase,
             ...(placement ? { placement } : {}),
-          });
+          };
+          // Claim the side effect in memory before persistence. If the write
+          // fails after placement creation, the catch path can persist this
+          // exact affinity instead of terminalising an unreferenced workspace.
+          pending = next;
+          try {
+            pending = await this.updateReceipt(scopedKey, next);
+          } catch (checkpointError) {
+            throw this.retryableReceiptError(pending, checkpointError);
+          }
         },
       });
       await this.updateReceipt(scopedKey, { ...pending, state: "succeeded" });
@@ -251,11 +280,19 @@ export class CreateAgentRequestStore {
       const agentWasRegistered =
         CREATE_AGENT_PHASE_ORDER[pending.phase] < CREATE_AGENT_PHASE_ORDER.agent_registered &&
         (await this.hasAgent(pending.agentId));
-      await this.updateReceipt(scopedKey, {
+      const recoveryReceipt = {
         ...pending,
-        state: pending.phase === "reserved" && !agentWasRegistered ? "failed" : "pending",
+        state:
+          pending.phase === "reserved" && !agentWasRegistered
+            ? ("failed" as const)
+            : ("pending" as const),
         ...(agentWasRegistered ? { phase: "agent_registered" as const } : {}),
-      });
+      };
+      try {
+        await this.updateReceipt(scopedKey, recoveryReceipt);
+      } catch (recoveryError) {
+        throw this.retryableReceiptError(recoveryReceipt, recoveryError);
+      }
       throw error;
     }
   }
@@ -477,7 +514,7 @@ export class CreateAgentRequestStore {
               `Create idempotency receipt file limit of ${this.maxFileBytes} bytes was reached`,
             );
           }
-          await writeJsonFileAtomic(this.filePath, snapshot);
+          await this.writeReceiptFile(this.filePath, snapshot);
           ensurePrivateFile(this.filePath);
         } catch (error) {
           this.receipts.clear();
@@ -490,6 +527,25 @@ export class CreateAgentRequestStore {
       });
     this.writeQueue = operation;
     await operation;
+  }
+
+  private retryableReceiptError(
+    receipt: CreateAgentRequestReceipt,
+    cause: unknown,
+  ): CreateAgentRetryableReceiptError {
+    const placement = receipt.placement;
+    const target = placement
+      ? `placement ${placement.workspaceId} at ${placement.cwd}`
+      : `agent ${receipt.agentId}`;
+    return new CreateAgentRetryableReceiptError(
+      `Create receipt persistence was not confirmed for ${target}. Retry with the same idempotency key '${receipt.key}'; the daemon will reuse the original placement and agent identity.`,
+      {
+        agentId: receipt.agentId,
+        idempotencyKey: receipt.key,
+        ...(placement ? { placement } : {}),
+      },
+      { cause },
+    );
   }
 }
 

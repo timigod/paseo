@@ -66,7 +66,29 @@ describe("failed run receipts", () => {
       normalizeRunErrorWithWorkspaceReceipt(new Error("connection reset"), atomicIntent, {}),
     ).toMatchObject({
       code: "AGENT_CREATE_OUTCOME_UNKNOWN",
-      details: expect.stringContaining("Inspect the agent and workspace lists"),
+      message: expect.stringContaining("connection reset"),
+      details: {
+        recovery: expect.stringContaining("Inspect the agent and workspace lists"),
+      },
+    });
+  });
+
+  it("materializes non-enumerable fields from a coded transport Error", () => {
+    const transportError = Object.assign(new Error("socket reset by peer"), {
+      code: "ECONNRESET",
+    });
+
+    expect(normalizeRunErrorWithWorkspaceReceipt(transportError, atomicIntent, {})).toMatchObject({
+      code: "AGENT_CREATE_OUTCOME_UNKNOWN",
+      message: "socket reset by peer",
+      details: {
+        cause: {
+          name: "Error",
+          code: "ECONNRESET",
+          message: "socket reset by peer",
+          stack: expect.stringContaining("Error: socket reset by peer"),
+        },
+      },
     });
   });
 
@@ -77,7 +99,10 @@ describe("failed run receipts", () => {
       error: "Invalid mode",
       code: "agent_create_failed",
     });
-    expect(normalizeRunErrorWithWorkspaceReceipt(rejection, atomicIntent, {})).toBe(rejection);
+    expect(normalizeRunErrorWithWorkspaceReceipt(rejection, atomicIntent, {})).toMatchObject({
+      code: "agent_create_failed",
+      message: expect.stringContaining("Invalid mode"),
+    });
   });
 
   it("reports the exact legacy workspace preserved after an ambiguous failure", () => {
@@ -93,7 +118,9 @@ describe("failed run receipts", () => {
       normalizeRunErrorWithWorkspaceReceipt(new Error("connection reset"), legacyIntent, {}),
     ).toMatchObject({
       code: "AGENT_CREATE_FAILED_WORKSPACE_PRESERVED",
-      details: expect.stringContaining("--workspace workspace-legacy"),
+      details: {
+        recovery: expect.stringContaining("--workspace workspace-legacy"),
+      },
     });
   });
 

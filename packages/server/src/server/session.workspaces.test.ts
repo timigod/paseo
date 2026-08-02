@@ -162,6 +162,13 @@ interface SessionTestAccess {
   handleArchiveAgentRequest(agentId: string, requestId: string, source?: object): Promise<unknown>;
   handleMessage(message: unknown, source?: object): Promise<unknown>;
   handleCreatePaseoWorktreeRequest(params: unknown): Promise<unknown>;
+  cleanupRequestCreatedPlacementAfterFailedAgentCreate(input: {
+    createdPlacement:
+      | { kind: "directory"; workspaceId: string; cwd: string }
+      | { kind: "worktree"; workspaceId: string; cwd: string; createdWorktree: unknown };
+    preserveForRetry: boolean;
+    createdAgentId: string | null;
+  }): Promise<void>;
   listAgentPayloads(...args: unknown[]): Promise<unknown[]>;
   listFetchWorkspacesEntries(params: unknown): Promise<ListFetchResult>;
   listFetchAgentsEntries(params: unknown): Promise<ListFetchResult>;
@@ -9252,6 +9259,99 @@ test("idempotent retry reuses its durable placement instead of archiving or dupl
   } finally {
     rmSync(paseoHome, { recursive: true, force: true });
   }
+});
+
+test("directory cleanup failure returns an exact cleanup-unconfirmed receipt", async () => {
+  const emitted: SessionOutboundMessage[] = [];
+  const workspaces = new Map<string, PersistedWorkspaceRecord>();
+  const session = createSessionForWorkspaceTests({
+    onMessage: (message) => emitted.push(message),
+    agentManager: {
+      createAgent: async () => {
+        throw new Error("provider rejected startup");
+      },
+    },
+    workspaceRegistry: {
+      initialize: async () => undefined,
+      existsOnDisk: async () => true,
+      list: async () => [...workspaces.values()],
+      get: async (workspaceId) => workspaces.get(workspaceId) ?? null,
+      upsert: async (workspace) => {
+        workspaces.set(workspace.workspaceId, workspace);
+      },
+      archive: async () => {
+        throw new Error("injected directory archive failure");
+      },
+      remove: async (workspaceId) => {
+        workspaces.delete(workspaceId);
+      },
+    },
+  });
+
+  await session.handleMessage({
+    type: "create_agent_request",
+    requestId: "req-directory-cleanup-unconfirmed",
+    config: { provider: "codex", cwd: REPO_CWD },
+    workspaceSource: { kind: "directory", path: REPO_CWD },
+    initialPrompt: "implement",
+    attachments: [],
+  });
+
+  const payload = findByType(emitted, "status")?.payload;
+  expect(payload).toMatchObject({
+    status: "agent_create_failed",
+    requestId: "req-directory-cleanup-unconfirmed",
+    errorCode: "workspace_cleanup_unconfirmed",
+    error: expect.stringMatching(/paseo workspace archive wks_/),
+  });
+  expect(workspaces.size).toBe(1);
+  expect([...workspaces.values()][0]?.archivedAt).toBeNull();
+});
+
+test("worktree cleanup verification surfaces the exact active placement", async () => {
+  const workspace = createPersistedWorkspaceRecord({
+    workspaceId: "wks_worktree_cleanup_unconfirmed",
+    projectId: "proj-worktree-cleanup-unconfirmed",
+    cwd: "/tmp/worktrees/cleanup-unconfirmed",
+    kind: "directory",
+    displayName: "cleanup-unconfirmed",
+    createdAt: "2026-08-02T12:00:00.000Z",
+    updatedAt: "2026-08-02T12:00:00.000Z",
+  });
+  const cleanupDispatch = createAgentLifecycleDispatchStub();
+  const cleanup = vi
+    .spyOn(cleanupDispatch, "cleanupCreatedWorktreeAfterFailedAgentCreate")
+    .mockResolvedValue(undefined);
+  const session = createSessionForWorkspaceTests({
+    createAgentLifecycleDispatch: cleanupDispatch,
+    workspaceRegistry: {
+      initialize: async () => undefined,
+      existsOnDisk: async () => true,
+      list: async () => [workspace],
+      get: async (workspaceId) => (workspaceId === workspace.workspaceId ? workspace : null),
+      upsert: async () => undefined,
+      archive: async () => undefined,
+      remove: async () => undefined,
+    },
+  });
+  const internals = asSessionInternals<SessionTestAccess>(session);
+
+  await expect(
+    internals.cleanupRequestCreatedPlacementAfterFailedAgentCreate({
+      createdPlacement: {
+        kind: "worktree",
+        workspaceId: workspace.workspaceId,
+        cwd: workspace.cwd,
+        createdWorktree: { created: true },
+      },
+      preserveForRetry: false,
+      createdAgentId: null,
+    }),
+  ).rejects.toMatchObject({
+    code: "workspace_cleanup_unconfirmed",
+    message: expect.stringContaining(`paseo workspace archive ${workspace.workspaceId}`),
+  });
+  expect(cleanup).toHaveBeenCalledOnce();
 });
 
 test("create_agent_request returns a sanitized managed-worktree writer conflict", async () => {

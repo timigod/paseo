@@ -6,9 +6,11 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   CreateAgentIdempotencyConflictError,
   CreateAgentRequestStore,
+  CreateAgentRetryableReceiptError,
   type CreateAgentRequestContext,
   fingerprintCreateAgentRequest,
 } from "./create-agent-request-store.js";
+import { writeJsonFileAtomic } from "../atomic-file.js";
 
 const REQUEST_A = "a".repeat(64);
 const REQUEST_B = "b".repeat(64);
@@ -32,6 +34,56 @@ afterEach(() => {
 });
 
 describe("CreateAgentRequestStore", () => {
+  it.each(["directory", "worktree"] as const)(
+    "keeps exact %s placement affinity when its checkpoint write fails",
+    async (kind) => {
+      const home = createHome();
+      let writeCount = 0;
+      const placement = {
+        workspaceId: kind === "directory" ? "wks_directory_fault" : "wks_worktree_fault",
+        cwd: kind === "directory" ? "/tmp/project" : "/tmp/worktrees/fault",
+      };
+      const observed: Array<{
+        phase: CreateAgentRequestContext["phase"];
+        placement: CreateAgentRequestContext["placement"];
+      }> = [];
+      const store = new CreateAgentRequestStore({
+        paseoHome: home,
+        hasAgent: async () => false,
+        idFactory: () => "00000000-0000-4000-8000-000000000000",
+        writeReceiptFile: async (filePath, value) => {
+          writeCount += 1;
+          if (writeCount === 2) {
+            throw new Error("injected placement checkpoint write failure");
+          }
+          await writeJsonFileAtomic(filePath, value);
+        },
+      });
+      const input = scopedInput({
+        key: `checkpoint-${kind}`,
+        fingerprint: REQUEST_A,
+        create: async (context: CreateAgentRequestContext) => {
+          observed.push({ phase: context.phase, placement: context.placement });
+          if (context.phase === "reserved") {
+            await context.checkpoint("placement_created", placement);
+          }
+        },
+      });
+
+      await expect(store.run(input)).rejects.toMatchObject({
+        name: "CreateAgentRetryableReceiptError",
+        code: "agent_create_retryable",
+        receipt: { idempotencyKey: `checkpoint-${kind}`, placement },
+      } satisfies Partial<CreateAgentRetryableReceiptError>);
+      await expect(store.run(input)).resolves.toBe("00000000-0000-4000-8000-000000000000");
+
+      expect(observed).toEqual([
+        { phase: "reserved", placement: undefined },
+        { phase: "placement_created", placement },
+      ]);
+    },
+  );
+
   it("coalesces concurrent requests and durably replays the created agent", async () => {
     const home = createHome();
     const existingAgents = new Set<string>();

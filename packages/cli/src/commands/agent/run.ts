@@ -683,9 +683,12 @@ export function normalizeRunErrorWithWorkspaceReceipt(
       return {
         ...commandError,
         code: "AGENT_CREATE_OUTCOME_UNKNOWN",
-        details: idempotencyKey
-          ? `The daemon did not confirm the atomic create response. Retry with the same --idempotency-key ${idempotencyKey}; it will reuse the original placement and agent.`
-          : "The daemon did not confirm the atomic create response. Inspect the agent and workspace lists before retrying; the daemon may have completed the request.",
+        details: {
+          recovery: idempotencyKey
+            ? `The daemon did not confirm the atomic create response. Retry with the same --idempotency-key ${idempotencyKey}; it will reuse the original placement and agent.`
+            : "The daemon did not confirm the atomic create response. Inspect the agent and workspace lists before retrying; the daemon may have completed the request.",
+          cause: describeRunError(error, commandError),
+        },
       } satisfies CommandError;
     }
     return normalized;
@@ -695,10 +698,22 @@ export function normalizeRunErrorWithWorkspaceReceipt(
   return {
     ...commandError,
     code: "AGENT_CREATE_FAILED_WORKSPACE_PRESERVED",
-    details:
-      `Workspace ${workspaceId} was preserved at ${intent?.create.config.cwd}. ` +
-      `Inspect it or retry with --workspace ${workspaceId}; do not create another workspace.`,
+    details: {
+      recovery:
+        `Workspace ${workspaceId} was preserved at ${intent?.create.config.cwd}. ` +
+        `Inspect it or retry with --workspace ${workspaceId}; do not create another workspace.`,
+      cause: describeRunError(error, commandError),
+    },
   } satisfies CommandError;
+}
+
+function describeRunError(error: unknown, normalized: CommandError) {
+  return {
+    name: error instanceof Error ? error.name : "Error",
+    message: normalized.message,
+    code: normalized.code,
+    ...(error instanceof Error && error.stack ? { stack: error.stack } : {}),
+  };
 }
 
 interface LocalRunInputs {
@@ -913,9 +928,26 @@ async function executeAgentRunIntent(
   return { type: "single", data: toRunResult(agent), schema: agentRunSchema };
 }
 
-function normalizeRunError(error: unknown): unknown {
+function normalizeRunError(error: unknown): CommandError {
   if (error && typeof error === "object" && "code" in error) {
-    return error;
+    const code = typeof error.code === "string" ? error.code : "AGENT_CREATE_FAILED";
+    let message = String(error);
+    if (error instanceof Error) {
+      message = error.message;
+    } else if ("message" in error && typeof error.message === "string") {
+      message = error.message;
+    }
+    let details: unknown;
+    if ("details" in error) {
+      details = error.details;
+    } else if (error instanceof Error && error.stack) {
+      details = error.stack;
+    }
+    return {
+      code,
+      message,
+      ...(details !== undefined ? { details } : {}),
+    };
   }
   const message = error instanceof Error ? error.message : String(error);
   return {
