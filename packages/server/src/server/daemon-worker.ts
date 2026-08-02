@@ -6,8 +6,10 @@ import { resolvePaseoHome } from "./paseo-home.js";
 import { createRootLogger } from "./logger.js";
 import type { DaemonLifecycleIntent } from "./bootstrap.js";
 import { getProcessDiagnostics } from "./process-diagnostics.js";
-
-process.title = "Paseo Daemon";
+import {
+  SUPERVISOR_OWNERSHIP_COMMITTED_MESSAGE,
+  SUPERVISOR_WORKER_TOKEN_ENV,
+} from "./supervisor-worker-ownership.js";
 
 type SupervisorLifecycleMessage =
   | {
@@ -21,6 +23,12 @@ type SupervisorLifecycleMessage =
   | {
       type: "paseo:restart";
       reason?: string;
+    }
+  | {
+      type: "paseo:start-failed";
+      code: string;
+      message: string;
+      listen: string;
     };
 
 interface SupervisorHeartbeatMessage {
@@ -34,6 +42,7 @@ interface BootstrapResult {
 }
 
 const SHUTDOWN_TIMEOUT_MS = 10_000;
+const OWNERSHIP_COMMIT_TIMEOUT_MS = 15_000;
 
 function isPidAlive(pid: number): boolean {
   try {
@@ -70,6 +79,58 @@ function writeWorkerLifecycleLog(
   } catch {
     // Exit-reason logging must never prevent the worker from exiting.
   }
+}
+
+async function waitForOwnershipCommit(): Promise<void> {
+  if (!process.env[SUPERVISOR_WORKER_TOKEN_ENV]) {
+    return;
+  }
+  if (typeof process.send !== "function") {
+    throw new Error("Supervised daemon worker started without an IPC channel");
+  }
+
+  await new Promise<void>((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      cleanup();
+      reject(new Error("Supervisor did not commit worker ownership before startup timeout"));
+    }, OWNERSHIP_COMMIT_TIMEOUT_MS);
+    const onMessage = (message: unknown) => {
+      if (
+        typeof message === "object" &&
+        message !== null &&
+        "type" in message &&
+        (message as { type?: unknown }).type === SUPERVISOR_OWNERSHIP_COMMITTED_MESSAGE
+      ) {
+        cleanup();
+        resolve();
+      }
+    };
+    const onDisconnect = () => {
+      cleanup();
+      reject(new Error("Supervisor disconnected before committing worker ownership"));
+    };
+    const cleanup = () => {
+      clearTimeout(timeout);
+      process.off("message", onMessage);
+      process.off("disconnect", onDisconnect);
+    };
+    process.on("message", onMessage);
+    process.once("disconnect", onDisconnect);
+  });
+}
+
+function findErrorCode(error: unknown): string | null {
+  let current = error;
+  for (let depth = 0; depth < 5; depth += 1) {
+    if (typeof current !== "object" || current === null) {
+      return null;
+    }
+    if ("code" in current && typeof current.code === "string") {
+      return current.code;
+    }
+    current = "cause" in current ? current.cause : null;
+  }
+  return null;
 }
 
 function bootstrapFromEnvironment(): BootstrapResult {
@@ -307,6 +368,15 @@ async function main() {
     sendSupervisorLifecycleMessage({ type: "paseo:ready", listen });
   } catch (err) {
     logger.fatal({ err }, "Daemon failed to start listening");
+    const code = findErrorCode(err);
+    if (code === "EADDRINUSE") {
+      sendSupervisorLifecycleMessage({
+        type: "paseo:start-failed",
+        code,
+        message: err instanceof Error ? err.message : String(err),
+        listen: config.listen,
+      });
+    }
     throw err;
   }
 
@@ -331,7 +401,9 @@ function exitAfterPinoFlush(): void {
   setTimeout(() => process.exit(1), 200);
 }
 
-main().catch((err) => {
-  process.stderr.write(`${err instanceof Error ? (err.stack ?? err.message) : String(err)}\n`);
-  exitAfterPinoFlush();
-});
+waitForOwnershipCommit()
+  .then(main)
+  .catch((err) => {
+    process.stderr.write(`${err instanceof Error ? (err.stack ?? err.message) : String(err)}\n`);
+    exitAfterPinoFlush();
+  });

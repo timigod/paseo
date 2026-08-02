@@ -79,6 +79,29 @@ not retain non-Git directories.
 | `server/loop-service.ts`        | Looping agent runs that retry until an exit condition                         |
 | `server/chat/`                  | Chat rooms for agent-to-agent and human-to-agent messaging                    |
 
+#### Daemon supervisor ownership
+
+The daemon supervisor records its current worker in
+`$PASEO_HOME/supervisor-worker.json` before allowing that worker to listen. The atomic record binds
+the worker PID to the Paseo home, resolved worker entrypoint, desktop-management mode, OS process
+start time, command line, a random worker token, and a random supervisor incarnation. A replacement
+supervisor acquires the normal PID lock first, then uses this record to recover an orphan from a
+previous supervisor incarnation.
+
+Recovery is fail-closed. The replacement sends `SIGTERM` only after the service boundary, process
+start time, and worker identity match. If the worker does not stop within the grace period, it checks
+the identity again before sending `SIGKILL`. Invalid state, failed inspection, or unavailable
+identity before a signal leaves the process untouched and preserves the state file for diagnosis.
+If the PID changes identity after a signal, recovery treats the owned worker as gone without
+signaling the replacement process. An unrelated process that happens to own the daemon port is never
+treated as an orphan; the worker reports `EADDRINUSE` and the supervisor exits with an actionable
+error instead of crash-looping.
+
+On macOS and Linux, external process inspection reads the random token from the worker environment.
+The supervised worker therefore retains its original process title because Node's `process.title`
+rewrite can overwrite the environment memory exposed by `ps`. The runtime-only ownership variables
+are removed before the daemon starts agent or user subprocesses.
+
 ### `packages/protocol` — Wire schemas and shared protocol types
 
 The source of truth for WebSocket messages, binary frame codecs, endpoint parsing,

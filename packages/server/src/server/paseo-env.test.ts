@@ -19,12 +19,16 @@ describe("paseo env contract", () => {
     PASEO_DESKTOP_MANAGED: "1",
     [PASEO_NODE_ENV]: "production",
     PASEO_SUPERVISED: "1",
+    PASEO_SUPERVISOR_INCARNATION: "supervisor-incarnation",
+    PASEO_SUPERVISOR_WORKER_TOKEN: "worker-token",
   };
   const runtimeControlEnvKeys = [
     "ELECTRON_RUN_AS_NODE",
     "PASEO_NODE_ENV",
     "PASEO_DESKTOP_MANAGED",
     "PASEO_SUPERVISED",
+    "PASEO_SUPERVISOR_INCARNATION",
+    "PASEO_SUPERVISOR_WORKER_TOKEN",
     "ELECTRON_NO_ATTACH_CONSOLE",
   ] as const;
 
@@ -39,6 +43,8 @@ describe("paseo env contract", () => {
       PASEO_DESKTOP_MANAGED: "1",
       [PASEO_NODE_ENV]: "production",
       PASEO_SUPERVISED: "1",
+      PASEO_SUPERVISOR_INCARNATION: "supervisor-incarnation",
+      PASEO_SUPERVISOR_WORKER_TOKEN: "worker-token",
       PASEO_AGENT_ID: "agent-123",
     });
   });

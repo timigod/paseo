@@ -2,6 +2,11 @@ import { fork, spawn, type ChildProcess } from "child_process";
 import { mkdirSync } from "node:fs";
 import path from "node:path";
 import { createStream as createRotatingFileStream } from "rotating-file-stream";
+import {
+  SUPERVISOR_OWNERSHIP_COMMITTED_MESSAGE,
+  type SupervisorWorkerClaim,
+  type SupervisorWorkerOwnership,
+} from "../src/server/supervisor-worker-ownership.js";
 
 interface SupervisorLogFileOptions {
   path: string;
@@ -23,6 +28,12 @@ type WorkerLifecycleMessage =
   | {
       type: "paseo:restart";
       reason?: string;
+    }
+  | {
+      type: "paseo:start-failed";
+      code: string;
+      message: string;
+      listen: string;
     };
 
 interface SupervisorHeartbeatMessage {
@@ -45,6 +56,11 @@ interface SupervisorOptions {
   restartOnCrash?: boolean;
   onSupervisorExit?: () => Promise<void> | void;
   logFile?: SupervisorLogFileOptions;
+  workerOwnership?: SupervisorWorkerOwnership;
+  startupReceipt?: {
+    message: string;
+    fields: Record<string, unknown>;
+  };
 }
 
 export interface SupervisorController {
@@ -80,6 +96,15 @@ function parseLifecycleMessage(msg: unknown): WorkerLifecycleMessage | null {
       type: "paseo:restart",
       ...(typeof reason === "string" && reason.trim().length > 0 ? { reason } : {}),
     };
+  }
+  if (type === "paseo:start-failed") {
+    const code = (msg as { code?: unknown }).code;
+    const message = (msg as { message?: unknown }).message;
+    const listen = (msg as { listen?: unknown }).listen;
+    if (typeof code !== "string" || typeof message !== "string" || typeof listen !== "string") {
+      return null;
+    }
+    return { type: "paseo:start-failed", code, message, listen };
   }
   return null;
 }
@@ -117,9 +142,13 @@ export function runSupervisor(options: SupervisorOptions): SupervisorController 
   const resolveWorkerSpawnSpec = options.resolveWorkerSpawnSpec;
 
   let child: ChildProcess | null = null;
+  let childOwnership: SupervisorWorkerClaim | null = null;
+  let workerStopTimer: NodeJS.Timeout | null = null;
   let restarting = false;
   let shuttingDown = false;
   let exiting = false;
+  let workerStartupFailure: Extract<WorkerLifecycleMessage, { type: "paseo:start-failed" }> | null =
+    null;
   const logStream = createSupervisorLogStream(options.logFile);
 
   const writeDurableChunk = (chunk: string | Buffer): void => {
@@ -139,9 +168,9 @@ export function runSupervisor(options: SupervisorOptions): SupervisorController 
     );
   };
 
-  const log = (message: string): void => {
+  const log = (message: string, fields: Record<string, unknown> = {}): void => {
     process.stderr.write(`[${options.name}] ${message}\n`);
-    writeLifecycleLog(message);
+    writeLifecycleLog(message, fields);
   };
 
   const closeLogStream = (): Promise<void> =>
@@ -169,6 +198,44 @@ export function runSupervisor(options: SupervisorOptions): SupervisorController 
       });
   };
 
+  const clearWorkerStopTimer = (): void => {
+    if (workerStopTimer) {
+      clearTimeout(workerStopTimer);
+      workerStopTimer = null;
+    }
+  };
+
+  const scheduleWorkerEscalation = (
+    currentChild: ChildProcess,
+    ownership: SupervisorWorkerClaim | null,
+    reason: string,
+  ): void => {
+    clearWorkerStopTimer();
+    workerStopTimer = setTimeout(() => {
+      void (async () => {
+        if (child !== currentChild || currentChild.exitCode !== null || currentChild.signalCode) {
+          return;
+        }
+        if (ownership && !(await ownership.verify())) {
+          log(
+            `Worker PID ${currentChild.pid ?? "unknown"} did not stop, but its ownership identity no longer matches. Refusing SIGKILL; inspect ${currentChild.pid ?? "the worker PID"} manually.`,
+          );
+          return;
+        }
+        writeLifecycleLog("Worker graceful stop timed out; escalating", {
+          reason,
+          signal: "SIGKILL",
+          workerPid: currentChild.pid ?? null,
+        });
+        log(`${reason}. Worker did not stop gracefully; sending SIGKILL...`);
+        currentChild.kill("SIGKILL");
+      })().catch((error) => {
+        log(`Worker escalation failed: ${error instanceof Error ? error.message : String(error)}`);
+      });
+    }, 12_000);
+    workerStopTimer.unref();
+  };
+
   const spawnWorker = () => {
     let workerEntry: string;
     try {
@@ -182,21 +249,50 @@ export function runSupervisor(options: SupervisorOptions): SupervisorController 
     }
 
     const spawnSpec = resolveWorkerSpawnSpec?.(workerEntry) ?? null;
+    const ownership = options.workerOwnership?.createClaim(spawnSpec?.env ?? workerEnv) ?? null;
     writeLifecycleLog("Spawning worker", { workerEntry });
     if (spawnSpec) {
       child = spawn(spawnSpec.command, spawnSpec.args, {
         stdio: ["inherit", "pipe", "pipe", "ipc"],
-        env: spawnSpec.env ?? workerEnv,
+        env: ownership?.env ?? spawnSpec.env ?? workerEnv,
       });
     } else {
       child = fork(workerEntry, workerArgs, {
         stdio: ["inherit", "pipe", "pipe", "ipc"],
-        env: workerEnv,
+        env: ownership?.env ?? workerEnv,
         execArgv: workerExecArgv,
       });
     }
 
     const currentChild = child;
+    childOwnership = ownership;
+    workerStartupFailure = null;
+    if (ownership) {
+      const workerPid = currentChild.pid;
+      if (!workerPid) {
+        log("Spawned worker did not expose a PID; refusing unowned startup");
+        currentChild.kill("SIGKILL");
+        exitSupervisor(1);
+        return;
+      }
+      void ownership
+        .commit(workerPid)
+        .then(() => {
+          if (child !== currentChild || !currentChild.connected) {
+            return ownership.clear();
+          }
+          writeLifecycleLog("Worker ownership committed", { workerPid });
+          currentChild.send({ type: SUPERVISOR_OWNERSHIP_COMMITTED_MESSAGE });
+          return undefined;
+        })
+        .catch((error) => {
+          log(
+            `Worker ownership commit failed: ${error instanceof Error ? error.message : String(error)}`,
+          );
+          currentChild.kill("SIGKILL");
+          exitSupervisor(1);
+        });
+    }
     const heartbeat = setInterval(() => {
       const message: SupervisorHeartbeatMessage = { type: "paseo:supervisor-heartbeat" };
       if (currentChild.connected) {
@@ -251,39 +347,70 @@ export function runSupervisor(options: SupervisorOptions): SupervisorController 
         return;
       }
 
+      if (lifecycleMessage.type === "paseo:start-failed") {
+        workerStartupFailure = lifecycleMessage;
+        log(
+          `Daemon worker could not listen on ${lifecycleMessage.listen} (${lifecycleMessage.code}: ${lifecycleMessage.message}). No owned stale worker matched this startup; refusing to terminate the unknown port owner.`,
+        );
+        return;
+      }
+
       const reason = lifecycleMessage.reason ?? "worker_requested_restart";
       writeLifecycleLog("Worker requested restart", { reason });
       requestRestart(reason);
     });
 
     child.on("close", (code, signal) => {
-      clearInterval(heartbeat);
-      const exitDescriptor = describeExit(code, signal);
-      writeLifecycleLog("Worker exited", { code, signal, exit: exitDescriptor });
+      void (async () => {
+        clearInterval(heartbeat);
+        clearWorkerStopTimer();
+        const exitDescriptor = describeExit(code, signal);
+        writeLifecycleLog("Worker exited", { code, signal, exit: exitDescriptor });
+        if (ownership) {
+          await ownership.clear();
+        }
+        if (child === currentChild) {
+          childOwnership = null;
+        }
+        if (exiting) {
+          return;
+        }
 
-      if (shuttingDown) {
-        log(`Worker exited (${exitDescriptor}). Supervisor shutting down.`);
-        exitSupervisor(0);
-        return;
-      }
+        if (shuttingDown) {
+          log(`Worker exited (${exitDescriptor}). Supervisor shutting down.`);
+          exitSupervisor(0);
+          return;
+        }
 
-      const crashed =
-        restartOnCrash &&
-        ((code !== 0 && code !== null) || (signal !== null && signal !== "SIGTERM"));
+        if (workerStartupFailure) {
+          log(`Worker startup failed (${exitDescriptor}). Supervisor exiting.`);
+          exitSupervisor(1);
+          return;
+        }
 
-      if (restarting || crashed) {
-        restarting = false;
+        const crashed =
+          restartOnCrash &&
+          ((code !== 0 && code !== null) || (signal !== null && signal !== "SIGTERM"));
+
+        if (restarting || crashed) {
+          restarting = false;
+          log(
+            crashed
+              ? `Worker crashed (${exitDescriptor}). Restarting worker...`
+              : `Worker exited (${exitDescriptor}). Restarting worker...`,
+          );
+          spawnWorker();
+          return;
+        }
+
+        log(`Worker exited (${exitDescriptor}). Supervisor exiting.`);
+        exitSupervisor(typeof code === "number" ? code : 1);
+      })().catch((error) => {
         log(
-          crashed
-            ? `Worker crashed (${exitDescriptor}). Restarting worker...`
-            : `Worker exited (${exitDescriptor}). Restarting worker...`,
+          `Worker exit cleanup failed: ${error instanceof Error ? error.message : String(error)}`,
         );
-        spawnWorker();
-        return;
-      }
-
-      log(`Worker exited (${exitDescriptor}). Supervisor exiting.`);
-      exitSupervisor(typeof code === "number" ? code : 1);
+        exitSupervisor(1);
+      });
     });
   };
 
@@ -298,6 +425,7 @@ export function runSupervisor(options: SupervisorOptions): SupervisorController 
       workerPid: child.pid ?? null,
     });
     child.kill(signal);
+    scheduleWorkerEscalation(child, childOwnership, reason);
   };
 
   const requestRestart = (reason: string) => {
@@ -334,6 +462,9 @@ export function runSupervisor(options: SupervisorOptions): SupervisorController 
 
   process.stdout.write(`[${options.name}] ${options.startupMessage}\n`);
   writeLifecycleLog(options.startupMessage);
+  if (options.startupReceipt) {
+    log(options.startupReceipt.message, options.startupReceipt.fields);
+  }
   spawnWorker();
 
   return { requestShutdown };

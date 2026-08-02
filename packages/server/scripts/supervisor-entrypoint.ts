@@ -13,6 +13,10 @@ import { loadPersistedConfig } from "../src/server/persisted-config.js";
 import { runSupervisor } from "./supervisor.js";
 import { resolveSupervisorLogFile } from "./supervisor-log-config.js";
 import { applySherpaLoaderEnv } from "../src/server/speech/providers/local/sherpa/sherpa-runtime-env.js";
+import {
+  SupervisorWorkerOwnership,
+  type StaleWorkerRecoveryReceipt,
+} from "../src/server/supervisor-worker-ownership.js";
 
 process.title = "Paseo Supervisor";
 
@@ -127,6 +131,19 @@ async function main(): Promise<void> {
     throw error;
   }
 
+  const workerOwnership = new SupervisorWorkerOwnership({
+    paseoHome,
+    workerEntry,
+    desktopManaged: workerEnv.PASEO_DESKTOP_MANAGED === "1",
+  });
+  let recoveryReceipt: StaleWorkerRecoveryReceipt;
+  try {
+    recoveryReceipt = await workerOwnership.recoverStaleWorker();
+  } catch (error) {
+    await releasePidLock(paseoHome, { ownerPid: process.pid });
+    throw error;
+  }
+
   let lockReleased = false;
   let requestSupervisorShutdown: ((reason: string) => void) | null = null;
   const stopLockHeartbeat = startPidLockHeartbeat(paseoHome, {
@@ -173,6 +190,17 @@ async function main(): Promise<void> {
         })
       : undefined,
     restartOnCrash: true,
+    workerOwnership,
+    startupReceipt:
+      recoveryReceipt.status === "none"
+        ? undefined
+        : {
+            message:
+              recoveryReceipt.status === "cleared-dead"
+                ? `Cleared completed stale worker ownership record for PID ${recoveryReceipt.workerPid}`
+                : `Recovered owned stale worker PID ${recoveryReceipt.workerPid} (${recoveryReceipt.status})`,
+            fields: recoveryReceipt,
+          },
     logFile: supervisorLogFile,
     onWorkerReady: async ({ listen }) => {
       await updatePidLock(paseoHome, { listen }, { ownerPid: process.pid });

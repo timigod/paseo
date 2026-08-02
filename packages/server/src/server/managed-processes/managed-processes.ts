@@ -159,9 +159,11 @@ export function createManagedProcessRegistry(
 export function createSystemManagedProcessTable(options?: {
   platform?: NodeJS.Platform;
   commandRunner?: ManagedProcessCommandRunner;
+  identityEnvKey?: string;
 }): ManagedProcessTable {
   return new SystemManagedProcessTable({
     platform: options?.platform ?? process.platform,
+    identityEnvKey: options?.identityEnvKey ?? MANAGED_PROCESS_IDENTITY_ENV,
     commandRunner: options?.commandRunner ?? {
       exec: execCommand,
     },
@@ -187,10 +189,16 @@ export async function verifySystemManagedProcessIdentity(
 
 class SystemManagedProcessTable implements ManagedProcessTable {
   private readonly platform: NodeJS.Platform;
+  private readonly identityEnvKey: string;
   private readonly commandRunner: ManagedProcessCommandRunner;
 
-  constructor(options: { platform: NodeJS.Platform; commandRunner: ManagedProcessCommandRunner }) {
+  constructor(options: {
+    platform: NodeJS.Platform;
+    identityEnvKey: string;
+    commandRunner: ManagedProcessCommandRunner;
+  }) {
     this.platform = options.platform;
+    this.identityEnvKey = options.identityEnvKey;
     this.commandRunner = options.commandRunner;
   }
 
@@ -304,7 +312,7 @@ class SystemManagedProcessTable implements ManagedProcessTable {
         pid,
         commandLine: commandLine || null,
         startedAt: startedAt || null,
-        token: extractIdentityToken(environmentOutput),
+        token: extractIdentityToken(environmentOutput, this.identityEnvKey),
       },
     };
   }
@@ -712,8 +720,8 @@ function normalizeCommandLine(commandLine: string): string {
   return commandLine.replace(/\s+/g, " ").trim().toLowerCase();
 }
 
-function extractIdentityToken(output: string): string | null {
-  const pattern = new RegExp(`(?:^|\\s)${MANAGED_PROCESS_IDENTITY_ENV}=([^\\s]+)`);
+function extractIdentityToken(output: string, identityEnvKey: string): string | null {
+  const pattern = new RegExp(`(?:^|\\s)${identityEnvKey}=([^\\s]+)`);
   return output.match(pattern)?.[1] ?? null;
 }
 

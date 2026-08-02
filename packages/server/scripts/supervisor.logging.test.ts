@@ -13,6 +13,7 @@ const supervisorPath = fileURLToPath(new URL("./supervisor.ts", import.meta.url)
 async function runSupervisorFixture(options: {
   workerSource: string;
   restartOnCrash?: boolean;
+  ownershipCommitFailure?: boolean;
 }): Promise<{
   code: number | null;
   signal: NodeJS.Signals | null;
@@ -39,6 +40,21 @@ async function runSupervisorFixture(options: {
         workerEnv: process.env,
         workerExecArgv: [],
         restartOnCrash: ${JSON.stringify(options.restartOnCrash ?? false)},
+        workerOwnership: ${
+          options.ownershipCommitFailure
+            ? `{
+                createClaim(env) {
+                  return {
+                    env,
+                    workerPid: null,
+                    async commit() { throw new Error("fixture ownership commit failed"); },
+                    async verify() { return false; },
+                    async clear() {},
+                  };
+                },
+              }`
+            : "undefined"
+        },
         logFile: {
           path: ${JSON.stringify(logPath)},
           rotate: { maxSize: "1m", maxFiles: 2 },
@@ -167,6 +183,20 @@ describe("supervisor durable logging", () => {
 
     expect(result.log).toContain("raw stdout line\n");
     expect(result.log).toContain("raw stderr line\n");
+  });
+
+  test("does not restart after worker ownership commit fails", async () => {
+    const result = await runSupervisorFixture({
+      workerSource: `setInterval(() => {}, 1000);`,
+      restartOnCrash: true,
+      ownershipCommitFailure: true,
+    });
+
+    expect(result.code).toBe(1);
+    expect(result.stderr).toContain(
+      "Worker ownership commit failed: fixture ownership commit failed",
+    );
+    expect(result.stderr).not.toContain("Restarting worker");
   });
 
   test("logs the worker shutdown reason before signaling the worker", async () => {

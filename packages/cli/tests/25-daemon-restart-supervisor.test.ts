@@ -216,6 +216,11 @@ try {
     "worker pid should change after restart",
   );
 
+  await waitFor(
+    async () => (await readDaemonStatus(paseoHome)).localDaemon === "running",
+    120000,
+    "daemon did not become healthy after restart",
+  );
   const statusAfterRestart = await readDaemonStatus(paseoHome);
   assert.strictEqual(
     statusAfterRestart.localDaemon,
@@ -239,6 +244,35 @@ try {
     `restart should log supervisor signal dispatch, logs:\n${capturedSupervisorLogs}`,
   );
   console.log("✓ app-style restart keeps daemon healthy and restarts worker\n");
+
+  console.log("Test 3: repeated restart should remain idempotent");
+  const secondClient = await tryConnectToDaemon({ host, timeout: 5000 });
+  assert(secondClient, "daemon client should reconnect before repeated restart");
+  try {
+    const restartAck = await secondClient.restartServer("settings_update_repeated");
+    assert.strictEqual(restartAck.status, "restart_requested");
+  } finally {
+    await secondClient.close().catch(() => undefined);
+  }
+  await waitFor(
+    () => {
+      const workerPid = readWorkerPid(supervisorPid);
+      return (
+        workerPid !== null && workerPid !== workerPidAfterRestart && isProcessRunning(workerPid)
+      );
+    },
+    20000,
+    "worker pid did not change after repeated restart request",
+  );
+  await waitFor(
+    async () => (await readDaemonStatus(paseoHome)).localDaemon === "running",
+    120000,
+    "daemon did not become healthy after repeated restart",
+  );
+  const statusAfterRepeatedRestart = await readDaemonStatus(paseoHome);
+  assert.strictEqual(statusAfterRepeatedRestart.localDaemon, "running");
+  assert.strictEqual(statusAfterRepeatedRestart.pid, supervisorPid);
+  console.log("✓ repeated restart keeps one healthy supervisor and worker\n");
 } finally {
   if (supervisorProcess?.pid && isProcessRunning(supervisorProcess.pid)) {
     supervisorProcess.kill("SIGTERM");
