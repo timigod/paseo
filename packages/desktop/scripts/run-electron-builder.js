@@ -45,10 +45,6 @@ function parseMacTargetSelection(builderArgs) {
       }
       continue;
     }
-
-    if (/^-[mowl]{2,}$/.test(argument) && (argument.includes("m") || argument.includes("o"))) {
-      selected = true;
-    }
   }
 
   return { selected, targets };
@@ -56,16 +52,21 @@ function parseMacTargetSelection(builderArgs) {
 
 function targetsMac(builderArgs, hostPlatform) {
   if (parseMacTargetSelection(builderArgs).selected) return true;
-  if (
-    builderArgs.some(
-      (argument) =>
-        /^(?:--linux|-l|--win|--windows|-w)(?:=|$)/.test(argument) ||
-        (/^-[mowl]{2,}$/.test(argument) && (argument.includes("w") || argument.includes("l"))),
-    )
-  ) {
+  if (builderArgs.some((argument) => /^(?:--linux|-l|--win|--windows|-w)(?:=|$)/.test(argument))) {
     return false;
   }
   return hostPlatform === "darwin";
+}
+
+function assertNoCombinedShortPlatformAliases(builderArgs) {
+  const combined = builderArgs.filter((argument) => /^-[mowl]{2,}(?:=|$)/.test(argument));
+  if (combined.length > 0) {
+    throw new Error(
+      `Combined short Electron Builder platform aliases are not supported by the Paseo wrapper (${combined.join(
+        ", ",
+      )}). Use separate explicit aliases such as --mac, --linux, or --win.`,
+    );
+  }
 }
 
 function hasAlternateConfigArgument(builderArgs) {
@@ -96,6 +97,7 @@ function resolveBuilderPlan(env, builderArgs = [], hostPlatform = process.platfo
   if (env[UNSIGNED_MAC_BUILD_ENV] !== undefined && env[UNSIGNED_MAC_BUILD_ENV] !== "1") {
     throw new Error(`${UNSIGNED_MAC_BUILD_ENV} must be exactly 1 when unsigned mode is intended.`);
   }
+  assertNoCombinedShortPlatformAliases(builderArgs);
 
   const macBuild = targetsMac(builderArgs, hostPlatform);
   const unsigned = isUnsignedMacBuildRequested(env);

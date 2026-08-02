@@ -168,8 +168,37 @@ describe("explicit unsigned mac build contract", () => {
       expect(plan.childEnv[INTERNAL_MAC_BUILD_MODE_ENV]).toBe(MAC_BUILD_MODE.SIGNED);
     }
     expect(resolveExtraBuilderArgs({}, ["--linux"], "darwin")).toEqual([]);
-    expect(resolveExtraBuilderArgs({}, ["-wl"], "darwin")).toEqual([]);
     expect(SIGNED_MAC_BUILD_FAILURE_HINT).toContain(`${UNSIGNED_MAC_BUILD_ENV}=1`);
+  });
+
+  it("rejects combined short platform aliases before signed or unsigned mode resolution", () => {
+    for (const arguments_ of [
+      ["-mo=mas"],
+      ["-om=mas"],
+      ["-mo", "mas"],
+      ["-om", "mas:arm64"],
+      ["-mo=zip", "-om=mas"],
+      ["-om", "zip", "-mo", "mas-dev:arm64"],
+      ["-mwl"],
+      ["-wl"],
+    ]) {
+      for (const env of [{}, { [UNSIGNED_MAC_BUILD_ENV]: "1" }]) {
+        expect(() => resolveBuilderPlan(env, arguments_, "linux")).toThrow(
+          /Combined short Electron Builder platform aliases/,
+        );
+      }
+    }
+
+    for (const alias of ["--mac", "--macos", "-m", "-o"]) {
+      const signed = resolveBuilderPlan({}, [`${alias}=zip`], "linux");
+      expect(signed.macBuildMode).toBe(MAC_BUILD_MODE.SIGNED);
+      const unsigned = resolveBuilderPlan(
+        { [UNSIGNED_MAC_BUILD_ENV]: "1" },
+        [`${alias}=zip`],
+        "linux",
+      );
+      expect(unsigned.macBuildMode).toBe(MAC_BUILD_MODE.UNSIGNED);
+    }
   });
 
   it("creates a private validated hook mode for the explicit unsigned opt-in", () => {
