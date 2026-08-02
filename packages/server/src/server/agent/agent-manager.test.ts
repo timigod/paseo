@@ -6771,7 +6771,7 @@ test("streamAgent clears pending run when startTurn fails before a turn id exist
   );
 });
 
-test("archiveAgent persists archivedAt and updatedAt before emitting closed state", async () => {
+test("archiveAgent closes the runtime before committing the archived record", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-archive-"));
   const storagePath = join(workdir, "agents");
   const storage = new AgentStorage(storagePath, logger);
@@ -6818,7 +6818,7 @@ test("archiveAgent persists archivedAt and updatedAt before emitting closed stat
   expect(
     Math.abs(new Date(stored!.updatedAt).getTime() - new Date(archivedAt).getTime()),
   ).toBeLessThanOrEqual(5);
-  expect(lifecycles.slice(-2)).toEqual(["idle", "closed"]);
+  expect(lifecycles.slice(-2)).toEqual(["closed", "closed"]);
 });
 
 test("fires onAgentArchived for archived parent and cascaded children", async () => {

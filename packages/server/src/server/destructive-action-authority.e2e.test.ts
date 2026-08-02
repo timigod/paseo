@@ -346,4 +346,76 @@ describe("destructive authority over real WebSocket execution paths", () => {
       getSpy.mockRestore();
     }
   }, 30_000);
+
+  test("disconnect after close and flush but before permanent delete preserves a closed record", async () => {
+    const originalRemove = AgentStorage.prototype.remove;
+    const originalCancelDelete = AgentStorage.prototype.cancelDelete;
+    let targetAgentId: string | null = null;
+    let releaseRemove = () => {};
+    let markRemoveStarted = () => {};
+    let deferRemove = true;
+    const removeStarted = new Promise<void>((resolve) => {
+      markRemoveStarted = resolve;
+    });
+    const removeSpy = vi
+      .spyOn(AgentStorage.prototype, "remove")
+      .mockImplementation(async function (id, options) {
+        if (deferRemove && id === targetAgentId) {
+          deferRemove = false;
+          markRemoveStarted();
+          await new Promise<void>((resolve) => {
+            releaseRemove = resolve;
+          });
+        }
+        return originalRemove.call(this, id, options);
+      });
+    const cancelDeleteSpy = vi
+      .spyOn(AgentStorage.prototype, "cancelDelete")
+      .mockImplementation(function (fence) {
+        return originalCancelDelete.call(this, fence);
+      });
+    const webSocketServerPrototype = VoiceAssistantWebSocketServer.prototype as unknown as {
+      revokeSocketDestructiveCaller(socket: unknown): void;
+    };
+    const originalRevokeSocketDestructiveCaller =
+      webSocketServerPrototype.revokeSocketDestructiveCaller;
+    const revokeSocketSpy = vi
+      .spyOn(webSocketServerPrototype, "revokeSocketDestructiveCaller")
+      .mockImplementation(function (socket) {
+        return originalRevokeSocketDestructiveCaller.call(this, socket);
+      });
+    const daemon = await createTestPaseoDaemon();
+    const cwd = createCwd();
+    const target = await createManagedAgent(daemon, cwd);
+    targetAgentId = target.id;
+    const client = new DaemonClient({
+      url: `ws://127.0.0.1:${daemon.port}/ws`,
+      clientId: "disconnect-before-permanent-delete",
+      reconnect: { enabled: false },
+    });
+
+    try {
+      await client.connect();
+      const deleteResult = client.deleteAgent(target.id).catch((error) => error as Error);
+      await removeStarted;
+      expect(daemon.daemon.agentManager.getAgent(target.id)).toBeNull();
+
+      await client.close();
+      await expect.poll(() => revokeSocketSpy.mock.calls.length).toBeGreaterThan(0);
+      releaseRemove();
+
+      await expect(deleteResult).resolves.toBeInstanceOf(Error);
+      await expect.poll(() => cancelDeleteSpy.mock.calls.length).toBeGreaterThan(0);
+      await expect
+        .poll(async () => (await daemon.daemon.agentStorage.get(target.id))?.lastStatus)
+        .toBe("closed");
+    } finally {
+      releaseRemove();
+      removeSpy.mockRestore();
+      cancelDeleteSpy.mockRestore();
+      revokeSocketSpy.mockRestore();
+      await client.close();
+      await daemon.close();
+    }
+  }, 30_000);
 });

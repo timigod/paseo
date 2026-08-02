@@ -124,7 +124,11 @@ import {
   type AgentRunOptions,
   type AgentSessionConfig,
 } from "./agent/agent-sdk-types.js";
-import type { AutoArchiveObligation, StoredAgentRecord } from "./agent/agent-storage.js";
+import type {
+  AgentDeleteFence,
+  AutoArchiveObligation,
+  StoredAgentRecord,
+} from "./agent/agent-storage.js";
 import type { AgentStorage } from "./agent/agent-storage.js";
 import {
   ImportSessionsRequestError,
@@ -314,12 +318,30 @@ function clientUsesLegacyWorkspaceRestore(appVersion: string | null): boolean {
 }
 
 type DeleteFencedAgentStorage = AgentStorage & {
-  beginDelete(agentId: string): void;
+  beginDelete(agentId: string): AgentDeleteFence;
+  cancelDelete(fence: AgentDeleteFence): Promise<void>;
 };
 
-function beginAgentDeleteIfSupported(agentStorage: AgentStorage, agentId: string): void {
+function beginAgentDeleteIfSupported(
+  agentStorage: AgentStorage,
+  agentId: string,
+): AgentDeleteFence | null {
   if ("beginDelete" in agentStorage && typeof agentStorage.beginDelete === "function") {
-    (agentStorage as DeleteFencedAgentStorage).beginDelete(agentId);
+    return (agentStorage as DeleteFencedAgentStorage).beginDelete(agentId);
+  }
+  return null;
+}
+
+async function cancelAgentDeleteIfSupported(
+  agentStorage: AgentStorage,
+  fence: AgentDeleteFence | null,
+): Promise<void> {
+  if (
+    fence &&
+    "cancelDelete" in agentStorage &&
+    typeof (agentStorage as DeleteFencedAgentStorage).cancelDelete === "function"
+  ) {
+    await (agentStorage as DeleteFencedAgentStorage).cancelDelete(fence);
   }
 }
 
@@ -2430,26 +2452,58 @@ export class Session {
 
     // File-backed storage still needs an early delete fence before closeAgent().
     authorize();
-    beginAgentDeleteIfSupported(this.agentStorage, agentId);
-
+    const deleteFence = beginAgentDeleteIfSupported(this.agentStorage, agentId);
     try {
-      await closeAgentCommand({ agentManager: this.agentManager }, agentId);
-    } catch (error) {
-      this.sessionLogger.warn(
-        { err: error, agentId },
-        `Failed to close agent ${agentId} during delete`,
-      );
-    }
+      try {
+        await closeAgentCommand({ agentManager: this.agentManager }, agentId, { caller });
+      } catch (error) {
+        if (error instanceof DestructiveActionAuthorizationError) {
+          throw error;
+        }
+        this.sessionLogger.warn(
+          { err: error, agentId },
+          `Failed to close agent ${agentId} during delete`,
+        );
+      }
 
-    // Drain queued persistence from the just-closed agent before removing its
-    // durable snapshot, otherwise an in-flight background write can recreate it.
-    await this.agentManager.flush();
+      // Drain queued persistence from the just-closed agent before removing its
+      // durable snapshot, otherwise an in-flight background write can recreate it.
+      await this.agentManager.flush();
+      authorize();
 
-    try {
-      await this.agentStorage.remove(agentId);
-      await this.agentManager.deleteAgentState(agentId);
+      try {
+        await this.agentStorage.remove(agentId, {
+          ...(deleteFence ? { fence: deleteFence } : {}),
+          recheck: authorize,
+        });
+        await this.agentManager.deleteAgentState(agentId);
+      } catch (error) {
+        if (error instanceof DestructiveActionAuthorizationError) {
+          throw error;
+        }
+        try {
+          await cancelAgentDeleteIfSupported(this.agentStorage, deleteFence);
+        } catch (cancelError) {
+          this.sessionLogger.error(
+            { err: cancelError, agentId },
+            "Failed to release unsuccessful agent deletion fence",
+          );
+        }
+        this.sessionLogger.error(
+          { err: error, agentId },
+          `Failed to fully delete agent ${agentId}`,
+        );
+      }
     } catch (error) {
-      this.sessionLogger.error({ err: error, agentId }, `Failed to fully delete agent ${agentId}`);
+      try {
+        await cancelAgentDeleteIfSupported(this.agentStorage, deleteFence);
+      } catch (cancelError) {
+        this.sessionLogger.error(
+          { err: cancelError, agentId },
+          "Failed to release aborted agent deletion fence",
+        );
+      }
+      throw error;
     }
 
     this.emit({
@@ -4089,8 +4143,8 @@ export class Session {
         markWorkspaceArchiving: (workspaceIds, archivingAt) =>
           this.markWorkspaceArchiving(workspaceIds, archivingAt),
         clearWorkspaceArchiving: (workspaceIds) => this.clearWorkspaceArchiving(workspaceIds),
-        killTerminalsForWorkspace: (workspaceId) =>
-          this.terminalController.killTerminalsForWorkspace(workspaceId),
+        killTerminalsForWorkspace: (workspaceId, recheck) =>
+          this.terminalController.killTerminalsForWorkspace(workspaceId, recheck),
         sessionLogger: this.sessionLogger,
       },
       msg,
@@ -6108,8 +6162,8 @@ export class Session {
           markWorkspaceArchiving: (workspaceIds, archivingAt) =>
             this.markWorkspaceArchiving(workspaceIds, archivingAt),
           clearWorkspaceArchiving: (workspaceIds) => this.clearWorkspaceArchiving(workspaceIds),
-          killTerminalsForWorkspace: (workspaceId) =>
-            this.terminalController.killTerminalsForWorkspace(workspaceId),
+          killTerminalsForWorkspace: (workspaceId, recheck) =>
+            this.terminalController.killTerminalsForWorkspace(workspaceId, recheck),
           workspaceRegistry: this.workspaceRegistry,
           sessionLogger: this.sessionLogger,
         },

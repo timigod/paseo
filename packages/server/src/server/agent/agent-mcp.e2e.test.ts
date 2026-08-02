@@ -13,6 +13,7 @@ import { hashDaemonPassword } from "../auth.js";
 import { createPaseoDaemon, type PaseoDaemonConfig } from "../bootstrap.js";
 import { createTestAgentClients } from "../test-utils/fake-agent-client.js";
 import { AgentManager } from "./agent-manager.js";
+import { AgentStorage } from "./agent-storage.js";
 import * as destructiveAuthority from "./destructive-action-authority.js";
 import type {
   AgentClient,
@@ -89,19 +90,8 @@ async function createMcpClient(
   const requestInit = authToken ? { headers: { Authorization: `Bearer ${authToken}` } } : undefined;
   const abortableFetch = signal
     ? async (input: string | URL, init?: RequestInit): Promise<Response> => {
-        const controller = new AbortController();
-        const abort = () => controller.abort();
-        signal.addEventListener("abort", abort, { once: true });
-        init?.signal?.addEventListener("abort", abort, { once: true });
-        if (signal.aborted || init?.signal?.aborted) {
-          abort();
-        }
-        try {
-          return await fetch(input, { ...init, signal: controller.signal });
-        } finally {
-          signal.removeEventListener("abort", abort);
-          init?.signal?.removeEventListener("abort", abort);
-        }
+        const requestSignal = init?.signal ? AbortSignal.any([signal, init.signal]) : signal;
+        return fetch(input, { ...init, signal: requestSignal });
       }
     : undefined;
   const transport = new StreamableHTTPClientTransport(
@@ -467,6 +457,191 @@ describe("agent MCP end-to-end (offline)", () => {
       clearAttentionSpy.mockRestore();
       archiveSpy.mockRestore();
       revokeCallerSpy.mockRestore();
+      await daemon.stop();
+      await Promise.all(
+        [paseoHome, staticDir, agentCwd].map((targetPath) =>
+          rm(targetPath, { recursive: true, force: true }),
+        ),
+      );
+    }
+  }, 30_000);
+
+  test("HTTP disconnect during archive storage lookup fences the archivedAt commit", async () => {
+    const paseoHome = await mkdtemp(path.join(os.tmpdir(), "paseo-home-"));
+    const staticDir = await mkdtemp(path.join(os.tmpdir(), "paseo-static-"));
+    const agentCwd = await mkdtemp(path.join(os.tmpdir(), "paseo-agent-cwd-"));
+    const port = await getAvailablePort();
+    const daemon = await createPaseoDaemon(
+      {
+        listen: `127.0.0.1:${port}`,
+        paseoHome,
+        corsAllowedOrigins: [],
+        hostnames: true,
+        mcpEnabled: true,
+        staticDir,
+        mcpDebug: false,
+        agentClients: createTestAgentClients(),
+        agentStoragePath: path.join(paseoHome, "agents"),
+      },
+      pino({ level: "silent" }),
+    );
+    await daemon.start();
+    const target = await daemon.agentManager.createAgent(
+      {
+        provider: "codex",
+        model: "gpt-5.4-mini",
+        modeId: "full-access",
+        cwd: agentCwd,
+      },
+      undefined,
+      { workspaceId: undefined },
+    );
+    const originalGet = AgentStorage.prototype.get;
+    let releaseLookup = () => {};
+    let markLookupStarted = () => {};
+    let deferLookup = true;
+    const lookupStarted = new Promise<void>((resolve) => {
+      markLookupStarted = resolve;
+    });
+    const getSpy = vi.spyOn(AgentStorage.prototype, "get").mockImplementation(async function (id) {
+      const stack = new Error().stack ?? "";
+      if (deferLookup && id === target.id && stack.includes("AgentManager.archiveAgent")) {
+        deferLookup = false;
+        markLookupStarted();
+        await new Promise<void>((resolve) => {
+          releaseLookup = resolve;
+        });
+      }
+      return originalGet.call(this, id);
+    });
+    const requestController = new AbortController();
+    const client = await createMcpClient(
+      `http://127.0.0.1:${port}/mcp/agents`,
+      undefined,
+      requestController.signal,
+    );
+    const archiveSpy = vi.spyOn(AgentManager.prototype, "archiveAgent");
+    const revokeCallerSpy = vi.spyOn(destructiveAuthority, "revokeDestructiveCaller");
+
+    try {
+      void client
+        .callTool({ name: "archive_agent", args: { agentId: target.id } })
+        .catch(() => undefined);
+      await lookupStarted;
+      const serverArchiveResult = Promise.resolve(archiveSpy.mock.results[0]?.value).catch(
+        (error) => error as Error,
+      );
+      requestController.abort();
+      await expect.poll(() => revokeCallerSpy.mock.calls.length).toBeGreaterThan(0);
+      releaseLookup();
+
+      const abortedResult = await withTimeout({
+        promise: serverArchiveResult,
+        timeoutMs: 5000,
+        label: "server archive after aborted MCP storage lookup",
+      });
+      expect(abortedResult).toBeInstanceOf(Error);
+      expect(daemon.agentManager.getAgent(target.id)).toBeNull();
+      await expect(daemon.agentStorage.get(target.id)).resolves.toMatchObject({
+        lastStatus: "closed",
+      });
+      expect((await daemon.agentStorage.get(target.id))?.archivedAt).toBeFalsy();
+    } finally {
+      releaseLookup();
+      getSpy.mockRestore();
+      archiveSpy.mockRestore();
+      revokeCallerSpy.mockRestore();
+      await client.close();
+      await daemon.stop();
+      await Promise.all(
+        [paseoHome, staticDir, agentCwd].map((targetPath) =>
+          rm(targetPath, { recursive: true, force: true }),
+        ),
+      );
+    }
+  }, 30_000);
+
+  test("HTTP disconnect during kill event drain fences live-agent removal", async () => {
+    const paseoHome = await mkdtemp(path.join(os.tmpdir(), "paseo-home-"));
+    const staticDir = await mkdtemp(path.join(os.tmpdir(), "paseo-static-"));
+    const agentCwd = await mkdtemp(path.join(os.tmpdir(), "paseo-agent-cwd-"));
+    const port = await getAvailablePort();
+    const daemon = await createPaseoDaemon(
+      {
+        listen: `127.0.0.1:${port}`,
+        paseoHome,
+        corsAllowedOrigins: [],
+        hostnames: true,
+        mcpEnabled: true,
+        staticDir,
+        mcpDebug: false,
+        agentClients: createTestAgentClients(),
+        agentStoragePath: path.join(paseoHome, "agents"),
+      },
+      pino({ level: "silent" }),
+    );
+    await daemon.start();
+    const target = await daemon.agentManager.createAgent(
+      {
+        provider: "codex",
+        model: "gpt-5.4-mini",
+        modeId: "full-access",
+        cwd: agentCwd,
+      },
+      undefined,
+      { workspaceId: undefined },
+    );
+    const managerPrototype = AgentManager.prototype as unknown as {
+      drainSessionEvents(agentId: string): Promise<void>;
+    };
+    const originalDrainSessionEvents = managerPrototype.drainSessionEvents;
+    let releaseDrain = () => {};
+    let markDrainStarted = () => {};
+    let deferDrain = true;
+    const drainStarted = new Promise<void>((resolve) => {
+      markDrainStarted = resolve;
+    });
+    const drainSpy = vi
+      .spyOn(managerPrototype, "drainSessionEvents")
+      .mockImplementation(async function (agentId) {
+        if (deferDrain && agentId === target.id) {
+          deferDrain = false;
+          markDrainStarted();
+          await new Promise<void>((resolve) => {
+            releaseDrain = resolve;
+          });
+        }
+        return originalDrainSessionEvents.call(this, agentId);
+      });
+    const requestController = new AbortController();
+    const client = await createMcpClient(
+      `http://127.0.0.1:${port}/mcp/agents`,
+      undefined,
+      requestController.signal,
+    );
+    const revokeCallerSpy = vi.spyOn(destructiveAuthority, "revokeDestructiveCaller");
+
+    try {
+      const killResult = client
+        .callTool({ name: "kill_agent", args: { agentId: target.id } })
+        .catch((error) => error as Error);
+      await drainStarted;
+      requestController.abort();
+      await expect.poll(() => revokeCallerSpy.mock.calls.length).toBeGreaterThan(0);
+      releaseDrain();
+
+      const abortedResult = await withTimeout({
+        promise: killResult,
+        timeoutMs: 5000,
+        label: "aborted MCP kill during event drain",
+      });
+      expect(abortedResult instanceof Error || abortedResult.isError === true).toBe(true);
+      expect(daemon.agentManager.getAgent(target.id)).not.toBeNull();
+    } finally {
+      releaseDrain();
+      drainSpy.mockRestore();
+      revokeCallerSpy.mockRestore();
+      await client.close();
       await daemon.stop();
       await Promise.all(
         [paseoHome, staticDir, agentCwd].map((targetPath) =>

@@ -3290,13 +3290,14 @@ function archiveWorktreeDependencies(
     markWorkspaceArchiving: options.markWorkspaceArchiving,
     clearWorkspaceArchiving: options.clearWorkspaceArchiving,
     lifecycleCoordinator: options.lifecycleCoordinator ?? defaultWorkspaceLifecycleCoordinator,
-    killTerminalsForWorkspace: (workspaceId: string) =>
+    killTerminalsForWorkspace: (workspaceId: string, recheck) =>
       killTerminalsForWorkspace(
         {
           terminalManager: context.terminalManager,
           sessionLogger: context.logger,
         },
         workspaceId,
+        recheck,
       ),
     sessionLogger: context.logger,
   };

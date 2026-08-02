@@ -43,6 +43,7 @@ import {
   assertDestructiveActionAuthorized,
   DESTRUCTIVE_ACTION_ERROR_CODES,
   DestructiveActionAuthorizationError,
+  type DestructiveActionRecheck,
   type DestructiveCallerContext,
 } from "./agent/destructive-action-authority.js";
 
@@ -73,7 +74,10 @@ export interface ArchiveDependencies {
   emitWorkspaceUpdatesForWorkspaceIds: (workspaceIds: Iterable<string>) => Promise<void>;
   markWorkspaceArchiving: (workspaceIds: Iterable<string>, archivingAt: string) => void;
   clearWorkspaceArchiving: (workspaceIds: Iterable<string>) => void;
-  killTerminalsForWorkspace: (workspaceId: string) => Promise<void>;
+  killTerminalsForWorkspace: (
+    workspaceId: string,
+    recheck?: DestructiveActionRecheck,
+  ) => Promise<void>;
   workspaceRegistry?: Pick<WorkspaceRegistry, "get" | "list" | "update">;
   lifecycleCoordinator?: WorkspaceLifecycleCoordinator;
   sessionLogger?: Logger;
@@ -407,6 +411,7 @@ async function archiveResolvedTarget(
       request.scope.kind === "worktree" ? "worktree.archive" : "workspace.archive",
       request.signal,
     );
+  const recheckCaller: DestructiveActionRecheck = authorizeCaller;
 
   await authorizeCaller();
 
@@ -429,6 +434,7 @@ async function archiveResolvedTarget(
       targetWorkspaceIds,
       request.requestId,
       authorizeCaller,
+      recheckCaller,
     );
     await clearCleanupPendingForUnarchivedTargets(dependencies, target, archivedWorkspaceIds);
     if (failures.length > 0) {
@@ -744,6 +750,7 @@ async function archiveTargetRecords(
   targetWorkspaceIds: string[],
   requestId: string,
   authorizeCaller: () => Promise<void>,
+  recheckCaller: DestructiveActionRecheck,
 ): Promise<{
   archivedAgents: Set<string>;
   archivedWorkspaceIds: string[];
@@ -754,7 +761,7 @@ async function archiveTargetRecords(
 
   const results = await Promise.allSettled(
     targetWorkspaceIds.map(async (workspaceId) => {
-      const agents = await archiveWorkspaceContents(dependencies, workspaceId, authorizeCaller);
+      const agents = await archiveWorkspaceContents(dependencies, workspaceId, recheckCaller);
       await authorizeCaller();
       await dependencies.archiveWorkspaceRecord(workspaceId);
       return { workspaceId, agents };
@@ -1360,7 +1367,7 @@ export type ArchiveWorkspaceContentsDependencies = Pick<
 export async function archiveWorkspaceContents(
   dependencies: ArchiveWorkspaceContentsDependencies,
   workspaceId: string,
-  authorizeCaller?: () => Promise<void>,
+  recheckCaller?: DestructiveActionRecheck,
 ): Promise<Set<string>> {
   const archivedAgents = new Set<string>();
 
@@ -1380,14 +1387,16 @@ export async function archiveWorkspaceContents(
     archivedAgents.add(record.id);
   }
 
-  await authorizeCaller?.();
+  await recheckCaller?.();
   const archivedAt = new Date().toISOString();
-  await Promise.all([
-    ...liveAgents.map((agent) => dependencies.agentManager.archiveAgent(agent.id)),
+  const archiveResults = await Promise.allSettled([
+    ...liveAgents.map((agent) => dependencies.agentManager.archiveAgent(agent.id, recheckCaller)),
     ...matchingStoredRecords
       .filter((record) => !liveAgentIds.has(record.id) && !record.archivedAt)
-      .map((record) => dependencies.agentManager.archiveSnapshot(record.id, archivedAt)),
-    dependencies.killTerminalsForWorkspace(workspaceId),
+      .map((record) =>
+        dependencies.agentManager.archiveSnapshot(record.id, archivedAt, recheckCaller),
+      ),
+    dependencies.killTerminalsForWorkspace(workspaceId, recheckCaller),
   ]);
 
   const remainingLiveAgents = dependencies.agentManager
@@ -1396,8 +1405,20 @@ export async function archiveWorkspaceContents(
   const remainingStoredAgents = (await dependencies.agentStorage.list()).filter(
     (record) => record.workspaceId === workspaceId && !record.archivedAt,
   );
+  const failures = archiveResults.flatMap((result) =>
+    result.status === "rejected" ? [result.reason] : [],
+  );
+  const authorityFailure = failures.find(
+    (failure): failure is WorkspaceArchiveError => failure instanceof WorkspaceArchiveError,
+  );
+  if (authorityFailure) {
+    throw authorityFailure;
+  }
   if (remainingLiveAgents.length > 0 || remainingStoredAgents.length > 0) {
-    throw new Error(`Workspace ownership remains after archive: ${workspaceId}`);
+    throw new AggregateError(failures, `Workspace ownership remains after archive: ${workspaceId}`);
+  }
+  if (failures.length > 0) {
+    throw new AggregateError(failures, `Workspace archive teardown failed: ${workspaceId}`);
   }
 
   return archivedAgents;
@@ -1425,6 +1446,7 @@ async function isDirectoryUnreferenced(
 export async function killTerminalsForWorkspace(
   dependencies: KillTerminalsForWorkspaceDependencies,
   workspaceId: string,
+  recheck?: DestructiveActionRecheck,
 ): Promise<void> {
   const terminalManager = dependencies.terminalManager;
   if (!terminalManager) {
@@ -1451,7 +1473,12 @@ export async function killTerminalsForWorkspace(
     }
   }
 
-  await Promise.all(
+  if (terminalIds.length === 0) {
+    return;
+  }
+
+  await recheck?.();
+  await Promise.allSettled(
     terminalIds.map(async (terminalId) => {
       dependencies.detachTerminalStream?.(terminalId, { emitExit: true });
       await terminalManager.killTerminalAndWait(terminalId, {

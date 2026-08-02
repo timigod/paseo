@@ -29,7 +29,9 @@ import {
 import { readPaseoWorktreeIncarnationId } from "../utils/worktree-metadata.js";
 import type { ManagedAgent } from "./agent/agent-manager.js";
 import type { AgentStorage, StoredAgentRecord } from "./agent/agent-storage.js";
+import type { TerminalManager } from "../terminal/terminal-manager.js";
 import {
+  assertDestructiveCallerActive,
   createAgentDestructiveCaller,
   createCoordinatorDestructiveCaller,
   createUncertainDestructiveCaller,
@@ -38,6 +40,7 @@ import {
 import type { WorkspaceGitService } from "./workspace-git-service.js";
 import {
   archiveByScope,
+  killTerminalsForWorkspace,
   type ActiveWorkspaceRef,
   type ArchiveDependencies,
   type ArchiveResult,
@@ -812,6 +815,47 @@ describe("archiveByScope", () => {
       code: WORKSPACE_ARCHIVE_ERROR_CODES.invalidCallerIdentity,
     });
     expect(deps.archiveWorkspaceRecord).not.toHaveBeenCalled();
+    expect(deps.activeWorkspaces).toHaveLength(1);
+  });
+
+  test("rechecks a captured caller inside each concurrent agent archive", async () => {
+    const { tempDir } = createGitRepo();
+    const workspaceId = "ws-revoked-during-agent-archive";
+    const agentId = "agent-revoked-during-agent-archive";
+    const deps = createArchiveDeps({
+      paseoHome: path.join(tempDir, ".paseo"),
+      activeWorkspaces: [{ workspaceId, cwd: tempDir, kind: "local_checkout" }],
+      liveAgents: [{ id: agentId, cwd: tempDir, workspaceId }],
+    });
+    const caller = createCoordinatorDestructiveCaller();
+    let releaseCommit = () => {};
+    let markCommitReached = () => {};
+    const commitReached = new Promise<void>((resolve) => {
+      markCommitReached = resolve;
+    });
+    deps.agentManager.archiveAgent = vi.fn(async (_id, recheck) => {
+      markCommitReached();
+      await new Promise<void>((resolve) => {
+        releaseCommit = resolve;
+      });
+      await recheck?.();
+      deps.archivedAgentIds.push(agentId);
+      return { archivedAt: new Date().toISOString() };
+    });
+
+    const archive = archiveByScope(deps, {
+      scope: { kind: "workspace", workspaceId },
+      requestId: "req-revoked-during-agent-archive",
+      caller,
+    });
+    await commitReached;
+    revokeDestructiveCaller(caller);
+    releaseCommit();
+
+    await expect(archive).rejects.toMatchObject({
+      code: WORKSPACE_ARCHIVE_ERROR_CODES.invalidCallerIdentity,
+    });
+    expect(deps.archivedAgentIds).toEqual([]);
     expect(deps.activeWorkspaces).toHaveLength(1);
   });
 
@@ -2412,6 +2456,43 @@ describe("archiveByScope", () => {
     expect(result.archivedWorkspaceIds).toHaveLength(3);
     expect(result.removedDirectory).toBe(true);
     expect(existsSync(worktree.worktreePath)).toBe(false);
+  });
+});
+
+describe("killTerminalsForWorkspace", () => {
+  test("rechecks a caller after terminal enumeration and before the kill batch", async () => {
+    const caller = createCoordinatorDestructiveCaller();
+    let releaseEnumeration = () => {};
+    let markEnumerationStarted = () => {};
+    const enumerationStarted = new Promise<void>((resolve) => {
+      markEnumerationStarted = resolve;
+    });
+    const killTerminalAndWait = vi.fn(async () => {});
+    const detachTerminalStream = vi.fn();
+    const terminalManager = {
+      listDirectories: () => ["/repo"],
+      getTerminals: vi.fn(async () => {
+        markEnumerationStarted();
+        await new Promise<void>((resolve) => {
+          releaseEnumeration = resolve;
+        });
+        return [{ id: "terminal-1", workspaceId: "workspace-1" }];
+      }),
+      killTerminalAndWait,
+    } as unknown as TerminalManager;
+
+    const kill = killTerminalsForWorkspace(
+      { terminalManager, sessionLogger: createLogger(), detachTerminalStream },
+      "workspace-1",
+      () => assertDestructiveCallerActive(caller),
+    );
+    await enumerationStarted;
+    revokeDestructiveCaller(caller);
+    releaseEnumeration();
+
+    await expect(kill).rejects.toMatchObject({ code: "INVALID_CALLER_IDENTITY" });
+    expect(killTerminalAndWait).not.toHaveBeenCalled();
+    expect(detachTerminalStream).not.toHaveBeenCalled();
   });
 });
 

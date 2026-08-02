@@ -10,6 +10,7 @@ import type { AgentProviderNotice } from "./agent-sdk-types.js";
 import {
   assertDestructiveActionAuthorized,
   type DestructiveActionName,
+  type DestructiveActionRecheck,
   type DestructiveCallerContext,
 } from "./destructive-action-authority.js";
 
@@ -24,9 +25,16 @@ export interface LifecycleAgentManager {
     options?: { assumeRunning?: boolean },
   ): Promise<AgentRunCancellationResult>;
   clearAgentAttention(agentId: string): Promise<void>;
-  archiveAgent(agentId: string): Promise<{ archivedAt: string }>;
-  archiveSnapshot(agentId: string, archivedAt: string): Promise<StoredAgentRecord>;
-  closeAgent(agentId: string): Promise<void>;
+  archiveAgent(
+    agentId: string,
+    recheck?: DestructiveActionRecheck,
+  ): Promise<{ archivedAt: string }>;
+  archiveSnapshot(
+    agentId: string,
+    archivedAt: string,
+    recheck?: DestructiveActionRecheck,
+  ): Promise<StoredAgentRecord>;
+  closeAgent(agentId: string, recheck?: DestructiveActionRecheck): Promise<void>;
   setLabels(agentId: string, labels: Record<string, string>): Promise<void>;
   detachAgent(agentId: string): Promise<{
     record: StoredAgentRecord;
@@ -200,7 +208,7 @@ export async function archiveAgentCommand(
     await requestAgentRunCancellation(dependencies, agentId);
     await dependencies.agentManager.clearAgentAttention(agentId).catch(() => undefined);
     authorize();
-    await dependencies.agentManager.archiveAgent(agentId);
+    await dependencies.agentManager.archiveAgent(agentId, authorize);
     record = await dependencies.agentStorage.get(agentId);
   } else {
     record = await archiveStoredAgent(dependencies, agentId, authorize);
@@ -232,7 +240,15 @@ export async function closeAgentCommand(
     "agent.kill",
     options?.signal,
   );
-  await dependencies.agentManager.closeAgent(agentId);
+  await dependencies.agentManager.closeAgent(agentId, () =>
+    assertAgentDestructiveActionAuthorized(
+      dependencies.agentManager,
+      options?.caller,
+      agentId,
+      "agent.kill",
+      options?.signal,
+    ),
+  );
 }
 
 export function assertAgentDestructiveActionAuthorized(
@@ -345,5 +361,5 @@ async function archiveStoredAgent(
 
   authorize();
   const archivedAt = new Date().toISOString();
-  return dependencies.agentManager.archiveSnapshot(agentId, archivedAt);
+  return dependencies.agentManager.archiveSnapshot(agentId, archivedAt, authorize);
 }

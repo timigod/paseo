@@ -9,6 +9,7 @@ import { toStoredAgentRecord } from "./agent-projections.js";
 import type { ManagedAgent } from "./agent-manager.js";
 import type { AgentSessionConfig } from "./agent-sdk-types.js";
 import { AgentOwnerSchema, daemonExecutionKey, type DaemonAgentOwner } from "./agent-owner.js";
+import type { DestructiveActionRecheck } from "./destructive-action-authority.js";
 
 const SERIALIZABLE_CONFIG_SCHEMA = z
   .object({
@@ -120,12 +121,30 @@ export function parseStoredAgentRecord(value: unknown): StoredAgentRecord {
   return STORED_AGENT_SCHEMA.parse(value);
 }
 
+export interface AgentDeleteFence {
+  readonly agentId: string;
+  readonly token: symbol;
+}
+
+type DeferredAgentWrite =
+  | {
+      readonly kind: "record";
+      readonly record: StoredAgentRecord;
+      readonly recheck?: DestructiveActionRecheck;
+    }
+  | {
+      readonly kind: "mutation";
+      readonly mutation: (record: StoredAgentRecord) => StoredAgentRecord;
+    };
+
 export class AgentStorage {
   private cache: Map<string, StoredAgentRecord> = new Map();
   private pathById: Map<string, string> = new Map();
   private pathsById: Map<string, Set<string>> = new Map();
   private pendingWrites: Map<string, Promise<void>> = new Map();
-  private deleting: Set<string> = new Set();
+  private deleteFences: Map<string, Set<symbol>> = new Map();
+  private permanentlyDeleted: Set<string> = new Set();
+  private deferredDeleteWrites: Map<string, DeferredAgentWrite[]> = new Map();
   private daemonAgentIdsByExecution: Map<string, string> = new Map();
   private daemonExecutionKeysByAgentId: Map<string, string> = new Map();
   private loaded = false;
@@ -158,9 +177,12 @@ export class AgentStorage {
     return agentId ? (this.cache.get(agentId) ?? null) : null;
   }
 
-  async upsert(record: StoredAgentRecord): Promise<void> {
+  async upsert(
+    record: StoredAgentRecord,
+    options?: { recheck?: DestructiveActionRecheck },
+  ): Promise<void> {
     await this.load();
-    await this.queueRecordWrite(record);
+    await this.queueRecordWrite(record, options?.recheck);
   }
 
   async beginPendingAgentCreation(
@@ -265,9 +287,16 @@ export class AgentStorage {
         throw new Error(`Agent ${agentId} not found`);
       }
       const next = mutation(current);
-      if (!this.deleting.has(agentId)) {
-        await this.writeRecord(next);
+      if (this.permanentlyDeleted.has(agentId)) {
+        return next;
       }
+      if (this.hasActiveDeleteFence(agentId)) {
+        const deferred = this.deferredDeleteWrites.get(agentId) ?? [];
+        deferred.push({ kind: "mutation", mutation });
+        this.deferredDeleteWrites.set(agentId, deferred);
+        return next;
+      }
+      await this.writeRecord(next);
       return next;
     })();
     const tracked = operation.then(
@@ -281,15 +310,14 @@ export class AgentStorage {
     return operation;
   }
 
-  private queueRecordWrite(record: StoredAgentRecord): Promise<void> {
+  private queueRecordWrite(
+    record: StoredAgentRecord,
+    recheck?: DestructiveActionRecheck,
+  ): Promise<void> {
     const agentId = record.id;
     const prev = this.pendingWrites.get(agentId) ?? Promise.resolve();
     const next = prev.then(async () => {
-      if (this.deleting.has(agentId)) {
-        return undefined;
-      }
-
-      await this.writeRecord(record);
+      await this.writeOrDeferRecord(record, recheck);
       return undefined;
     });
 
@@ -301,6 +329,25 @@ export class AgentStorage {
 
     this.pendingWrites.set(agentId, tracked);
     return tracked;
+  }
+
+  private async writeOrDeferRecord(
+    record: StoredAgentRecord,
+    recheck?: DestructiveActionRecheck,
+  ): Promise<void> {
+    const agentId = record.id;
+    if (this.permanentlyDeleted.has(agentId)) {
+      return;
+    }
+    if (this.hasActiveDeleteFence(agentId)) {
+      const deferred = this.deferredDeleteWrites.get(agentId) ?? [];
+      deferred.push({ kind: "record", record, recheck });
+      this.deferredDeleteWrites.set(agentId, deferred);
+      return;
+    }
+
+    await recheck?.();
+    await this.writeRecord(record);
   }
 
   private async writeRecord(record: StoredAgentRecord): Promise<void> {
@@ -325,14 +372,62 @@ export class AgentStorage {
     this.pathById.set(agentId, nextPath);
   }
 
-  beginDelete(agentId: string): void {
-    this.deleting.add(agentId);
+  beginDelete(agentId: string): AgentDeleteFence {
+    const token = Symbol(agentId);
+    const fences = this.deleteFences.get(agentId) ?? new Set<symbol>();
+    fences.add(token);
+    this.deleteFences.set(agentId, fences);
+    return { agentId, token };
   }
 
-  async remove(agentId: string): Promise<void> {
+  async cancelDelete(fence: AgentDeleteFence): Promise<void> {
+    if (this.permanentlyDeleted.has(fence.agentId)) {
+      return;
+    }
+    await this.waitForPendingWrite(fence.agentId);
+    const fences = this.deleteFences.get(fence.agentId);
+    if (!fences?.delete(fence.token)) {
+      return;
+    }
+    if (fences.size > 0) {
+      return;
+    }
+    this.deleteFences.delete(fence.agentId);
+    const deferred = this.deferredDeleteWrites.get(fence.agentId) ?? [];
+    this.deferredDeleteWrites.delete(fence.agentId);
+    let replayError: unknown;
+    for (const write of deferred) {
+      try {
+        if (write.kind === "record") {
+          await this.queueRecordWrite(write.record, write.recheck);
+        } else {
+          await this.update(fence.agentId, write.mutation);
+        }
+      } catch (error) {
+        replayError ??= error;
+      }
+    }
+    if (replayError !== undefined) {
+      throw replayError;
+    }
+  }
+
+  async remove(
+    agentId: string,
+    options?: { fence?: AgentDeleteFence; recheck?: DestructiveActionRecheck },
+  ): Promise<void> {
     await this.load();
-    this.beginDelete(agentId);
-    await (this.pendingWrites.get(agentId) ?? Promise.resolve());
+    const fence = options?.fence ?? this.beginDelete(agentId);
+    if (fence.agentId !== agentId) {
+      throw new Error(`Delete fence for ${fence.agentId} cannot remove agent ${agentId}`);
+    }
+    try {
+      await (this.pendingWrites.get(agentId) ?? Promise.resolve());
+      await options?.recheck?.();
+    } catch (error) {
+      await this.cancelDelete(fence);
+      throw error;
+    }
     const paths = Array.from(this.pathsById.get(agentId) ?? []);
     await Promise.all(
       paths.map(async (filePath) => {
@@ -354,6 +449,9 @@ export class AgentStorage {
     this.removeOwnerIndex(agentId);
     this.pathById.delete(agentId);
     this.pathsById.delete(agentId);
+    this.deferredDeleteWrites.delete(agentId);
+    this.deleteFences.delete(agentId);
+    this.permanentlyDeleted.add(agentId);
   }
 
   async applySnapshot(
@@ -381,9 +479,7 @@ export class AgentStorage {
       record.archivedAt = existing?.archivedAt;
       record.autoArchiveObligation =
         options?.autoArchiveObligation ?? existing?.autoArchiveObligation;
-      if (!this.deleting.has(agent.id)) {
-        await this.writeRecord(record);
-      }
+      await this.writeOrDeferRecord(record);
     })();
     const tracked = operation.then(
       () => undefined,
@@ -572,6 +668,13 @@ export class AgentStorage {
       this.daemonAgentIdsByExecution.delete(key);
     }
     this.daemonExecutionKeysByAgentId.delete(agentId);
+  }
+  private async waitForPendingWrite(agentId: string): Promise<void> {
+    await (this.pendingWrites.get(agentId) ?? Promise.resolve()).catch(() => undefined);
+  }
+
+  private hasActiveDeleteFence(agentId: string): boolean {
+    return (this.deleteFences.get(agentId)?.size ?? 0) > 0;
   }
 }
 

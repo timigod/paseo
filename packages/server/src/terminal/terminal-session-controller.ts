@@ -14,6 +14,7 @@ import type {
   UnsubscribeTerminalsRequest,
 } from "../server/messages.js";
 import { killTerminalsForWorkspace as killWorkspaceTerminals } from "../server/workspace-archive-service.js";
+import type { DestructiveActionRecheck } from "../server/agent/destructive-action-authority.js";
 import {
   defaultWorkspaceLifecycleCoordinator,
   type WorkspaceLifecycleCoordinator,
@@ -264,7 +265,10 @@ export class TerminalSessionController {
     return { terminalId, success: true };
   }
 
-  async killTerminalsForWorkspace(workspaceId: string): Promise<void> {
+  async killTerminalsForWorkspace(
+    workspaceId: string,
+    recheck?: DestructiveActionRecheck,
+  ): Promise<void> {
     return killWorkspaceTerminals(
       {
         detachTerminalStream: (terminalId, options) => void this.detachStream(terminalId, options),
@@ -272,6 +276,7 @@ export class TerminalSessionController {
         terminalManager: this.terminalManager,
       },
       workspaceId,
+      recheck,
     );
   }
 

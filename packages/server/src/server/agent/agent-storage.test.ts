@@ -300,6 +300,58 @@ describe("AgentStorage", () => {
     });
   });
 
+  test("revoked permanent deletion releases its fence and restores the deferred snapshot", async () => {
+    const agentId = "agent-delete-revoked";
+    await storage.applySnapshot(createManagedAgent({ id: agentId, lifecycle: "idle" }));
+    const fence = storage.beginDelete(agentId);
+
+    await storage.applySnapshot(createManagedAgent({ id: agentId, lifecycle: "closed" }));
+    expect((await storage.get(agentId))?.lastStatus).toBe("idle");
+
+    await expect(
+      storage.remove(agentId, {
+        fence,
+        recheck: () => {
+          throw new Error("caller revoked");
+        },
+      }),
+    ).rejects.toThrow("caller revoked");
+
+    expect((await storage.get(agentId))?.lastStatus).toBe("closed");
+    const reloaded = new AgentStorage(storagePath, logger);
+    expect((await reloaded.get(agentId))?.lastStatus).toBe("closed");
+  });
+
+  test("rechecks deferred destructive writes while restoring an aborted deletion", async () => {
+    const agentId = "agent-delete-deferred-archive-revoked";
+    await storage.applySnapshot(createManagedAgent({ id: agentId, lifecycle: "idle" }));
+    const fence = storage.beginDelete(agentId);
+
+    await storage.applySnapshot(createManagedAgent({ id: agentId, lifecycle: "closed" }));
+    const archivedAt = "2026-08-02T00:00:00.000Z";
+    let callerRevoked = false;
+    await storage.upsert(
+      {
+        ...(await storage.get(agentId))!,
+        archivedAt,
+        updatedAt: archivedAt,
+      },
+      {
+        recheck: () => {
+          if (callerRevoked) throw new Error("archive caller revoked");
+        },
+      },
+    );
+    callerRevoked = true;
+
+    await expect(storage.cancelDelete(fence)).rejects.toThrow("archive caller revoked");
+    expect(await storage.get(agentId)).toMatchObject({ lastStatus: "closed" });
+    expect((await storage.get(agentId))?.archivedAt).toBeUndefined();
+    const reloaded = new AgentStorage(storagePath, logger);
+    expect(await reloaded.get(agentId)).toMatchObject({ lastStatus: "closed" });
+    expect((await reloaded.get(agentId))?.archivedAt).toBeUndefined();
+  });
+
   test("applySnapshot stores and reloads featureValues when present", async () => {
     await storage.applySnapshot(
       createManagedAgent({

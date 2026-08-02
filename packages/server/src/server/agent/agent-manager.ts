@@ -77,7 +77,10 @@ import { isSystemInjectedEnvelope } from "./agent-prompt.js";
 import { stripInternalPaseoMcpServer, withRuntimePaseoMcpServer } from "./runtime-mcp-config.js";
 import { resolveCreateAgentTitles } from "./create-agent-title.js";
 import type { PaseoToolCatalogFactory } from "./tools/types.js";
-import type { AgentCallerIdentity } from "./destructive-action-authority.js";
+import type {
+  AgentCallerIdentity,
+  DestructiveActionRecheck,
+} from "./destructive-action-authority.js";
 import {
   ProviderSubagentStore,
   type ProviderSubagentDescriptor,
@@ -1761,13 +1764,13 @@ export class AgentManager {
     }
   }
 
-  closeAgent(agentId: string): Promise<void> {
+  closeAgent(agentId: string, recheck?: DestructiveActionRecheck): Promise<void> {
     const existing = this.inFlightAgentCloses.get(agentId);
     if (existing) {
       return existing;
     }
 
-    const close = this.closeAgentRuntime(agentId);
+    const close = this.closeAgentRuntime(agentId, recheck);
     this.inFlightAgentCloses.set(agentId, close);
     const clearClose = () => {
       if (this.inFlightAgentCloses.get(agentId) === close) {
@@ -1778,7 +1781,10 @@ export class AgentManager {
     return close;
   }
 
-  private async closeAgentRuntime(agentId: string): Promise<void> {
+  private async closeAgentRuntime(
+    agentId: string,
+    recheck?: DestructiveActionRecheck,
+  ): Promise<void> {
     const agent = this.requireAgent(agentId);
     this.logger.trace(
       {
@@ -1793,6 +1799,7 @@ export class AgentManager {
       "agent.manager.close.start",
     );
     await this.drainSessionEvents(agentId);
+    await recheck?.();
     this.cancelRunningProviderSubagents(agentId);
     const closedAgent = this.prepareAgentForClosure(agent, "agent closed");
     let closeError: unknown;
@@ -1840,23 +1847,25 @@ export class AgentManager {
     }
   }
 
-  async archiveAgent(agentId: string): Promise<{ archivedAt: string }> {
-    const agent = this.requireAgent(agentId);
+  async archiveAgent(
+    agentId: string,
+    recheck?: DestructiveActionRecheck,
+  ): Promise<{ archivedAt: string }> {
+    this.requireAgent(agentId);
     if (!this.registry) {
       throw new Error("Agent storage is not configured");
     }
 
-    await this.registry.applySnapshot(agent, {
-      internal: agent.internal,
-    });
+    // Close first so a caller revoked during later storage preparation leaves a
+    // durable, resumable closed agent instead of an archived record with a live runtime.
+    await this.closeAgent(agentId, recheck);
     const stored = await this.registry.get(agentId);
     if (!stored) {
-      throw new Error(`Agent ${agentId} not found in storage after snapshot`);
+      throw new Error(`Agent ${agentId} not found in storage after close`);
     }
 
-    const { archivedAt } = await this.markRecordArchived(stored);
-    agent.updatedAt = new Date(archivedAt);
-    await this.closeAgent(agentId);
+    await recheck?.();
+    const { archivedAt } = await this.markRecordArchived(stored, recheck);
     this.discardRetainedAgentState(agentId);
 
     await this.cascadeArchiveChildren(agentId);
@@ -1889,12 +1898,15 @@ export class AgentManager {
     }
   }
 
-  private async markRecordArchived(record: StoredAgentRecord): Promise<ArchivedStoredAgentRecord> {
+  private async markRecordArchived(
+    record: StoredAgentRecord,
+    recheck?: DestructiveActionRecheck,
+  ): Promise<ArchivedStoredAgentRecord> {
     const registry = this.requireRegistry();
     const archivedAt = new Date().toISOString();
     const archivedRecord = buildArchivedAgentRecord(record, { archivedAt, updatedAt: archivedAt });
 
-    await registry.upsert(archivedRecord);
+    await registry.upsert(archivedRecord, { recheck });
 
     await this.archiveNativeSessionBestEffort(record.provider, record.persistence);
 
@@ -2154,7 +2166,11 @@ export class AgentManager {
     }
   }
 
-  async archiveSnapshot(agentId: string, archivedAt: string): Promise<StoredAgentRecord> {
+  async archiveSnapshot(
+    agentId: string,
+    archivedAt: string,
+    recheck?: DestructiveActionRecheck,
+  ): Promise<StoredAgentRecord> {
     const registry = this.requireRegistry();
     const liveAgent = this.getAgent(agentId);
     if (liveAgent) {
@@ -2168,8 +2184,9 @@ export class AgentManager {
       throw new Error(`Agent not found: ${agentId}`);
     }
 
+    await recheck?.();
     const nextRecord = buildArchivedAgentRecord(record, { archivedAt });
-    await registry.upsert(nextRecord);
+    await registry.upsert(nextRecord, { recheck });
 
     await this.archiveNativeSessionBestEffort(record.provider, record.persistence);
 

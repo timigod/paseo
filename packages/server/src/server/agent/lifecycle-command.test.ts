@@ -18,6 +18,7 @@ import {
   createAgentDestructiveCaller,
   createCoordinatorDestructiveCaller,
   revokeDestructiveCaller,
+  type DestructiveActionRecheck,
 } from "./destructive-action-authority.js";
 
 class FakeLifecycleAgentStorage implements LifecycleAgentStorage {
@@ -53,6 +54,8 @@ class FakeLifecycleAgentManager implements LifecycleAgentManager {
   readonly settledDuringCancellationAgentIds = new Set<string>();
   readonly rejectedCancellationAgentIds = new Set<string>();
   readonly incarnations = new Map<string, string>();
+  beforeArchiveCommit: (() => Promise<void>) | null = null;
+  beforeCloseCommit: (() => Promise<void>) | null = null;
 
   constructor(private readonly storage: FakeLifecycleAgentStorage) {}
 
@@ -87,7 +90,12 @@ class FakeLifecycleAgentManager implements LifecycleAgentManager {
     this.clearedAttentionAgentIds.push(agentId);
   }
 
-  async archiveAgent(agentId: string): Promise<{ archivedAt: string }> {
+  async archiveAgent(
+    agentId: string,
+    recheck?: DestructiveActionRecheck,
+  ): Promise<{ archivedAt: string }> {
+    await this.beforeArchiveCommit?.();
+    await recheck?.();
     this.archivedAgentIds.push(agentId);
     this.liveAgents.delete(agentId);
     const archivedAt = "2026-05-10T10:00:00.000Z";
@@ -99,7 +107,13 @@ class FakeLifecycleAgentManager implements LifecycleAgentManager {
     return { archivedAt };
   }
 
-  async archiveSnapshot(agentId: string, archivedAt: string): Promise<StoredAgentRecord> {
+  async archiveSnapshot(
+    agentId: string,
+    archivedAt: string,
+    recheck?: DestructiveActionRecheck,
+  ): Promise<StoredAgentRecord> {
+    await this.beforeArchiveCommit?.();
+    await recheck?.();
     const existing = this.storage.records.get(agentId);
     if (!existing) {
       throw new Error(`Agent not found: ${agentId}`);
@@ -112,7 +126,9 @@ class FakeLifecycleAgentManager implements LifecycleAgentManager {
     return archived;
   }
 
-  async closeAgent(agentId: string): Promise<void> {
+  async closeAgent(agentId: string, recheck?: DestructiveActionRecheck): Promise<void> {
+    await this.beforeCloseCommit?.();
+    await recheck?.();
     this.closedAgentIds.push(agentId);
     this.liveAgents.delete(agentId);
   }
@@ -436,6 +452,65 @@ describe("agent lifecycle commands", () => {
 
     await expect(archive).rejects.toMatchObject({ code: "INVALID_CALLER_IDENTITY" });
     expect(manager.archivedAgentIds).toEqual([]);
+    expect(manager.liveAgents.has("agent-1")).toBe(true);
+  });
+
+  test("rechecks a caller after the manager's archive preparation await", async () => {
+    const storage = new FakeLifecycleAgentStorage();
+    const manager = new FakeLifecycleAgentManager(storage);
+    manager.liveAgents.set("agent-1", managedAgent("agent-1", "idle"));
+    storage.records.set("agent-1", storedAgent("agent-1"));
+    const caller = createCoordinatorDestructiveCaller();
+    let releaseCommit = () => {};
+    let markCommitReached = () => {};
+    const commitReached = new Promise<void>((resolve) => {
+      markCommitReached = resolve;
+    });
+    manager.beforeArchiveCommit = async () => {
+      markCommitReached();
+      await new Promise<void>((resolve) => {
+        releaseCommit = resolve;
+      });
+    };
+
+    const archive = archiveAgentCommand(
+      { agentManager: manager, agentStorage: storage, logger },
+      "agent-1",
+      { caller },
+    );
+    await commitReached;
+    revokeDestructiveCaller(caller);
+    releaseCommit();
+
+    await expect(archive).rejects.toMatchObject({ code: "INVALID_CALLER_IDENTITY" });
+    expect(manager.archivedAgentIds).toEqual([]);
+    expect(manager.liveAgents.has("agent-1")).toBe(true);
+  });
+
+  test("rechecks a caller after the manager's close preparation await", async () => {
+    const storage = new FakeLifecycleAgentStorage();
+    const manager = new FakeLifecycleAgentManager(storage);
+    manager.liveAgents.set("agent-1", managedAgent("agent-1", "idle"));
+    const caller = createCoordinatorDestructiveCaller();
+    let releaseCommit = () => {};
+    let markCommitReached = () => {};
+    const commitReached = new Promise<void>((resolve) => {
+      markCommitReached = resolve;
+    });
+    manager.beforeCloseCommit = async () => {
+      markCommitReached();
+      await new Promise<void>((resolve) => {
+        releaseCommit = resolve;
+      });
+    };
+
+    const close = closeAgentCommand({ agentManager: manager }, "agent-1", { caller });
+    await commitReached;
+    revokeDestructiveCaller(caller);
+    releaseCommit();
+
+    await expect(close).rejects.toMatchObject({ code: "INVALID_CALLER_IDENTITY" });
+    expect(manager.closedAgentIds).toEqual([]);
     expect(manager.liveAgents.has("agent-1")).toBe(true);
   });
 

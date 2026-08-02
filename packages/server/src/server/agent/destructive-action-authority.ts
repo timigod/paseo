@@ -51,6 +51,8 @@ export type DestructiveActionName =
   | "workspace.archive"
   | "worktree.archive";
 
+export type DestructiveActionRecheck = () => void | Promise<void>;
+
 export interface DestructiveActionTarget {
   action: DestructiveActionName;
   targetAgentIds: readonly string[];
