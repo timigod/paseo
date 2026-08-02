@@ -8,6 +8,7 @@ import { afterEach, describe, expect, test, vi } from "vitest";
 
 import { findExecutable } from "../../../executable-resolution/executable-resolution.js";
 import { createTestLogger } from "../../../test-utils/test-logger.js";
+import { ProviderSnapshotManager } from "../provider-snapshot-manager.js";
 import type { ProviderRuntimeSettings } from "../provider-launch-config.js";
 import type {
   ManagedProcessRecord,
@@ -28,6 +29,8 @@ import {
   type OpenCodePortAllocator,
   type OpenCodeServerProcessSpawner,
 } from "./opencode/server-manager.js";
+import { OpenCodeAgentClient } from "./opencode-agent.js";
+import { TestOpenCodeClient } from "./opencode/test-utils/test-opencode-harness.js";
 
 afterEach(() => {
   vi.useRealTimers();
@@ -161,6 +164,191 @@ describe("OpenCodeServerManager generations", () => {
 
     await failure;
     expect(runtime.terminatedPorts).toEqual([4471]);
+    expect(await runtime.managedProcesses.list()).toEqual([]);
+  });
+
+  test("catalog deadline cancels and joins the orphaned real-manager startup", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    const { manager, runtime } = createTestManager([4481, 4482], { autoAnnounce: false });
+    const client = new OpenCodeAgentClient(createTestLogger(), undefined, {
+      serverManager: manager,
+      createClient: () => new TestOpenCodeClient().asSdkClient(),
+    });
+    const catalog = client.fetchCatalog({
+      scope: "workspace",
+      cwd: "/tmp/opencode-catalog-deadline",
+      force: false,
+      timeoutMs: 250,
+    });
+    const failure = expect(catalog).rejects.toThrow(
+      "OpenCode server acquisition timed out within the 250ms catalog budget",
+    );
+    await runtime.settle();
+
+    await vi.advanceTimersByTimeAsync(250);
+    await failure;
+
+    expect(runtime.terminatedPorts).toEqual([4481]);
+    expect(await runtime.managedProcesses.list()).toEqual([]);
+    runtime.processForPort(4481).announceListening();
+    await runtime.settle();
+    expect(runtime.terminatedPorts).toEqual([4481]);
+
+    const nextStart = manager.acquireCurrent();
+    await runtime.settle();
+    runtime.processForPort(4482).announceListening();
+    const next = await nextStart;
+    expect(next.server.url).toBe("http://127.0.0.1:4482");
+    await next.release();
+  });
+
+  test("provider snapshots do not publish after a real-manager catalog timeout", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    const { manager: serverManager, runtime } = createTestManager([4486], {
+      autoAnnounce: false,
+    });
+    const client = new OpenCodeAgentClient(createTestLogger(), undefined, {
+      serverManager,
+      createClient: () => new TestOpenCodeClient().asSdkClient(),
+    });
+    vi.spyOn(client, "isAvailable").mockResolvedValue(true);
+    const snapshots = new ProviderSnapshotManager({
+      logger: createTestLogger(),
+      refreshTimeoutMs: 250,
+      extraClients: { opencode: client },
+    });
+
+    try {
+      const entryPromise = snapshots.getProvider({
+        cwd: "/tmp/opencode-catalog-provider-timeout",
+        provider: "opencode",
+        wait: true,
+      });
+      await runtime.settle();
+      await vi.advanceTimersByTimeAsync(250);
+      const timedOutEntry = await entryPromise;
+
+      expect(timedOutEntry).toMatchObject({
+        provider: "opencode",
+        status: "error",
+        error: "OpenCode server acquisition timed out within the 250ms catalog budget",
+      });
+      expect(runtime.terminatedPorts).toEqual([4486]);
+      expect(await runtime.managedProcesses.list()).toEqual([]);
+
+      runtime.processForPort(4486).announceListening();
+      await runtime.settle();
+      expect(
+        await snapshots.getProvider({
+          cwd: "/tmp/opencode-catalog-provider-timeout",
+          provider: "opencode",
+          wait: false,
+        }),
+      ).toEqual(timedOutEntry);
+    } finally {
+      snapshots.destroy();
+    }
+  });
+
+  test("a timed-out catalog waiter leaves a shared real-manager startup alive", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    const { manager, runtime } = createTestManager([4483], { autoAnnounce: false });
+    const providerAcquisition = manager.acquireCurrent();
+    await runtime.settle();
+    const client = new OpenCodeAgentClient(createTestLogger(), undefined, {
+      serverManager: manager,
+      createClient: () => new TestOpenCodeClient().asSdkClient(),
+    });
+    const catalog = client.fetchCatalog({
+      scope: "workspace",
+      cwd: "/tmp/opencode-catalog-shared",
+      force: false,
+      timeoutMs: 250,
+    });
+    const failure = expect(catalog).rejects.toThrow(
+      "OpenCode server acquisition timed out within the 250ms catalog budget",
+    );
+
+    await vi.advanceTimersByTimeAsync(250);
+    await failure;
+    expect(runtime.terminatedPorts).toEqual([]);
+
+    runtime.processForPort(4483).announceListening();
+    const provider = await providerAcquisition;
+    expect(provider.server.url).toBe("http://127.0.0.1:4483");
+    await provider.release();
+    expect(runtime.terminatedPorts).toEqual([4483]);
+    expect(await runtime.managedProcesses.list()).toEqual([]);
+  });
+
+  test("only the last canceled waiter tears down a shared real-manager startup", async () => {
+    const { manager, runtime } = createTestManager([4487], { autoAnnounce: false });
+    const firstController = new AbortController();
+    const secondController = new AbortController();
+    const first = manager.acquireCurrent({
+      signal: firstController.signal,
+      abortMessage: "first catalog acquisition aborted",
+    });
+    const firstFailure = expect(first).rejects.toThrow("first catalog acquisition aborted");
+    const second = manager.acquireCurrent({
+      signal: secondController.signal,
+      abortMessage: "second catalog acquisition aborted",
+    });
+    const secondFailure = expect(second).rejects.toThrow("second catalog acquisition aborted");
+    await runtime.settle();
+
+    firstController.abort();
+    await firstFailure;
+    expect(runtime.terminatedPorts).toEqual([]);
+    expect(await runtime.managedProcesses.list()).toHaveLength(1);
+
+    secondController.abort();
+    await secondFailure;
+    expect(runtime.terminatedPorts).toEqual([4487]);
+    expect(await runtime.managedProcesses.list()).toEqual([]);
+  });
+
+  test("an aborted forced catalog refresh keeps the previous current generation", async () => {
+    const { manager, runtime } = createTestManager([4484, 4485], { autoAnnounce: false });
+    const oldStart = manager.acquireCurrent();
+    await runtime.settle();
+    runtime.processForPort(4484).announceListening();
+    const old = await oldStart;
+    const controller = new AbortController();
+    const client = new OpenCodeAgentClient(createTestLogger(), undefined, {
+      serverManager: manager,
+      createClient: () => new TestOpenCodeClient().asSdkClient(),
+    });
+    const catalog = client.fetchCatalog({
+      scope: "workspace",
+      cwd: "/tmp/opencode-catalog-forced-abort",
+      force: true,
+      timeoutMs: 30_000,
+      signal: controller.signal,
+    });
+    const failure = expect(catalog).rejects.toThrow(
+      "OpenCode server acquisition aborted by caller",
+    );
+    await runtime.settle();
+    expect(runtime.launchedPorts).toEqual([4484, 4485]);
+
+    controller.abort();
+    await failure;
+
+    expect(runtime.terminatedPorts).toEqual([4485]);
+    expect(await runtime.managedProcesses.list()).toHaveLength(1);
+    runtime.processForPort(4485).announceListening();
+    await runtime.settle();
+    expect(runtime.terminatedPorts).toEqual([4485]);
+
+    const current = await manager.acquireCurrent();
+    expect(current.server.url).toBe(old.server.url);
+    await current.release();
+    await old.release();
+    expect(runtime.terminatedPorts).toEqual([4485, 4484]);
     expect(await runtime.managedProcesses.list()).toEqual([]);
   });
 

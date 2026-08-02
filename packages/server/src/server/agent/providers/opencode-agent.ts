@@ -70,6 +70,7 @@ import { mapOpencodeToolCall } from "./opencode/tool-call-mapper.js";
 import {
   OpenCodeServerManager,
   type OpenCodeServerAcquisition,
+  type OpenCodeServerAcquisitionOptions,
   type OpenCodeServerManagerLike,
 } from "./opencode/server-manager.js";
 import { resolveOpenCodeHomeDir } from "./opencode/paths.js";
@@ -351,7 +352,7 @@ async function runOpenCodeCatalogRequest<T>(
 }
 
 async function acquireOpenCodeCatalogServer(
-  acquire: () => Promise<OpenCodeServerAcquisition>,
+  acquire: (options: OpenCodeServerAcquisitionOptions) => Promise<OpenCodeServerAcquisition>,
   budget: OpenCodeCatalogBudget,
   logger: Logger,
 ): Promise<OpenCodeServerAcquisition> {
@@ -365,7 +366,12 @@ async function acquireOpenCodeCatalogServer(
     );
   }
 
-  const acquisitionPromise = acquire();
+  const acquisitionPromise = acquire({
+    signal: budget.signal,
+    deadlineAtMs: budget.deadlineAtMs,
+    abortMessage: "OpenCode server acquisition aborted by caller",
+    timeoutMessage: `OpenCode server acquisition timed out within the ${budget.timeoutMs}ms catalog budget`,
+  });
   let timeout: ReturnType<typeof setTimeout> | undefined;
   let cancelled = false;
   const cancel = (reject: (error: Error) => void, error: Error) => {
@@ -1539,8 +1545,8 @@ export class OpenCodeAgentClient implements AgentClient {
     }
     const acquisition = await acquireOpenCodeCatalogServer(
       options.force
-        ? () => this.serverManager.acquireNew()
-        : () => this.serverManager.acquireCurrent(),
+        ? (acquisitionOptions) => this.serverManager.acquireNew(acquisitionOptions)
+        : (acquisitionOptions) => this.serverManager.acquireCurrent(acquisitionOptions),
       catalogBudget,
       this.logger,
     );

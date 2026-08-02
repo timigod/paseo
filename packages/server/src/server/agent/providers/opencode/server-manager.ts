@@ -49,10 +49,17 @@ export interface OpenCodeServerAcquisition {
   release: () => Promise<void>;
 }
 
+export interface OpenCodeServerAcquisitionOptions {
+  signal?: AbortSignal;
+  deadlineAtMs?: number;
+  abortMessage?: string;
+  timeoutMessage?: string;
+}
+
 export interface OpenCodeServerManagerLike {
   configureRuntimeCapacityController(controller: AgentRuntimeCapacityController): void;
-  acquireCurrent(): Promise<OpenCodeServerAcquisition>;
-  acquireNew(): Promise<OpenCodeServerAcquisition>;
+  acquireCurrent(options?: OpenCodeServerAcquisitionOptions): Promise<OpenCodeServerAcquisition>;
+  acquireNew(options?: OpenCodeServerAcquisitionOptions): Promise<OpenCodeServerAcquisition>;
   acquireDedicated(env: Record<string, string>): Promise<OpenCodeServerAcquisition>;
   acquireExisting(url: string): OpenCodeServerAcquisition | null;
   shutdown(): Promise<void>;
@@ -72,6 +79,26 @@ export interface OpenCodeServerGeneration {
   identityToken?: string;
   cleanupComplete: boolean;
   abortStartup?: (error: Error) => void;
+}
+
+interface OpenCodeServerStartup {
+  kind: "current" | "new";
+  controller: AbortController;
+  promise: Promise<OpenCodeServerGeneration>;
+  server: OpenCodeServerGeneration | null;
+  waiterCount: number;
+  published: boolean;
+  cancellationPromise: Promise<void> | null;
+}
+
+class OpenCodeServerAcquisitionCancellationError extends Error {
+  constructor(
+    message: string,
+    readonly reason: "abort" | "timeout",
+  ) {
+    super(message);
+    this.name = "OpenCodeServerAcquisitionCancellationError";
+  }
 }
 
 export type OpenCodePortAllocator = () => Promise<number>;
@@ -111,8 +138,8 @@ export class OpenCodeServerManager implements OpenCodeServerManagerLike {
   private cleanupRetriesDisabled = new WeakSet<OpenCodeServerGeneration>();
   private pendingStarts = new Set<Promise<OpenCodeServerGeneration>>();
   private shutdownPromise: Promise<void> | null = null;
-  private startPromise: Promise<OpenCodeServerGeneration> | null = null;
-  private newServerPromise: Promise<OpenCodeServerGeneration> | null = null;
+  private currentStartup: OpenCodeServerStartup | null = null;
+  private newServerStartup: OpenCodeServerStartup | null = null;
   private readonly logger: Logger;
   private readonly runtimeSettings?: ProviderRuntimeSettings;
   private readonly runtimeSettingsKey: string;
@@ -167,8 +194,8 @@ export class OpenCodeServerManager implements OpenCodeServerManagerLike {
       (this.currentServer ||
         this.retiredServers.size > 0 ||
         this.pendingStarts.size > 0 ||
-        this.startPromise ||
-        this.newServerPromise ||
+        this.currentStartup ||
+        this.newServerStartup ||
         this.shutdownPromise)
     ) {
       throw new Error(
@@ -219,20 +246,36 @@ export class OpenCodeServerManager implements OpenCodeServerManagerLike {
     process.on("SIGINT", cleanup);
   }
 
-  async acquireCurrent(): Promise<OpenCodeServerAcquisition> {
+  async acquireCurrent(
+    options?: OpenCodeServerAcquisitionOptions,
+  ): Promise<OpenCodeServerAcquisition> {
     if (this.shutdownPromise) {
       await this.shutdownPromise;
     }
-    const server = await this.getCurrentServer();
+    this.throwIfAcquisitionCanceled(options);
+    const startup = this.getCurrentServerStartup();
+    if (startup) {
+      return this.acquireFromStartup(startup, options);
+    }
+    const server = this.currentServer;
+    if (!server) {
+      throw new Error("OpenCode current server was not available");
+    }
+    this.throwIfAcquisitionCanceled(options);
     return this.acquireServer(server);
   }
 
-  async acquireNew(): Promise<OpenCodeServerAcquisition> {
+  async acquireNew(options?: OpenCodeServerAcquisitionOptions): Promise<OpenCodeServerAcquisition> {
     if (this.shutdownPromise) {
       await this.shutdownPromise;
     }
-    const server = await this.getNewServer();
-    return this.acquireServer(server);
+    this.throwIfAcquisitionCanceled(options);
+    if (this.currentStartup && !this.newServerStartup) {
+      await this.waitForStartupPromise(this.currentStartup.promise, options);
+      this.throwIfAcquisitionCanceled(options);
+    }
+    const startup = this.getNewServerStartup();
+    return this.acquireFromStartup(startup, options);
   }
 
   async acquireDedicated(env: Record<string, string>): Promise<OpenCodeServerAcquisition> {
@@ -309,87 +352,223 @@ export class OpenCodeServerManager implements OpenCodeServerManagerLike {
     await this.killServer(server);
   }
 
-  private async getNewServer(): Promise<OpenCodeServerGeneration> {
-    if (this.newServerPromise) {
-      return this.newServerPromise;
+  private getNewServerStartup(): OpenCodeServerStartup {
+    if (this.newServerStartup) {
+      return this.newServerStartup;
     }
+    const startup = this.createServerStartup("new");
+    this.newServerStartup = startup;
+    return startup;
+  }
 
-    const generation = this.trackPendingStart(
-      Promise.resolve().then(async () => {
-        await this.rotateCurrentServer();
-        const server = await this.startServer();
-        if (!server.retired) {
-          this.currentServer = server;
-        }
-        return server;
-      }),
-    );
-    this.newServerPromise = generation
+  private getCurrentServerStartup(): OpenCodeServerStartup | null {
+    if (this.newServerStartup) {
+      return this.newServerStartup;
+    }
+    if (this.currentStartup) {
+      return this.currentStartup;
+    }
+    if (this.currentServer && this.isServerLive(this.currentServer)) {
+      return null;
+    }
+    const startup = this.createServerStartup("current");
+    this.currentStartup = startup;
+    return startup;
+  }
+
+  private createServerStartup(kind: OpenCodeServerStartup["kind"]): OpenCodeServerStartup {
+    const controller = new AbortController();
+    const startup: OpenCodeServerStartup = {
+      kind,
+      controller,
+      promise: Promise.resolve(null as never),
+      server: null,
+      waiterCount: 0,
+      published: false,
+      cancellationPromise: null,
+    };
+    const generation = this.trackPendingStart(this.startServer(undefined, controller.signal));
+    startup.promise = generation
       .then(async (server) => {
+        startup.server = server;
+        if (controller.signal.aborted) {
+          await this.killServer(server);
+          throw this.readStartupAbortReason(controller.signal);
+        }
         await server.ready;
+        if (controller.signal.aborted) {
+          await this.killServer(server);
+          throw this.readStartupAbortReason(controller.signal);
+        }
         return server;
       })
-      .finally(() => {
-        this.newServerPromise = null;
+      .catch((error: unknown) => {
+        this.clearStartup(startup);
+        throw error;
       });
-    return this.newServerPromise;
+    return startup;
   }
 
-  private async getCurrentServer(): Promise<OpenCodeServerGeneration> {
-    if (this.newServerPromise) {
-      return this.newServerPromise;
-    }
-
-    if (this.startPromise) {
-      const server = await this.startPromise;
-      await server.ready;
-      return server;
-    }
-
-    if (this.currentServer && !this.currentServer.process.killed) {
-      await this.currentServer.ready;
-      return this.currentServer;
-    }
-
-    this.startPromise = this.trackPendingStart(
-      this.startServer().then((server) => {
-        if (!server.retired) {
-          this.currentServer = server;
+  private async acquireFromStartup(
+    startup: OpenCodeServerStartup,
+    options?: OpenCodeServerAcquisitionOptions,
+  ): Promise<OpenCodeServerAcquisition> {
+    startup.waiterCount += 1;
+    let waiterReleased = false;
+    try {
+      const server = await this.waitForStartupPromise(startup.promise, options);
+      this.throwIfAcquisitionCanceled(options);
+      if (startup.controller.signal.aborted) {
+        throw this.readStartupAbortReason(startup.controller.signal);
+      }
+      const acquisition = this.acquireServer(server);
+      this.publishStartup(startup, server);
+      return acquisition;
+    } catch (error) {
+      if (error instanceof OpenCodeServerAcquisitionCancellationError) {
+        startup.waiterCount = Math.max(0, startup.waiterCount - 1);
+        waiterReleased = true;
+        if (startup.waiterCount === 0 && !startup.published) {
+          await this.cancelStartup(startup, error);
         }
-        return server;
-      }),
-    );
-    const currentStart = this.startPromise;
-    const result = await currentStart.finally(() => {
-      if (this.startPromise === currentStart) {
-        this.startPromise = null;
+      }
+      throw error;
+    } finally {
+      if (!waiterReleased) {
+        startup.waiterCount = Math.max(0, startup.waiterCount - 1);
+      }
+    }
+  }
+
+  private publishStartup(startup: OpenCodeServerStartup, server: OpenCodeServerGeneration): void {
+    if (startup.published) {
+      return;
+    }
+    const previous = this.currentServer;
+    if (previous && previous !== server) {
+      previous.retired = true;
+      this.retiredServers.add(previous);
+    }
+    server.retired = false;
+    this.currentServer = server;
+    startup.published = true;
+    this.clearStartup(startup);
+    void this.cleanupRetiredServers();
+  }
+
+  private async cancelStartup(startup: OpenCodeServerStartup, error: Error): Promise<void> {
+    if (startup.cancellationPromise) {
+      return startup.cancellationPromise;
+    }
+    startup.controller.abort(error);
+    this.clearStartup(startup);
+    const cancellation = startup.server ? this.killServer(startup.server) : Promise.resolve();
+    startup.cancellationPromise = cancellation;
+    return cancellation;
+  }
+
+  private clearStartup(startup: OpenCodeServerStartup): void {
+    if (this.currentStartup === startup) {
+      this.currentStartup = null;
+    }
+    if (this.newServerStartup === startup) {
+      this.newServerStartup = null;
+    }
+  }
+
+  private waitForStartupPromise(
+    promise: Promise<OpenCodeServerGeneration>,
+    options?: OpenCodeServerAcquisitionOptions,
+  ): Promise<OpenCodeServerGeneration> {
+    this.throwIfAcquisitionCanceled(options);
+    if (!options?.signal && options?.deadlineAtMs === undefined) {
+      return promise;
+    }
+    return new Promise<OpenCodeServerGeneration>((resolve, reject) => {
+      let settled = false;
+      let timeout: NodeJS.Timeout | undefined;
+      const finish = (operation: () => void) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        if (timeout) {
+          clearTimeout(timeout);
+        }
+        options?.signal?.removeEventListener("abort", onAbort);
+        operation();
+      };
+      const onAbort = () =>
+        finish(() =>
+          reject(
+            new OpenCodeServerAcquisitionCancellationError(
+              options?.abortMessage ?? "OpenCode server acquisition aborted by caller",
+              "abort",
+            ),
+          ),
+        );
+      options?.signal?.addEventListener("abort", onAbort, { once: true });
+      if (options?.deadlineAtMs !== undefined) {
+        timeout = setTimeout(
+          () =>
+            finish(() =>
+              reject(
+                new OpenCodeServerAcquisitionCancellationError(
+                  options.timeoutMessage ?? "OpenCode server acquisition timed out",
+                  "timeout",
+                ),
+              ),
+            ),
+          Math.max(0, options.deadlineAtMs - Date.now()),
+        );
+      }
+      promise.then(
+        (server) => finish(() => resolve(server)),
+        (error: unknown) => finish(() => reject(error)),
+      );
+      if (options?.signal?.aborted) {
+        onAbort();
       }
     });
-    await result.ready;
-    return result;
   }
 
-  private async rotateCurrentServer(): Promise<void> {
-    const existing = this.currentServer;
-    if (existing) {
-      existing.retired = true;
-      this.retiredServers.add(existing);
-      this.currentServer = null;
-      await this.cleanupRetiredServers();
+  private throwIfAcquisitionCanceled(options?: OpenCodeServerAcquisitionOptions): void {
+    if (options?.signal?.aborted) {
+      throw new OpenCodeServerAcquisitionCancellationError(
+        options.abortMessage ?? "OpenCode server acquisition aborted by caller",
+        "abort",
+      );
     }
-    if (this.startPromise) {
-      const pending = await this.startPromise;
-      pending.retired = true;
-      this.retiredServers.add(pending);
-      this.currentServer = null;
-      await this.cleanupRetiredServers();
+    if (options?.deadlineAtMs !== undefined && options.deadlineAtMs <= Date.now()) {
+      throw new OpenCodeServerAcquisitionCancellationError(
+        options.timeoutMessage ?? "OpenCode server acquisition timed out",
+        "timeout",
+      );
     }
   }
 
-  private async startServer(launchEnv?: Record<string, string>): Promise<OpenCodeServerGeneration> {
+  private readStartupAbortReason(signal: AbortSignal): Error {
+    return signal.reason instanceof Error
+      ? signal.reason
+      : new Error("OpenCode server terminated during startup");
+  }
+
+  private async startServer(
+    launchEnv?: Record<string, string>,
+    signal?: AbortSignal,
+  ): Promise<OpenCodeServerGeneration> {
+    if (signal?.aborted) {
+      throw this.readStartupAbortReason(signal);
+    }
     const port = await this.portAllocator();
+    if (signal?.aborted) {
+      throw this.readStartupAbortReason(signal);
+    }
     const url = `http://127.0.0.1:${port}`;
     const launchPrefix = await this.resolveCommandPrefix();
+    if (signal?.aborted) {
+      throw this.readStartupAbortReason(signal);
+    }
     const serverArgs = [...launchPrefix.args, "serve", "--port", String(port)];
     // Use a neutral OpenCode home as the server cwd. Launching from the user's
     // home directory causes OpenCode to treat it as the default workspace and
@@ -484,8 +663,11 @@ export class OpenCodeServerManager implements OpenCodeServerManagerLike {
         }
         settled = true;
         clearTimeout(timeout);
+        signal?.removeEventListener("abort", abortFromSignal);
         reject(error);
       };
+      const abortFromSignal = () => failStartup(this.readStartupAbortReason(signal!));
+      signal?.addEventListener("abort", abortFromSignal, { once: true });
       timeout = setTimeout(() => {
         if (!settled) {
           failStartup(new Error(buildStartupErrorMessage("OpenCode server startup timeout")));
@@ -501,6 +683,7 @@ export class OpenCodeServerManager implements OpenCodeServerManagerLike {
             if (!settled) {
               settled = true;
               clearTimeout(timeout);
+              signal?.removeEventListener("abort", abortFromSignal);
               resolve();
             }
             return undefined;
@@ -541,6 +724,9 @@ export class OpenCodeServerManager implements OpenCodeServerManagerLike {
         }
       });
       server.abortStartup = failStartup;
+      if (signal?.aborted) {
+        abortFromSignal();
+      }
     });
 
     server.ready = ready.catch(async (error) => {
@@ -572,9 +758,13 @@ export class OpenCodeServerManager implements OpenCodeServerManagerLike {
   }
 
   private async shutdownOnce(): Promise<void> {
+    const startups = [this.currentStartup, this.newServerStartup].filter(
+      (startup): startup is OpenCodeServerStartup => startup !== null,
+    );
     const servers = new Set<OpenCodeServerGeneration>([
       ...(this.currentServer ? [this.currentServer] : []),
       ...this.retiredServers,
+      ...startups.flatMap((startup) => (startup.server ? [startup.server] : [])),
     ]);
     for (const server of servers) {
       this.disableCleanupRetry(server);
@@ -585,6 +775,13 @@ export class OpenCodeServerManager implements OpenCodeServerManagerLike {
         servers.add(result.value);
         this.disableCleanupRetry(result.value);
       }
+    }
+    for (const startup of startups) {
+      if (startup.server) {
+        servers.add(startup.server);
+        this.disableCleanupRetry(startup.server);
+      }
+      this.clearStartup(startup);
     }
     await Promise.all(Array.from(servers, (server) => this.killServer(server)));
     this.currentServer = null;
