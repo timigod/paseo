@@ -1762,6 +1762,31 @@ describe("OpenCode adapter startTurn error handling", () => {
     ]);
   });
 
+  test("streamHistory rejects an OpenCode messages API error instead of reporting empty history", async () => {
+    const fakeClient = {
+      session: {
+        get: vi.fn().mockResolvedValue({ data: {}, error: undefined }),
+        messages: vi.fn().mockResolvedValue({
+          data: undefined,
+          error: { name: "APIError", data: { message: "Forbidden", statusCode: 403 } },
+        }),
+      },
+    } as never;
+    const session = new __openCodeInternals.OpenCodeAgentSession(
+      { provider: "opencode", cwd: "/tmp/test" },
+      fakeClient,
+      "ses_history_error",
+      createTestLogger(),
+    );
+
+    const consume = async () => {
+      for await (const _event of session.streamHistory()) {
+        // The provider must fail before yielding a synthetic empty history.
+      }
+    };
+    await expect(consume()).rejects.toThrow(/Failed to read OpenCode session history.*Forbidden/);
+  });
+
   test("streamHistory omits replay timestamps when OpenCode omits times", async () => {
     const fakeClient = {
       session: {

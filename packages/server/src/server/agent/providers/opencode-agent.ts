@@ -4004,7 +4004,11 @@ class OpenCodeAgentSession implements AgentSession {
     });
 
     if (response.error || !response.data) {
-      return;
+      throw new Error(
+        `Failed to read OpenCode session history: ${toDiagnosticErrorMessage(
+          response.error ?? "messages response contained no data",
+        )}`,
+      );
     }
 
     const messages = filterOpenCodeRevertedMessages(
