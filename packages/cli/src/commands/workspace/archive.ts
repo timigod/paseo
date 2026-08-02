@@ -22,8 +22,17 @@ export async function runArchiveCommand(
   options: { host?: string },
   _command: Command,
 ): Promise<SingleResult<WorkspaceArchiveResult>> {
+  return runArchiveCommandWithDeps(workspaceId, options, { connectToDaemon });
+}
+
+export async function runArchiveCommandWithDeps(
+  workspaceId: string,
+  options: { host?: string },
+  deps: { connectToDaemon: typeof connectToDaemon },
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<SingleResult<WorkspaceArchiveResult>> {
   const host = getDaemonHost({ host: options.host });
-  const client = await connectToDaemon({ host: options.host }).catch((error: unknown) => {
+  const client = await deps.connectToDaemon({ host: options.host }).catch((error: unknown) => {
     const message = error instanceof Error ? error.message : String(error);
     throw {
       code: "DAEMON_NOT_RUNNING",
@@ -31,9 +40,16 @@ export async function runArchiveCommand(
     } satisfies CommandError;
   });
   try {
-    const payload = await client.archiveWorkspace(workspaceId);
+    const payload = await client.archiveWorkspace(
+      workspaceId,
+      undefined,
+      resolveArchiveCaller(env),
+    );
     if (payload.error) {
-      throw new Error(payload.error);
+      throw {
+        code: payload.errorCode ?? "WORKSPACE_ARCHIVE_FAILED",
+        message: payload.error,
+      } satisfies CommandError;
     }
     if (!payload.archivedAt) {
       throw new Error("Workspace archive did not return an archive timestamp");
@@ -44,9 +60,23 @@ export async function runArchiveCommand(
       schema: workspaceArchiveSchema,
     };
   } catch (error) {
+    if (error && typeof error === "object" && "code" in error) {
+      throw error;
+    }
     const message = error instanceof Error ? error.message : String(error);
     throw { code: "WORKSPACE_ARCHIVE_FAILED", message } satisfies CommandError;
   } finally {
     await client.close().catch(() => undefined);
   }
+}
+
+function resolveArchiveCaller(
+  env: NodeJS.ProcessEnv,
+): { agentId: string; proof?: string } | undefined {
+  const agentId = env.PASEO_AGENT_ID?.trim();
+  const proof = env.PASEO_AGENT_CALLER_PROOF?.trim();
+  if (!agentId && !proof) {
+    return undefined;
+  }
+  return { agentId: agentId ?? "", ...(proof ? { proof } : {}) };
 }

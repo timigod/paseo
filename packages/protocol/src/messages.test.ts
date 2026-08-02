@@ -1,8 +1,11 @@
 import { describe, expect, test } from "vitest";
 import {
+  ArchiveWorkspaceRequestSchema,
+  ArchiveWorkspaceResponseMessageSchema,
   FileExplorerRequestSchema,
   MANAGED_WORKTREE_WRITER_CONFLICT_ERROR_CODE,
   PaseoWorktreeArchiveRequestSchema,
+  PaseoWorktreeArchiveResponseSchema,
   parseServerInfoStatusPayload,
   SessionInboundMessageSchema,
   SessionOutboundMessageSchema,
@@ -479,6 +482,106 @@ describe("paseo worktree archive request compatibility", () => {
     });
     expect(parsed).not.toHaveProperty("extraField");
     expect(parsed.scope).toBe("workspace");
+  });
+
+  test("optional caller identity parses without changing old requests", () => {
+    expect(
+      PaseoWorktreeArchiveRequestSchema.parse({
+        type: "paseo_worktree_archive_request",
+        worktreePath: "/repo/app",
+        requestId: "req-old-caller",
+      }),
+    ).not.toHaveProperty("callerAgentId");
+
+    expect(
+      PaseoWorktreeArchiveRequestSchema.parse({
+        type: "paseo_worktree_archive_request",
+        worktreePath: "/repo/app",
+        callerAgentId: "agent-1",
+        callerAgentProof: "proof-1",
+        requestId: "req-new-caller",
+      }),
+    ).toMatchObject({ callerAgentId: "agent-1", callerAgentProof: "proof-1" });
+  });
+});
+
+describe("archive caller protocol compatibility", () => {
+  test("parses the agent archive caller feature gate", () => {
+    const parsed = parseServerInfoStatusPayload({
+      status: "server_info",
+      serverId: "srv-test",
+      features: { agentArchiveCaller: true },
+    });
+
+    expect(parsed?.features?.agentArchiveCaller).toBe(true);
+  });
+
+  test("workspace archive accepts old and caller-scoped requests", () => {
+    expect(
+      ArchiveWorkspaceRequestSchema.parse({
+        type: "archive_workspace_request",
+        workspaceId: "workspace-1",
+        requestId: "req-old",
+      }),
+    ).not.toHaveProperty("callerAgentId");
+
+    expect(
+      ArchiveWorkspaceRequestSchema.parse({
+        type: "archive_workspace_request",
+        workspaceId: "workspace-1",
+        callerAgentId: "agent-1",
+        callerAgentProof: "proof-1",
+        requestId: "req-new",
+      }),
+    ).toMatchObject({ callerAgentId: "agent-1", callerAgentProof: "proof-1" });
+  });
+
+  test("archive responses accept old payloads and preserve typed error codes", () => {
+    expect(
+      ArchiveWorkspaceResponseMessageSchema.parse({
+        type: "archive_workspace_response",
+        payload: {
+          requestId: "req-old-workspace",
+          workspaceId: "workspace-1",
+          archivedAt: null,
+          error: "failed",
+        },
+      }).payload,
+    ).not.toHaveProperty("errorCode");
+    expect(
+      ArchiveWorkspaceResponseMessageSchema.parse({
+        type: "archive_workspace_response",
+        payload: {
+          requestId: "req-new-workspace",
+          workspaceId: "workspace-1",
+          archivedAt: null,
+          error: "blocked",
+          errorCode: "SELF_ARCHIVE_BLOCKED",
+        },
+      }).payload.errorCode,
+    ).toBe("SELF_ARCHIVE_BLOCKED");
+
+    expect(
+      PaseoWorktreeArchiveResponseSchema.parse({
+        type: "paseo_worktree_archive_response",
+        payload: {
+          success: false,
+          error: { code: "UNKNOWN", message: "failed" },
+          requestId: "req-old-worktree",
+        },
+      }).payload,
+    ).not.toHaveProperty("errorCode");
+    expect(
+      PaseoWorktreeArchiveResponseSchema.parse({
+        type: "paseo_worktree_archive_response",
+        payload: {
+          success: false,
+          error: { code: "UNKNOWN", message: "blocked" },
+          errorCode: "SELF_ARCHIVE_BLOCKED",
+          requestId: "req-new-worktree",
+        },
+      }).payload.errorCode,
+    ).toBe("SELF_ARCHIVE_BLOCKED");
   });
 });
 

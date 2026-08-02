@@ -49,7 +49,8 @@ export interface ArchiveDependencies {
   paseoWorktreesBaseRoot?: string;
   github: ForgeService;
   workspaceGitService: Pick<WorkspaceGitService, "getSnapshot">;
-  agentManager: Pick<AgentManager, "listAgents" | "archiveAgent" | "archiveSnapshot">;
+  agentManager: Pick<AgentManager, "listAgents" | "archiveAgent" | "archiveSnapshot"> &
+    Partial<Pick<AgentManager, "verifyCallerAgentProof">>;
   agentStorage: Pick<AgentStorage, "list">;
   // Resolves the worktree at a path to its workspaceId for archive-by-path. The
   // path uniquely identifies a worktree workspace; this is a directory lookup for
@@ -114,10 +115,51 @@ export function requireArchiveCleanupComplete(
   return result;
 }
 
+export const WORKSPACE_ARCHIVE_ERROR_CODES = {
+  invalidCallerIdentity: "INVALID_CALLER_IDENTITY",
+  selfArchiveBlocked: "SELF_ARCHIVE_BLOCKED",
+} as const;
+
+export type WorkspaceArchiveErrorCode =
+  (typeof WORKSPACE_ARCHIVE_ERROR_CODES)[keyof typeof WORKSPACE_ARCHIVE_ERROR_CODES];
+
+export class WorkspaceArchiveError extends Error {
+  constructor(
+    readonly code: WorkspaceArchiveErrorCode,
+    message: string,
+  ) {
+    super(message);
+    this.name = "WorkspaceArchiveError";
+  }
+}
+
+export interface ArchiveCallerContext {
+  agentId: string;
+  verified: boolean;
+}
+
+export function resolveArchiveCallerContext(
+  agentManager: ArchiveDependencies["agentManager"],
+  request: { callerAgentId?: string; callerAgentProof?: string },
+): ArchiveCallerContext | undefined {
+  if (!request.callerAgentId) {
+    return request.callerAgentProof
+      ? { agentId: "missing-caller-agent-id", verified: false }
+      : undefined;
+  }
+  return {
+    agentId: request.callerAgentId,
+    verified:
+      agentManager.verifyCallerAgentProof?.(request.callerAgentId, request.callerAgentProof) ===
+      true,
+  };
+}
+
 export interface ArchiveByScopeRequest {
   scope: ArchiveScope;
   requestId: string;
   signal?: AbortSignal;
+  caller?: ArchiveCallerContext;
 }
 
 export interface PendingWorkspaceCleanupRetryRequest {
@@ -370,6 +412,8 @@ async function archiveResolvedTarget(
 ): Promise<ArchiveResult> {
   const targetWorkspaceIds = target.workspaceIds;
 
+  assertCallerCanArchive(dependencies, request.caller, targetWorkspaceIds);
+
   if (targetWorkspaceIds.length > 0) {
     dependencies.markWorkspaceArchiving(targetWorkspaceIds, new Date().toISOString());
   }
@@ -430,6 +474,38 @@ async function archiveResolvedTarget(
       dependencies.clearWorkspaceArchiving(targetWorkspaceIds);
       await dependencies.emitWorkspaceUpdatesForWorkspaceIds(targetWorkspaceIds);
     }
+  }
+}
+
+function assertCallerCanArchive(
+  dependencies: Pick<ArchiveDependencies, "agentManager">,
+  caller: ArchiveCallerContext | undefined,
+  targetWorkspaceIds: string[],
+): void {
+  if (!caller) {
+    return;
+  }
+  if (!caller.verified) {
+    throw new WorkspaceArchiveError(
+      WORKSPACE_ARCHIVE_ERROR_CODES.invalidCallerIdentity,
+      `Archive caller identity could not be verified: ${caller.agentId}`,
+    );
+  }
+
+  const callerAgent = dependencies.agentManager
+    .listAgents()
+    .find((agent) => agent.id === caller.agentId);
+  if (!callerAgent?.workspaceId) {
+    throw new WorkspaceArchiveError(
+      WORKSPACE_ARCHIVE_ERROR_CODES.invalidCallerIdentity,
+      `Archive caller has no active workspace identity: ${caller.agentId}`,
+    );
+  }
+  if (targetWorkspaceIds.includes(callerAgent.workspaceId)) {
+    throw new WorkspaceArchiveError(
+      WORKSPACE_ARCHIVE_ERROR_CODES.selfArchiveBlocked,
+      `Agent ${caller.agentId} cannot archive its own workspace`,
+    );
   }
 }
 

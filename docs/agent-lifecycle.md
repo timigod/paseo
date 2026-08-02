@@ -78,6 +78,13 @@ archived workspace. History navigation must not infer workspace lifecycle from `
 or mutate either lifecycle. The workspace route asks the daemon for authoritative recovery state;
 only the route's explicit Unarchive or Restore action changes the archived workspace.
 
+An active provider agent cannot archive its own workspace. The shared workspace archive service
+checks the caller's persisted `workspaceId` against every resolved target workspace before marking
+anything as archiving or performing teardown. Native tools carry daemon-trusted caller context; the
+agent MCP endpoint and provider-launched CLI carry a per-agent proof issued by the daemon. A supplied
+agent identity with a missing or invalid proof is rejected. Requests without agent identity remain
+external coordinator actions and retain the ability to archive any workspace.
+
 History navigation preserves the selected agent as an explicit recovery target. If both that agent
 and its workspace are archived, the workspace recovery action restores the workspace and unarchives
 the selected agent as one user action. Other archived agents in the restored workspace remain

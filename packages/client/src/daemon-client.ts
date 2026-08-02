@@ -2249,12 +2249,17 @@ export class DaemonClient {
   async archiveWorkspace(
     workspaceId: string,
     requestId?: string,
+    caller?: { agentId: string; proof?: string },
   ): Promise<ArchiveWorkspacePayload> {
+    if (caller) {
+      this.requireAgentArchiveCallerSupport();
+    }
     return this.sendCorrelatedSessionRequest({
       requestId,
       message: {
         type: "archive_workspace_request",
         workspaceId,
+        ...(caller ? { callerAgentId: caller.agentId, callerAgentProof: caller.proof } : {}),
       },
       responseType: "archive_workspace_response",
     });
@@ -3972,9 +3977,13 @@ export class DaemonClient {
       branchName?: string;
       workspaceId?: string;
       scope?: "workspace" | "worktree";
+      caller?: { agentId: string; proof?: string };
     },
     requestId?: string,
   ): Promise<PaseoWorktreeArchivePayload> {
+    if (input.caller) {
+      this.requireAgentArchiveCallerSupport();
+    }
     return this.sendCorrelatedSessionRequest({
       requestId,
       message: {
@@ -3984,6 +3993,9 @@ export class DaemonClient {
         branchName: input.branchName,
         ...(input.workspaceId !== undefined ? { workspaceId: input.workspaceId } : {}),
         ...(input.scope !== undefined ? { scope: input.scope } : {}),
+        ...(input.caller
+          ? { callerAgentId: input.caller.agentId, callerAgentProof: input.caller.proof }
+          : {}),
       },
       responseType: "paseo_worktree_archive_response",
     });
@@ -5276,6 +5288,13 @@ export class DaemonClient {
     // COMPAT(hubRelationship): added in v0.1.X, drop the gate when floor >= v0.1.X.
     if (this.lastServerInfoMessage?.features?.hubRelationship !== true) {
       throw new Error("Update the host to use Hub relationship management.");
+    }
+  }
+
+  private requireAgentArchiveCallerSupport(): void {
+    // COMPAT(agentArchiveCaller): added after v0.2.5; remove after 2027-02-02.
+    if (this.lastServerInfoMessage?.features?.agentArchiveCaller !== true) {
+      throw new Error("Update the host to archive workspaces from a managed agent.");
     }
   }
 

@@ -303,6 +303,29 @@ test("Hub management requires daemon support before dispatching requests", async
   expect(mock.sent).toEqual([]);
 });
 
+test("managed-agent archives require daemon support before dispatching requests", async () => {
+  const mock = createMockTransport();
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "archive_caller_feature_gate_unit_test",
+    transportFactory: () => mock.transport,
+    reconnect: { enabled: false },
+  });
+  clients.push(client);
+  const connecting = client.connect();
+  mock.triggerOpen();
+  await connecting;
+
+  const caller = { agentId: "agent-1", proof: "proof-1" };
+  await expect(client.archiveWorkspace("workspace-1", undefined, caller)).rejects.toThrow(
+    "Update the host to archive workspaces from a managed agent.",
+  );
+  await expect(client.archivePaseoWorktree({ workspaceId: "workspace-1", caller })).rejects.toThrow(
+    "Update the host to archive workspaces from a managed agent.",
+  );
+  expect(mock.sent).toEqual([]);
+});
+
 test("sets the complete viewed timeline subscription only when the daemon supports it", async () => {
   const supportedTransport = createMockTransport();
   const supportedClient = new DaemonClient({

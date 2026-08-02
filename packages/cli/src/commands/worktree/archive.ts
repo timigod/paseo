@@ -47,6 +47,7 @@ export async function runArchiveCommandWithDeps(
   nameArg: string,
   options: WorktreeArchiveOptions,
   deps: { connectToDaemon: typeof connectToDaemon },
+  env: NodeJS.ProcessEnv = process.env,
 ): Promise<WorktreeArchiveCommandResult> {
   const host = getDaemonHost({ host: options.host });
 
@@ -105,13 +106,14 @@ export async function runArchiveCommandWithDeps(
     const response = await client.archivePaseoWorktree({
       worktreePath: worktree.worktreePath,
       scope: "worktree",
+      caller: resolveArchiveCaller(env),
     });
 
     await client.close();
 
     if (response.error) {
       const error: CommandError = {
-        code: "WORKTREE_ARCHIVE_FAILED",
+        code: response.errorCode ?? "WORKTREE_ARCHIVE_FAILED",
         message: `Failed to archive worktree: ${response.error.message}`,
       };
       throw error;
@@ -143,4 +145,15 @@ export async function runArchiveCommandWithDeps(
     };
     throw error;
   }
+}
+
+function resolveArchiveCaller(
+  env: NodeJS.ProcessEnv,
+): { agentId: string; proof?: string } | undefined {
+  const agentId = env.PASEO_AGENT_ID?.trim();
+  const proof = env.PASEO_AGENT_CALLER_PROOF?.trim();
+  if (!agentId && !proof) {
+    return undefined;
+  }
+  return { agentId: agentId ?? "", ...(proof ? { proof } : {}) };
 }

@@ -6,6 +6,7 @@ import {
   requireActiveWorkspaceForArchive,
   resolveWorkspaceIdAtPath,
   WorkspaceArchiveTargetNotFoundError,
+  type ArchiveByScopeRequest,
   type ArchiveDependencies,
   type ArchiveScope,
 } from "../workspace-archive-service.js";
@@ -106,6 +107,7 @@ export interface ArchiveCommandInput {
   branchName?: string;
   workspaceId?: string;
   scope?: ArchiveScope["kind"];
+  caller?: ArchiveByScopeRequest["caller"];
 }
 
 export type ArchiveCommandResult =
@@ -142,6 +144,7 @@ export async function archiveCommand(
     const result = await archiveByScope(dependencies, {
       scope: { kind: "workspace", workspaceId: input.workspaceId },
       requestId: input.requestId,
+      caller: input.caller,
     });
     return {
       ok: true,
@@ -170,6 +173,7 @@ export async function archiveCommand(
     const result = await archiveByScope(dependencies, {
       scope: { kind: "worktree", targetPath },
       requestId: input.requestId,
+      caller: input.caller,
     });
 
     return {
@@ -196,6 +200,7 @@ export async function archiveCommand(
   const result = await archiveByScope(dependencies, {
     scope: { kind: "workspace", workspaceId },
     requestId: input.requestId,
+    caller: input.caller,
   });
 
   return {

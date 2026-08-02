@@ -237,7 +237,12 @@ import {
   handleWorkspaceSetupStatusRequest as handleWorkspaceSetupStatusRequestMessage,
   cacheWorkspaceSetupSnapshot,
 } from "./worktree-session.js";
-import { archiveByScope, type ActiveWorkspaceRef } from "./workspace-archive-service.js";
+import {
+  archiveByScope,
+  resolveArchiveCallerContext,
+  type ActiveWorkspaceRef,
+  WorkspaceArchiveError,
+} from "./workspace-archive-service.js";
 import { defaultWorkspaceLifecycleCoordinator } from "./workspace-lifecycle-coordinator.js";
 import { WorktreeRequestError, toWorktreeWireError } from "./worktree-errors.js";
 import { parseGitRemoteLocation } from "@getpaseo/protocol/git-remote";
@@ -6059,6 +6064,7 @@ export class Session {
         {
           scope: { kind: "workspace", workspaceId: existing.workspaceId },
           requestId: request.requestId,
+          caller: resolveArchiveCallerContext(this.agentManager, request),
         },
       );
       requireArchiveCleanupComplete(archiveResult, "Workspace archive");
@@ -6090,6 +6096,7 @@ export class Session {
           workspaceId: request.workspaceId,
           archivedAt: null,
           error: message,
+          ...(error instanceof WorkspaceArchiveError ? { errorCode: error.code } : {}),
         },
       });
     }

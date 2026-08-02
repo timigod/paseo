@@ -40,6 +40,8 @@ import {
   retryPendingWorkspaceCleanup,
   resolveWorkspaceIdAtPath,
   WorkspaceArchiveTargetNotFoundError,
+  WORKSPACE_ARCHIVE_ERROR_CODES,
+  WorkspaceArchiveError,
 } from "./workspace-archive-service.js";
 import { WorkspaceCleanupRetryService } from "./workspace-cleanup-retry-service.js";
 import { WorkspaceLifecycleCoordinator } from "./workspace-lifecycle-coordinator.js";
@@ -163,6 +165,7 @@ interface ArchiveDepsInput {
   activeWorkspaces: ActiveWorkspaceRef[];
   paseoWorktreesBaseRoot?: string;
   findWorkspaceIdForCwd?: (cwd: string) => Promise<string | null>;
+  liveAgents?: Array<{ id: string; workspaceId?: string }>;
 }
 
 interface ArchiveTestDependencies extends ArchiveDependencies {
@@ -185,7 +188,7 @@ function createArchiveDeps(input: ArchiveDepsInput): ArchiveTestDependencies {
       getSnapshot: vi.fn(async () => null),
     } as unknown as Pick<WorkspaceGitService, "getSnapshot">,
     agentManager: {
-      listAgents: () => [],
+      listAgents: () => (input.liveAgents ?? []) as ManagedAgent[],
       archiveAgent: vi.fn(async (agentId: string) => {
         archivedAgentIds.push(agentId);
         return { archivedAt: new Date().toISOString() };
@@ -526,6 +529,137 @@ describe("archiveByScope", () => {
     reservation.release();
     const result = await archiveTask;
     expect(result.removedDirectory).toBe(false);
+    expect(existsSync(worktree.worktreePath)).toBe(true);
+  });
+
+  test("rejects an active agent archiving its own workspace before any mutation", async () => {
+    const { tempDir } = createGitRepo();
+    const workspaceId = "ws-self-archive";
+    const agentId = "agent-self-archive";
+    const deps = createArchiveDeps({
+      paseoHome: path.join(tempDir, ".paseo"),
+      activeWorkspaces: [{ workspaceId, cwd: tempDir, kind: "local_checkout" }],
+      liveAgents: [{ id: agentId, workspaceId }],
+    });
+    deps.archiveWorkspaceRecord = vi.fn(deps.archiveWorkspaceRecord);
+
+    const archive = archiveByScope(deps, {
+      scope: { kind: "workspace", workspaceId },
+      requestId: "req-self-archive",
+      caller: { agentId, verified: true },
+    });
+
+    await expect(archive).rejects.toMatchObject({
+      code: WORKSPACE_ARCHIVE_ERROR_CODES.selfArchiveBlocked,
+      name: "WorkspaceArchiveError",
+    });
+    expect(deps.markWorkspaceArchiving).not.toHaveBeenCalled();
+    expect(deps.emitWorkspaceUpdatesForWorkspaceIds).not.toHaveBeenCalled();
+    expect(deps.archiveWorkspaceRecord).not.toHaveBeenCalled();
+    expect(deps.killTerminalsForWorkspace).not.toHaveBeenCalled();
+    expect(deps.clearWorkspaceArchiving).not.toHaveBeenCalled();
+  });
+
+  test("allows a verified agent to archive a different workspace", async () => {
+    const { tempDir } = createGitRepo();
+    const callerWorkspaceId = "ws-caller";
+    const targetWorkspaceId = "ws-target";
+    const deps = createArchiveDeps({
+      paseoHome: path.join(tempDir, ".paseo"),
+      activeWorkspaces: [
+        { workspaceId: callerWorkspaceId, cwd: tempDir, kind: "local_checkout" },
+        { workspaceId: targetWorkspaceId, cwd: tempDir, kind: "local_checkout" },
+      ],
+      liveAgents: [{ id: "agent-caller", workspaceId: callerWorkspaceId }],
+    });
+
+    const result = await archiveByScope(deps, {
+      scope: { kind: "workspace", workspaceId: targetWorkspaceId },
+      requestId: "req-cross-workspace-archive",
+      caller: { agentId: "agent-caller", verified: true },
+    });
+
+    expect(result.archivedWorkspaceIds).toEqual([targetWorkspaceId]);
+    expect(deps.activeWorkspaces.map((workspace) => workspace.workspaceId)).toEqual([
+      callerWorkspaceId,
+    ]);
+  });
+
+  test("preserves external coordinator archive behavior", async () => {
+    const { tempDir } = createGitRepo();
+    const workspaceId = "ws-external-archive";
+    const deps = createArchiveDeps({
+      paseoHome: path.join(tempDir, ".paseo"),
+      activeWorkspaces: [{ workspaceId, cwd: tempDir, kind: "local_checkout" }],
+      liveAgents: [{ id: "agent-in-target", workspaceId }],
+    });
+
+    const result = await archiveByScope(deps, {
+      scope: { kind: "workspace", workspaceId },
+      requestId: "req-external-archive",
+    });
+
+    expect(result.archivedWorkspaceIds).toEqual([workspaceId]);
+    expect(deps.archivedAgentIds).toEqual(["agent-in-target"]);
+  });
+
+  test("rejects forged and unknown agent identities before mutation", async () => {
+    const { tempDir } = createGitRepo();
+    const workspaceId = "ws-forged-caller";
+    const deps = createArchiveDeps({
+      paseoHome: path.join(tempDir, ".paseo"),
+      activeWorkspaces: [{ workspaceId, cwd: tempDir, kind: "local_checkout" }],
+      liveAgents: [{ id: "real-agent", workspaceId }],
+    });
+
+    for (const caller of [
+      { agentId: "real-agent", verified: false },
+      { agentId: "unknown-agent", verified: true },
+    ]) {
+      await expect(
+        archiveByScope(deps, {
+          scope: { kind: "workspace", workspaceId },
+          requestId: `req-${caller.agentId}`,
+          caller,
+        }),
+      ).rejects.toEqual(
+        expect.objectContaining({
+          code: WORKSPACE_ARCHIVE_ERROR_CODES.invalidCallerIdentity,
+        }),
+      );
+    }
+    expect(deps.markWorkspaceArchiving).not.toHaveBeenCalled();
+  });
+
+  test("blocks self-archive when a worktree is targeted through a symlink", async () => {
+    const { tempDir, repoDir } = createGitRepo();
+    const paseoHome = path.join(tempDir, ".paseo");
+    const worktree = await createPaseoOwnedWorktree(repoDir, paseoHome, "symlink-self-archive");
+    const symlinkPath = path.join(tempDir, "worktree-alias");
+    symlinkSync(worktree.worktreePath, symlinkPath);
+    const workspaceId = "ws-symlink-self-archive";
+    const deps = createArchiveDeps({
+      paseoHome,
+      activeWorkspaces: [
+        {
+          workspaceId,
+          cwd: worktree.worktreePath,
+          kind: "worktree",
+          worktreeRoot: worktree.worktreePath,
+          isPaseoOwnedWorktree: true,
+        },
+      ],
+      liveAgents: [{ id: "agent-symlink", workspaceId }],
+    });
+
+    await expect(
+      archiveByScope(deps, {
+        scope: { kind: "worktree", targetPath: symlinkPath },
+        requestId: "req-symlink-self-archive",
+        caller: { agentId: "agent-symlink", verified: true },
+      }),
+    ).rejects.toBeInstanceOf(WorkspaceArchiveError);
+    expect(deps.markWorkspaceArchiving).not.toHaveBeenCalled();
     expect(existsSync(worktree.worktreePath)).toBe(true);
   });
 

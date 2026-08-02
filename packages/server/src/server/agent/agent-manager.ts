@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHmac, randomUUID, timingSafeEqual } from "node:crypto";
 import { resolve } from "node:path";
 import { stat } from "node:fs/promises";
 import {
@@ -96,6 +96,10 @@ const STORED_AGENT_CAPABILITIES: AgentCapabilityFlags = {
   supportsRewindFiles: false,
   supportsRewindBoth: false,
 };
+
+function nullableCallerIdentitySecret(secret: string | undefined): string | null {
+  return secret ?? null;
+}
 
 type TimeoutResult = "completed" | "timed_out";
 
@@ -310,6 +314,7 @@ export interface AgentManagerOptions {
   terminalManager?: TerminalManager | null;
   mcpBaseUrl?: string;
   mcpAuthToken?: string;
+  callerIdentitySecret?: string;
   paseoToolsEnabled?: boolean;
   paseoToolCatalogFactory?: PaseoToolCatalogFactory;
   appendSystemPrompt?: string;
@@ -645,6 +650,7 @@ export class AgentManager {
   private readonly agentStreamCoalescer: AgentStreamCoalescer;
   private mcpBaseUrl: string | null;
   private readonly mcpAuthToken: string | null;
+  private readonly callerIdentitySecret: string | null;
   private paseoToolsEnabled = true;
   private paseoToolCatalogFactory: PaseoToolCatalogFactory | null = null;
   private appendSystemPrompt: string;
@@ -665,6 +671,7 @@ export class AgentManager {
     this.onWorkspaceStateMayHaveChanged = options?.onWorkspaceStateMayHaveChanged;
     this.mcpBaseUrl = options?.mcpBaseUrl ?? null;
     this.mcpAuthToken = options?.mcpAuthToken ?? null;
+    this.callerIdentitySecret = nullableCallerIdentitySecret(options.callerIdentitySecret);
     this.configurePaseoTools(options);
     this.appendSystemPrompt = options.appendSystemPrompt ?? "";
     this.logger = options.logger.child({ module: "agent", component: "agent-manager" });
@@ -780,6 +787,25 @@ export class AgentManager {
    */
   getMcpAuthToken(): string | null {
     return this.mcpAuthToken;
+  }
+
+  createCallerAgentProof(agentId: string): string | null {
+    if (!this.callerIdentitySecret) {
+      return null;
+    }
+    return createHmac("sha256", this.callerIdentitySecret).update(agentId).digest("base64url");
+  }
+
+  verifyCallerAgentProof(agentId: string, proof: string | undefined): boolean {
+    const expected = this.createCallerAgentProof(agentId);
+    if (!expected || !proof) {
+      return false;
+    }
+    const actualBuffer = Buffer.from(proof);
+    const expectedBuffer = Buffer.from(expected);
+    return (
+      actualBuffer.length === expectedBuffer.length && timingSafeEqual(actualBuffer, expectedBuffer)
+    );
   }
 
   setAppendSystemPrompt(prompt: string | null | undefined): void {
@@ -4657,6 +4683,7 @@ export class AgentManager {
         agentId,
         mcpBaseUrl: this.mcpBaseUrl,
         mcpAuthToken: this.mcpAuthToken,
+        callerAgentProof: this.createCallerAgentProof(agentId),
       }),
     );
     return { storedConfig, launchConfig };
@@ -4681,12 +4708,14 @@ export class AgentManager {
     cwd: string,
     env?: Record<string, string>,
   ): Promise<AgentLaunchContext> {
+    const callerAgentProof = this.createCallerAgentProof(agentId);
     const context: AgentLaunchContext = {
       agentId,
       env: {
         ...env,
         PASEO_AGENT_ID: agentId,
         PASEO_AGENT_CWD: cwd,
+        ...(callerAgentProof ? { PASEO_AGENT_CALLER_PROOF: callerAgentProof } : {}),
       },
     };
     if (
@@ -4694,7 +4723,10 @@ export class AgentManager {
       client.capabilities.supportsNativePaseoTools &&
       this.paseoToolCatalogFactory
     ) {
-      context.paseoTools = await this.paseoToolCatalogFactory({ callerAgentId: agentId });
+      context.paseoTools = await this.paseoToolCatalogFactory({
+        callerAgentId: agentId,
+        callerAgentVerified: true,
+      });
     }
     return context;
   }

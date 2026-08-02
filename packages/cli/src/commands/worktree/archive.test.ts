@@ -64,11 +64,13 @@ describe("runArchiveCommand", () => {
       {
         connectToDaemon: async () => fakeClient,
       },
+      {},
     );
 
     expect(archiveCalls).toHaveLength(1);
     expect(archiveCalls[0]?.input.scope).toBe("worktree");
     expect(archiveCalls[0]?.input.worktreePath).toBe(worktreePath);
+    expect(archiveCalls[0]?.input.caller).toBeUndefined();
     expect(result).toEqual({
       type: "single",
       data: {
@@ -78,6 +80,75 @@ describe("runArchiveCommand", () => {
       },
       schema: expect.any(Object),
     });
+  });
+
+  it("sends daemon-issued caller identity from a provider environment", async () => {
+    const worktreePath = "/tmp/paseo-home/worktrees/repo/feature";
+    const archiveCalls: Array<Parameters<DaemonClient["archivePaseoWorktree"]>[0]> = [];
+    const fakeClient = createFakeDaemonClient({
+      getPaseoWorktreeList: async () => ({
+        worktrees: [
+          {
+            worktreePath,
+            branchName: "feature",
+            head: "abc123",
+            createdAt: "2026-04-12T00:00:00.000Z",
+          },
+        ],
+        error: null,
+        requestId: "req-list",
+      }),
+      archivePaseoWorktree: async (input) => {
+        archiveCalls.push(input);
+        return {
+          success: true,
+          removedAgents: [],
+          error: null,
+          requestId: "req-archive",
+        };
+      },
+    });
+
+    await runArchiveCommandWithDeps(
+      "feature",
+      {},
+      { connectToDaemon: async () => fakeClient },
+      {
+        PASEO_AGENT_ID: " agent-1 ",
+        PASEO_AGENT_CALLER_PROOF: " proof-1 ",
+      },
+    );
+
+    expect(archiveCalls[0]?.caller).toEqual({ agentId: "agent-1", proof: "proof-1" });
+  });
+
+  it("preserves the typed self-archive rejection code", async () => {
+    const worktreePath = "/tmp/paseo-home/worktrees/repo/feature";
+    const fakeClient = createFakeDaemonClient({
+      getPaseoWorktreeList: async () => ({
+        worktrees: [
+          {
+            worktreePath,
+            branchName: "feature",
+            head: "abc123",
+            createdAt: "2026-04-12T00:00:00.000Z",
+          },
+        ],
+        error: null,
+        requestId: "req-list",
+      }),
+      archivePaseoWorktree: async () => ({
+        success: false,
+        removedAgents: [],
+        error: { code: "UNKNOWN", message: "Agent cannot archive its own workspace" },
+        errorCode: "SELF_ARCHIVE_BLOCKED",
+        requestId: "req-archive",
+      }),
+    });
+
+    await expect(
+      runArchiveCommandWithDeps("feature", {}, { connectToDaemon: async () => fakeClient }, {}),
+    ).rejects.toMatchObject({ code: "SELF_ARCHIVE_BLOCKED" });
   });
 
   it("archives by matching branch name when no directory name matches", async () => {
@@ -115,6 +186,7 @@ describe("runArchiveCommand", () => {
       {
         connectToDaemon: async () => fakeClient,
       },
+      {},
     );
 
     expect(archiveCalls).toHaveLength(1);

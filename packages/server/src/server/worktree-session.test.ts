@@ -38,6 +38,7 @@ import {
 import type { TerminalManager } from "../terminal/terminal-manager.js";
 import type { TerminalSession } from "../terminal/terminal.js";
 import type { AgentStorage, StoredAgentRecord } from "./agent/agent-storage.js";
+import type { ManagedAgent } from "./agent/agent-manager.js";
 import {
   createPersistedProjectRecord,
   type PersistedProjectRecord,
@@ -2250,6 +2251,65 @@ describe("handlePaseoWorktreeArchiveRequest worktree scope", () => {
       payload: {
         success: false,
         error: { message: "workspace registry read failed" },
+      },
+    });
+  });
+
+  test("returns a typed error without mutation when the caller targets its workspace", async () => {
+    const { tempDir, repoDir } = createGitRepo();
+    cleanupPaths.push(tempDir);
+    const workspaceId = "ws-self-archive-response";
+    const agentId = "agent-self-archive-response";
+    const activeWorkspaces = [{ workspaceId, cwd: repoDir, kind: "local_checkout" as const }];
+    const emitted: SessionOutboundMessage[] = [];
+    const archiveWorkspaceRecord = vi.fn(async () => {});
+    const markWorkspaceArchiving = vi.fn();
+
+    await handlePaseoWorktreeArchiveRequest(
+      {
+        paseoHome: path.join(tempDir, ".paseo"),
+        github: createGitHubServiceStub(),
+        workspaceGitService: {
+          getSnapshot: vi.fn(async () => null),
+          listWorktrees: vi.fn(async () => []),
+        },
+        agentManager: {
+          listAgents: () => [{ id: agentId, workspaceId } as ManagedAgent],
+          archiveAgent: vi.fn(async () => ({ archivedAt: new Date().toISOString() })),
+          archiveSnapshot: vi.fn(async () => ({})),
+          verifyCallerAgentProof: (candidateAgentId, proof) =>
+            candidateAgentId === agentId && proof === "caller-proof",
+        },
+        agentStorage: createAgentStorageStub(),
+        findWorkspaceIdForCwd: vi.fn(async () => workspaceId),
+        listActiveWorkspaces: vi.fn(async () => activeWorkspaces),
+        archiveWorkspaceRecord,
+        emit: (message) => emitted.push(message),
+        emitWorkspaceUpdatesForWorkspaceIds: vi.fn(async () => {}),
+        markWorkspaceArchiving,
+        clearWorkspaceArchiving: vi.fn(),
+        killTerminalsForWorkspace: vi.fn(async () => {}),
+        sessionLogger: createLogger(),
+      },
+      {
+        type: "paseo_worktree_archive_request",
+        requestId: "req-self-archive-response",
+        worktreePath: repoDir,
+        workspaceId,
+        scope: "workspace",
+        callerAgentId: agentId,
+        callerAgentProof: "caller-proof",
+      },
+    );
+
+    expect(markWorkspaceArchiving).not.toHaveBeenCalled();
+    expect(archiveWorkspaceRecord).not.toHaveBeenCalled();
+    expect(
+      emitted.find((message) => message.type === "paseo_worktree_archive_response"),
+    ).toMatchObject({
+      payload: {
+        success: false,
+        errorCode: "SELF_ARCHIVE_BLOCKED",
       },
     });
   });

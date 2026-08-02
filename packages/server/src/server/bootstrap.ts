@@ -764,6 +764,7 @@ export async function createPaseoDaemon(
   // no plaintext available). Mirrors the /api/files/download capability-token
   // pattern.
   const agentMcpAuthToken = randomUUID();
+  const agentCallerIdentitySecret = randomUUID();
 
   const listenTarget = parseListenString(config.listen);
 
@@ -1017,6 +1018,7 @@ export async function createPaseoDaemon(
       workspaceGitService.onWorkspaceStateMayHaveChanged(cwd);
     },
     mcpAuthToken: agentMcpAuthToken,
+    callerIdentitySecret: agentCallerIdentitySecret,
     logger,
   });
 
@@ -1564,6 +1566,7 @@ export async function createPaseoDaemon(
     runLifecycleMutation: (operation) => lifecycleMutationIngress.run(operation),
     createAgentLifecycleDispatch: hubAgentLifecycle,
     callerAgentId: runtime.callerAgentId,
+    callerAgentVerified: runtime.callerAgentVerified,
     enableVoiceTools: runtime.enableVoiceTools,
     voiceOnly: runtime.voiceOnly,
     resolveSpeakHandler: (agentId) => wsServer?.resolveVoiceSpeakHandler(agentId) ?? null,
@@ -1580,10 +1583,8 @@ export async function createPaseoDaemon(
   if (mcpEnabled) {
     const agentMcpRoute = "/mcp/agents";
 
-    const createAgentMcpSession = async (callerAgentId?: string) => {
-      const agentMcpServer = await createAgentMcpServer(
-        createAgentToolHostDependencies({ callerAgentId }),
-      );
+    const createAgentMcpSession = async (runtime: PaseoToolRuntimeContext) => {
+      const agentMcpServer = await createAgentMcpServer(createAgentToolHostDependencies(runtime));
 
       // Stateless mode: each HTTP request builds a fresh server + transport that is
       // torn down when the response closes, so no per-session state is retained between
@@ -1653,12 +1654,26 @@ export async function createPaseoDaemon(
         }
         const callerAgentIdRaw = req.query.callerAgentId;
         let callerAgentId: string | undefined;
+        const callerAgentProof = req.header("x-paseo-agent-proof");
         if (typeof callerAgentIdRaw === "string") {
           callerAgentId = callerAgentIdRaw;
         } else if (Array.isArray(callerAgentIdRaw) && typeof callerAgentIdRaw[0] === "string") {
           callerAgentId = callerAgentIdRaw[0];
         }
-        const { server, transport } = await createAgentMcpSession(callerAgentId);
+        if (!callerAgentId && callerAgentProof) {
+          callerAgentId = "missing-caller-agent-id";
+        }
+        const { server, transport } = await createAgentMcpSession({
+          callerAgentId,
+          ...(callerAgentId
+            ? {
+                callerAgentVerified: agentManager.verifyCallerAgentProof(
+                  callerAgentId,
+                  callerAgentProof,
+                ),
+              }
+            : {}),
+        });
         res.on("close", () => {
           void transport.close();
           void server.close();

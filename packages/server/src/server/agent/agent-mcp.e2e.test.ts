@@ -93,6 +93,19 @@ interface LaunchRecorder {
   recordedLaunches: AgentSessionConfig[];
 }
 
+function findRecordedPaseoMcpServer(recorder: LaunchRecorder, agentId: string) {
+  for (const launch of recorder.recordedLaunches) {
+    const server = launch.mcpServers?.paseo;
+    if (
+      server?.type === "http" &&
+      new URL(server.url).searchParams.get("callerAgentId") === agentId
+    ) {
+      return server;
+    }
+  }
+  return undefined;
+}
+
 class RecordingAgentClient implements AgentClient {
   readonly provider: AgentClient["provider"];
   readonly capabilities: AgentClient["capabilities"];
@@ -368,12 +381,13 @@ describe("agent MCP end-to-end (offline)", () => {
       const payload = getStructuredContent(result);
       agentId = typeof payload?.agentId === "string" ? payload.agentId : null;
       expect(agentId).toBeTruthy();
+      const callerProof = daemon.agentManager.createCallerAgentProof(agentId!);
+      expect(callerProof).toEqual(expect.any(String));
 
-      expect(recorder.recordedLaunches.at(-1)?.mcpServers).toMatchObject({
-        paseo: {
-          type: "http",
-          url: `http://127.0.0.1:${port}/mcp/agents?callerAgentId=${agentId!}`,
-        },
+      expect(findRecordedPaseoMcpServer(recorder, agentId!)).toMatchObject({
+        type: "http",
+        url: `http://127.0.0.1:${port}/mcp/agents?callerAgentId=${agentId!}`,
+        headers: { "X-Paseo-Agent-Proof": callerProof! },
       });
       const injectedAgent = daemon.agentManager.getAgent(agentId!);
       expect(injectedAgent?.config.mcpServers?.paseo).toBeUndefined();
@@ -457,12 +471,13 @@ describe("agent MCP end-to-end (offline)", () => {
       const payload = getStructuredContent(result);
       agentId = typeof payload?.agentId === "string" ? payload.agentId : null;
       expect(agentId).toBeTruthy();
+      const callerProof = daemon.agentManager.createCallerAgentProof(agentId!);
+      expect(callerProof).toEqual(expect.any(String));
 
-      expect(recorder.recordedLaunches.at(-1)?.mcpServers).toMatchObject({
-        paseo: {
-          type: "http",
-          url: `http://127.0.0.1:${port}/mcp/agents?callerAgentId=${agentId!}`,
-        },
+      expect(findRecordedPaseoMcpServer(recorder, agentId!)).toMatchObject({
+        type: "http",
+        url: `http://127.0.0.1:${port}/mcp/agents?callerAgentId=${agentId!}`,
+        headers: { "X-Paseo-Agent-Proof": callerProof! },
       });
       const injectedAgent = daemon.agentManager.getAgent(agentId!);
       expect(injectedAgent?.config.mcpServers?.paseo).toBeUndefined();

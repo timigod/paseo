@@ -36,10 +36,19 @@ export function withRuntimePaseoMcpServer(params: {
    * this header the agent's MCP requests are rejected when a password is set.
    */
   mcpAuthToken: string | null;
+  callerAgentProof: string | null;
 }): AgentSessionConfig {
   const storedConfig = stripInternalPaseoMcpServer(params.config);
   if (!params.mcpBaseUrl || storedConfig.mcpServers?.[PASEO_MCP_SERVER_NAME]) {
     return storedConfig;
+  }
+
+  const headers: Record<string, string> = {};
+  if (params.mcpAuthToken) {
+    headers.Authorization = `Bearer ${params.mcpAuthToken}`;
+  }
+  if (params.callerAgentProof) {
+    headers["X-Paseo-Agent-Proof"] = params.callerAgentProof;
   }
 
   return {
@@ -47,14 +56,18 @@ export function withRuntimePaseoMcpServer(params: {
     mcpServers: {
       [PASEO_MCP_SERVER_NAME]: {
         type: "http",
-        url: `${params.mcpBaseUrl}?callerAgentId=${params.agentId}`,
-        ...(params.mcpAuthToken
-          ? { headers: { Authorization: `Bearer ${params.mcpAuthToken}` } }
-          : {}),
+        url: createAgentMcpUrl(params.mcpBaseUrl, params.agentId),
+        ...(Object.keys(headers).length > 0 ? { headers } : {}),
       },
       ...storedConfig.mcpServers,
     },
   };
+}
+
+function createAgentMcpUrl(baseUrl: string, agentId: string): string {
+  const url = new URL(baseUrl);
+  url.searchParams.set("callerAgentId", agentId);
+  return url.toString();
 }
 
 function isInternalPaseoMcpServer(config: McpServerConfig): boolean {

@@ -146,6 +146,7 @@ export interface PaseoToolHostDependencies {
    * Used for cwd/mode inheritance when agents spawn child agents.
    */
   callerAgentId?: string;
+  callerAgentVerified?: boolean;
   /**
    * Optional resolver for session-bound speak handlers.
    * Used by hidden voice agents to narrate through daemon-managed TTS.
@@ -1440,6 +1441,14 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
         {
           requestId: "mcp:archive_workspace",
           scope: { kind: "workspace", workspaceId: workspace.workspaceId },
+          ...(callerAgentId
+            ? {
+                caller: {
+                  agentId: callerAgentId,
+                  verified: options.callerAgentVerified === true,
+                },
+              }
+            : {}),
         },
       );
       return {

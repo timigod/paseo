@@ -45,7 +45,11 @@ import type {
   CreatePaseoWorktreeInput,
   CreatePaseoWorktreeResult,
 } from "./paseo-worktree-service.js";
-import type { ArchiveDependencies } from "./workspace-archive-service.js";
+import {
+  type ArchiveDependencies,
+  resolveArchiveCallerContext,
+  WorkspaceArchiveError,
+} from "./workspace-archive-service.js";
 import { toWorktreeWireError } from "./worktree-errors.js";
 import {
   archiveCommand,
@@ -506,6 +510,7 @@ export async function handlePaseoWorktreeArchiveRequest(
       branchName: msg.branchName,
       workspaceId: msg.workspaceId,
       scope: msg.scope,
+      caller: resolveArchiveCallerContext(dependencies.agentManager, msg),
     });
     if (!result.ok) {
       dependencies.emit({
@@ -517,6 +522,7 @@ export async function handlePaseoWorktreeArchiveRequest(
             code: result.code,
             message: result.message,
           },
+          errorCode: result.code,
           requestId,
         },
       });
@@ -541,6 +547,7 @@ export async function handlePaseoWorktreeArchiveRequest(
         success: false,
         removedAgents: [],
         error: toCheckoutError(error),
+        ...(error instanceof WorkspaceArchiveError ? { errorCode: error.code } : {}),
         requestId,
       },
     });

@@ -1948,6 +1948,10 @@ export const PaseoWorktreeArchiveRequestSchema = z.object({
   // (disk removal derived from scope + last-reference + ownership); field
   // retained for wire parse-compat, drop when floor >= v0.1.97.
   deleteWorktreeFromDisk: z.boolean().optional().default(false),
+  // COMPAT(agentArchiveCaller): added after v0.2.5; remove after 2027-02-02.
+  // Optional so external and old clients retain coordinator archive behavior.
+  callerAgentId: z.string().optional(),
+  callerAgentProof: z.string().optional(),
   requestId: z.string(),
 });
 
@@ -2047,6 +2051,10 @@ export const ProjectGithubCloneRequestSchema = z.object({
 export const ArchiveWorkspaceRequestSchema = z.object({
   type: z.literal("archive_workspace_request"),
   workspaceId: z.string(),
+  // COMPAT(agentArchiveCaller): added after v0.2.5; remove after 2027-02-02.
+  // Optional so external and old clients retain coordinator archive behavior.
+  callerAgentId: z.string().optional(),
+  callerAgentProof: z.string().optional(),
   requestId: z.string(),
 });
 
@@ -2840,6 +2848,9 @@ export const ServerInfoStatusPayloadSchema = z
         stableProjectIdentity: z.boolean().optional(),
         // COMPAT(workspaceScriptManagement): added in v0.1.105, remove gate after 2027-01-10.
         workspaceScriptManagement: z.boolean().optional(),
+        // COMPAT(agentArchiveCaller): added after v0.2.5; remove after 2027-02-02.
+        // Optional for old daemons.
+        agentArchiveCaller: z.boolean().optional(),
       })
       .optional(),
   })
@@ -3500,6 +3511,7 @@ export const ArchiveWorkspaceResponseMessageSchema = z.object({
     workspaceId: z.string(),
     archivedAt: z.string().nullable(),
     error: z.string().nullable(),
+    errorCode: z.string().optional(),
   }),
 });
 
@@ -4683,6 +4695,9 @@ export const PaseoWorktreeArchiveResponseSchema = z.object({
     removedDirectory: z.boolean().optional(),
     cleanupPending: z.boolean().optional(),
     error: CheckoutErrorSchema.nullable(),
+    // COMPAT(agentArchiveCaller): added after v0.2.5; remove after 2027-02-02.
+    // Optional for old daemons.
+    errorCode: z.string().optional(),
     requestId: z.string(),
   }),
 });
