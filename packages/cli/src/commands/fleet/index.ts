@@ -32,6 +32,7 @@ import {
 } from "./status.js";
 import {
   findFleetHost,
+  findFleetHostById,
   findFleetHostForCwd,
   findFleetHostForHostname,
   loadFleetConfig,
@@ -141,7 +142,7 @@ export async function runFleetRunCommand(
     } satisfies CommandError;
   }
   if (existingAffinity && idempotencyKey) {
-    const currentHost = findFleetHost(existingAffinity.host.id, config.hosts);
+    const currentHost = findFleetHostById(existingAffinity.host.id, config.hosts);
     if (!currentHost) {
       throw {
         code: "FLEET_AFFINITY_HOST_MISSING",
@@ -199,7 +200,7 @@ export async function runFleetRunCommand(
         message: `Idempotency key is owned by ${affinity.host.id}, not pinned host ${pinnedHost.id}`,
       } satisfies CommandError;
     }
-    const currentHost = findFleetHost(affinity.host.id, config.hosts);
+    const currentHost = findFleetHostById(affinity.host.id, config.hosts);
     if (!currentHost) {
       throw {
         code: "FLEET_AFFINITY_HOST_MISSING",

@@ -113,6 +113,12 @@ export function findFleetHost(value: string, hosts: readonly FleetHost[]): Fleet
   );
 }
 
+export function findFleetHostById(value: string, hosts: readonly FleetHost[]): FleetHost | null {
+  const normalized = value.trim().toLowerCase();
+  if (!normalized) return null;
+  return hosts.find((host) => host.id.toLowerCase() === normalized) ?? null;
+}
+
 export function findFleetHostForHostname(
   hostname: string,
   hosts: readonly FleetHost[],
