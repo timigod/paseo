@@ -658,18 +658,24 @@ export interface AgentSession {
   } | null;
 }
 
-export type FetchCatalogOptions =
+export type FetchCatalogOptions = (
   | {
       scope: "global";
       force: boolean;
-      timeoutMs?: number;
     }
   | {
       scope: "workspace";
       cwd: string;
       force: boolean;
-      timeoutMs?: number;
-    };
+    }
+) & {
+  /** Total end-to-end catalog budget, including provider runtime acquisition. */
+  timeoutMs?: number;
+  /** Absolute deadline owned by the caller that enforces `timeoutMs`. */
+  deadlineAtMs?: number;
+  /** Aborted when the caller's end-to-end catalog budget is exhausted. */
+  signal?: AbortSignal;
+};
 
 export interface ProviderCatalog {
   models: AgentModelDefinition[];

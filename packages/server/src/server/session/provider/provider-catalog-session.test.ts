@@ -145,6 +145,37 @@ describe("ProviderCatalogSession", () => {
     expect(res?.payload.error).toBe("Provider codex is disabled");
   });
 
+  it("reports unknown degraded modes without fabricating an empty catalog", async () => {
+    const { subsystem, emitted } = makeSubsystem({
+      snapshot: {
+        getSnapshot: () => [
+          {
+            provider: "opencode",
+            status: "ready",
+            enabled: true,
+            models: [{ provider: "opencode", id: "openai/gpt-5.4", label: "GPT 5.4" }],
+            error: "OpenCode app.agents timed out within the catalog budget",
+            fetchedAt: "2026-08-02T00:00:00.000Z",
+          },
+        ],
+      },
+    });
+
+    await subsystem.handleListProviderModesRequest({
+      type: "list_provider_modes_request",
+      provider: "opencode",
+      requestId: "modes-degraded",
+    });
+
+    const res = findByType(emitted, "list_provider_modes_response");
+    expect(res?.payload).toEqual({
+      provider: "opencode",
+      error: "OpenCode app.agents timed out within the catalog budget",
+      fetchedAt: "2026-08-02T00:00:00.000Z",
+      requestId: "modes-degraded",
+    });
+  });
+
   it("preserves missing cwd as the semantic global snapshot for model list reads", async () => {
     const getSnapshot = vi.fn(() => [{ provider: "codex", status: "loading", enabled: true }]);
     const warmUpSnapshotForCwd = vi.fn(async () => {});

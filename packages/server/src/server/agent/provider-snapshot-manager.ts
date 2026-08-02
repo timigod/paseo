@@ -13,6 +13,7 @@ import type {
   AgentModelDefinition,
   AgentProvider,
   FetchCatalogOptions,
+  ProviderCatalog,
   ProviderSnapshotEntry,
 } from "./agent-sdk-types.js";
 import type { ManagedAgent } from "./agent-manager.js";
@@ -320,9 +321,9 @@ export class ProviderSnapshotManager {
     return entry.models ?? [];
   }
 
-  async listModes(input: ProviderSnapshotProviderOptions): Promise<AgentMode[]> {
+  async listModes(input: ProviderSnapshotProviderOptions): Promise<AgentMode[] | undefined> {
     const entry = await this.getReadyProvider(input);
-    return entry.modes ?? [];
+    return entry.modes;
   }
 
   async resolveDefaultModel(input: ResolveDefaultModelOptions): Promise<string | undefined> {
@@ -820,11 +821,26 @@ export class ProviderSnapshotManager {
       }
 
       const catalogOptions = createFetchCatalogOptions(catalogScope, force);
-      const catalog = await withTimeout(
-        definition.fetchCatalog({ ...catalogOptions, timeoutMs: this.refreshTimeoutMs }, client),
-        this.refreshTimeoutMs,
-        `Timed out refreshing ${definition.label} after ${this.refreshTimeoutMs}ms`,
-      );
+      const catalogDeadlineAtMs = Date.now() + this.refreshTimeoutMs;
+      const catalogAbortController = new AbortController();
+      let catalog: ProviderCatalog;
+      try {
+        catalog = await withTimeout(
+          definition.fetchCatalog(
+            {
+              ...catalogOptions,
+              timeoutMs: this.refreshTimeoutMs,
+              deadlineAtMs: catalogDeadlineAtMs,
+              signal: catalogAbortController.signal,
+            },
+            client,
+          ),
+          Math.max(0, catalogDeadlineAtMs - Date.now()),
+          `Timed out refreshing ${definition.label} after ${this.refreshTimeoutMs}ms`,
+        );
+      } finally {
+        catalogAbortController.abort();
+      }
 
       setEntry({
         ...base,

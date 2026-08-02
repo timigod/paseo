@@ -285,23 +285,66 @@ type OpenCodeMcpConfig =
 const MCP_ALREADY_PRESENT_ERROR_TOKENS = ["already", "exists", "connected"] as const;
 const OPENCODE_PROVIDER_LIST_TIMEOUT_MS = 30_000;
 const OPENCODE_METADATA_CONCURRENCY = 4;
+const OPENCODE_OPTIONAL_MODE_COMPLETION_RESERVE_FRACTION = 0.05;
+const OPENCODE_OPTIONAL_MODE_COMPLETION_RESERVE_MAX_MS = 1_000;
 const openCodeMetadataLimit = pLimit(OPENCODE_METADATA_CONCURRENCY);
 
-function resolveOpenCodeCatalogTimeoutMs(timeoutMs: number | undefined): number {
-  return typeof timeoutMs === "number" && Number.isFinite(timeoutMs) && timeoutMs > 0
-    ? timeoutMs
-    : OPENCODE_PROVIDER_LIST_TIMEOUT_MS;
+interface OpenCodeCatalogBudget {
+  timeoutMs: number;
+  deadlineAtMs: number;
+  optionalModeDeadlineAtMs: number;
+  signal?: AbortSignal;
+}
+
+function resolveOpenCodeCatalogBudget(options: FetchCatalogOptions): OpenCodeCatalogBudget {
+  const timeoutMs =
+    typeof options.timeoutMs === "number" &&
+    Number.isFinite(options.timeoutMs) &&
+    options.timeoutMs > 0
+      ? options.timeoutMs
+      : OPENCODE_PROVIDER_LIST_TIMEOUT_MS;
+  const startedAtMs = Date.now();
+  const timeoutDeadlineAtMs = startedAtMs + timeoutMs;
+  const deadlineAtMs =
+    typeof options.deadlineAtMs === "number" && Number.isFinite(options.deadlineAtMs)
+      ? Math.min(options.deadlineAtMs, timeoutDeadlineAtMs)
+      : timeoutDeadlineAtMs;
+  const completionReserveMs = Math.min(
+    OPENCODE_OPTIONAL_MODE_COMPLETION_RESERVE_MAX_MS,
+    Math.max(1, Math.ceil(timeoutMs * OPENCODE_OPTIONAL_MODE_COMPLETION_RESERVE_FRACTION)),
+  );
+  return {
+    timeoutMs,
+    deadlineAtMs,
+    optionalModeDeadlineAtMs: Math.max(startedAtMs, deadlineAtMs - completionReserveMs),
+    signal: options.signal,
+  };
 }
 
 async function runOpenCodeCatalogRequest<T>(
   request: (signal: AbortSignal) => Promise<T>,
-  timeoutMs: number,
+  deadlineAtMs: number,
+  parentSignal: AbortSignal | undefined,
   timeoutMessage: string,
 ): Promise<T> {
   const controller = new AbortController();
+  const abortFromParent = () => controller.abort(parentSignal?.reason);
+  if (parentSignal?.aborted) {
+    abortFromParent();
+  } else {
+    parentSignal?.addEventListener("abort", abortFromParent, { once: true });
+  }
   try {
-    return await withTimeout(request(controller.signal), timeoutMs, timeoutMessage);
+    if (controller.signal.aborted) {
+      throw new Error("OpenCode catalog request aborted by caller");
+    }
+    return await withTimeout(
+      request(controller.signal),
+      Math.max(0, deadlineAtMs - Date.now()),
+      timeoutMessage,
+    );
   } finally {
+    parentSignal?.removeEventListener("abort", abortFromParent);
     controller.abort();
   }
 }
@@ -1417,6 +1460,10 @@ export class OpenCodeAgentClient implements AgentClient {
   }
 
   async fetchCatalog(options: FetchCatalogOptions): Promise<ProviderCatalog> {
+    const catalogBudget = resolveOpenCodeCatalogBudget(options);
+    if (catalogBudget.signal?.aborted) {
+      throw new Error("OpenCode catalog refresh aborted by caller");
+    }
     const acquisition = options.force
       ? await this.serverManager.acquireNew()
       : await this.serverManager.acquireCurrent();
@@ -1424,6 +1471,9 @@ export class OpenCodeAgentClient implements AgentClient {
     const isGlobalCatalog = options.scope === "global";
 
     try {
+      if (catalogBudget.signal?.aborted) {
+        throw new Error("OpenCode catalog refresh aborted by caller");
+      }
       // OpenCode treats the catalog directory as a workspace. The global catalog
       // is not a project, so use the neutral OpenCode home instead of user home.
       const directory = isGlobalCatalog ? this.resolveHomeDir() : options.cwd;
@@ -1437,10 +1487,9 @@ export class OpenCodeAgentClient implements AgentClient {
       }
 
       const client = this.createOpenCodeClient({ baseUrl: url, directory });
-      const timeoutMs = resolveOpenCodeCatalogTimeoutMs(options.timeoutMs);
       const [models, modesCatalog] = await Promise.all([
-        this.fetchModelsFromClient(client, directory, timeoutMs),
-        this.fetchModesFromClient(client, directory, timeoutMs),
+        this.fetchModelsFromClient(client, directory, catalogBudget),
+        this.fetchModesFromClient(client, directory, catalogBudget),
       ]);
       return { models, ...modesCatalog };
     } finally {
@@ -1631,12 +1680,13 @@ export class OpenCodeAgentClient implements AgentClient {
   private async fetchModelsFromClient(
     client: OpencodeClient,
     directory: string,
-    timeoutMs: number,
+    catalogBudget: OpenCodeCatalogBudget,
   ): Promise<AgentModelDefinition[]> {
     const response = await runOpenCodeCatalogRequest(
       (signal) => openCodeMetadataLimit(() => client.provider.list({ directory }, { signal })),
-      timeoutMs,
-      `OpenCode provider.list timed out after ${timeoutMs}ms - server may not be authenticated or connected to any providers`,
+      catalogBudget.deadlineAtMs,
+      catalogBudget.signal,
+      `OpenCode provider.list did not complete within the ${catalogBudget.timeoutMs}ms catalog budget - server may not be authenticated or connected to any providers`,
     );
 
     if (response.error) {
@@ -1687,13 +1737,14 @@ export class OpenCodeAgentClient implements AgentClient {
   private async fetchModesFromClient(
     client: OpencodeClient,
     directory: string,
-    timeoutMs: number,
+    catalogBudget: OpenCodeCatalogBudget,
   ): Promise<Pick<ProviderCatalog, "modes" | "modeDiscoveryError">> {
     try {
       const response = await runOpenCodeCatalogRequest(
         (signal) => openCodeMetadataLimit(() => client.app.agents({ directory }, { signal })),
-        timeoutMs,
-        `OpenCode app.agents timed out after ${timeoutMs}ms`,
+        catalogBudget.optionalModeDeadlineAtMs,
+        catalogBudget.signal,
+        `OpenCode app.agents timed out within the ${catalogBudget.timeoutMs}ms catalog budget`,
       );
 
       if (response.error) {
@@ -1712,7 +1763,7 @@ export class OpenCodeAgentClient implements AgentClient {
     } catch (error) {
       const modeDiscoveryError = toDiagnosticErrorMessage(error);
       this.logger.warn(
-        { err: error, directory, timeoutMs },
+        { err: error, directory, timeoutMs: catalogBudget.timeoutMs },
         "OpenCode mode discovery degraded; provider models remain available",
       );
       // Keep the legacy array shape without claiming the empty list is

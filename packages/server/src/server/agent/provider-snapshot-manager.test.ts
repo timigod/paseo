@@ -18,6 +18,10 @@ import {
   resolveSnapshotCwd,
 } from "./provider-snapshot-manager.js";
 import { OpenCodeAgentClient } from "./providers/opencode-agent.js";
+import {
+  TestOpenCodeClient,
+  TestOpenCodeHarness,
+} from "./providers/opencode/test-utils/test-opencode-harness.js";
 
 const TEST_CAPABILITIES = {
   supportsStreaming: false,
@@ -952,9 +956,84 @@ describe("ProviderSnapshotManager public surface", () => {
         error: "OpenCode app.agents timed out after 250ms",
       });
       expect(entry.modes).toBeUndefined();
+      await expect(
+        manager.listModes({ cwd: "/tmp/project", provider: "codex", wait: false }),
+      ).resolves.toBeUndefined();
       expect(fetchCatalog).toHaveBeenCalledTimes(1);
     } finally {
       manager.destroy();
+    }
+  });
+
+  test("degrades real OpenCode mode discovery before the manager catalog deadline", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    const runtime = new TestOpenCodeHarness();
+    const openCodeClient = new TestOpenCodeClient();
+    openCodeClient.providerListResponse = {
+      data: {
+        connected: ["openai"],
+        all: [
+          {
+            id: "openai",
+            name: "OpenAI",
+            models: { "gpt-5.4": { name: "GPT 5.4" } },
+          },
+        ],
+      },
+    };
+    openCodeClient.appAgentsImplementation = async (_parameters, options) => {
+      const signal = (options as { signal?: AbortSignal } | undefined)?.signal;
+      return await new Promise((_finish, reject) => {
+        signal?.addEventListener("abort", () => reject(new Error("app.agents aborted")), {
+          once: true,
+        });
+      });
+    };
+    runtime.enqueueClient(openCodeClient);
+    const openCodeAgentClient = new OpenCodeAgentClient(createTestLogger(), undefined, {
+      serverManager: runtime,
+      createClient: runtime.createClient,
+    });
+    vi.spyOn(openCodeAgentClient, "isAvailable").mockResolvedValue(true);
+    const manager = new ProviderSnapshotManager({
+      logger: createTestLogger(),
+      refreshTimeoutMs: 1_000,
+      extraClients: {
+        opencode: openCodeAgentClient,
+      },
+    });
+    const entryPromise = manager.getProvider({
+      cwd: "/tmp/project",
+      provider: "opencode",
+      wait: true,
+    });
+
+    try {
+      await vi.waitFor(() => expect(openCodeClient.calls.appAgents).toHaveLength(1), {
+        interval: 1,
+        timeout: 100,
+      });
+      await vi.advanceTimersByTimeAsync(Math.max(0, 975 - Date.now()));
+      const earlyResult = await Promise.race([
+        entryPromise,
+        Promise.resolve({ status: "pending" as const }),
+      ]);
+
+      await vi.advanceTimersByTimeAsync(Math.max(0, 1_000 - Date.now()));
+      await entryPromise.catch(() => undefined);
+
+      expect(earlyResult).toMatchObject({
+        provider: "opencode",
+        status: "ready",
+        models: [{ id: "openai/gpt-5.4" }],
+        error: expect.stringContaining("app.agents"),
+      });
+      expect("modes" in earlyResult ? earlyResult.modes : undefined).toBeUndefined();
+      expect(runtime.acquisitions).toEqual([{ kind: "current", releaseCount: 1 }]);
+    } finally {
+      manager.destroy();
+      vi.useRealTimers();
     }
   });
 

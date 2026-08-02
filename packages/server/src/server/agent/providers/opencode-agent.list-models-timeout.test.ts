@@ -110,7 +110,7 @@ test("uses the supplied catalog budget for mode discovery and releases the runti
   await expect(catalogPromise).resolves.toMatchObject({
     models: [{ id: "openai/gpt-5.4" }],
     modes: [],
-    modeDiscoveryError: "OpenCode app.agents timed out after 250ms",
+    modeDiscoveryError: "OpenCode app.agents timed out within the 250ms catalog budget",
   });
   expect(modeDiscoverySignal?.aborted).toBe(true);
   expect(runtime.acquisitions).toEqual([{ kind: "current", releaseCount: 1 }]);

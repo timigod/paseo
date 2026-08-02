@@ -220,11 +220,23 @@ export class ProviderCatalogSession {
     }
 
     if (entry.status === "ready") {
+      if (entry.modes === undefined) {
+        this.host.emit({
+          type: "list_provider_modes_response",
+          payload: {
+            provider: msg.provider,
+            error: entry.error ?? `Modes are not currently known for ${msg.provider}`,
+            fetchedAt: entry.fetchedAt ?? fetchedAt,
+            requestId: msg.requestId,
+          },
+        });
+        return;
+      }
       this.host.emit({
         type: "list_provider_modes_response",
         payload: {
           provider: msg.provider,
-          modes: this.downgradeModeIconsForClient(entry.modes ?? []),
+          modes: this.downgradeModeIconsForClient(entry.modes),
           error: null,
           fetchedAt: entry.fetchedAt ?? fetchedAt,
           requestId: msg.requestId,
