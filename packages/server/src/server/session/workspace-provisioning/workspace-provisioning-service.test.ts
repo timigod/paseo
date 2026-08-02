@@ -110,6 +110,32 @@ test("fresh non-git directory creates a directory workspace at the exact path", 
   expect(workspace.cwd).toBe(dir);
 });
 
+test("deterministic directory workspace creation resumes the same placement", async () => {
+  const dir = path.join(tmpDir, "deterministic");
+  const context = { expectsInitialAgent: true, workspaceId: "wks_deterministic1" };
+
+  const first = await provisioning.createWorkspaceForDirectory(dir, "First", undefined, context);
+  const replay = await provisioning.createWorkspaceForDirectory(dir, "Ignored", undefined, context);
+
+  expect(replay).toEqual(first);
+  expect(replay.workspaceId).toBe("wks_deterministic1");
+  expect(await workspaceRegistry.list()).toHaveLength(1);
+});
+
+test("deterministic workspace identity fails closed on conflicting placement", async () => {
+  const context = { expectsInitialAgent: true, workspaceId: "wks_deterministic2" };
+  await provisioning.createWorkspaceForDirectory(
+    path.join(tmpDir, "first"),
+    null,
+    undefined,
+    context,
+  );
+
+  await expect(
+    provisioning.createWorkspaceForDirectory(path.join(tmpDir, "second"), null, undefined, context),
+  ).rejects.toThrow("conflicting placement");
+});
+
 test("re-opening an active workspace by exact path returns the same record without duplicating", async () => {
   const repo = path.join(tmpDir, "repo");
   gitRoots.add(repo);

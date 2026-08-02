@@ -6,7 +6,7 @@ import type { CommandError } from "../../output/index.js";
 
 export const FLEET_TOPOLOGY_VERSION = 1;
 
-const FleetHostSchema = z.object({
+export const FleetHostSchema = z.object({
   id: z.string().trim().min(1),
   name: z.string().trim().min(1),
   endpoint: z.string().trim().min(1),

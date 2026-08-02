@@ -238,6 +238,7 @@ export async function buildAgentSessionConfig(
   legacyWorktreeName?: string,
   firstAgentContext?: FirstAgentContext,
   worktreeCreationJournal?: WorktreeCreationJournalCallbacks,
+  placementIdentity?: { workspaceId: string; worktreeSlug: string },
 ): Promise<{
   sessionConfig: AgentSessionConfig;
   setupContinuation?: AgentWorktreeSetupContinuation;
@@ -266,7 +267,8 @@ export async function buildAgentSessionConfig(
     const createdWorktree = await dependencies.createPaseoWorktree(
       {
         cwd,
-        worktreeSlug: normalized.worktreeSlug,
+        worktreeSlug: normalized.worktreeSlug ?? placementIdentity?.worktreeSlug,
+        workspaceId: placementIdentity?.workspaceId,
         refName: normalized.refName,
         action: normalized.action,
         checkoutSource: normalized.checkoutSource,

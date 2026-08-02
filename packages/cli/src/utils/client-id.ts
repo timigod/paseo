@@ -1,7 +1,8 @@
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
+import { publishPrivateFile } from "./private-file.js";
 
 const CLIENT_SESSION_KEY_FILE = join(
   process.env.PASEO_HOME ?? join(homedir(), ".paseo"),
@@ -38,8 +39,17 @@ export async function getOrCreateCliClientId(): Promise<string> {
   }
 
   const nextValue = generateClientId();
-  await mkdir(dirname(CLIENT_SESSION_KEY_FILE), { recursive: true });
-  await writeFile(CLIENT_SESSION_KEY_FILE, nextValue, { mode: 0o600 });
-  cachedClientId = nextValue;
-  return nextValue;
+  const directory = dirname(CLIENT_SESSION_KEY_FILE);
+  await mkdir(directory, { recursive: true, mode: 0o700 });
+  await chmod(directory, 0o700);
+  if (await publishPrivateFile(CLIENT_SESSION_KEY_FILE, nextValue)) {
+    cachedClientId = nextValue;
+    return nextValue;
+  }
+  const existing = normalizeClientId(await readFile(CLIENT_SESSION_KEY_FILE, "utf8"));
+  if (!existing) {
+    throw new Error("CLI client identity file is empty after concurrent creation");
+  }
+  cachedClientId = existing;
+  return existing;
 }

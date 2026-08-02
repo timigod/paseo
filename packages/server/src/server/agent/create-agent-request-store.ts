@@ -24,7 +24,13 @@ const CreateAgentRequestReceiptSchema = CreateAgentRequestIdentitySchema.extend(
   fingerprint: z.string().regex(/^[a-f0-9]{64}$/),
   agentId: z.string().min(1).max(200),
   state: z.enum(["pending", "succeeded", "failed"]),
-  phase: z.enum(["reserved", "placement_created", "agent_registered", "prompt_dispatched"]),
+  phase: z.enum([
+    "reserved",
+    "placement_created",
+    "agent_registered",
+    "prompt_dispatching",
+    "prompt_dispatched",
+  ]),
   placement: z
     .object({ workspaceId: z.string().min(1).max(200), cwd: z.string().min(1).max(4096) })
     .strict()
@@ -53,6 +59,23 @@ const CreateAgentRequestReceiptFileSchema = z
   .object({
     version: z.literal(2),
     receipts: z.array(CreateAgentRequestReceiptSchema).max(CREATE_AGENT_REQUEST_MAX_RECEIPTS),
+  })
+  .strict();
+
+const LegacyCreateAgentRequestReceiptSchema = z
+  .object({
+    key: z.string().regex(CREATE_AGENT_REQUEST_KEY_PATTERN),
+    fingerprint: z.string().regex(/^[a-f0-9]{64}$/),
+    agentId: z.string().min(1).max(200),
+    state: z.enum(["pending", "succeeded", "failed"]),
+    updatedAt: z.string().datetime({ offset: true }),
+  })
+  .strict();
+
+const LegacyCreateAgentRequestReceiptFileSchema = z
+  .object({
+    version: z.literal(1),
+    receipts: z.array(z.unknown()).max(CREATE_AGENT_REQUEST_MAX_RECEIPTS),
   })
   .strict();
 
@@ -127,6 +150,13 @@ interface InflightCreateAgentRequest {
   promise: Promise<string>;
 }
 
+type PreparedCreateAgentRequest =
+  | { kind: "replay"; agentId: string }
+  | { kind: "pending"; receipt: CreateAgentRequestReceipt };
+
+type CompletedCreateAgentRequestReceipt = CreateAgentRequestReceipt &
+  ({ state: "succeeded" } | { phase: "prompt_dispatched" });
+
 export class CreateAgentRequestStore {
   private readonly filePath: string;
   private readonly daemonId: string;
@@ -191,37 +221,13 @@ export class CreateAgentRequestStore {
     input: RunCreateAgentRequestInput,
     identity: CreateAgentRequestIdentity,
     scopedKey: string,
-    existing: CreateAgentRequestReceipt | undefined,
+    current: CreateAgentRequestReceipt | undefined,
   ): Promise<string> {
-    if (existing?.state === "failed") {
-      throw new Error("The previous create request failed");
+    const prepared = await this.prepareRequest(input, identity, scopedKey, current);
+    if (prepared.kind === "replay") {
+      return prepared.agentId;
     }
-    if (existing?.state === "succeeded") {
-      if (await this.hasAgent(existing.agentId)) {
-        return existing.agentId;
-      }
-      throw new Error(
-        `Agent ${existing.agentId} from the previous create request no longer exists`,
-      );
-    }
-
-    const agentId = existing?.agentId ?? this.idFactory(identity);
-    if (!existing && (await this.hasAgent(agentId))) {
-      throw new Error("The create idempotency receipt expired; refusing to create a duplicate");
-    }
-    if (!existing && this.receipts.size >= this.maxReceipts) {
-      throw new Error(`Create idempotency receipt limit of ${this.maxReceipts} was reached`);
-    }
-
-    let pending: CreateAgentRequestReceipt = existing ?? {
-      ...identity,
-      fingerprint: input.fingerprint,
-      agentId,
-      state: "pending",
-      phase: "reserved",
-      updatedAt: this.now().toISOString(),
-    };
-    pending = await this.updateReceipt(scopedKey, pending);
+    let pending = prepared.receipt;
 
     try {
       await input.create({
@@ -252,6 +258,78 @@ export class CreateAgentRequestStore {
     }
   }
 
+  private async prepareRequest(
+    input: RunCreateAgentRequestInput,
+    identity: CreateAgentRequestIdentity,
+    scopedKey: string,
+    current: CreateAgentRequestReceipt | undefined,
+  ): Promise<PreparedCreateAgentRequest> {
+    const existing =
+      current ??
+      (await this.claimLegacyReceipt({
+        identity,
+        scopedKey,
+        fingerprint: input.fingerprint,
+      }));
+    if (existing && existing.fingerprint !== input.fingerprint) {
+      throw new CreateAgentIdempotencyConflictError();
+    }
+    if (existing?.state === "failed") {
+      throw new Error("The previous create request failed");
+    }
+    if (isCompletedReceipt(existing)) {
+      return this.replayCompletedReceipt(existing, scopedKey);
+    }
+    if (existing?.phase === "prompt_dispatching") {
+      throw new Error(
+        `Initial prompt delivery for agent ${existing.agentId} is indeterminate; inspect the agent before manually resubmitting`,
+      );
+    }
+
+    const agentId = existing?.agentId ?? this.idFactory(identity);
+    if (!existing && (await this.hasAgent(agentId))) {
+      throw new Error("The create idempotency receipt expired; refusing to create a duplicate");
+    }
+    if (!existing && this.receipts.size >= this.maxReceipts) {
+      throw new Error(`Create idempotency receipt limit of ${this.maxReceipts} was reached`);
+    }
+
+    let pending: CreateAgentRequestReceipt = existing ?? {
+      ...identity,
+      fingerprint: input.fingerprint,
+      agentId,
+      state: "pending",
+      phase: "reserved",
+      updatedAt: this.now().toISOString(),
+    };
+    pending = await this.updateReceipt(scopedKey, pending);
+
+    if (
+      CREATE_AGENT_PHASE_ORDER[pending.phase] < CREATE_AGENT_PHASE_ORDER.agent_registered &&
+      (await this.hasAgent(pending.agentId))
+    ) {
+      pending = await this.updateReceipt(scopedKey, {
+        ...pending,
+        phase: "agent_registered",
+      });
+    }
+
+    return { kind: "pending", receipt: pending };
+  }
+
+  private async replayCompletedReceipt(
+    receipt: CreateAgentRequestReceipt,
+    scopedKey: string,
+  ): Promise<PreparedCreateAgentRequest> {
+    if (!(await this.hasAgent(receipt.agentId))) {
+      throw new Error(`Agent ${receipt.agentId} from the previous create request no longer exists`);
+    }
+    if (receipt.state !== "succeeded") {
+      await this.updateReceipt(scopedKey, { ...receipt, state: "succeeded" });
+    }
+    return { kind: "replay", agentId: receipt.agentId };
+  }
+
   private async load(): Promise<void> {
     if (!this.loadPromise) {
       this.loadPromise = this.loadFromDisk();
@@ -274,7 +352,13 @@ export class CreateAgentRequestStore {
         `Create idempotency receipt file exceeds ${this.maxFileBytes} bytes; file was preserved`,
       );
     }
-    const parsed = CreateAgentRequestReceiptFileSchema.parse(JSON.parse(raw));
+    const json: unknown = JSON.parse(raw);
+    const version = z.object({ version: z.number() }).passthrough().parse(json).version;
+    if (version === 1) {
+      this.loadLegacyReceipts(LegacyCreateAgentRequestReceiptFileSchema.parse(json));
+      return;
+    }
+    const parsed = CreateAgentRequestReceiptFileSchema.parse(json);
     const now = this.now().getTime();
     for (const receipt of parsed.receipts) {
       if (Date.parse(receipt.updatedAt) > now) {
@@ -286,6 +370,66 @@ export class CreateAgentRequestStore {
       }
       this.receipts.set(scopedKey, receipt);
     }
+  }
+
+  private loadLegacyReceipts(
+    file: z.infer<typeof LegacyCreateAgentRequestReceiptFileSchema>,
+  ): void {
+    const now = this.now().getTime();
+    for (const candidate of file.receipts) {
+      const parsed = LegacyCreateAgentRequestReceiptSchema.safeParse(candidate);
+      if (!parsed.success || Date.parse(parsed.data.updatedAt) > now) {
+        continue;
+      }
+      const receipt: CreateAgentRequestReceipt = {
+        callerId: "legacy-v1-unscoped",
+        action: "create_agent",
+        daemonId: this.daemonId,
+        key: parsed.data.key,
+        fingerprint: parsed.data.fingerprint,
+        agentId: parsed.data.agentId,
+        state: parsed.data.state,
+        phase: "reserved",
+        updatedAt: parsed.data.updatedAt,
+      };
+      const legacyKey = fingerprintIdentity(receipt);
+      if (!this.receipts.has(legacyKey)) {
+        this.receipts.set(legacyKey, receipt);
+      }
+    }
+  }
+
+  private async claimLegacyReceipt(input: {
+    identity: CreateAgentRequestIdentity;
+    scopedKey: string;
+    fingerprint: string;
+  }): Promise<CreateAgentRequestReceipt | undefined> {
+    const legacyIdentity: CreateAgentRequestIdentity = {
+      ...input.identity,
+      callerId: "legacy-v1-unscoped",
+    };
+    const legacyKey = fingerprintIdentity(legacyIdentity);
+    const legacy = this.receipts.get(legacyKey);
+    if (!legacy) {
+      return undefined;
+    }
+    if (legacy.fingerprint !== input.fingerprint) {
+      throw new CreateAgentIdempotencyConflictError();
+    }
+    const agentExists = await this.hasAgent(legacy.agentId);
+    const claimed: CreateAgentRequestReceipt = {
+      ...legacy,
+      ...input.identity,
+      ...(legacy.state === "pending" && agentExists
+        ? { state: "succeeded" as const, phase: "prompt_dispatched" as const }
+        : {}),
+      updatedAt: this.now().toISOString(),
+    };
+    await this.mutateAndPersist(() => {
+      this.receipts.delete(legacyKey);
+      this.receipts.set(input.scopedKey, claimed);
+    });
+    return claimed;
   }
 
   private async pruneExpiredReceipts(): Promise<void> {
@@ -351,7 +495,8 @@ const CREATE_AGENT_PHASE_ORDER: Record<CreateAgentRequestPhase, number> = {
   reserved: 0,
   placement_created: 1,
   agent_registered: 2,
-  prompt_dispatched: 3,
+  prompt_dispatching: 3,
+  prompt_dispatched: 4,
 };
 
 function assertPhaseTransition(
@@ -361,6 +506,12 @@ function assertPhaseTransition(
   if (CREATE_AGENT_PHASE_ORDER[next] < CREATE_AGENT_PHASE_ORDER[current]) {
     throw new Error(`Create receipt phase cannot move backward from ${current} to ${next}`);
   }
+}
+
+function isCompletedReceipt(
+  receipt: CreateAgentRequestReceipt | undefined,
+): receipt is CompletedCreateAgentRequestReceipt {
+  return receipt?.state === "succeeded" || receipt?.phase === "prompt_dispatched";
 }
 
 function fingerprintIdentity(identity: CreateAgentRequestIdentity): string {

@@ -40,6 +40,7 @@ export interface ImportWorkspaceResult<T> {
 }
 
 export interface CreateWorktreeWorkspaceInput {
+  workspaceId?: string;
   sourceCwd: string;
   projectId?: string;
   repoRoot: string;
@@ -62,7 +63,7 @@ export interface WorkspaceProvisioningService {
     cwd: string,
     title?: string | null,
     projectId?: string,
-    context?: { expectsInitialAgent?: boolean },
+    context?: { expectsInitialAgent?: boolean; workspaceId?: string },
   ): Promise<PersistedWorkspaceRecord>;
   createWorkspaceForWorktree(
     input: CreateWorktreeWorkspaceInput,
@@ -203,7 +204,7 @@ export function createWorkspaceProvisioningService(deps: {
     cwd: string,
     title?: string | null,
     projectId?: string,
-    context?: { expectsInitialAgent?: boolean },
+    context?: { expectsInitialAgent?: boolean; workspaceId?: string },
   ): Promise<PersistedWorkspaceRecord> {
     const normalizedCwd = resolve(cwd);
     return lifecycleCoordinator.runDirectoryExclusive(normalizedCwd, async () => {
@@ -216,8 +217,15 @@ export function createWorkspaceProvisioningService(deps: {
     normalizedCwd: string,
     title?: string | null,
     projectId?: string,
-    context?: { expectsInitialAgent?: boolean },
+    context?: { expectsInitialAgent?: boolean; workspaceId?: string },
   ): Promise<PersistedWorkspaceRecord> {
+    const existing = context?.workspaceId ? await workspaceRegistry.get(context.workspaceId) : null;
+    if (existing) {
+      if (existing.archivedAt || !areEquivalentPaths(existing.cwd, normalizedCwd)) {
+        throw new Error(`Workspace ${existing.workspaceId} has conflicting placement`);
+      }
+      return existing;
+    }
     const checkout = await workspaceGitService.getCheckout(normalizedCwd);
     const project = projectId
       ? await refreshProjectKind(await requireActiveProject(projectId), normalizedCwd, checkout)
@@ -225,7 +233,7 @@ export function createWorkspaceProvisioningService(deps: {
         await findOrCreateProjectForDirectory(normalizedCwd);
     const timestamp = new Date().toISOString();
     const workspace = createPersistedWorkspaceRecord({
-      workspaceId: generateWorkspaceId(),
+      workspaceId: context?.workspaceId ?? generateWorkspaceId(),
       projectId: project.projectId,
       ...initialWorkspacePlacement({ source: "checkout", cwd: normalizedCwd, checkout }),
       title: title?.trim() || null,
@@ -250,6 +258,19 @@ export function createWorkspaceProvisioningService(deps: {
     const cwd = resolve(input.cwd);
     const worktreeRoot = resolve(input.worktreeRoot);
     return lifecycleCoordinator.runDirectoryExclusive(worktreeRoot, async () => {
+      const existing = input.workspaceId ? await workspaceRegistry.get(input.workspaceId) : null;
+      if (existing) {
+        if (
+          existing.archivedAt ||
+          !areEquivalentPaths(existing.cwd, cwd) ||
+          !existing.worktreeRoot ||
+          !areEquivalentPaths(existing.worktreeRoot, worktreeRoot)
+        ) {
+          throw new Error(`Workspace ${existing.workspaceId} has conflicting placement`);
+        }
+        return existing;
+      }
+
       const matchesWorktreeRoot = createRealpathAwarePathMatcher(worktreeRoot);
       const activeOwner = (await workspaceRegistry.list())
         .filter(
@@ -261,7 +282,12 @@ export function createWorkspaceProvisioningService(deps: {
             Date.parse(left.createdAt) - Date.parse(right.createdAt) ||
             left.workspaceId.localeCompare(right.workspaceId),
         )[0];
-      if (activeOwner) return activeOwner;
+      if (activeOwner) {
+        if (input.workspaceId && activeOwner.workspaceId !== input.workspaceId) {
+          throw new Error(`Workspace ${input.workspaceId} has conflicting placement`);
+        }
+        return activeOwner;
+      }
 
       const project = await resolveSourceProjectForWorktree({
         sourceCwd,
@@ -270,7 +296,7 @@ export function createWorkspaceProvisioningService(deps: {
       });
       const timestamp = new Date().toISOString();
       const workspace = createPersistedWorkspaceRecord({
-        workspaceId: generateWorkspaceId(),
+        workspaceId: input.workspaceId ?? generateWorkspaceId(),
         projectId: project.projectId,
         ...initialWorkspacePlacement({
           source: "created_worktree",

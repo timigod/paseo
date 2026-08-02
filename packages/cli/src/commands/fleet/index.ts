@@ -5,6 +5,7 @@ import { withOutput } from "../../output/index.js";
 import type { CommandError, ListResult, OutputSchema, SingleResult } from "../../output/index.js";
 import { addJsonOption } from "../../utils/command-options.js";
 import { connectToDaemon } from "../../utils/client.js";
+import { getOrCreateCliClientId } from "../../utils/client-id.js";
 import { fetchAllAgents } from "../../utils/inventory.js";
 import {
   addRunOptions,
@@ -38,6 +39,7 @@ import {
   resolveFleetRunPrompt,
   resolveFleetWorktreeBase,
 } from "./run.js";
+import { claimFleetAffinity, loadFleetAffinity } from "./affinity.js";
 
 interface FleetRunOptions extends AgentRunOptions {
   host?: string;
@@ -127,29 +129,45 @@ async function runFleetRunCommand(
   const config = loadFleetConfig();
   const prompt = await resolveFleetRunPrompt(positionalPrompt, options);
   const pinnedHost = requireFleetHost(options.host, config.hosts);
-  const statuses = await collectFleetStatus(config);
+  const idempotencyKey = options.idempotencyKey?.trim() || null;
+  const callerId = idempotencyKey ? await getOrCreateCliClientId() : null;
+  const existingAffinity =
+    idempotencyKey && callerId ? await loadFleetAffinity({ callerId, idempotencyKey }) : null;
   const workspaceId = options.workspace ?? process.env.PASEO_WORKSPACE_ID;
   const cwd = options.cwd ?? process.cwd();
   const sourceHost = findFleetHostForCwd(cwd, config.hosts);
   const localHost = findFleetHostForHostname(os.hostname(), config.hosts);
-  const plan = workspaceId
-    ? {
-        ...selectFleetWorkspaceHost({
-          observations: statuses,
-          workspaceId,
-          pinnedHost,
-        }),
-        cwd,
-      }
-    : selectFleetHost({
-        observations: statuses,
+  if (existingAffinity && pinnedHost && pinnedHost.id !== existingAffinity.host.id) {
+    throw {
+      code: "FLEET_KEY_HOST_CONFLICT",
+      message: `Idempotency key is owned by ${existingAffinity.host.id}, not pinned host ${pinnedHost.id}`,
+    } satisfies CommandError;
+  }
+  let plan = existingAffinity
+    ? { ...existingAffinity, reason: "idempotency_key" as const }
+    : await resolveNewFleetRunPlan({
+        config,
+        workspaceId,
         cwd,
         sourceHost,
         localHost,
         pinnedHost,
-        requiresLocalContext: Boolean(process.env.PASEO_AGENT_ID),
-        idempotencyKey: options.idempotencyKey?.trim() || null,
+        idempotencyKey,
       });
+  if (!existingAffinity && idempotencyKey && callerId) {
+    const affinity = await claimFleetAffinity({
+      callerId,
+      idempotencyKey,
+      affinity: { host: plan.host, cwd: plan.cwd },
+    });
+    if (pinnedHost && pinnedHost.id !== affinity.host.id) {
+      throw {
+        code: "FLEET_KEY_HOST_CONFLICT",
+        message: `Idempotency key is owned by ${affinity.host.id}, not pinned host ${pinnedHost.id}`,
+      } satisfies CommandError;
+    }
+    plan = { ...affinity, reason: "idempotency_key" };
+  }
   const model = resolveFleetProviderModelOptions(options, config.defaults);
   const thinking = options.thinking ?? config.defaults.thinking;
   const result = await runRunCommand(
@@ -176,6 +194,36 @@ async function runFleetRunCommand(
     },
     schema: fleetRunSchema,
   };
+}
+
+async function resolveNewFleetRunPlan(input: {
+  config: ReturnType<typeof loadFleetConfig>;
+  workspaceId: string | undefined;
+  cwd: string;
+  sourceHost: FleetHost | null;
+  localHost: FleetHost | null;
+  pinnedHost: FleetHost | null;
+  idempotencyKey: string | null;
+}) {
+  const statuses = await collectFleetStatus(input.config);
+  return input.workspaceId
+    ? {
+        ...selectFleetWorkspaceHost({
+          observations: statuses,
+          workspaceId: input.workspaceId,
+          pinnedHost: input.pinnedHost,
+        }),
+        cwd: input.cwd,
+      }
+    : selectFleetHost({
+        observations: statuses,
+        cwd: input.cwd,
+        sourceHost: input.sourceHost,
+        localHost: input.localHost,
+        pinnedHost: input.pinnedHost,
+        requiresLocalContext: Boolean(process.env.PASEO_AGENT_ID),
+        idempotencyKey: input.idempotencyKey,
+      });
 }
 
 export async function runFleetFinishCommand(

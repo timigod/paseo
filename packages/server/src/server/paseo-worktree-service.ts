@@ -30,6 +30,7 @@ import { buildAgentBranchNameSeed } from "./agent/prompt-attachments.js";
 import type { FirstAgentContext } from "@getpaseo/protocol/messages";
 
 export interface CreatePaseoWorktreeInput extends CreateWorktreeCoreInput {
+  workspaceId?: string;
   projectId?: string;
   title?: string;
 }
@@ -83,6 +84,7 @@ export async function createPaseoWorktree(
       });
     }
     const workspace = await deps.workspaceProvisioning.createWorkspaceForWorktree({
+      workspaceId: input.workspaceId,
       sourceCwd: workspaceCwdPlan.inputCwd,
       projectId: input.projectId,
       repoRoot: createdWorktree.repoRoot,

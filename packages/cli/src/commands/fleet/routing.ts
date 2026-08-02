@@ -64,7 +64,7 @@ export function selectFleetHost(input: {
   const candidates = routeDomain.filter(isEligible);
 
   if (idempotencyKey) {
-    const ordered = [...routeDomain].sort((left, right) =>
+    const ordered = [...candidates].sort((left, right) =>
       left.host.id.localeCompare(right.host.id),
     );
     if (ordered.length === 0) {
@@ -76,13 +76,6 @@ export function selectFleetHost(input: {
       throw commandError(
         "FLEET_KEY_HOST_CONFLICT",
         `Idempotency key routes to ${keyed.host.id}, not pinned host ${pinnedHost.id}`,
-      );
-    }
-    if (!isEligible(keyed)) {
-      throw commandError(
-        "FLEET_KEY_HOST_INELIGIBLE",
-        `Fleet host ${keyed.host.id} for this idempotency key is not eligible for the run`,
-        "Retry after that host is healthy and has capacity; choosing another host could duplicate the agent.",
       );
     }
     return {

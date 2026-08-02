@@ -638,6 +638,32 @@ function describeRegistryTransition(record: ArchivedRecordSnapshot | null): Regi
   return record.archivedAt ? "unarchived" : "existing";
 }
 
+function deterministicCreatePlacementIdentity(agentId: string): {
+  workspaceId: string;
+  sourceWorkspaceId: string;
+  worktreeSlug: string;
+} {
+  const compact = agentId.replaceAll("-", "").toLowerCase();
+  return {
+    workspaceId: `wks_${compact.slice(0, 16)}`,
+    sourceWorkspaceId: `wks_${compact.slice(0, 12)}src0`,
+    worktreeSlug: `create-${compact.slice(0, 16)}`,
+  };
+}
+
+function resolveCreatePlacementIdentity(
+  requestContext: CreateAgentRequestContext | undefined,
+): ReturnType<typeof deterministicCreatePlacementIdentity> | undefined {
+  return requestContext ? deterministicCreatePlacementIdentity(requestContext.agentId) : undefined;
+}
+
+function resolveRequestedCreateWorkspaceId(
+  msg: CreateAgentRequestMessage,
+  identity: ReturnType<typeof deterministicCreatePlacementIdentity> | undefined,
+): string | undefined {
+  return msg.git || msg.worktreeName ? identity?.sourceWorkspaceId : identity?.workspaceId;
+}
+
 /**
  * Session represents a single connected client session.
  * It owns all state management, orchestration logic, and message processing.
@@ -3262,7 +3288,9 @@ export class Session {
 
     if (
       requestContext &&
-      (requestContext.phase === "agent_registered" || requestContext.phase === "prompt_dispatched")
+      (requestContext.phase === "agent_registered" ||
+        requestContext.phase === "prompt_dispatching" ||
+        requestContext.phase === "prompt_dispatched")
     ) {
       return this.resumeCreateAgentRequest(msg, requestContext, resolvedClientMessageId);
     }
@@ -3288,31 +3316,21 @@ export class Session {
     const prompt = buildAgentPrompt(trimmedPrompt ?? "", msg.images, msg.attachments);
     const hasPromptContent = Array.isArray(prompt) ? prompt.length > 0 : prompt.length > 0;
     if (hasPromptContent) {
-      const timeline = [
-        ...this.agentManager.getTimeline(requestContext.agentId),
-        ...(await this.agentManager.getTimelineRows(requestContext.agentId)).map(
-          ({ item }) => item,
-        ),
-      ];
-      const alreadyDispatched = timeline.some(
-        (item) => item.type === "user_message" && item.clientMessageId === clientMessageId,
-      );
-      if (!alreadyDispatched) {
-        await startCreatedAgentInitialPrompt({
-          agentManager: this.agentManager,
-          agentId: requestContext.agentId,
-          snapshot,
-          prompt,
-          runOptions:
-            msg.outputSchema || clientMessageId
-              ? {
-                  ...(msg.outputSchema ? { outputSchema: msg.outputSchema } : {}),
-                  ...(clientMessageId ? { clientMessageId } : {}),
-                }
-              : undefined,
-          logger: this.sessionLogger,
-        });
-      }
+      await requestContext.checkpoint("prompt_dispatching");
+      await startCreatedAgentInitialPrompt({
+        agentManager: this.agentManager,
+        agentId: requestContext.agentId,
+        snapshot,
+        prompt,
+        runOptions:
+          msg.outputSchema || clientMessageId
+            ? {
+                ...(msg.outputSchema ? { outputSchema: msg.outputSchema } : {}),
+                ...(clientMessageId ? { clientMessageId } : {}),
+              }
+            : undefined,
+        logger: this.sessionLogger,
+      });
     }
     await requestContext.checkpoint("prompt_dispatched");
     return requestContext.agentId;
@@ -3350,9 +3368,9 @@ export class Session {
         ...(attachments && attachments.length > 0 ? { attachments } : {}),
       };
       const workspacePromptTitle = resolveFirstAgentPromptTitle(firstAgentContext);
+      const placementIdentity = resolveCreatePlacementIdentity(requestContext);
       const pendingCreation = await this.reservePendingAgentCreation(
-        shouldJournalAgentCreation(msg),
-        requestContext?.agentId,
+        shouldJournalAgentCreation(msg) && !requestContext,
       );
       pendingCreationAgentId = pendingCreation.agentId;
       const createdWorktree = await this.createWorktreeForCreateAgentRequest({
@@ -3361,13 +3379,21 @@ export class Session {
         firstAgentContext,
         hasLegacyGitOptions: Boolean(git),
         worktreeCreationJournal: pendingCreation.worktreeCreationJournal,
+        placementIdentity,
       });
       createdWorktreeForCleanup = createdWorktree;
       const resolvedIntent = await this.resolveSessionCreateAgentIntent({
         request: placedRequest,
         createdWorktree,
         workspacePromptTitle,
+        requestedWorkspaceId: resolveRequestedCreateWorkspaceId(msg, placementIdentity),
       });
+      if (requestContext && requestContext.phase === "reserved" && !msg.git && !msg.worktreeName) {
+        await requestContext.checkpoint("placement_created", {
+          workspaceId: resolvedIntent.intent.workspaceId,
+          cwd: resolvedIntent.config.cwd,
+        });
+      }
       const resolvedCwd = resolve(resolvedIntent.config.cwd);
       if (!(await this.filesystem.isDirectory(resolvedCwd))) {
         throw new Error(`Working directory does not exist or is not a directory: ${resolvedCwd}`);
@@ -3414,7 +3440,8 @@ export class Session {
           provisionalTitle,
           firstAgentContext,
           autoArchiveObligation,
-          agentId: pendingCreationAgentId,
+          agentId: requestContext?.agentId ?? pendingCreationAgentId,
+          skipPendingCreationJournal: Boolean(requestContext),
           onCreated: ({ agentId, autoArchiveObligation: persistedObligation }) => {
             createdAgentId = agentId;
             this.registerCreatedAgentAutoArchive(agentId, persistedObligation);
@@ -3422,6 +3449,12 @@ export class Session {
           onAgentRegistered: async (registeredAgent) => {
             createdAgentId = registeredAgent.id;
             await requestContext?.checkpoint("agent_registered");
+          },
+          onPlacementCreated: async (placement) => {
+            await requestContext?.checkpoint("placement_created", placement);
+          },
+          onInitialPromptDispatching: async () => {
+            await requestContext?.checkpoint("prompt_dispatching");
           },
           onInitialPromptDispatched: async () => {
             await requestContext?.checkpoint("prompt_dispatched");
@@ -3433,6 +3466,7 @@ export class Session {
               legacyWorktreeName,
               ctx,
               onPath,
+              placementIdentity,
             ),
         },
       );
@@ -3451,7 +3485,7 @@ export class Session {
       return snapshot.id;
     } catch (error) {
       await this.createAgentLifecycleDispatch.cleanupCreatedWorktreeAfterFailedAgentCreate({
-        createdWorktree: createdWorktreeForCleanup,
+        createdWorktree: requestContext ? null : createdWorktreeForCleanup,
         createdAgentId,
       });
       await this.recoverPendingAgentCreation(pendingCreationAgentId);
@@ -3465,7 +3499,7 @@ export class Session {
   ): Promise<CreateAgentRequestMessage> {
     let placement = requestContext?.placement;
     if (msg.workspaceSource && !placement) {
-      placement = await this.createWorkspacePlacementForAgentRequest(msg);
+      placement = await this.createWorkspacePlacementForAgentRequest(msg, requestContext?.agentId);
       await requestContext?.checkpoint("placement_created", placement);
     }
     if (requestContext?.phase === "placement_created" && !placement) {
@@ -3491,6 +3525,7 @@ export class Session {
 
   private async createWorkspacePlacementForAgentRequest(
     request: CreateAgentRequestMessage,
+    reservedAgentId?: string,
   ): Promise<{ workspaceId: string; cwd: string }> {
     const source = request.workspaceSource;
     if (!source) {
@@ -3513,7 +3548,12 @@ export class Session {
         cwd,
         title,
         source.projectId,
-        { expectsInitialAgent: true },
+        {
+          expectsInitialAgent: true,
+          workspaceId: reservedAgentId
+            ? deterministicCreatePlacementIdentity(reservedAgentId).workspaceId
+            : undefined,
+        },
       );
       await this.syncWorkspaceGitObserverForWorkspace(workspace);
       return { workspaceId: workspace.workspaceId, cwd: workspace.cwd };
@@ -3527,7 +3567,14 @@ export class Session {
       {
         cwd: sourceCwd,
         projectId: source.projectId,
-        worktreeSlug: source.worktreeSlug,
+        worktreeSlug:
+          source.worktreeSlug ??
+          (reservedAgentId
+            ? deterministicCreatePlacementIdentity(reservedAgentId).worktreeSlug
+            : undefined),
+        workspaceId: reservedAgentId
+          ? deterministicCreatePlacementIdentity(reservedAgentId).workspaceId
+          : undefined,
         action: source.action,
         refName: source.refName,
         branchName: source.branchName,
@@ -3613,6 +3660,7 @@ export class Session {
     request: CreateAgentRequestMessage;
     createdWorktree: CreatePaseoWorktreeWorkflowResult | null;
     workspacePromptTitle: string | null;
+    requestedWorkspaceId?: string;
   }): Promise<ResolvedSessionCreateAgentIntent> {
     const { request, createdWorktree } = input;
     const callerAgent = request.callerAgentId
@@ -3645,6 +3693,7 @@ export class Session {
           createdWorktree: null,
           cwd: config.cwd,
           initialTitle: input.workspacePromptTitle,
+          requestedWorkspaceId: input.requestedWorkspaceId,
         }),
         cwd: config.cwd,
       }),
@@ -3998,6 +4047,7 @@ export class Session {
     legacyWorktreeName?: string,
     firstAgentContext?: FirstAgentContext,
     worktreeCreationJournal?: WorktreeCreationJournalCallbacks,
+    placementIdentity?: { workspaceId: string; worktreeSlug: string },
   ): Promise<{
     sessionConfig: AgentSessionConfig;
     setupContinuation?: CreatePaseoWorktreeWorkflowResult["setupContinuation"];
@@ -4039,6 +4089,7 @@ export class Session {
       legacyWorktreeName,
       firstAgentContext,
       worktreeCreationJournal,
+      placementIdentity,
     );
   }
 
@@ -6275,6 +6326,7 @@ export class Session {
     firstAgentContext: FirstAgentContext;
     hasLegacyGitOptions: boolean;
     worktreeCreationJournal?: WorktreeCreationJournalCallbacks;
+    placementIdentity?: { workspaceId: string; worktreeSlug: string };
   }): Promise<CreatePaseoWorktreeWorkflowResult | null> {
     if (input.target && input.hasLegacyGitOptions) {
       throw new Error("create_agent_request worktree cannot be combined with git options");
@@ -6289,6 +6341,7 @@ export class Session {
       runSetup: false,
       paseoHome: this.paseoHome,
       worktreesRoot: this.worktreesRoot,
+      workspaceId: input.placementIdentity?.workspaceId,
       onWorktreePathPlanned: input.worktreeCreationJournal?.onWorktreePathPlanned,
       onWorktreePathResolved: input.worktreeCreationJournal?.onWorktreePathResolved,
     } as const;
@@ -6308,12 +6361,14 @@ export class Session {
       case "checkout-branch":
         return this.createPaseoWorktreeWorkflow({
           ...baseInput,
+          worktreeSlug: input.placementIdentity?.worktreeSlug,
           action: "checkout",
           refName: input.target.branch,
         });
       case "checkout-pr":
         return this.createPaseoWorktreeWorkflow({
           ...baseInput,
+          worktreeSlug: input.placementIdentity?.worktreeSlug,
           action: "checkout",
           githubPrNumber: input.target.prNumber,
         });

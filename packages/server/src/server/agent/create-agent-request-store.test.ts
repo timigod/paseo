@@ -169,6 +169,132 @@ describe("CreateAgentRequestStore", () => {
     expect(resumeCreate).toHaveBeenCalledOnce();
   });
 
+  it("fails closed when prompt provider acceptance is indeterminate", async () => {
+    const home = createHome();
+    const existingAgents = new Set<string>();
+    const firstStore = new CreateAgentRequestStore({
+      paseoHome: home,
+      hasAgent: async (agentId) => existingAgents.has(agentId),
+      idFactory: () => "00000000-0000-4000-8000-000000000014",
+    });
+    await expect(
+      firstStore.run(
+        scopedInput({
+          key: "prompt-acceptance-unknown",
+          fingerprint: REQUEST_A,
+          create: async ({ agentId, checkpoint }) => {
+            existingAgents.add(agentId);
+            await checkpoint("agent_registered");
+            await checkpoint("prompt_dispatching");
+            throw new Error("daemon crashed after provider call");
+          },
+        }),
+      ),
+    ).rejects.toThrow("daemon crashed");
+
+    const restartedStore = new CreateAgentRequestStore({
+      paseoHome: home,
+      hasAgent: async (agentId) => existingAgents.has(agentId),
+    });
+    const retryCreate = vi.fn(async () => {});
+    await expect(
+      restartedStore.run(
+        scopedInput({
+          key: "prompt-acceptance-unknown",
+          fingerprint: REQUEST_A,
+          create: retryCreate,
+        }),
+      ),
+    ).rejects.toThrow("prompt delivery");
+    expect(retryCreate).not.toHaveBeenCalled();
+  });
+
+  it("finishes replay without redispatching after the prompt checkpoint", async () => {
+    const home = createHome();
+    const existingAgents = new Set<string>();
+    const firstStore = new CreateAgentRequestStore({
+      paseoHome: home,
+      hasAgent: async (agentId) => existingAgents.has(agentId),
+      idFactory: () => "00000000-0000-4000-8000-000000000016",
+    });
+    await expect(
+      firstStore.run(
+        scopedInput({
+          key: "prompt-checkpoint-complete",
+          fingerprint: REQUEST_A,
+          create: async ({ agentId, checkpoint }) => {
+            existingAgents.add(agentId);
+            await checkpoint("agent_registered");
+            await checkpoint("prompt_dispatching");
+            await checkpoint("prompt_dispatched");
+            throw new Error("daemon crashed before success receipt");
+          },
+        }),
+      ),
+    ).rejects.toThrow("daemon crashed");
+
+    const restartedStore = new CreateAgentRequestStore({
+      paseoHome: home,
+      hasAgent: async (agentId) => existingAgents.has(agentId),
+    });
+    const retryCreate = vi.fn(async () => {});
+    await expect(
+      restartedStore.run(
+        scopedInput({
+          key: "prompt-checkpoint-complete",
+          fingerprint: REQUEST_A,
+          create: retryCreate,
+        }),
+      ),
+    ).resolves.toBe("00000000-0000-4000-8000-000000000016");
+    expect(retryCreate).not.toHaveBeenCalled();
+  });
+
+  it("migrates matching version-1 receipts without recreating an existing agent", async () => {
+    const home = createHome();
+    const file = path.join(home, "create-agent-requests.json");
+    const agentId = "00000000-0000-4000-8000-000000000015";
+    writeFileSync(
+      file,
+      JSON.stringify({
+        version: 1,
+        receipts: [
+          { invalid: "ignored independently" },
+          {
+            key: "legacy-key",
+            fingerprint: REQUEST_A,
+            agentId,
+            state: "pending",
+            updatedAt: "2026-08-01T00:00:00.000Z",
+          },
+        ],
+      }),
+    );
+    const store = new CreateAgentRequestStore({
+      paseoHome: home,
+      daemonId: "daemon-a",
+      hasAgent: async (candidate) => candidate === agentId,
+      now: () => new Date("2026-08-02T00:00:00.000Z"),
+    });
+    const create = vi.fn(async () => {});
+
+    await expect(
+      store.run(scopedInput({ key: "legacy-key", fingerprint: REQUEST_A, create })),
+    ).resolves.toBe(agentId);
+    expect(create).not.toHaveBeenCalled();
+    const migrated = JSON.parse(readFileSync(file, "utf8"));
+    expect(migrated.version).toBe(2);
+    expect(migrated.receipts).toEqual([
+      expect.objectContaining({
+        callerId: "cli-client",
+        key: "legacy-key",
+        agentId,
+        state: "succeeded",
+        phase: "prompt_dispatched",
+      }),
+    ]);
+  });
+
   it("reuses durable workspace placement after an interrupted create", async () => {
     const home = createHome();
     const placement = { workspaceId: "workspace-1", cwd: "/tmp/worktree-1" };

@@ -77,8 +77,11 @@ export interface CreateAgentFromSessionInput {
   firstAgentContext: FirstAgentContext;
   autoArchiveObligation?: AutoArchiveObligation;
   agentId?: string;
+  skipPendingCreationJournal?: boolean;
   onCreated?: (created: { agentId: string; autoArchiveObligation?: AutoArchiveObligation }) => void;
   onAgentRegistered?: (snapshot: ManagedAgent) => Promise<void>;
+  onPlacementCreated?: (placement: { workspaceId: string; cwd: string }) => Promise<void>;
+  onInitialPromptDispatching?: () => Promise<void>;
   onInitialPromptDispatched?: () => Promise<void>;
   buildSessionConfig: (
     config: AgentSessionConfig,
@@ -86,6 +89,7 @@ export interface CreateAgentFromSessionInput {
     legacyWorktreeName?: string,
     firstAgentContext?: FirstAgentContext,
     worktreeCreationJournal?: WorktreeCreationJournalCallbacks,
+    placementIdentity?: { workspaceId: string; worktreeSlug: string },
   ) => Promise<CreateAgentSessionWorktreeResult>;
 }
 
@@ -207,7 +211,7 @@ export async function createAgentCommand(
       () =>
         dependencies.agentManager.createAgent(
           resolved.config,
-          pendingAgentId,
+          input.kind === "session" ? input.agentId : pendingAgentId,
           resolved.createOptions,
         ),
     );
@@ -224,20 +228,10 @@ export async function createAgentCommand(
     agentId: snapshot.id,
   });
 
-  let liveSnapshot = snapshot;
-  let initialPromptStarted = false;
-  let initialPromptError: unknown | null = null;
   await completePendingAgentCreation(dependencies, pendingAgentId);
   notifyAgentCreated(input, resolved, snapshot);
-  if (resolved.prompt !== undefined) {
-    const sendResult = await sendInitialPrompt(dependencies, resolved, snapshot);
-    initialPromptStarted = sendResult.started;
-    liveSnapshot = sendResult.liveSnapshot;
-    initialPromptError = sendResult.error ?? null;
-    if (input.kind === "session" && sendResult.started) {
-      await input.onInitialPromptDispatched?.();
-    }
-  }
+  const { liveSnapshot, initialPromptStarted, initialPromptError } =
+    await dispatchCreatedAgentInitialPrompt(dependencies, input, resolved, snapshot);
 
   if (input.kind === "mcp" && input.notifyOnFinish && input.callerAgentId && initialPromptStarted) {
     setupFinishNotification({
@@ -264,7 +258,9 @@ async function reservePendingAgentId(
   dependencies: CreateAgentCommandDependencies,
   input: CreateAgentCommandInput,
 ): Promise<string | undefined> {
-  if (input.kind === "session") return input.agentId;
+  if (input.kind === "session") {
+    return input.skipPendingCreationJournal ? undefined : input.agentId;
+  }
   if (!shouldCreateMcpWorktree(input.worktree)) return undefined;
 
   const pendingAgentId = dependencies.agentManager.allocateAgentId();
@@ -340,6 +336,33 @@ async function removeSideEffectFreePendingCreation(
   }
 }
 
+async function dispatchCreatedAgentInitialPrompt(
+  dependencies: CreateAgentCommandDependencies,
+  input: CreateAgentCommandInput,
+  resolved: ResolvedCreateAgent,
+  snapshot: ManagedAgent,
+): Promise<{
+  liveSnapshot: ManagedAgent;
+  initialPromptStarted: boolean;
+  initialPromptError: unknown | null;
+}> {
+  if (resolved.prompt === undefined) {
+    return { liveSnapshot: snapshot, initialPromptStarted: false, initialPromptError: null };
+  }
+  if (input.kind === "session") {
+    await input.onInitialPromptDispatching?.();
+  }
+  const sendResult = await sendInitialPrompt(dependencies, resolved, snapshot);
+  if (input.kind === "session" && sendResult.started) {
+    await input.onInitialPromptDispatched?.();
+  }
+  return {
+    liveSnapshot: sendResult.liveSnapshot,
+    initialPromptStarted: sendResult.started,
+    initialPromptError: sendResult.error ?? null,
+  };
+}
+
 async function resolveSessionCreateAgent(
   dependencies: CreateAgentCommandDependencies,
   input: CreateAgentFromSessionInput,
@@ -355,10 +378,17 @@ async function resolveSessionCreateAgent(
     input.git,
     input.worktreeName,
     input.firstAgentContext,
-    pendingAgentId
+    !input.skipPendingCreationJournal && pendingAgentId
       ? pendingWorktreeCreationJournal(dependencies.agentStorage, pendingAgentId)
       : undefined,
+    input.agentId ? deterministicPlacementIdentity(input.agentId) : undefined,
   );
+  if (createdWorkspaceId) {
+    await input.onPlacementCreated?.({
+      workspaceId: createdWorkspaceId,
+      cwd: builtSessionConfig.cwd,
+    });
+  }
   // Validate the requested mode against the provider's modes for the resolved
   // cwd. The app remembers mode preferences globally, so a saved mode can be
   // stale for a workspace whose provider config no longer defines it — reject
@@ -436,6 +466,17 @@ async function resolveSessionCreateAgent(
     setupContinuation?.releaseWithoutStarting();
     throw error;
   }
+}
+
+function deterministicPlacementIdentity(agentId: string): {
+  workspaceId: string;
+  worktreeSlug: string;
+} {
+  const compact = agentId.replaceAll("-", "").toLowerCase();
+  return {
+    workspaceId: `wks_${compact.slice(0, 16)}`,
+    worktreeSlug: `create-${compact.slice(0, 16)}`,
+  };
 }
 
 async function resolveMcpCreateAgent(

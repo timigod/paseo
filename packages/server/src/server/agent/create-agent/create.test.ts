@@ -48,13 +48,17 @@ function fakeWorktreeCreator(args: { repoRoot: string; createdWorkspaceId: strin
 }
 
 test("session create forwards clientMessageId to the initial prompt run options", async () => {
+  const events: string[] = [];
   const snapshot = {
     id: "agent-1",
     provider: "codex",
     cwd: "/tmp/paseo-create-test",
     runtimeInfo: null,
   } as ManagedAgent;
-  const streamAgent = vi.fn(() => (async function* noop() {})());
+  const streamAgent = vi.fn(() => {
+    events.push("provider");
+    return (async function* noop() {})();
+  });
   const dependencies: Parameters<typeof createAgentCommand>[0] = {
     agentManager: {
       createAgent: vi.fn(async () => snapshot),
@@ -78,12 +82,19 @@ test("session create forwards clientMessageId to the initial prompt run options"
     labels: {},
     provisionalTitle: null,
     firstAgentContext: { attachments: [] },
+    onInitialPromptDispatching: async () => {
+      events.push("dispatching");
+    },
+    onInitialPromptDispatched: async () => {
+      events.push("dispatched");
+    },
     buildSessionConfig: async (config) => ({ sessionConfig: config }),
   });
 
   expect(streamAgent).toHaveBeenCalledWith("agent-1", "hello from create", {
     clientMessageId: "msg-create-1",
   });
+  expect(events).toEqual(["dispatching", "provider", "dispatched"]);
 });
 
 test("session create persists and arms auto-archive before starting the initial prompt", async () => {
