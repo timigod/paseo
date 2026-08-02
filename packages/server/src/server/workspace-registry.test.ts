@@ -1,8 +1,9 @@
 import os from "node:os";
 import path from "node:path";
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync } from "node:fs";
+import { promises as fs } from "node:fs";
 
-import { beforeEach, afterEach, describe, expect, test } from "vitest";
+import { beforeEach, afterEach, describe, expect, test, vi } from "vitest";
 
 import { createTestLogger } from "../test-utils/test-logger.js";
 import {
@@ -760,6 +761,68 @@ describe("workspace registries", () => {
     await reloadedRegistry.initialize();
     expect(await reloadedRegistry.get("ws-1")).toMatchObject({
       title: "Payments work",
+      pinnedAt: "2026-03-03T00:00:00.000Z",
+    });
+  });
+
+  test("shares a cold load before serializing concurrent workspace updates", async () => {
+    const workspaceId = "workspace-cold-concurrent-updates";
+    await workspaceRegistry.upsert(
+      createPersistedWorkspaceRecord({
+        workspaceId,
+        projectId: "project-one",
+        cwd: "/tmp/repo",
+        kind: "local_checkout",
+        displayName: "main",
+        createdAt: "2026-03-01T00:00:00.000Z",
+        updatedAt: "2026-03-01T00:00:00.000Z",
+      }),
+    );
+
+    const filePath = path.join(tmpDir, "projects", "workspaces.json");
+    const coldRegistry = new FileBackedWorkspaceRegistry(filePath, logger);
+    const readFile = fs.readFile.bind(fs);
+    let readCount = 0;
+    let releaseSecondRead = () => {};
+    const secondReadReleased = new Promise<void>((resolve) => {
+      releaseSecondRead = resolve;
+    });
+    const readSpy = vi.spyOn(fs, "readFile").mockImplementation(async (...args) => {
+      readCount += 1;
+      const raw = await readFile(...args);
+      if (readCount === 2) {
+        await secondReadReleased;
+      }
+      return raw;
+    });
+
+    try {
+      const titleUpdate = coldRegistry.update(workspaceId, (record) => ({
+        ...record,
+        title: "Cold title",
+        updatedAt: "2026-03-02T00:00:00.000Z",
+      }));
+      const pinUpdate = coldRegistry.update(workspaceId, (record) => ({
+        ...record,
+        pinnedAt: "2026-03-03T00:00:00.000Z",
+        updatedAt: "2026-03-03T00:00:00.000Z",
+      }));
+
+      await expect(titleUpdate).resolves.toMatchObject({ title: "Cold title" });
+      releaseSecondRead();
+      await expect(pinUpdate).resolves.toMatchObject({
+        title: "Cold title",
+        pinnedAt: "2026-03-03T00:00:00.000Z",
+      });
+      expect(readCount).toBe(1);
+    } finally {
+      releaseSecondRead();
+      readSpy.mockRestore();
+    }
+
+    const reloadedRegistry = new FileBackedWorkspaceRegistry(filePath, logger);
+    expect(await reloadedRegistry.get(workspaceId)).toMatchObject({
+      title: "Cold title",
       pinnedAt: "2026-03-03T00:00:00.000Z",
     });
   });

@@ -173,6 +173,7 @@ class FileBackedRegistry<TRecord extends RegistryRecord> {
   private readonly schema: z.ZodType<TRecord, unknown>;
   private readonly getId: (record: TRecord) => string;
   private loaded = false;
+  private loadPromise: Promise<void> | null = null;
   private readonly cache = new Map<string, TRecord>();
   private persistQueue: Promise<void> = Promise.resolve();
   private membershipVersion = 0;
@@ -341,20 +342,31 @@ class FileBackedRegistry<TRecord extends RegistryRecord> {
       return;
     }
 
-    this.cache.clear();
-    try {
-      const raw = await fs.readFile(this.filePath, "utf8");
-      const parsed = z.array(this.schema).parse(JSON.parse(raw));
-      for (const record of parsed) {
-        this.cache.set(this.getId(record), record);
+    this.loadPromise ??= this.enqueueOperation(async () => {
+      if (this.loaded) {
+        return;
       }
-    } catch (error) {
-      const code = (error as NodeJS.ErrnoException).code;
-      if (code !== "ENOENT") {
-        this.logger.error({ err: error, filePath: this.filePath }, "Failed to load registry file");
+
+      this.cache.clear();
+      try {
+        const raw = await fs.readFile(this.filePath, "utf8");
+        const parsed = z.array(this.schema).parse(JSON.parse(raw));
+        for (const record of parsed) {
+          this.cache.set(this.getId(record), record);
+        }
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code !== "ENOENT") {
+          this.logger.error(
+            { err: error, filePath: this.filePath },
+            "Failed to load registry file",
+          );
+        }
       }
-    }
-    this.loaded = true;
+      this.loaded = true;
+    });
+
+    await this.loadPromise;
   }
 
   private async persistRecords(
