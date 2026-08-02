@@ -1,11 +1,46 @@
 import { describe, expect, test } from "vitest";
 import {
   FileExplorerRequestSchema,
+  MANAGED_WORKTREE_WRITER_CONFLICT_ERROR_CODE,
   PaseoWorktreeArchiveRequestSchema,
   parseServerInfoStatusPayload,
   SessionInboundMessageSchema,
   SessionOutboundMessageSchema,
 } from "./messages.js";
+
+describe("managed-worktree writer conflict compatibility", () => {
+  test("preserves the conflict code on create failures", () => {
+    const parsed = SessionOutboundMessageSchema.parse({
+      type: "status",
+      payload: {
+        status: "agent_create_failed",
+        requestId: "req-create",
+        error: "The managed worktree is already in use.",
+        errorCode: MANAGED_WORKTREE_WRITER_CONFLICT_ERROR_CODE,
+      },
+    });
+
+    expect(parsed.payload).toMatchObject({
+      errorCode: "managed_worktree_writer_conflict",
+    });
+  });
+
+  test("preserves the conflict code on RPC failures", () => {
+    const parsed = SessionOutboundMessageSchema.parse({
+      type: "rpc_error",
+      payload: {
+        requestId: "req-resume",
+        requestType: "resume_agent_request",
+        error: "The managed worktree is already in use.",
+        code: MANAGED_WORKTREE_WRITER_CONFLICT_ERROR_CODE,
+      },
+    });
+
+    expect(parsed.payload).toMatchObject({
+      code: "managed_worktree_writer_conflict",
+    });
+  });
+});
 
 function workspaceDescriptor(overrides: Record<string, unknown> = {}) {
   return {

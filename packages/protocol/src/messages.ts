@@ -2869,6 +2869,9 @@ export const PongMessageSchema = z.object({
   }),
 });
 
+export const MANAGED_WORKTREE_WRITER_CONFLICT_ERROR_CODE =
+  "managed_worktree_writer_conflict" as const;
+
 export const RpcErrorMessageSchema = z.object({
   type: z.literal("rpc_error"),
   payload: z.object({

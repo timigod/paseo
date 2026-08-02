@@ -22,7 +22,7 @@ import type { AgentUpdatesService } from "./session/agent-updates/agent-updates-
 import type { AgentSnapshotPayload, SessionOutboundMessage } from "@getpaseo/protocol/messages";
 import type { TerminalManager } from "../terminal/terminal-manager.js";
 import { createTerminalManager } from "../terminal/terminal-manager.js";
-import { AgentManager } from "./agent/agent-manager.js";
+import { AgentManager, ManagedWorktreeWriterConflictError } from "./agent/agent-manager.js";
 import { AgentStorage, type StoredAgentRecord } from "./agent/agent-storage.js";
 import type {
   AgentClient,
@@ -118,6 +118,7 @@ interface SessionTestAccess {
     upsert(record: unknown): Promise<void>;
   };
   agentManager: {
+    createAgent(...args: unknown[]): Promise<unknown>;
     listAgents(): unknown[];
     getAgent(agentId: string): unknown;
     reloadAgentSession(agentId: string, overrides?: unknown, options?: unknown): Promise<unknown>;
@@ -4191,6 +4192,88 @@ test("import_agent_request maps an import failure to agent_create_failed", async
     requestId: "req-failed-import",
     error: "provider session is unavailable",
   });
+});
+
+test("import_agent_request returns a sanitized managed-worktree writer conflict", async () => {
+  const emitted: SessionOutboundMessage[] = [];
+  const session = createSessionForWorkspaceTests({
+    onMessage: (message) => emitted.push(message),
+  });
+  const secretWorktreeRoot = "/Users/private/source/.paseo/worktrees/secret-branch";
+  session.projectRegistry.get = async () =>
+    createPersistedProjectRecord({
+      projectId: "proj-repo-running",
+      rootPath: REPO_CWD,
+      kind: "non_git",
+      displayName: "repo",
+      createdAt: "2026-03-01T12:00:00.000Z",
+      updatedAt: "2026-03-01T12:00:00.000Z",
+    });
+  session.agentStorage.list = async () => [];
+  session.agentManager.importProviderSession = async () => {
+    throw new ManagedWorktreeWriterConflictError(
+      "owner-agent",
+      "owner-workspace",
+      "requested-workspace",
+      secretWorktreeRoot,
+    );
+  };
+
+  await session.handleMessage({
+    type: "import_agent_request",
+    requestId: "req-conflicting-import",
+    providerId: "codex",
+    providerHandleId: "conflicting-session",
+    cwd: REPO_CWD,
+    workspaceId: "ws-repo-running",
+  });
+
+  const payload = findByType(emitted, "status")?.payload;
+  expect(payload).toMatchObject({
+    status: "agent_create_failed",
+    requestId: "req-conflicting-import",
+    error:
+      "This managed worktree is already in use by another agent. Close the other agent and try again.",
+    errorCode: "managed_worktree_writer_conflict",
+  });
+  expect(JSON.stringify(payload)).not.toContain(secretWorktreeRoot);
+});
+
+test("resume_agent_request returns a sanitized managed-worktree writer conflict", async () => {
+  const emitted: SessionOutboundMessage[] = [];
+  const session = createSessionForWorkspaceTests({
+    onMessage: (message) => emitted.push(message),
+  });
+  const secretWorktreeRoot = "/Users/private/source/.paseo/worktrees/secret-branch";
+  session.agentStorage.list = async () => [];
+  session.agentManager.resumeAgentFromPersistence = async () => {
+    throw new ManagedWorktreeWriterConflictError(
+      "owner-agent",
+      "owner-workspace",
+      "requested-workspace",
+      secretWorktreeRoot,
+    );
+  };
+
+  await session.handleMessage({
+    type: "resume_agent_request",
+    requestId: "req-conflicting-resume",
+    handle: {
+      provider: "codex",
+      sessionId: "conflicting-session",
+      metadata: { cwd: REPO_CWD },
+    },
+  });
+
+  const payload = findByType(emitted, "rpc_error")?.payload;
+  expect(payload).toMatchObject({
+    requestId: "req-conflicting-resume",
+    requestType: "resume_agent_request",
+    error:
+      "This managed worktree is already in use by another agent. Close the other agent and try again.",
+    code: "managed_worktree_writer_conflict",
+  });
+  expect(JSON.stringify(payload)).not.toContain(secretWorktreeRoot);
 });
 
 test("open_project_response returns immediately even when the GitHub fetch is slow", async () => {
@@ -8678,6 +8761,40 @@ test("failed local create_agent_request does not schedule workspace title genera
   } finally {
     vi.useRealTimers();
   }
+});
+
+test("create_agent_request returns a sanitized managed-worktree writer conflict", async () => {
+  const emitted: SessionOutboundMessage[] = [];
+  const session = createSessionForWorkspaceTests({
+    onMessage: (message) => emitted.push(message),
+  });
+  const secretWorktreeRoot = "/Users/private/source/.paseo/worktrees/secret-branch";
+  session.agentManager.createAgent = async () => {
+    throw new ManagedWorktreeWriterConflictError(
+      "owner-agent",
+      "owner-workspace",
+      "ws-repo-running",
+      secretWorktreeRoot,
+    );
+  };
+
+  await session.handleMessage({
+    type: "create_agent_request",
+    requestId: "req-conflicting-create",
+    workspaceId: "ws-repo-running",
+    config: { provider: "codex", cwd: REPO_CWD },
+    attachments: [],
+  });
+
+  const payload = findByType(emitted, "status")?.payload;
+  expect(payload).toMatchObject({
+    status: "agent_create_failed",
+    requestId: "req-conflicting-create",
+    error:
+      "This managed worktree is already in use by another agent. Close the other agent and try again.",
+    errorCode: "managed_worktree_writer_conflict",
+  });
+  expect(JSON.stringify(payload)).not.toContain(secretWorktreeRoot);
 });
 
 test("workspace auto-name keeps a manual title written before the scheduled title lands", async () => {

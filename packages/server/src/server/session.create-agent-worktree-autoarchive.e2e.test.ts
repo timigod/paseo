@@ -360,6 +360,26 @@ test("archiving a created worktree removes the directory on last reference", asy
   expect(existsSync(created.worktreePath)).toBe(false);
 });
 
+test("resume_agent_request restores the archived managed-worktree agent identity", async () => {
+  const created = await createAgentInBranchOffWorktree();
+
+  await ctx.client.waitForFinish(created.agentId, 10000);
+  const beforeArchive = await ctx.client.fetchAgent({ agentId: created.agentId });
+  const handle = beforeArchive?.agent.persistence;
+  if (!handle) {
+    throw new Error("Expected persistence handle for managed-worktree resume test");
+  }
+  await ctx.client.archiveAgent(created.agentId);
+
+  const resumed = await ctx.client.resumeAgent(handle);
+
+  expect(resumed.id).toBe(created.agentId);
+  const resumedDetails = await ctx.client.fetchAgent({ agentId: created.agentId });
+  expect(resumedDetails?.agent.archivedAt).toBeNull();
+
+  await ctx.client.archivePaseoWorktree({ worktreePath: created.worktreePath });
+}, 30000);
+
 test("auto-archiving a created worktree keeps the directory when a sibling workspace references it", async () => {
   const created = await createAgentInBranchOffWorktree({
     autoArchive: true,

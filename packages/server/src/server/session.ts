@@ -35,7 +35,12 @@ import { CursorError } from "./pagination/cursor.js";
 import { SortablePager, type SortSpec } from "./pagination/sortable-pager.js";
 import type { SpeechToTextProvider, TextToSpeechProvider } from "./speech/speech-provider.js";
 import type { TurnDetectionProvider } from "./speech/turn-detection-provider.js";
-import { isStoredAgentProviderAvailable, toAgentPersistenceHandle } from "./persistence-hooks.js";
+import {
+  buildConfigOverrides,
+  extractTimestamps,
+  isStoredAgentProviderAvailable,
+  toAgentPersistenceHandle,
+} from "./persistence-hooks.js";
 import { ensureAgentLoaded, ensureUnarchivedAgentLoaded } from "./agent/agent-loading.js";
 import {
   formatSystemNotificationPrompt,
@@ -2539,17 +2544,44 @@ export class Session {
     });
   }
 
-  private async unarchiveAgentByHandle(handle: AgentPersistenceHandle): Promise<void> {
+  private async findAgentRecordByHandle(
+    handle: AgentPersistenceHandle,
+  ): Promise<StoredAgentRecord | null> {
     const records = await this.agentStorage.list();
-    const matched = records.find(
-      (record) =>
-        record.persistence?.provider === handle.provider &&
-        record.persistence?.sessionId === handle.sessionId,
+    return (
+      records.find(
+        (record) =>
+          record.persistence?.provider === handle.provider &&
+          record.persistence?.sessionId === handle.sessionId,
+      ) ?? null
     );
-    if (!matched) {
+  }
+
+  private async restoreArchivedAgentAfterResumeFailure(record: StoredAgentRecord): Promise<void> {
+    const archivedAt = record.archivedAt;
+    if (!archivedAt) {
       return;
     }
-    await unarchiveAgentState(this.agentStorage, this.agentManager, matched.id);
+    try {
+      if (this.agentManager.getAgent(record.id)) {
+        await this.agentManager.closeAgent(record.id);
+      }
+      await this.agentManager.archiveSnapshot(record.id, archivedAt);
+    } catch (error) {
+      this.sessionLogger.error(
+        { err: error, agentId: record.id },
+        "Failed to re-archive agent after resume failure",
+      );
+    }
+
+    try {
+      await this.agentStorage.upsert(record);
+    } catch (error) {
+      this.sessionLogger.error(
+        { err: error, agentId: record.id },
+        "Failed to restore archived agent record after resume failure",
+      );
+    }
   }
 
   private async handleUpdateAgentRequest(
@@ -3337,9 +3369,25 @@ export class Session {
       { sessionId: handle.sessionId, provider: handle.provider },
       `Resuming agent ${handle.sessionId} (${handle.provider})`,
     );
+    let archivedRecordToRestore: StoredAgentRecord | null = null;
     try {
-      await this.unarchiveAgentByHandle(handle);
-      const snapshot = await this.agentManager.resumeAgentFromPersistence(handle, overrides);
+      const storedRecord = await this.findAgentRecordByHandle(handle);
+      if (storedRecord?.archivedAt) {
+        const unarchived = await unarchiveAgentState(
+          this.agentStorage,
+          this.agentManager,
+          storedRecord.id,
+        );
+        if (unarchived) {
+          archivedRecordToRestore = storedRecord;
+        }
+      }
+      const snapshot = await this.agentManager.resumeAgentFromPersistence(
+        handle,
+        storedRecord ? { ...buildConfigOverrides(storedRecord), ...overrides } : overrides,
+        storedRecord?.id,
+        storedRecord ? extractTimestamps(storedRecord) : undefined,
+      );
       await unarchiveAgentState(this.agentStorage, this.agentManager, snapshot.id);
       await this.agentManager.hydrateTimelineFromProvider(snapshot.id);
       await this.agentUpdates.forwardLiveAgent(snapshot);
@@ -3358,7 +3406,11 @@ export class Session {
         });
       }
     } catch (error) {
-      const message = getErrorMessage(error);
+      if (archivedRecordToRestore) {
+        await this.restoreArchivedAgentAfterResumeFailure(archivedRecordToRestore);
+      }
+      const wireError = toWorktreeWireError(error);
+      const code = wireError.code === "unknown" ? "agent_resume_failed" : wireError.code;
       this.sessionLogger.error({ err: error }, "Failed to resume agent");
       if (requestId) {
         this.emit({
@@ -3366,8 +3418,8 @@ export class Session {
           payload: {
             requestId,
             requestType: msg.type,
-            error: message,
-            code: "agent_resume_failed",
+            error: wireError.message,
+            code,
           },
         });
       }
@@ -3377,7 +3429,7 @@ export class Session {
           id: uuidv4(),
           timestamp: new Date(),
           type: "error",
-          content: `Failed to resume agent: ${message}`,
+          content: `Failed to resume agent: ${wireError.message}`,
         },
       });
     }
@@ -3430,14 +3482,15 @@ export class Session {
         },
       });
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
+      const wireError = toWorktreeWireError(error);
       this.sessionLogger.error({ err: error }, "Failed to import agent");
       this.emit({
         type: "status",
         payload: {
           status: "agent_create_failed",
           requestId,
-          error: message,
+          error: wireError.message,
+          ...(wireError.code !== "unknown" ? { errorCode: wireError.code } : {}),
         },
       });
       this.emit({
@@ -3446,7 +3499,7 @@ export class Session {
           id: uuidv4(),
           timestamp: new Date(),
           type: "error",
-          content: `Failed to import agent: ${message}`,
+          content: `Failed to import agent: ${wireError.message}`,
         },
       });
     }

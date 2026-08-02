@@ -2034,11 +2034,17 @@ test("sends create_agent_request with workspace and caller identity", async () =
         status: "agent_create_failed",
         requestId: request.requestId,
         error: "compat test sentinel",
+        errorCode: "managed_worktree_writer_conflict",
       },
     }),
   );
 
-  await expect(createPromise).rejects.toThrow("compat test sentinel");
+  await expect(createPromise).rejects.toMatchObject({
+    name: "DaemonRpcError",
+    requestId: request.requestId,
+    requestType: "create_agent_request",
+    code: "managed_worktree_writer_conflict",
+  });
 });
 
 test("sends worktree target and autoArchive in create_agent_request", async () => {
@@ -4154,6 +4160,92 @@ test("imports an agent by provider handle id", async () => {
   await expect(promise).resolves.toMatchObject({
     id: "agent-1",
     provider: "custom-codex",
+  });
+});
+
+test("resumeAgent exposes managed-worktree writer conflict details", async () => {
+  const logger = createMockLogger();
+  const mock = createMockTransport();
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "clsk_unit_test",
+    logger,
+    reconnect: { enabled: false },
+    transportFactory: () => mock.transport,
+  });
+  clients.push(client);
+
+  const connectPromise = client.connect();
+  mock.triggerOpen();
+  await connectPromise;
+
+  const promise = client.resumeAgent({
+    provider: "codex",
+    sessionId: "thread-1",
+    metadata: { cwd: "/tmp/repo" },
+  });
+  const request = parseSentFrame(mock.sent[0]);
+
+  mock.triggerMessage(
+    wrapSessionMessage({
+      type: "rpc_error",
+      payload: {
+        requestId: request.requestId,
+        requestType: "resume_agent_request",
+        error: "The managed worktree is already in use.",
+        code: "managed_worktree_writer_conflict",
+      },
+    }),
+  );
+
+  await expect(promise).rejects.toMatchObject({
+    name: "DaemonRpcError",
+    requestId: request.requestId,
+    requestType: "resume_agent_request",
+    code: "managed_worktree_writer_conflict",
+  });
+});
+
+test("importAgent exposes managed-worktree writer conflict details", async () => {
+  const logger = createMockLogger();
+  const mock = createMockTransport();
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "clsk_unit_test",
+    logger,
+    reconnect: { enabled: false },
+    transportFactory: () => mock.transport,
+  });
+  clients.push(client);
+
+  const connectPromise = client.connect();
+  mock.triggerOpen();
+  await connectPromise;
+
+  const promise = client.importAgent({
+    providerId: "codex",
+    providerHandleId: "thread-1",
+    cwd: "/tmp/repo",
+  });
+  const request = parseSentFrame(mock.sent[0]);
+
+  mock.triggerMessage(
+    wrapSessionMessage({
+      type: "status",
+      payload: {
+        status: "agent_create_failed",
+        requestId: request.requestId,
+        error: "The managed worktree is already in use.",
+        errorCode: "managed_worktree_writer_conflict",
+      },
+    }),
+  );
+
+  await expect(promise).rejects.toMatchObject({
+    name: "DaemonRpcError",
+    requestId: request.requestId,
+    requestType: "import_agent_request",
+    code: "managed_worktree_writer_conflict",
   });
 });
 

@@ -830,6 +830,43 @@ test("refresh_agent rejects when persisted session resume fails", async () => {
   }
 });
 
+test("resume_agent keeps the stored agent archived when provider resume fails", async () => {
+  const cwd = tmpCwd();
+  const client = new FailingResumeClient();
+  const localCtx = await createDaemonTestContext({
+    agentClients: {
+      claude: client,
+    },
+  });
+
+  try {
+    const created = await localCtx.client.createAgent({
+      config: {
+        provider: "claude",
+        cwd,
+      },
+    });
+    const beforeArchive = await localCtx.client.fetchAgent({ agentId: created.id });
+    const handle = beforeArchive?.agent.persistence;
+    if (!handle) {
+      throw new Error("Expected persistence handle for failed resume test");
+    }
+    const archived = await localCtx.client.archiveAgent(created.id);
+
+    await expect(localCtx.client.resumeAgent(handle)).rejects.toMatchObject({
+      name: "DaemonRpcError",
+      code: "agent_resume_failed",
+      requestType: "resume_agent_request",
+    });
+    expect(client.resumeSessionCalls).toBe(1);
+    const afterFailure = await localCtx.client.fetchAgent({ agentId: created.id });
+    expect(afterFailure?.agent.archivedAt).toBe(archived.archivedAt);
+  } finally {
+    await localCtx.cleanup();
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
 test("resume_agent auto-unarchives archived agents", async () => {
   const cwd = tmpCwd();
   try {
@@ -848,13 +885,10 @@ test("resume_agent auto-unarchives archived agents", async () => {
       throw new Error("Expected persistence handle for resume test");
     }
     const resumed = await ctx.client.resumeAgent(handle);
+    expect(resumed.id).toBe(created.id);
     const resumedDetails = await ctx.client.fetchAgent({ agentId: resumed.id });
     expect(resumedDetails).not.toBeNull();
     expect(resumedDetails?.agent.archivedAt).toBeNull();
-
-    if (resumed.id !== created.id) {
-      await ctx.client.deleteAgent(resumed.id);
-    }
   } finally {
     rmSync(cwd, { recursive: true, force: true });
   }

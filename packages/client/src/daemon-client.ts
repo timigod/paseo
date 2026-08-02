@@ -905,7 +905,7 @@ type CorrelatedResponsePayload<TType extends CorrelatedResponseType> = Extract<
   { type: TType }
 >["payload"];
 
-class DaemonRpcError extends Error {
+export class DaemonRpcError extends Error {
   readonly requestId: string;
   readonly requestType?: string;
   readonly code?: string;
@@ -2409,6 +2409,14 @@ export class DaemonClient {
       },
     });
     if (status.status === "agent_create_failed") {
+      if (status.errorCode) {
+        throw new DaemonRpcError({
+          requestId,
+          requestType: "create_agent_request",
+          error: status.error,
+          code: status.errorCode,
+        });
+      }
       throw new Error(status.error);
     }
 
@@ -2681,6 +2689,14 @@ export class DaemonClient {
     });
 
     if (status.status === "agent_create_failed") {
+      if (status.errorCode) {
+        throw new DaemonRpcError({
+          requestId,
+          requestType: "import_agent_request",
+          error: status.error,
+          code: status.errorCode,
+        });
+      }
       throw new Error(status.error);
     }
 

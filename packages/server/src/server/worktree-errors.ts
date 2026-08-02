@@ -1,8 +1,10 @@
+import { MANAGED_WORKTREE_WRITER_CONFLICT_ERROR_CODE } from "@getpaseo/protocol/messages";
 import { MissingCheckoutTargetError } from "./resolve-worktree-creation-intent.js";
 import { BranchAlreadyCheckedOutError, UnknownBranchError } from "../utils/worktree.js";
 
 export type WorktreeWireErrorCode =
   | "branch_already_checked_out"
+  | typeof MANAGED_WORKTREE_WRITER_CONFLICT_ERROR_CODE
   | "missing_checkout_target"
   | "unknown_branch"
   | "unknown";
@@ -23,6 +25,16 @@ export class WorktreeRequestError extends Error {
 }
 
 export function toWorktreeWireError(error: unknown): WorktreeWireError {
+  if (
+    error instanceof Error &&
+    (error as Error & { code?: unknown }).code === MANAGED_WORKTREE_WRITER_CONFLICT_ERROR_CODE
+  ) {
+    return {
+      code: MANAGED_WORKTREE_WRITER_CONFLICT_ERROR_CODE,
+      message:
+        "This managed worktree is already in use by another agent. Close the other agent and try again.",
+    };
+  }
   if (error instanceof BranchAlreadyCheckedOutError) {
     return { code: "branch_already_checked_out", message: error.message };
   }

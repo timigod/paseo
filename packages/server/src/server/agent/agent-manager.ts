@@ -10,6 +10,7 @@ import {
   isDelegatedAgent,
   PARENT_AGENT_ID_LABEL,
 } from "@getpaseo/protocol/agent-labels";
+import { MANAGED_WORKTREE_WRITER_CONFLICT_ERROR_CODE } from "@getpaseo/protocol/messages";
 import type { Logger } from "pino";
 import { z } from "zod";
 import type { TerminalManager } from "../../terminal/terminal-manager.js";
@@ -115,7 +116,7 @@ export class AgentRunCancellationError extends Error {
 }
 
 export class ManagedWorktreeWriterConflictError extends Error {
-  readonly code = "managed_worktree_writer_conflict";
+  readonly code = MANAGED_WORKTREE_WRITER_CONFLICT_ERROR_CODE;
 
   constructor(
     readonly ownerAgentId: string,
