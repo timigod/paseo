@@ -1629,7 +1629,7 @@ export class AgentManager {
         agentIncarnation,
       );
       const providerLaunchConfig = this.resolveProviderLaunchConfig(launchConfig, launchContext);
-      return this.withManagedWorktreeWriter(
+      return await this.withManagedWorktreeWriter(
         {
           agentId: resolvedAgentId,
           cwd: storedConfig.cwd,

@@ -7219,6 +7219,7 @@ test.each(["create", "resume"] as const)(
 test.each([
   { registrationKind: "create" as const, cleanupFails: false },
   { registrationKind: "resume" as const, cleanupFails: true },
+  { registrationKind: "import" as const, cleanupFails: false },
 ])(
   "$registrationKind restores durable state when registration fails after its first snapshot",
   async ({ registrationKind, cleanupFails }) => {
@@ -7252,14 +7253,24 @@ test.each([
           ...config,
         });
       }
+
+      override async importSession(input: ImportProviderSessionInput) {
+        return {
+          session: this.makeSession({ provider: "codex", cwd: workdir }),
+          config: { provider: "codex" as const, cwd: workdir },
+          persistence: { provider: "codex" as const, sessionId: input.providerHandleId },
+          timeline: [],
+        };
+      }
     })();
+    const agentId = "00000000-0000-4000-8000-000000000143";
     const manager = new AgentManager({
       clients: { codex: client },
       registry: storage,
       membershipGate,
+      idFactory: () => agentId,
       logger,
     });
-    const agentId = "00000000-0000-4000-8000-000000000143";
     const priorRecord: StoredAgentRecord | null =
       registrationKind === "resume"
         ? {
@@ -7317,23 +7328,31 @@ test.each([
       ReturnType<DestructiveMembershipGate["acquireDestructive"]>
     > | null = null;
     try {
-      registration =
-        registrationKind === "create"
-          ? manager.createAgent(
-              { provider: "codex", cwd: workdir, title: "Failed registration" },
-              agentId,
-              { workspaceId: "workspace-registration-rollback" },
-            )
-          : manager.resumeAgentFromPersistence(
-              {
-                provider: "codex",
-                sessionId: "resume-registration-rollback",
-                metadata: { provider: "codex", cwd: workdir },
-              },
-              { cwd: workdir, title: "Failed registration" },
-              agentId,
-              { workspaceId: "workspace-registration-rollback" },
-            );
+      if (registrationKind === "create") {
+        registration = manager.createAgent(
+          { provider: "codex", cwd: workdir, title: "Failed registration" },
+          agentId,
+          { workspaceId: "workspace-registration-rollback" },
+        );
+      } else if (registrationKind === "resume") {
+        registration = manager.resumeAgentFromPersistence(
+          {
+            provider: "codex",
+            sessionId: "resume-registration-rollback",
+            metadata: { provider: "codex", cwd: workdir },
+          },
+          { cwd: workdir, title: "Failed registration" },
+          agentId,
+          { workspaceId: "workspace-registration-rollback" },
+        );
+      } else {
+        registration = manager.importProviderSession({
+          provider: "codex",
+          providerHandleId: "import-registration-rollback",
+          cwd: workdir,
+          workspaceId: "workspace-registration-rollback",
+        });
+      }
 
       await rollbackStarted.promise;
       let destructiveLeaseAcquired = false;
@@ -7345,6 +7364,9 @@ test.each([
         });
       await Promise.resolve();
       expect(destructiveLeaseAcquired).toBe(false);
+      expect(() => membershipGate.beginMembershipMutation({ agentIds: [agentId] })).toThrow(
+        DestructiveMembershipExcludedError,
+      );
 
       rollbackAllowed.resolve();
       const rejection = await registration.then(
