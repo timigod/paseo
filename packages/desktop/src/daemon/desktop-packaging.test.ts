@@ -6,6 +6,7 @@ import {
   mkdtempSync,
   readFileSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -87,6 +88,24 @@ describe("desktop packaging", () => {
     const config = readFileSync(join(packageRoot, "electron-builder.yml"), "utf8");
 
     expect(config).toContain("!node_modules/@getpaseo/server/dist/server/web-ui/**");
+  });
+
+  // The LaunchAgent plist written by launch-agent.ts executes
+  // Contents/Resources/bin/paseo-daemon-launcher inside the installed bundle.
+  // electron-builder only ships what extraResources lists and preserves the
+  // source file's permission bits, so a missing manifest entry or a dropped
+  // exec bit produces a signed app whose persistent daemon can never start.
+  it("ships both mac bin executables through extraResources", () => {
+    const config = readFileSync(join(packageRoot, "electron-builder.yml"), "utf8");
+
+    for (const bin of ["bin/paseo", "bin/paseo-daemon-launcher"]) {
+      expect(config, `${bin} must be listed in extraResources`).toContain(`- from: ${bin}\n`);
+    }
+
+    for (const bin of ["paseo", "paseo-daemon-launcher"]) {
+      const mode = statSync(join(packageRoot, "bin", bin)).mode;
+      expect(mode & 0o111, `bin/${bin} must be executable`).not.toBe(0);
+    }
   });
 
   it("registers Paseo agent links with the operating system", () => {
