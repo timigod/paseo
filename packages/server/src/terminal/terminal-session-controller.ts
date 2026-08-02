@@ -265,6 +265,19 @@ export class TerminalSessionController {
     return { terminalId, success: true };
   }
 
+  getTerminalForClose(
+    terminalId: string,
+  ): { terminalId: string; cwd: string; workspaceId: string } | null {
+    const terminal = this.terminalManager?.getTerminal(terminalId);
+    return terminal
+      ? {
+          terminalId: terminal.id,
+          cwd: terminal.cwd,
+          workspaceId: terminal.workspaceId,
+        }
+      : null;
+  }
+
   async killTerminalsForWorkspace(
     workspaceId: string,
     recheck?: DestructiveActionRecheck,

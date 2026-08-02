@@ -5,6 +5,7 @@ import path from "node:path";
 interface AtomicFileOptions {
   mode?: number;
   durable?: boolean;
+  beforeCommit?: () => void | Promise<void>;
 }
 
 export async function writeFileAtomic(
@@ -14,6 +15,7 @@ export async function writeFileAtomic(
 ): Promise<void> {
   const directory = path.dirname(filePath);
   await fs.mkdir(directory, { recursive: true });
+  await options.beforeCommit?.();
   const tempPath = path.join(
     directory,
     `.${path.basename(filePath)}.${process.pid}.${Date.now()}.${randomUUID()}.tmp`,
@@ -31,6 +33,7 @@ export async function writeFileAtomic(
     }
     await tempHandle.close();
     tempHandle = undefined;
+    await options.beforeCommit?.();
     await fs.rename(tempPath, filePath);
     if (options.durable) {
       await syncDirectory(directory);

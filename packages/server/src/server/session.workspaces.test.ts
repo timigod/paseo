@@ -1968,6 +1968,10 @@ test("close_items_request archives agents and kills terminals in one batch", asy
       tts: null,
       providerSnapshotManager: createProviderSnapshotManagerStub().manager,
       terminalManager: asTerminalManager({
+        getTerminal: (terminalId: string) =>
+          terminalId === "term-1"
+            ? { id: terminalId, cwd: REPO_CWD, workspaceId: "ws-close" }
+            : undefined,
         killTerminal,
         subscribeTerminalsChanged: () => () => {},
       }),
@@ -2306,6 +2310,10 @@ test("close_items_request continues after an archive failure", async () => {
       tts: null,
       providerSnapshotManager: createProviderSnapshotManagerStub().manager,
       terminalManager: asTerminalManager({
+        getTerminal: (terminalId: string) =>
+          terminalId === "term-1"
+            ? { id: terminalId, cwd: REPO_CWD, workspaceId: "ws-err" }
+            : undefined,
         killTerminal: killTerminalBestEffort,
         subscribeTerminalsChanged: () => () => {},
       }),

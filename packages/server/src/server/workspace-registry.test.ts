@@ -464,6 +464,40 @@ describe("workspace registries", () => {
     });
   });
 
+  test("does not commit a workspace archive when authority is revoked before rename", async () => {
+    await workspaceRegistry.initialize();
+    await workspaceRegistry.upsert(
+      createPersistedWorkspaceRecord({
+        workspaceId: "workspace-guarded",
+        projectId: "project-one",
+        cwd: "/tmp/repo",
+        kind: "local_checkout",
+        displayName: "main",
+        createdAt: "2026-03-01T00:00:00.000Z",
+        updatedAt: "2026-03-01T00:00:00.000Z",
+      }),
+    );
+    let recheckCount = 0;
+
+    await expect(
+      workspaceRegistry.archive("workspace-guarded", "2026-03-03T00:00:00.000Z", {
+        recheck: () => {
+          recheckCount += 1;
+          if (recheckCount === 3) {
+            throw new Error("workspace authority revoked before rename");
+          }
+        },
+      }),
+    ).rejects.toThrow("workspace authority revoked before rename");
+
+    expect((await workspaceRegistry.get("workspace-guarded"))?.archivedAt).toBeNull();
+    const reloaded = new FileBackedWorkspaceRegistry(
+      path.join(tmpDir, "projects", "workspaces.json"),
+      logger,
+    );
+    expect((await reloaded.get("workspace-guarded"))?.archivedAt).toBeNull();
+  });
+
   test("composes concurrent workspace field updates without losing either change", async () => {
     await workspaceRegistry.initialize();
     await workspaceRegistry.upsert(

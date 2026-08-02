@@ -29,6 +29,10 @@ class FakeLifecycleAgentStorage implements LifecycleAgentStorage {
     return this.records.get(agentId) ?? null;
   }
 
+  async list(): Promise<StoredAgentRecord[]> {
+    return Array.from(this.records.values());
+  }
+
   async upsert(record: StoredAgentRecord): Promise<void> {
     this.upserts.push(record);
     this.records.set(record.id, record);
@@ -61,6 +65,10 @@ class FakeLifecycleAgentManager implements LifecycleAgentManager {
 
   getAgent(agentId: string): LifecycleAgentSnapshot | null {
     return this.liveAgents.get(agentId) ?? null;
+  }
+
+  listAgents(): LifecycleAgentSnapshot[] {
+    return Array.from(this.liveAgents.values());
   }
 
   isCurrentAgentIncarnation(agentId: string, incarnation: string): boolean {
@@ -403,6 +411,44 @@ describe("agent lifecycle commands", () => {
     expect(manager.closedAgentIds).toEqual([]);
   });
 
+  test("blocks a child from archiving a cross-workspace parent whose cascade reaches itself", async () => {
+    const storage = new FakeLifecycleAgentStorage();
+    const manager = new FakeLifecycleAgentManager(storage);
+    manager.liveAgents.set("parent", {
+      ...managedAgent("parent", "idle"),
+      workspaceId: "workspace-parent",
+    });
+    manager.liveAgents.set("child", {
+      ...managedAgent("child", "idle"),
+      workspaceId: "workspace-child",
+      labels: { [PARENT_AGENT_ID_LABEL]: "parent" },
+    });
+    manager.incarnations.set("child", "child-incarnation");
+    storage.records.set("parent", {
+      ...storedAgent("parent"),
+      workspaceId: "workspace-parent",
+    });
+    storage.records.set("child", {
+      ...storedAgent("child"),
+      workspaceId: "workspace-child",
+      labels: { [PARENT_AGENT_ID_LABEL]: "parent" },
+    });
+
+    await expect(
+      archiveAgentCommand({ agentManager: manager, agentStorage: storage, logger }, "parent", {
+        caller: createAgentDestructiveCaller({
+          agentId: "child",
+          incarnation: "child-incarnation",
+        }),
+      }),
+    ).rejects.toMatchObject({ code: "SELF_ARCHIVE_BLOCKED" });
+
+    expect(manager.cancelledAgentIds).toEqual([]);
+    expect(manager.archivedAgentIds).toEqual([]);
+    expect(manager.liveAgents.has("parent")).toBe(true);
+    expect(manager.liveAgents.has("child")).toBe(true);
+  });
+
   test("rejects a stale incarnation before archiving another live agent", async () => {
     const storage = new FakeLifecycleAgentStorage();
     const manager = new FakeLifecycleAgentManager(storage);
@@ -637,6 +683,7 @@ function managedAgent(
     id,
     cwd: "/workspace/project",
     lifecycle,
+    labels: {},
   };
 }
 

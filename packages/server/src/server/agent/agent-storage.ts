@@ -347,15 +347,18 @@ export class AgentStorage {
     }
 
     await recheck?.();
-    await this.writeRecord(record);
+    await this.writeRecord(record, recheck);
   }
 
-  private async writeRecord(record: StoredAgentRecord): Promise<void> {
+  private async writeRecord(
+    record: StoredAgentRecord,
+    recheck?: DestructiveActionRecheck,
+  ): Promise<void> {
     const agentId = record.id;
     const nextPath = this.buildRecordPath(record);
     const previousPath = this.pathById.get(agentId);
 
-    await writeJsonFileAtomic(nextPath, record);
+    await writeJsonFileAtomic(nextPath, record, { beforeCommit: recheck });
     this.addIndexedPath(agentId, nextPath);
 
     if (previousPath && previousPath !== nextPath) {
@@ -460,6 +463,7 @@ export class AgentStorage {
       title?: string | null;
       internal?: boolean;
       autoArchiveObligation?: AutoArchiveObligation;
+      recheck?: DestructiveActionRecheck;
     },
   ): Promise<void> {
     await this.load();
@@ -479,7 +483,7 @@ export class AgentStorage {
       record.archivedAt = existing?.archivedAt;
       record.autoArchiveObligation =
         options?.autoArchiveObligation ?? existing?.autoArchiveObligation;
-      await this.writeOrDeferRecord(record);
+      await this.writeOrDeferRecord(record, options?.recheck);
     })();
     const tracked = operation.then(
       () => undefined,

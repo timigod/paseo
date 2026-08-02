@@ -80,6 +80,12 @@ describe("destructive authority over real WebSocket execution paths", () => {
     const agentA = await createManagedAgent(daemon, cwd);
     const agentB = await createManagedAgent(daemon, cwd);
     const agentC = await createManagedAgent(daemon, cwd);
+    const terminalManager = daemon.daemon.terminalManager;
+    if (!terminalManager) throw new Error("Expected terminal manager");
+    const terminal = await terminalManager.createTerminal({
+      cwd,
+      workspaceId: "workspace-close-items-authority",
+    });
     const identity = daemon.daemon.agentManager.getAgentCallerIdentity(agentA.id);
     if (!identity) throw new Error("Expected a current caller incarnation");
 
@@ -111,10 +117,19 @@ describe("destructive authority over real WebSocket execution paths", () => {
       await expect(agentCaller.deleteAgent(agentA.id)).rejects.toThrow(
         "managed agent cannot target itself",
       );
-      await expect(agentCaller.closeItems({ agentIds: [agentA.id] })).resolves.toMatchObject({
-        agents: [],
-      });
+      await expect(agentCaller.closeItems({ terminalIds: [terminal.id] })).rejects.toThrow(
+        "SELF_ARCHIVE_BLOCKED",
+      );
+      expect(terminalManager.getTerminal(terminal.id)).not.toBeUndefined();
+      await expect(
+        agentCaller.closeItems({
+          agentIds: [agentB.id, agentA.id],
+          terminalIds: [terminal.id],
+        }),
+      ).rejects.toThrow("SELF_ARCHIVE_BLOCKED");
       expect(daemon.daemon.agentManager.getAgent(agentA.id)).not.toBeNull();
+      expect(daemon.daemon.agentManager.getAgent(agentB.id)).not.toBeNull();
+      expect(terminalManager.getTerminal(terminal.id)).not.toBeUndefined();
 
       await expect(agentCaller.archiveAgent(agentB.id)).resolves.toHaveProperty("archivedAt");
       expect(daemon.daemon.agentManager.getAgent(agentB.id)).toBeNull();
@@ -347,7 +362,7 @@ describe("destructive authority over real WebSocket execution paths", () => {
     }
   }, 30_000);
 
-  test("disconnect after close and flush but before permanent delete preserves a closed record", async () => {
+  test("disconnect before permanent delete does not commit the guarded final closed snapshot", async () => {
     const originalRemove = AgentStorage.prototype.remove;
     const originalCancelDelete = AgentStorage.prototype.cancelDelete;
     let targetAgentId: string | null = null;
@@ -408,7 +423,7 @@ describe("destructive authority over real WebSocket execution paths", () => {
       await expect.poll(() => cancelDeleteSpy.mock.calls.length).toBeGreaterThan(0);
       await expect
         .poll(async () => (await daemon.daemon.agentStorage.get(target.id))?.lastStatus)
-        .toBe("closed");
+        .toBe("idle");
     } finally {
       releaseRemove();
       removeSpy.mockRestore();

@@ -2950,7 +2950,10 @@ describe("create_agent MCP tool", () => {
         force: true,
         reason: "archive-worktree",
       });
-      expect(archiveWorkspaceRecord).toHaveBeenCalledWith("ws-archive-tool-worktree");
+      expect(archiveWorkspaceRecord).toHaveBeenCalledWith(
+        "ws-archive-tool-worktree",
+        expect.any(Function),
+      );
       expect(markWorkspaceArchiving).toHaveBeenCalledWith(
         ["ws-archive-tool-worktree"],
         expect.any(String),

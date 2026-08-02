@@ -1,4 +1,5 @@
 import type { Logger } from "pino";
+import { PARENT_AGENT_ID_LABEL } from "@getpaseo/protocol/agent-labels";
 
 import {
   AgentRunCancellationError,
@@ -14,10 +15,14 @@ import {
   type DestructiveCallerContext,
 } from "./destructive-action-authority.js";
 
-export type LifecycleAgentSnapshot = Pick<ManagedAgent, "id" | "cwd" | "workspaceId" | "lifecycle">;
+export type LifecycleAgentSnapshot = Pick<
+  ManagedAgent,
+  "id" | "cwd" | "workspaceId" | "lifecycle" | "labels"
+>;
 
 export interface LifecycleAgentManager {
   getAgent(agentId: string): LifecycleAgentSnapshot | null;
+  listAgents(): LifecycleAgentSnapshot[];
   isCurrentAgentIncarnation?(agentId: string, incarnation: string): boolean;
   hasInFlightRun(agentId: string): boolean;
   cancelAgentRun(
@@ -54,6 +59,7 @@ export interface LifecycleAgentManager {
 
 export interface LifecycleAgentStorage {
   get(agentId: string): Promise<StoredAgentRecord | null>;
+  list(): Promise<StoredAgentRecord[]>;
   upsert(record: StoredAgentRecord): Promise<void>;
 }
 
@@ -184,6 +190,109 @@ export interface ArchiveAgentResult {
   record: StoredAgentRecord;
 }
 
+export interface AgentArchiveCascadeTarget {
+  targetAgentIds: string[];
+  targetWorkspaceIds: string[];
+  liveAgentIds: Set<string>;
+}
+
+export async function resolveAgentArchiveCascadeTarget(
+  dependencies: {
+    agentManager: Pick<LifecycleAgentManager, "listAgents">;
+    agentStorage: Pick<LifecycleAgentStorage, "list">;
+  },
+  seedAgentIds: readonly string[],
+): Promise<AgentArchiveCascadeTarget> {
+  const liveAgents = dependencies.agentManager.listAgents();
+  const storedRecords = await dependencies.agentStorage.list();
+  const labelsById = new Map<string, Record<string, string>>();
+  const workspaceIdById = new Map<string, string>();
+  const liveAgentIds = new Set(liveAgents.map((agent) => agent.id));
+
+  for (const record of storedRecords) {
+    if (!record.archivedAt || liveAgentIds.has(record.id)) {
+      labelsById.set(record.id, record.labels ?? {});
+      if (record.workspaceId) {
+        workspaceIdById.set(record.id, record.workspaceId);
+      }
+    }
+  }
+  for (const agent of liveAgents) {
+    labelsById.set(agent.id, agent.labels ?? {});
+    if (agent.workspaceId) {
+      workspaceIdById.set(agent.id, agent.workspaceId);
+    }
+  }
+
+  const targetAgentIds = Array.from(new Set(seedAgentIds));
+  const targetAgentIdSet = new Set(targetAgentIds);
+  for (let index = 0; index < targetAgentIds.length; index += 1) {
+    const parentAgentId = targetAgentIds[index];
+    for (const [candidateAgentId, labels] of labelsById) {
+      if (
+        !targetAgentIdSet.has(candidateAgentId) &&
+        labels[PARENT_AGENT_ID_LABEL] === parentAgentId
+      ) {
+        targetAgentIdSet.add(candidateAgentId);
+        targetAgentIds.push(candidateAgentId);
+      }
+    }
+  }
+
+  const targetWorkspaceIds = Array.from(
+    new Set(
+      targetAgentIds
+        .map((targetAgentId) => workspaceIdById.get(targetAgentId))
+        .filter((workspaceId): workspaceId is string => typeof workspaceId === "string"),
+    ),
+  );
+  return { targetAgentIds, targetWorkspaceIds, liveAgentIds };
+}
+
+export async function assertAgentArchiveBatchAuthorized(
+  dependencies: {
+    agentManager: Pick<
+      LifecycleAgentManager,
+      "getAgent" | "listAgents" | "isCurrentAgentIncarnation"
+    >;
+    agentStorage: Pick<LifecycleAgentStorage, "list">;
+  },
+  caller: DestructiveCallerContext | undefined,
+  seedAgentIds: readonly string[],
+  action: Extract<DestructiveActionName, "agent.archive" | "agent.finish">,
+  options?: {
+    signal?: AbortSignal;
+    additionalWorkspaceIds?: readonly string[];
+    targetPaths?: readonly string[];
+    hasAdditionalLiveTarget?: boolean;
+  },
+): Promise<AgentArchiveCascadeTarget> {
+  const target = await resolveAgentArchiveCascadeTarget(dependencies, seedAgentIds);
+  if (caller) {
+    assertDestructiveActionAuthorized(
+      {
+        getAgent: (agentId) => dependencies.agentManager.getAgent(agentId),
+        isCurrentAgentIncarnation: (agentId, incarnation) =>
+          dependencies.agentManager.isCurrentAgentIncarnation?.(agentId, incarnation) === true,
+      },
+      caller,
+      {
+        action,
+        targetAgentIds: target.targetAgentIds,
+        targetWorkspaceIds: Array.from(
+          new Set([...target.targetWorkspaceIds, ...(options?.additionalWorkspaceIds ?? [])]),
+        ),
+        targetPaths: options?.targetPaths,
+        hasLiveTarget:
+          options?.hasAdditionalLiveTarget === true ||
+          target.targetAgentIds.some((agentId) => target.liveAgentIds.has(agentId)),
+      },
+      options?.signal,
+    );
+  }
+  return target;
+}
+
 export async function archiveAgentCommand(
   dependencies: AgentLifecycleCommandDependencies,
   agentId: string,
@@ -194,20 +303,21 @@ export async function archiveAgentCommand(
   },
 ): Promise<ArchiveAgentResult> {
   const liveAgent = dependencies.agentManager.getAgent(agentId);
-  const authorize = () =>
-    assertAgentDestructiveActionAuthorized(
-      dependencies.agentManager,
+  const authorize: DestructiveActionRecheck = async () => {
+    await assertAgentArchiveBatchAuthorized(
+      dependencies,
       options?.caller,
-      agentId,
+      [agentId],
       options?.action ?? "agent.archive",
-      options?.signal,
+      { signal: options?.signal },
     );
-  authorize();
+  };
+  await authorize();
   let record: StoredAgentRecord | null;
   if (liveAgent) {
     await requestAgentRunCancellation(dependencies, agentId);
     await dependencies.agentManager.clearAgentAttention(agentId).catch(() => undefined);
-    authorize();
+    await authorize();
     await dependencies.agentManager.archiveAgent(agentId, authorize);
     record = await dependencies.agentStorage.get(agentId);
   } else {
@@ -348,7 +458,7 @@ export async function setAgentModeCommand(
 async function archiveStoredAgent(
   dependencies: Pick<AgentLifecycleCommandDependencies, "agentManager" | "agentStorage">,
   agentId: string,
-  authorize: () => void,
+  authorize: DestructiveActionRecheck,
 ): Promise<StoredAgentRecord> {
   const existing = await dependencies.agentStorage.get(agentId);
   if (!existing) {
@@ -359,7 +469,7 @@ async function archiveStoredAgent(
     return existing;
   }
 
-  authorize();
+  await authorize();
   const archivedAt = new Date().toISOString();
   return dependencies.agentManager.archiveSnapshot(agentId, archivedAt, authorize);
 }

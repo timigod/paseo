@@ -1811,7 +1811,8 @@ export class AgentManager {
 
     let persistError: unknown;
     try {
-      await this.persistSnapshot(closedAgent);
+      await recheck?.();
+      await this.persistSnapshot(closedAgent, { recheck });
     } catch (error) {
       persistError = error;
     }
@@ -1868,7 +1869,7 @@ export class AgentManager {
     const { archivedAt } = await this.markRecordArchived(stored, recheck);
     this.discardRetainedAgentState(agentId);
 
-    await this.cascadeArchiveChildren(agentId);
+    await this.cascadeArchiveChildren(agentId, recheck);
 
     return { archivedAt };
   }
@@ -1877,12 +1878,16 @@ export class AgentManager {
   // label pointing back at the caller. Archiving the parent cascades to those
   // children so subagent fleets don't outlive their orchestrator. Detached
   // handoff agents omit this label, so they stand outside the cascade.
-  private async cascadeArchiveChildren(parentAgentId: string): Promise<void> {
+  private async cascadeArchiveChildren(
+    parentAgentId: string,
+    recheck?: DestructiveActionRecheck,
+  ): Promise<void> {
     const registry = this.registry;
     if (!registry) {
       return;
     }
     const records = await registry.list();
+    await recheck?.();
     for (const record of records) {
       if (record.archivedAt) {
         continue;
@@ -1890,10 +1895,11 @@ export class AgentManager {
       if (record.labels?.[PARENT_AGENT_ID_LABEL] !== parentAgentId) {
         continue;
       }
+      await recheck?.();
       if (this.agents.has(record.id)) {
-        await this.archiveAgent(record.id);
+        await this.archiveAgent(record.id, recheck);
       } else {
-        await this.archiveSnapshot(record.id, new Date().toISOString());
+        await this.archiveSnapshot(record.id, new Date().toISOString(), recheck);
       }
     }
   }
@@ -2200,7 +2206,7 @@ export class AgentManager {
     }
 
     await this.fireAgentArchived(agentId);
-    await this.cascadeArchiveChildren(agentId);
+    await this.cascadeArchiveChildren(agentId, recheck);
 
     return nextRecord;
   }
@@ -3556,6 +3562,7 @@ export class AgentManager {
       title?: string | null;
       internal?: boolean;
       autoArchiveObligation?: AutoArchiveObligation;
+      recheck?: DestructiveActionRecheck;
     },
   ): Promise<void> {
     if (!this.registry) {

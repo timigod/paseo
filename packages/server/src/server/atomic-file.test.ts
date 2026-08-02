@@ -111,4 +111,48 @@ describe("atomic file durability", () => {
       expect(events).toEqual(["unlink", "open-directory", "sync-directory", "close-directory"]);
     },
   );
+  test("rechecks after the temporary write and before the atomic rename", async () => {
+    const events: string[] = [];
+    const directory = path.resolve("fixture-state");
+    const filePath = path.join(directory, "record.json");
+    const tempHandle = {
+      writeFile: vi.fn(async () => {
+        events.push("write");
+      }),
+      sync: vi.fn(),
+      close: vi.fn(async () => {
+        events.push("close-file");
+      }),
+    };
+    fsMocks.mkdir.mockImplementation(async () => {
+      events.push("mkdir");
+    });
+    fsMocks.open.mockResolvedValue(tempHandle);
+    fsMocks.rm.mockImplementation(async () => {
+      events.push("remove-temp");
+    });
+    let recheckCount = 0;
+
+    await expect(
+      writeFileAtomic(filePath, "new", {
+        beforeCommit: () => {
+          recheckCount += 1;
+          events.push(`recheck-${recheckCount}`);
+          if (recheckCount === 2) {
+            throw new Error("authority revoked after temporary write");
+          }
+        },
+      }),
+    ).rejects.toThrow("authority revoked after temporary write");
+
+    expect(events).toEqual([
+      "mkdir",
+      "recheck-1",
+      "write",
+      "close-file",
+      "recheck-2",
+      "remove-temp",
+    ]);
+    expect(fsMocks.rename).not.toHaveBeenCalled();
+  });
 });

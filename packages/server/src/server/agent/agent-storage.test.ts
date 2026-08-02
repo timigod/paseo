@@ -352,6 +352,36 @@ describe("AgentStorage", () => {
     expect((await reloaded.get(agentId))?.archivedAt).toBeUndefined();
   });
 
+  test("does not commit archivedAt when authority is revoked after the temporary write", async () => {
+    const agentId = "agent-archive-precommit-revoked";
+    await storage.applySnapshot(createManagedAgent({ id: agentId, lifecycle: "closed" }));
+    const archivedAt = "2026-08-02T01:00:00.000Z";
+    let recheckCount = 0;
+
+    await expect(
+      storage.upsert(
+        {
+          ...(await storage.get(agentId))!,
+          archivedAt,
+          updatedAt: archivedAt,
+        },
+        {
+          recheck: () => {
+            recheckCount += 1;
+            if (recheckCount === 3) {
+              throw new Error("archive authority revoked before rename");
+            }
+          },
+        },
+      ),
+    ).rejects.toThrow("archive authority revoked before rename");
+
+    expect((await storage.get(agentId))?.archivedAt).toBeUndefined();
+    const reloaded = new AgentStorage(storagePath, logger);
+    expect((await reloaded.get(agentId))?.archivedAt).toBeUndefined();
+    expect(readdirSync(storagePath).filter((entry) => entry.endsWith(".tmp"))).toEqual([]);
+  });
+
   test("applySnapshot stores and reloads featureValues when present", async () => {
     await storage.applySnapshot(
       createManagedAgent({

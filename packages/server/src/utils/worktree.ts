@@ -1141,6 +1141,7 @@ export async function runWorktreeTeardownCommands(options: {
   branchName?: string;
   repoRootPath?: string;
   signal?: AbortSignal;
+  recheck?: () => void | Promise<void>;
 }): Promise<WorktreeTeardownCommandResult[]> {
   const teardownCwd = options.teardownCwd ?? options.worktreePath;
   if (getRealpathAwareRelativePath(options.worktreePath, teardownCwd) === null) {
@@ -1153,8 +1154,10 @@ export async function runWorktreeTeardownCommands(options: {
 
   const repoRootPath =
     options.repoRootPath ?? (await inferRepoRootPathFromWorktreePath(options.worktreePath));
+  await options.recheck?.();
   const branchName =
     options.branchName ?? (await resolveBranchNameForWorktreePath(options.worktreePath));
+  await options.recheck?.();
   const worktreePort = readPaseoWorktreeRuntimePort(options.worktreePath);
 
   const teardownEnv: NodeJS.ProcessEnv = createStringCommandShellEnv(
@@ -1174,6 +1177,7 @@ export async function runWorktreeTeardownCommands(options: {
   const results: WorktreeTeardownCommandResult[] = [];
   const maxOutputBytes = getWorktreeSetupCommandOutputLimit(teardownCommands.length);
   for (const [index, cmd] of teardownCommands.entries()) {
+    await options.recheck?.();
     const result = await execSetupCommandStreamed({
       command: cmd,
       cwd: teardownCwd,
@@ -1183,6 +1187,7 @@ export async function runWorktreeTeardownCommands(options: {
       maxOutputBytes,
       signal: options.signal,
     });
+    await options.recheck?.();
     results.push(result);
 
     if (result.exitCode !== 0) {
@@ -1520,6 +1525,7 @@ export interface DeletePaseoWorktreeOptions {
   cleanupFindExecutable?: string;
   cleanupHelperTimeoutMs?: number;
   signal?: AbortSignal;
+  recheck?: () => void | Promise<void>;
 }
 
 export class WorktreeCleanupRelocatedError extends Error {
@@ -1584,6 +1590,51 @@ async function waitForWorktreeDeletionRetry(delayMs: number, signal?: AbortSigna
   });
 }
 
+async function resolvePaseoWorktreeDeleteTarget(options: {
+  cwd: string | null;
+  worktreePath?: string;
+  worktreeSlug?: string;
+  worktreesRoot?: string;
+  paseoHome?: string;
+  worktreesBaseRoot?: string;
+  recheck?: () => void | Promise<void>;
+}): Promise<string> {
+  let resolvedWorktreesRoot: string;
+  if (options.worktreesRoot) {
+    resolvedWorktreesRoot = options.worktreesRoot;
+  } else if (options.cwd) {
+    resolvedWorktreesRoot = await getPaseoWorktreesRoot(
+      options.cwd,
+      options.paseoHome,
+      options.worktreesBaseRoot,
+    );
+    await options.recheck?.();
+  } else {
+    throw new Error("cwd or worktreesRoot is required to delete a Paseo worktree");
+  }
+
+  const requestedPath = options.worktreePath ?? join(resolvedWorktreesRoot, options.worktreeSlug!);
+  const requestedReceipt = isPaseoWorktreeCleanupReceiptPath(requestedPath);
+  const resolvedRequested = normalizePathForOwnership(requestedPath);
+  const ownership = await isPaseoOwnedWorktreeCwd(requestedPath, {
+    paseoHome: options.paseoHome,
+    worktreesRoot: options.worktreesBaseRoot,
+  });
+  await options.recheck?.();
+  const resolvedWorktree =
+    !requestedReceipt && ownership.allowed && ownership.worktreePath
+      ? ownership.worktreePath
+      : resolvedRequested;
+  const relativeWorktreePath = getRealpathAwareRelativePath(
+    resolvedWorktreesRoot,
+    resolvedWorktree,
+  );
+  if (relativeWorktreePath === null || relativeWorktreePath === "") {
+    throw new Error("Refusing to delete non-Paseo worktree");
+  }
+  return resolvedWorktree;
+}
+
 export async function deletePaseoWorktree({
   cwd,
   worktreePath,
@@ -1600,44 +1651,24 @@ export async function deletePaseoWorktree({
   cleanupFindExecutable,
   cleanupHelperTimeoutMs,
   signal,
+  recheck,
 }: DeletePaseoWorktreeOptions): Promise<void> {
   throwIfWorktreeDeletionCanceled(signal);
   if (!worktreePath && !worktreeSlug) {
     throw new Error("worktreePath or worktreeSlug is required");
   }
 
-  // Resolve the worktrees-root. With a repo cwd we hash it the normal way; if
-  // git has forgotten about the worktree we expect the caller to hand us the
-  // path-derived worktreesRoot from the ownership check.
-  let resolvedWorktreesRoot: string;
-  if (worktreesRoot) {
-    resolvedWorktreesRoot = worktreesRoot;
-  } else if (cwd) {
-    resolvedWorktreesRoot = await getPaseoWorktreesRoot(cwd, paseoHome, worktreesBaseRoot);
-  } else {
-    throw new Error("cwd or worktreesRoot is required to delete a Paseo worktree");
-  }
-
-  const requestedPath = worktreePath ?? join(resolvedWorktreesRoot, worktreeSlug!);
-  const requestedReceipt = isPaseoWorktreeCleanupReceiptPath(requestedPath);
-  const resolvedRequested = normalizePathForOwnership(requestedPath);
-  const ownership = await isPaseoOwnedWorktreeCwd(requestedPath, {
+  const resolvedWorktree = await resolvePaseoWorktreeDeleteTarget({
+    cwd,
+    worktreePath,
+    worktreeSlug,
+    worktreesRoot,
     paseoHome,
-    worktreesRoot: worktreesBaseRoot,
+    worktreesBaseRoot,
+    recheck,
   });
-  const resolvedWorktree =
-    !requestedReceipt && ownership.allowed && ownership.worktreePath
-      ? ownership.worktreePath
-      : resolvedRequested;
 
-  const relativeWorktreePath = getRealpathAwareRelativePath(
-    resolvedWorktreesRoot,
-    resolvedWorktree,
-  );
-  if (relativeWorktreePath === null || relativeWorktreePath === "") {
-    throw new Error("Refusing to delete non-Paseo worktree");
-  }
-
+  await recheck?.();
   const {
     initialIdentity,
     requestedRecovery,
@@ -1656,11 +1687,13 @@ export async function deletePaseoWorktree({
         worktreePath: resolvedWorktree,
         teardownCwd,
         signal,
+        recheck,
       });
     }
   }
 
   throwIfWorktreeDeletionCanceled(signal);
+  await recheck?.();
   const quarantined =
     existingQuarantine ??
     (await quarantineDirectory({
@@ -1669,6 +1702,7 @@ export async function deletePaseoWorktree({
       worktreeIncarnationId,
       quarantineMarker,
       requestedRecovery,
+      recheck,
     }));
   await removeQuarantinedWorktree({
     cwd,
@@ -1679,6 +1713,7 @@ export async function deletePaseoWorktree({
     cleanupFindExecutable,
     cleanupHelperTimeoutMs,
     signal,
+    recheck,
   });
 }
 
@@ -1787,10 +1822,12 @@ async function removeQuarantinedWorktree(input: {
   cleanupFindExecutable?: string;
   cleanupHelperTimeoutMs?: number;
   signal?: AbortSignal;
+  recheck?: () => void | Promise<void>;
 }): Promise<void> {
   try {
     throwIfWorktreeDeletionCanceled(input.signal);
     if (input.cwd) {
+      await input.recheck?.();
       try {
         await runGitCommand(["worktree", "prune", "--expire=now"], {
           cwd: input.cwd,
@@ -1802,9 +1839,11 @@ async function removeQuarantinedWorktree(input: {
         throwIfWorktreeDeletionCanceled(input.signal);
         // The missing worktree admin entry is harmless; Git also prunes it lazily.
       }
+      await input.recheck?.();
     }
 
     if (input.quarantined) {
+      await input.recheck?.();
       await removeDirectoryWithRetries({
         path: input.quarantined.path,
         receiptPath: input.quarantined.receiptPath,
@@ -1816,6 +1855,7 @@ async function removeQuarantinedWorktree(input: {
         findExecutable: input.cleanupFindExecutable,
         helperTimeoutMs: input.cleanupHelperTimeoutMs,
         signal: input.signal,
+        recheck: input.recheck,
       });
     }
   } catch (error) {
@@ -1861,8 +1901,10 @@ async function quarantineDirectory(input: {
   worktreeIncarnationId: string | null;
   quarantineMarker: string;
   requestedRecovery: boolean;
+  recheck?: () => void | Promise<void>;
 }): Promise<QuarantinedDirectory | null> {
   const identity = await readDirectoryIdentity(input.directoryPath);
+  await input.recheck?.();
   if (identity === null) {
     if (input.expectedIdentity === null) return null;
     if (input.worktreeIncarnationId === null) return null;
@@ -1886,12 +1928,17 @@ async function quarantineDirectory(input: {
   if ((await readDirectoryIdentity(quarantinePath)) !== null) {
     throw new Error(`Cleanup quarantine path already exists: ${quarantinePath}`);
   }
+  await input.recheck?.();
   await ensurePaseoWorktreeCleanupMarker(input.directoryPath, input.quarantineMarker);
-  if ((await readDirectoryIdentity(input.directoryPath)) !== identity) {
+  const identityBeforeRename = await readDirectoryIdentity(input.directoryPath);
+  await input.recheck?.();
+  if (identityBeforeRename !== identity) {
     throw new Error(`Cleanup path identity changed for ${input.directoryPath}`);
   }
   await rename(input.directoryPath, quarantinePath);
-  if ((await readDirectoryIdentity(quarantinePath)) !== identity) {
+  const quarantinedIdentity = await readDirectoryIdentity(quarantinePath);
+  await input.recheck?.();
+  if (quarantinedIdentity !== identity) {
     throw new WorktreeCleanupRelocatedError(
       quarantinePath,
       input.worktreeIncarnationId,
@@ -2217,14 +2264,17 @@ async function removeDirectoryWithRetries(input: {
   findExecutable?: string;
   helperTimeoutMs?: number;
   signal?: AbortSignal;
+  recheck?: () => void | Promise<void>;
 }): Promise<void> {
   throwIfWorktreeDeletionCanceled(input.signal);
   const delaysMs = [0, 100, 300, 700, 1500];
   let lastError: unknown = null;
   for (const delay of delaysMs) {
     await waitForWorktreeDeletionRetry(delay, input.signal);
+    await input.recheck?.();
     try {
       const cleanupPath = await findRemainingPinnedCleanupPath(input);
+      await input.recheck?.();
       if (!cleanupPath) return;
       await removePinnedDirectory({
         path: cleanupPath,
@@ -2237,9 +2287,12 @@ async function removeDirectoryWithRetries(input: {
         findExecutable: input.findExecutable,
         helperTimeoutMs: input.helperTimeoutMs,
         signal: input.signal,
+        recheck: input.recheck,
       });
       throwIfWorktreeDeletionCanceled(input.signal);
+      await input.recheck?.();
       const remainingPath = await findRemainingPinnedCleanupPath(input);
+      await input.recheck?.();
       if (!remainingPath) return;
       lastError = new Error(`Cleanup receipt is incomplete: ${remainingPath}`);
     } catch (error) {
@@ -2303,6 +2356,7 @@ interface RemovePinnedDirectoryInput {
   findExecutable?: string;
   helperTimeoutMs?: number;
   signal?: AbortSignal;
+  recheck?: () => void | Promise<void>;
 }
 
 type CleanupHelperStopReason = "abort" | "authorization" | "timeout";
@@ -2356,6 +2410,7 @@ function handleCleanupHelperProtocolLine(context: CleanupHelperProtocolContext):
       state.ready = true;
       await assertPinnedCleanupDirectory({ ...input, requireCompleted: false });
       await input.onDirectoryPinned?.(input.path);
+      await input.recheck?.();
       armTimeout(input.helperTimeoutMs ?? DEFAULT_CLEANUP_HELPER_TIMEOUT_MS);
       sendCommand("REMOVE\n");
     });
@@ -2378,6 +2433,7 @@ function handleCleanupHelperProtocolLine(context: CleanupHelperProtocolContext):
           `Cleanup receipt already exists: ${input.receiptPath}`,
         );
       }
+      await input.recheck?.();
       sendCommand("RELOCATE\n");
     });
     return;
@@ -2418,6 +2474,7 @@ async function preparePinnedCleanupHelper(
   input: RemovePinnedDirectoryInput,
 ): Promise<PreparedPinnedCleanupHelper> {
   throwIfWorktreeDeletionCanceled(input.signal);
+  await input.recheck?.();
   const startsInReceipt = input.path === input.receiptPath;
   const helperTimeoutMs = input.helperTimeoutMs ?? DEFAULT_CLEANUP_HELPER_TIMEOUT_MS;
   if (!Number.isFinite(helperTimeoutMs) || helperTimeoutMs <= 0) {

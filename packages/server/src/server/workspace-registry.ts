@@ -117,6 +117,10 @@ export interface WorkspaceMutationContext {
   expectsInitialAgent?: boolean;
 }
 
+export interface RegistryArchiveOptions {
+  recheck?: () => void | Promise<void>;
+}
+
 export interface ProjectMutation {
   kind: "upsert" | "archive" | "remove";
   projectId: string;
@@ -152,7 +156,7 @@ export interface WorkspaceRegistry {
     updater: (record: PersistedWorkspaceRecord) => PersistedWorkspaceRecord,
   ): Promise<PersistedWorkspaceRecord | null>;
   upsert(record: PersistedWorkspaceRecord, context?: WorkspaceMutationContext): Promise<void>;
-  archive(workspaceId: string, archivedAt: string): Promise<void>;
+  archive(workspaceId: string, archivedAt: string, options?: RegistryArchiveOptions): Promise<void>;
   remove(workspaceId: string): Promise<void>;
   /** Central lifecycle seam for daemon-global workspace observers. */
   subscribeToMutations?(
@@ -229,15 +233,20 @@ class FileBackedRegistry<TRecord extends RegistryRecord> {
     return next;
   }
 
-  async archive(id: string, archivedAt: string): Promise<void> {
-    await this.archiveIfPresent(id, archivedAt);
+  async archive(id: string, archivedAt: string, options?: RegistryArchiveOptions): Promise<void> {
+    await this.archiveIfPresent(id, archivedAt, options);
   }
 
-  protected async archiveIfPresent(id: string, archivedAt: string): Promise<TRecord | null> {
+  protected async archiveIfPresent(
+    id: string,
+    archivedAt: string,
+    options?: RegistryArchiveOptions,
+  ): Promise<TRecord | null> {
     await this.load();
     const existing = this.cache.get(id);
     if (!existing) return null;
-    return this.persistArchive(existing, archivedAt);
+    await options?.recheck?.();
+    return this.persistArchive(existing, archivedAt, options);
   }
 
   protected async archiveIfActive(id: string, archivedAt: string): Promise<TRecord | null> {
@@ -249,14 +258,26 @@ class FileBackedRegistry<TRecord extends RegistryRecord> {
     return this.persistArchive(existing, archivedAt);
   }
 
-  private async persistArchive(existing: TRecord, archivedAt: string): Promise<TRecord> {
+  private async persistArchive(
+    existing: TRecord,
+    archivedAt: string,
+    options?: RegistryArchiveOptions,
+  ): Promise<TRecord> {
     const next = this.schema.parse({
       ...existing,
       updatedAt: archivedAt,
       archivedAt,
     });
-    this.cache.set(this.getId(next), next);
-    await this.enqueuePersist();
+    const id = this.getId(next);
+    this.cache.set(id, next);
+    try {
+      await this.enqueuePersist(options?.recheck);
+    } catch (error) {
+      if (this.cache.get(id) === next) {
+        this.cache.set(id, existing);
+      }
+      throw error;
+    }
     return next;
   }
 
@@ -296,13 +317,13 @@ class FileBackedRegistry<TRecord extends RegistryRecord> {
     this.loaded = true;
   }
 
-  private async persist(): Promise<void> {
+  private async persist(recheck?: () => void | Promise<void>): Promise<void> {
     const records = Array.from(this.cache.values());
-    await writeJsonFileAtomic(this.filePath, records);
+    await writeJsonFileAtomic(this.filePath, records, { beforeCommit: recheck });
   }
 
-  private async enqueuePersist(): Promise<void> {
-    const nextPersist = this.persistQueue.then(() => this.persist());
+  private async enqueuePersist(recheck?: () => void | Promise<void>): Promise<void> {
+    const nextPersist = this.persistQueue.then(() => this.persist(recheck));
     this.persistQueue = nextPersist.catch(() => {});
     await nextPersist;
   }
@@ -473,8 +494,12 @@ export class FileBackedWorkspaceRegistry
     });
   }
 
-  override async archive(workspaceId: string, archivedAt: string): Promise<void> {
-    const workspace = await this.archiveIfPresent(workspaceId, archivedAt);
+  override async archive(
+    workspaceId: string,
+    archivedAt: string,
+    options?: RegistryArchiveOptions,
+  ): Promise<void> {
+    const workspace = await this.archiveIfPresent(workspaceId, archivedAt, options);
     if (!workspace) return;
     await this.notifyMutation({ kind: "archive", workspaceId, workspace });
   }

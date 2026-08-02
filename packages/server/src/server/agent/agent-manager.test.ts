@@ -8117,6 +8117,60 @@ test("closeAgent persists one final closed snapshot", async () => {
   }
 });
 
+test("closeAgent does not commit its final snapshot after authority is revoked during session close", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-close-revoked-"));
+  const storagePath = join(workdir, "agents");
+  const storage = new AgentStorage(storagePath, logger);
+  let sessionClosed = false;
+  let postCloseRecheckCount = 0;
+  const client = new (class extends TestAgentClient {
+    override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+      const markClosed = () => {
+        sessionClosed = true;
+      };
+      return new (class extends TestAgentSession {
+        override async close(): Promise<void> {
+          markClosed();
+        }
+      })(config);
+    }
+  })();
+  const manager = new AgentManager({
+    clients: { codex: client },
+    registry: storage,
+    logger,
+    idFactory: () => "00000000-0000-4000-8000-000000000113",
+  });
+
+  try {
+    const snapshot = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+    await manager.flush();
+    const beforeClose = await storage.get(snapshot.id);
+
+    await expect(
+      manager.closeAgent(snapshot.id, () => {
+        if (sessionClosed) {
+          postCloseRecheckCount += 1;
+          if (postCloseRecheckCount === 4) {
+            throw new Error("close authority revoked after final snapshot temporary write");
+          }
+        }
+      }),
+    ).rejects.toThrow("close authority revoked after final snapshot temporary write");
+
+    expect((await storage.get(snapshot.id))?.lastStatus).toBe(beforeClose?.lastStatus);
+    const reloaded = new AgentStorage(storagePath, logger);
+    expect((await reloaded.get(snapshot.id))?.lastStatus).toBe(beforeClose?.lastStatus);
+    expect((await reloaded.get(snapshot.id))?.lastStatus).not.toBe("closed");
+  } finally {
+    await manager.flush().catch(() => undefined);
+    await storage.flush().catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
 test("idle agents remain resident until an explicit lifecycle action closes them", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-idle-residency-"));
   let closeCount = 0;

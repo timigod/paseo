@@ -93,6 +93,7 @@ import {
 import { resolveCreateAgentIntent, type CreateAgentIntent } from "./agent/create-agent/intent.js";
 import {
   archiveAgentCommand,
+  assertAgentArchiveBatchAuthorized,
   assertAgentDestructiveActionAuthorized,
   cancelAgentRunCommand,
   closeAgentCommand,
@@ -103,6 +104,7 @@ import {
 import {
   createCoordinatorDestructiveCaller,
   DestructiveActionAuthorizationError,
+  type DestructiveActionRecheck,
   type DestructiveCallerContext,
 } from "./agent/destructive-action-authority.js";
 import {
@@ -2675,6 +2677,27 @@ export class Session {
 
   private async handleCloseItemsRequest(msg: CloseItemsRequest, source?: object): Promise<void> {
     const caller = this.getDestructiveCaller(source);
+    const terminalTargets = msg.terminalIds
+      .map((terminalId) => this.terminalController.getTerminalForClose(terminalId))
+      .filter((target): target is NonNullable<typeof target> => target !== null);
+    const authorize: DestructiveActionRecheck = async () => {
+      await assertAgentArchiveBatchAuthorized(
+        {
+          agentManager: this.agentManager,
+          agentStorage: this.agentStorage,
+        },
+        caller,
+        msg.agentIds,
+        "agent.finish",
+        {
+          additionalWorkspaceIds: terminalTargets.map((target) => target.workspaceId),
+          targetPaths: terminalTargets.map((target) => target.cwd),
+          hasAdditionalLiveTarget: terminalTargets.length > 0,
+        },
+      );
+    };
+
+    await authorize();
     const archiveResults = await Promise.allSettled(
       msg.agentIds.map((agentId) => this.archiveAgentForClose(agentId, caller, "agent.finish")),
     );
@@ -2684,6 +2707,9 @@ export class Session {
       if (result.status === "fulfilled") {
         agents.push(result.value);
       } else {
+        if (result.reason instanceof DestructiveActionAuthorizationError) {
+          throw result.reason;
+        }
         this.sessionLogger.warn(
           { err: result.reason, agentId: msg.agentIds[i], requestId: msg.requestId },
           "Failed to archive agent during close_items batch",
@@ -2694,8 +2720,12 @@ export class Session {
     const terminals = [];
     for (const terminalId of msg.terminalIds) {
       try {
+        await authorize();
         terminals.push(this.terminalController.killTerminalForClose(terminalId));
       } catch (error) {
+        if (error instanceof DestructiveActionAuthorizationError) {
+          throw error;
+        }
         this.sessionLogger.warn(
           { err: error, terminalId, requestId: msg.requestId },
           "Failed to kill terminal during close_items batch",
@@ -4391,7 +4421,8 @@ export class Session {
         agentStorage: this.agentStorage,
         findWorkspaceIdForCwd: (cwd) => this.findWorkspaceIdForCwd(cwd),
         listActiveWorkspaces: () => this.listActiveWorkspaceRefs(),
-        archiveWorkspaceRecord: (workspaceId) => this.archiveWorkspaceRecord(workspaceId),
+        archiveWorkspaceRecord: (workspaceId, recheck) =>
+          this.archiveWorkspaceRecord(workspaceId, undefined, recheck),
         workspaceRegistry: this.workspaceRegistry,
         emit: (message) => this.emit(message),
         emitWorkspaceUpdatesForWorkspaceIds: (workspaceIds) =>
@@ -5139,15 +5170,21 @@ export class Session {
       }));
   }
 
-  private async archiveWorkspaceRecord(workspaceId: string, archivedAt?: string): Promise<void> {
+  private async archiveWorkspaceRecord(
+    workspaceId: string,
+    archivedAt?: string,
+    recheck?: DestructiveActionRecheck,
+  ): Promise<void> {
     const archiveTimestamp = archivedAt ?? new Date().toISOString();
     const existingWorkspace = await archivePersistedWorkspaceRecord({
       workspaceId,
       archivedAt: archiveTimestamp,
       workspaceRegistry: this.workspaceRegistry,
+      recheck,
     });
     this.workspaceSetupSnapshots.delete(workspaceId);
     if (!existingWorkspace) {
+      await recheck?.();
       this.workspaceGitObserver.removeForWorkspaceId(workspaceId);
       return;
     }
@@ -5168,6 +5205,7 @@ export class Session {
       );
     }
 
+    await recheck?.();
     await this.teardownArchivedWorkspace(existingWorkspace.workspaceId);
   }
 
@@ -6416,7 +6454,8 @@ export class Session {
           agentStorage: this.agentStorage,
           findWorkspaceIdForCwd: (cwd) => this.findWorkspaceIdForCwd(cwd),
           listActiveWorkspaces: () => this.listActiveWorkspaceRefs(),
-          archiveWorkspaceRecord: (workspaceId) => this.archiveWorkspaceRecord(workspaceId),
+          archiveWorkspaceRecord: (workspaceId, recheck) =>
+            this.archiveWorkspaceRecord(workspaceId, undefined, recheck),
           emitWorkspaceUpdatesForWorkspaceIds: (workspaceIds) =>
             this.emitWorkspaceUpdatesForWorkspaceIds(workspaceIds),
           markWorkspaceArchiving: (workspaceIds, archivingAt) =>

@@ -1273,6 +1273,75 @@ describe.skipIf(isPlatform("win32"))("worktree POSIX-only", () => {
       expect(teardownLog).toContain(`port=${runtimeEnv.PASEO_WORKTREE_PORT}`);
     });
 
+    it("rechecks after each awaited teardown command before continuing or deleting", async () => {
+      writeFileSync(
+        join(repoDir, "paseo.json"),
+        JSON.stringify({
+          worktree: {
+            teardown: [
+              'echo first > "$PASEO_SOURCE_CHECKOUT_PATH/first-teardown.log"',
+              'echo second > "$PASEO_SOURCE_CHECKOUT_PATH/second-teardown.log"',
+            ],
+          },
+        }),
+      );
+      execFileSync("git", ["add", "paseo.json"], { cwd: repoDir });
+      execFileSync("git", ["-c", "commit.gpgsign=false", "commit", "-m", "guard teardown"], {
+        cwd: repoDir,
+      });
+      const created = await createLegacyWorktreeForTest({
+        branchName: "guarded-teardown-branch",
+        cwd: repoDir,
+        baseBranch: "main",
+        worktreeSlug: "guarded-teardown",
+        paseoHome,
+      });
+
+      await expect(
+        deletePaseoWorktree({
+          cwd: repoDir,
+          worktreePath: created.worktreePath,
+          paseoHome,
+          recheck: () => {
+            if (existsSync(join(repoDir, "first-teardown.log"))) {
+              throw new Error("teardown authority revoked");
+            }
+          },
+        }),
+      ).rejects.toThrow("teardown authority revoked");
+
+      expect(existsSync(join(repoDir, "first-teardown.log"))).toBe(true);
+      expect(existsSync(join(repoDir, "second-teardown.log"))).toBe(false);
+      expect(existsSync(created.worktreePath)).toBe(true);
+    });
+
+    it("rechecks after ownership resolution before removing a worktree", async () => {
+      const created = await createLegacyWorktreeForTest({
+        branchName: "guarded-ownership-branch",
+        cwd: repoDir,
+        baseBranch: "main",
+        worktreeSlug: "guarded-ownership",
+        paseoHome,
+      });
+      let recheckCount = 0;
+
+      await expect(
+        deletePaseoWorktree({
+          cwd: repoDir,
+          worktreePath: created.worktreePath,
+          paseoHome,
+          recheck: () => {
+            recheckCount += 1;
+            if (recheckCount === 2) {
+              throw new Error("ownership authority revoked");
+            }
+          },
+        }),
+      ).rejects.toThrow("ownership authority revoked");
+
+      expect(existsSync(created.worktreePath)).toBe(true);
+    });
+
     it("runs string teardown scripts from paseo.json as a single shell command", async () => {
       const paseoConfig = {
         worktree: {

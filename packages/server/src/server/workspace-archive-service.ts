@@ -6,6 +6,7 @@ import type { Logger } from "pino";
 
 import type { AgentManager } from "./agent/agent-manager.js";
 import type { AgentStorage, StoredAgentRecord } from "./agent/agent-storage.js";
+import { resolveAgentArchiveCascadeTarget } from "./agent/lifecycle-command.js";
 import type { WorkspaceGitService } from "./workspace-git-service.js";
 import type { ForgeService } from "../services/forge-service.js";
 import {
@@ -58,7 +59,7 @@ export interface ArchiveDependencies {
   paseoWorktreesBaseRoot?: string;
   github: ForgeService;
   workspaceGitService: Pick<WorkspaceGitService, "getCheckout" | "getSnapshot">;
-  agentManager: Pick<AgentManager, "listAgents" | "archiveAgent" | "archiveSnapshot"> &
+  agentManager: Pick<AgentManager, "getAgent" | "listAgents" | "archiveAgent" | "archiveSnapshot"> &
     Partial<Pick<AgentManager, "isCurrentAgentIncarnation">>;
   agentStorage: Pick<AgentStorage, "list">;
   // Resolves the worktree at a path to its workspaceId for archive-by-path. The
@@ -70,7 +71,10 @@ export interface ArchiveDependencies {
   // break a same-cwd tie in favor of the worktree-kind record when archiving by
   // path (no explicit workspaceId).
   listActiveWorkspaces: () => Promise<ActiveWorkspaceRef[]>;
-  archiveWorkspaceRecord: (workspaceId: string) => Promise<void>;
+  archiveWorkspaceRecord: (
+    workspaceId: string,
+    recheck?: DestructiveActionRecheck,
+  ) => Promise<void>;
   emitWorkspaceUpdatesForWorkspaceIds: (workspaceIds: Iterable<string>) => Promise<void>;
   markWorkspaceArchiving: (workspaceIds: Iterable<string>, archivingAt: string) => void;
   clearWorkspaceArchiving: (workspaceIds: Iterable<string>) => void;
@@ -491,7 +495,7 @@ async function archiveResolvedTarget(
 }
 
 async function assertCallerCanArchive(
-  dependencies: Pick<ArchiveDependencies, "agentManager" | "workspaceGitService">,
+  dependencies: Pick<ArchiveDependencies, "agentManager" | "agentStorage" | "workspaceGitService">,
   caller: ArchiveCallerContext | undefined,
   target: ArchiveTarget,
   action: "workspace.archive" | "worktree.archive",
@@ -520,7 +524,7 @@ async function assertCallerCanArchive(
               target.teardownTargets.map((teardownTarget) => teardownTarget.cwd),
             )),
           ];
-    const targetAgentIds = liveAgents
+    const directLiveTargetAgentIds = liveAgents
       .filter(
         (agent) =>
           (agent.workspaceId && targetWorkspaceIds.includes(agent.workspaceId)) ||
@@ -533,6 +537,23 @@ async function assertCallerCanArchive(
           ),
       )
       .map((agent) => agent.id);
+    const storedRecords = await dependencies.agentStorage.list();
+    const directStoredTargetAgentIds = storedRecords
+      .filter(
+        (record) =>
+          !record.archivedAt &&
+          ((record.workspaceId && targetWorkspaceIds.includes(record.workspaceId)) ||
+            agentCheckoutIsWithinTarget({ cwd: record.cwd }, targetPaths)),
+      )
+      .map((record) => record.id);
+    const cascadeTarget = await resolveAgentArchiveCascadeTarget(dependencies, [
+      ...directLiveTargetAgentIds,
+      ...directStoredTargetAgentIds,
+    ]);
+    const targetAgentIds = cascadeTarget.targetAgentIds;
+    const authorizedWorkspaceIds = Array.from(
+      new Set([...targetWorkspaceIds, ...cascadeTarget.targetWorkspaceIds]),
+    );
 
     assertDestructiveActionAuthorized(
       {
@@ -554,7 +575,7 @@ async function assertCallerCanArchive(
       {
         action,
         targetAgentIds,
-        targetWorkspaceIds,
+        targetWorkspaceIds: authorizedWorkspaceIds,
         targetPaths,
         hasLiveTarget: targetWorkspaceIds.length > 0 || targetAgentIds.length > 0,
       },
@@ -763,7 +784,7 @@ async function archiveTargetRecords(
     targetWorkspaceIds.map(async (workspaceId) => {
       const agents = await archiveWorkspaceContents(dependencies, workspaceId, recheckCaller);
       await authorizeCaller();
-      await dependencies.archiveWorkspaceRecord(workspaceId);
+      await dependencies.archiveWorkspaceRecord(workspaceId, recheckCaller);
       return { workspaceId, agents };
     }),
   );
@@ -949,6 +970,7 @@ async function runPendingCleanupTeardown(
         teardownCwd,
         repoRootPath: backing.mainRepoRoot ?? undefined,
         signal,
+        recheck: authorizeCaller,
       });
     }
   } catch (error) {
@@ -984,6 +1006,7 @@ async function removePendingCleanupDirectory(
       expectedWorktreeIncarnationId,
       expectedQuarantineMarker,
       signal,
+      recheck: authorizeCaller,
     });
     dependencies.github.invalidate({ cwd: backing.path });
     await clearPendingCleanup(dependencies, pendingCleanupTargets);
@@ -1480,6 +1503,7 @@ export async function killTerminalsForWorkspace(
   await recheck?.();
   await Promise.allSettled(
     terminalIds.map(async (terminalId) => {
+      await recheck?.();
       dependencies.detachTerminalStream?.(terminalId, { emitExit: true });
       await terminalManager.killTerminalAndWait(terminalId, {
         gracefulTimeoutMs: 2000,
@@ -1512,8 +1536,10 @@ export async function archivePersistedWorkspaceRecord(input: {
   workspaceId: string;
   workspaceRegistry: Pick<WorkspaceRegistry, "get" | "archive">;
   archivedAt?: string;
+  recheck?: DestructiveActionRecheck;
 }): Promise<PersistedWorkspaceRecord | null> {
   const existingWorkspace = await input.workspaceRegistry.get(input.workspaceId);
+  await input.recheck?.();
   if (!existingWorkspace) {
     return null;
   }
@@ -1523,7 +1549,9 @@ export async function archivePersistedWorkspaceRecord(input: {
   }
 
   const archivedAt = input.archivedAt ?? new Date().toISOString();
-  await input.workspaceRegistry.archive(input.workspaceId, archivedAt);
+  await input.workspaceRegistry.archive(input.workspaceId, archivedAt, {
+    recheck: input.recheck,
+  });
 
   return existingWorkspace;
 }

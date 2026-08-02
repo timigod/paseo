@@ -14,6 +14,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import pino, { type Logger } from "pino";
 import { afterEach, describe, expect, test, vi } from "vitest";
+import { PARENT_AGENT_ID_LABEL } from "@getpaseo/protocol/agent-labels";
 
 import type { ForgeService } from "../services/forge-service.js";
 import { createRealpathAwarePathMatcher } from "../utils/path.js";
@@ -174,7 +175,13 @@ interface ArchiveDepsInput {
   activeWorkspaces: ActiveWorkspaceRef[];
   paseoWorktreesBaseRoot?: string;
   findWorkspaceIdForCwd?: (cwd: string) => Promise<string | null>;
-  liveAgents?: Array<{ id: string; workspaceId?: string; cwd?: string }>;
+  liveAgents?: Array<{
+    id: string;
+    workspaceId?: string;
+    cwd?: string;
+    labels?: Record<string, string>;
+  }>;
+  storedAgents?: StoredAgentRecord[];
   incarnations?: Record<string, string>;
   checkoutRootForCwd?: (cwd: string) => string | null;
 }
@@ -222,25 +229,34 @@ function createArchiveDeps(input: ArchiveDepsInput): ArchiveTestDependencies {
     } as Pick<WorkspaceGitService, "getSnapshot" | "getCheckout">,
     agentManager: {
       listAgents: () => (input.liveAgents ?? []) as ManagedAgent[],
-      archiveAgent: vi.fn(async (agentId: string) => {
+      getAgent: (agentId: string) =>
+        ((input.liveAgents ?? []).find((agent) => agent.id === agentId) as
+          | ManagedAgent
+          | undefined) ?? null,
+      archiveAgent: vi.fn(async (agentId: string, recheck?: () => void | Promise<void>) => {
+        await recheck?.();
         archivedAgentIds.push(agentId);
         return { archivedAt: new Date().toISOString() };
       }),
-      archiveSnapshot: vi.fn(async (agentId: string, _archivedAt: string) => {
-        archivedSnapshotIds.push(agentId);
-        return {};
-      }),
+      archiveSnapshot: vi.fn(
+        async (agentId: string, _archivedAt: string, recheck?: () => void | Promise<void>) => {
+          await recheck?.();
+          archivedSnapshotIds.push(agentId);
+          return {};
+        },
+      ),
       isCurrentAgentIncarnation: (agentId: string, incarnation: string) =>
         (input.incarnations?.[agentId] ?? `incarnation-${agentId}`) === incarnation &&
         (input.liveAgents ?? []).some((agent) => agent.id === agentId),
     },
     agentStorage: {
-      list: async (): Promise<StoredAgentRecord[]> => [],
+      list: async (): Promise<StoredAgentRecord[]> => input.storedAgents ?? [],
     } as Pick<AgentStorage, "list">,
     findWorkspaceIdForCwd: input.findWorkspaceIdForCwd ?? vi.fn(async () => null),
     listActiveWorkspaces: async () =>
       active.filter((workspace) => !archivedWorkspaceIds.has(workspace.workspaceId)),
-    archiveWorkspaceRecord: async (workspaceId: string) => {
+    archiveWorkspaceRecord: async (workspaceId: string, recheck?: () => void | Promise<void>) => {
+      await recheck?.();
       archivedWorkspaceIds.add(workspaceId);
       const index = active.findIndex((workspace) => workspace.workspaceId === workspaceId);
       if (index !== -1) {
@@ -629,6 +645,70 @@ describe("archiveByScope", () => {
     expect(deps.activeWorkspaces.map((workspace) => workspace.workspaceId)).toEqual([
       callerWorkspaceId,
     ]);
+  });
+
+  test("blocks a cross-workspace child when the target workspace cascades through its parent", async () => {
+    const { tempDir } = createGitRepo();
+    const parentWorkspaceId = "ws-parent";
+    const childWorkspaceId = "ws-child";
+    const parentId = "agent-parent";
+    const childId = "agent-child";
+    const storedAgent = (
+      id: string,
+      workspaceId: string,
+      labels: Record<string, string>,
+    ): StoredAgentRecord => ({
+      id,
+      provider: "codex",
+      cwd: path.join(tempDir, workspaceId),
+      workspaceId,
+      createdAt: "2026-08-02T00:00:00.000Z",
+      updatedAt: "2026-08-02T00:00:00.000Z",
+      labels,
+      lastStatus: "idle",
+      config: null,
+      persistence: null,
+      archivedAt: null,
+    });
+    const deps = createArchiveDeps({
+      paseoHome: path.join(tempDir, ".paseo"),
+      activeWorkspaces: [
+        { workspaceId: parentWorkspaceId, cwd: tempDir, kind: "local_checkout" },
+        {
+          workspaceId: childWorkspaceId,
+          cwd: path.join(tempDir, "child"),
+          kind: "directory",
+        },
+      ],
+      liveAgents: [
+        { id: parentId, workspaceId: parentWorkspaceId, labels: {} },
+        {
+          id: childId,
+          workspaceId: childWorkspaceId,
+          labels: { [PARENT_AGENT_ID_LABEL]: parentId },
+        },
+      ],
+      storedAgents: [
+        storedAgent(parentId, parentWorkspaceId, {}),
+        storedAgent(childId, childWorkspaceId, { [PARENT_AGENT_ID_LABEL]: parentId }),
+      ],
+    });
+    deps.archiveWorkspaceRecord = vi.fn(deps.archiveWorkspaceRecord);
+
+    await expect(
+      archiveByScope(deps, {
+        scope: { kind: "workspace", workspaceId: parentWorkspaceId },
+        requestId: "req-parent-cascade-self-archive",
+        caller: createAgentDestructiveCaller({
+          agentId: childId,
+          incarnation: `incarnation-${childId}`,
+        }),
+      }),
+    ).rejects.toMatchObject({ code: WORKSPACE_ARCHIVE_ERROR_CODES.selfArchiveBlocked });
+
+    expect(deps.markWorkspaceArchiving).not.toHaveBeenCalled();
+    expect(deps.archiveWorkspaceRecord).not.toHaveBeenCalled();
+    expect(deps.archivedAgentIds).toEqual([]);
   });
 
   test("preserves external coordinator archive behavior", async () => {

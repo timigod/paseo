@@ -215,6 +215,7 @@ import {
   createCoordinatorDestructiveCaller,
   createUncertainDestructiveCaller,
   revokeDestructiveCaller,
+  type DestructiveActionRecheck,
   type DestructiveCallerContext,
 } from "./agent/destructive-action-authority.js";
 import { CreateAgentLifecycleDispatch } from "./agent/create-agent-lifecycle-dispatch.js";
@@ -1140,12 +1141,17 @@ export async function createPaseoDaemon(
     paseoHome: config.paseoHome,
     workspaceGitService,
   });
-  const archiveWorkspaceRecordExternal = async (workspaceId: string) => {
+  const archiveWorkspaceRecordExternal = async (
+    workspaceId: string,
+    recheck?: DestructiveActionRecheck,
+  ) => {
     const existingWorkspace = await archivePersistedWorkspaceRecord({
       workspaceId,
       workspaceRegistry,
+      recheck,
     });
     if (!existingWorkspace || existingWorkspace.archivedAt) return;
+    await recheck?.();
     teardownArchivedWorkspaceRuntime(workspaceId);
   };
   // external path→workspace adapter, not ownership: archive-by-path requests that
@@ -1358,10 +1364,11 @@ export async function createPaseoDaemon(
           emitWorkspaceUpdatesForWorkspaceIds: emitWorkspaceUpdatesExternal,
           markWorkspaceArchiving: markWorkspaceArchivingExternal,
           clearWorkspaceArchiving: clearWorkspaceArchivingExternal,
-          killTerminalsForWorkspace: (workspaceIdToKill) =>
+          killTerminalsForWorkspace: (workspaceIdToKill, recheck) =>
             killTerminalsForWorkspace(
               { terminalManager, sessionLogger: logger },
               workspaceIdToKill,
+              recheck,
             ),
           workspaceRegistry,
           sessionLogger: logger,
