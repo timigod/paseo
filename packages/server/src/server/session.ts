@@ -1376,12 +1376,37 @@ export class Session {
   async syncWorkspaceGitObserversForExternalWorkspaceIds(
     workspaceIds: Iterable<string>,
   ): Promise<void> {
+    const subscription = this.workspaceUpdatesSubscription;
+    if (!subscription) {
+      return;
+    }
+    const uniqueWorkspaceIds = Array.from(new Set(workspaceIds));
+    const descriptorsByWorkspaceId = await this.buildWorkspaceDescriptorMap({
+      workspaceIds: uniqueWorkspaceIds,
+      includeGitData: false,
+    });
+    if (this.workspaceUpdatesSubscription !== subscription) {
+      return;
+    }
     await Promise.all(
-      Array.from(new Set(workspaceIds)).map(async (workspaceId) => {
-        const workspace = await this.workspaceRegistry.get(workspaceId);
-        if (workspace && !workspace.archivedAt) {
-          await this.workspaceGitObserver.syncObserverForWorkspace(workspace);
+      uniqueWorkspaceIds.map(async (workspaceId) => {
+        const descriptor = descriptorsByWorkspaceId.get(workspaceId);
+        if (
+          !descriptor ||
+          !this.matchesWorkspaceFilter({ workspace: descriptor, filter: subscription.filter })
+        ) {
+          this.workspaceGitObserver.removeForWorkspaceId(workspaceId);
+          return;
         }
+        const workspace = await this.workspaceRegistry.get(workspaceId);
+        if (this.workspaceUpdatesSubscription !== subscription) {
+          return;
+        }
+        if (!workspace || workspace.archivedAt) {
+          this.workspaceGitObserver.removeForWorkspaceId(workspaceId);
+          return;
+        }
+        await this.workspaceGitObserver.syncObserverForWorkspace(workspace);
       }),
     );
   }

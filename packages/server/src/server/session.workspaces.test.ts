@@ -159,6 +159,7 @@ interface SessionTestAccess {
       subscriptionCount: number;
     };
   };
+  syncWorkspaceGitObserversForExternalWorkspaceIds(workspaceIds: Iterable<string>): Promise<void>;
   interruptAgentIfRunning(agentId: string): unknown;
   reconcileWorkspaceRecord(workspaceId: string): Promise<{
     changed: boolean;
@@ -7127,6 +7128,24 @@ test("external workspace updates emit one deduplicated batch", async () => {
     },
   ]);
   expect(snapshotReads).toEqual({ projects: 1, workspaces: 1 });
+});
+
+test("external reconciliation does not attach Git observers to a passive CLI session", async () => {
+  const registerWorkspace = vi.fn(() => ({ unsubscribe: vi.fn() }));
+  const workspaceGitService = createNoopWorkspaceGitService({ registerWorkspace });
+  const session = asTestSession(createSessionForWorkspaceTests({ workspaceGitService }));
+
+  await session.syncWorkspaceGitObserversForExternalWorkspaceIds([
+    "workspace-passive-cli",
+    "workspace-passive-cli",
+  ]);
+
+  expect(registerWorkspace).not.toHaveBeenCalled();
+  expect(session.workspaceGitObserver.getMetrics()).toEqual({
+    watchedDirectoryCount: 0,
+    workspaceRecordCount: 0,
+    subscriptionCount: 0,
+  });
 });
 
 test("fetch_workspaces_response reads runtime fields from passive workspace git service snapshots", async () => {
