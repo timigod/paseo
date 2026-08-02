@@ -130,15 +130,14 @@ export async function runFleetRunCommand(
   command: Command,
 ): Promise<SingleResult<FleetRunResult>> {
   const config = loadFleetConfig();
-  const pinnedHost = requireFleetHost(options.host, config.hosts);
   const idempotencyKey = options.idempotencyKey?.trim() || null;
   const callerId = idempotencyKey ? await getOrCreateCliClientId() : null;
   const existingAffinity =
     idempotencyKey && callerId ? await loadFleetAffinity({ callerId, idempotencyKey }) : null;
-  if (existingAffinity && pinnedHost && pinnedHost.id !== existingAffinity.host.id) {
+  if (existingAffinity && options.host && !findFleetHost(options.host, [existingAffinity.host])) {
     throw {
       code: "FLEET_KEY_HOST_CONFLICT",
-      message: `Idempotency key is owned by ${existingAffinity.host.id}, not pinned host ${pinnedHost.id}`,
+      message: `Idempotency key is owned by ${existingAffinity.host.id}, not pinned host ${options.host}`,
     } satisfies CommandError;
   }
   if (existingAffinity && idempotencyKey) {
@@ -162,6 +161,7 @@ export async function runFleetRunCommand(
     });
   }
 
+  const pinnedHost = requireFleetHost(options.host, config.hosts);
   const prompt = await resolveFleetRunPrompt(positionalPrompt, options);
   const workspaceId = options.workspace ?? process.env.PASEO_WORKSPACE_ID;
   const cwd = options.cwd ?? process.cwd();

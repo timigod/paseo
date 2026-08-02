@@ -81,7 +81,7 @@ function readyFleetStatuses(config: { hosts: unknown[] }) {
 }
 
 describe("fleet run retry affinity", () => {
-  it("uses the current endpoint while preserving the original resolved create intent", async () => {
+  it("accepts the original endpoint selector after drift and preserves the resolved intent", async () => {
     const directory = await mkdtemp(path.join(tmpdir(), "paseo-fleet-run-retry-"));
     directories.push(directory);
     const configPath = path.join(directory, "fleet.json");
@@ -130,17 +130,15 @@ describe("fleet run retry affinity", () => {
       },
       schema: { idField: "agentId", columns: [] },
     });
+    const runOptions = {
+      idempotencyKey: "create-1",
+      background: true,
+      cwd: "/srv/code/project",
+      newWorkspace: "worktree" as const,
+      host: "builder-a.internal:6767",
+    };
 
-    await runFleetRunCommand(
-      undefined,
-      {
-        idempotencyKey: "create-1",
-        background: true,
-        cwd: "/srv/code/project",
-        newWorkspace: "worktree",
-      },
-      {} as Parameters<typeof runFleetRunCommand>[2],
-    );
+    await runFleetRunCommand(undefined, runOptions, {} as Parameters<typeof runFleetRunCommand>[2]);
     await writeFleetConfig(configPath, "builder-a.internal:7777", "gpt-new-default");
     mocks.resolveFleetRunPrompt.mockResolvedValue("changed prompt");
     mocks.resolveFleetProviderModelOptions.mockReturnValue({
@@ -151,11 +149,7 @@ describe("fleet run retry affinity", () => {
     });
     mocks.resolveFleetWorktreeBase.mockReturnValue("b".repeat(40));
 
-    await runFleetRunCommand(
-      undefined,
-      { idempotencyKey: "create-1", background: true },
-      {} as Parameters<typeof runFleetRunCommand>[2],
-    );
+    await runFleetRunCommand(undefined, runOptions, {} as Parameters<typeof runFleetRunCommand>[2]);
 
     expect(mocks.resolveFleetRunPrompt).toHaveBeenCalledOnce();
     expect(mocks.resolveFleetProviderModelOptions).toHaveBeenCalledOnce();
