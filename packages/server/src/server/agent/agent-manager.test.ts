@@ -4253,6 +4253,79 @@ test("a force admitted while a skipped hydration is releasing still performs one
   }
 });
 
+test("a broadcast admitted after publish handoff replays the snapshot without a provider read", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-history-late-broadcast-"));
+  const agentId = "00000000-0000-4000-8000-000000000195";
+  const releaseEntered = deferred<void>();
+  const allowRelease = deferred<void>();
+  let historyReads = 0;
+  class LateBroadcastSession extends TestAgentSession {
+    override async *streamHistory(): AsyncGenerator<AgentStreamEvent> {
+      historyReads += 1;
+      yield* [];
+    }
+  }
+  class LateBroadcastClient extends TestAgentClient {
+    override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+      return new LateBroadcastSession(config);
+    }
+  }
+  const manager = new AgentManager({
+    clients: { codex: new LateBroadcastClient() },
+    logger,
+    idFactory: () => agentId,
+  });
+  type ReleaseHistoryHydration = (
+    id: string,
+    token: symbol,
+    shouldRetire?: () => boolean,
+  ) => Promise<boolean>;
+  const releaseOwner = manager as unknown as {
+    releaseHistoryHydration: ReleaseHistoryHydration;
+  };
+  const originalRelease = releaseOwner.releaseHistoryHydration.bind(manager);
+  const releaseSpy = vi
+    .spyOn(releaseOwner, "releaseHistoryHydration")
+    .mockImplementation(async (...args) => {
+      releaseEntered.resolve();
+      await allowRelease.promise;
+      return await originalRelease(...args);
+    });
+  const events: AgentManagerEvent[] = [];
+  try {
+    await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+    await manager.appendTimelineItem(agentId, {
+      type: "assistant_message",
+      text: "snapshot for late broadcast",
+    });
+    manager.subscribe((event) => events.push(event), { agentId, replayState: false });
+
+    const quietHydration = manager.hydrateTimelineFromProvider(agentId);
+    await releaseEntered.promise;
+    const lateBroadcast = manager.hydrateTimelineFromProvider(agentId, { broadcast: true });
+    allowRelease.resolve();
+    await Promise.all([quietHydration, lateBroadcast]);
+
+    expect(historyReads).toBe(0);
+    expect(
+      events.filter(
+        (event) =>
+          event.type === "agent_stream" &&
+          event.event.type === "timeline" &&
+          event.event.item.type === "assistant_message" &&
+          event.event.item.text === "snapshot for late broadcast",
+      ),
+    ).toHaveLength(1);
+  } finally {
+    allowRelease.resolve();
+    releaseSpy.mockRestore();
+    await manager.closeAgent(agentId).catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
 test("provider history consumes ordered live timeline and child overlap exactly once", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-history-overlap-"));
   const agentId = "00000000-0000-4000-8000-000000000183";
@@ -4326,6 +4399,85 @@ test("provider history consumes ordered live timeline and child overlap exactly 
           event.event.subagent.id === "overlap-child",
       ),
     ).toHaveLength(1);
+  } finally {
+    releaseHistory.resolve();
+    await manager.closeAgent(agentId).catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("overlap dedupe preserves user state and completed-shell workspace effects exactly once", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-history-overlap-effects-"));
+  const agentId = "00000000-0000-4000-8000-000000000196";
+  const historyStarted = deferred<void>();
+  const releaseHistory = deferred<void>();
+  const userItem = { type: "user_message", text: "overlapping user input" } as const;
+  const shellItem = {
+    type: "tool_call",
+    callId: "overlap-shell",
+    name: "bash",
+    status: "completed",
+    detail: { type: "shell", command: "gh pr merge 123 --squash" },
+    error: null,
+  } as const;
+  let session: TestAgentSession | null = null;
+  const onWorkspaceStateMayHaveChanged = vi.fn();
+  class OverlapEffectsSession extends TestAgentSession {
+    override async *streamHistory(): AsyncGenerator<AgentStreamEvent> {
+      historyStarted.resolve();
+      await releaseHistory.promise;
+      yield { type: "timeline", provider: "codex", item: userItem };
+      yield { type: "timeline", provider: "codex", item: shellItem };
+    }
+  }
+  class OverlapEffectsClient extends TestAgentClient {
+    override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+      session = new OverlapEffectsSession(config);
+      return session;
+    }
+  }
+  const agentStorage = new AgentStorage(join(workdir, "agents"), logger);
+  const durableTimelineStore = new FileAgentTimelineStore(join(workdir, "timelines"), logger);
+  const manager = new AgentManager({
+    clients: { codex: new OverlapEffectsClient() },
+    registry: agentStorage,
+    durableTimelineStore,
+    logger,
+    idFactory: () => agentId,
+    onWorkspaceStateMayHaveChanged,
+  });
+  const events: AgentManagerEvent[] = [];
+  manager.subscribe((event) => events.push(event), { agentId, replayState: false });
+  try {
+    await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+    const hydration = manager.hydrateTimelineFromProvider(agentId, {
+      force: true,
+      broadcast: true,
+    });
+    await historyStarted.promise;
+    session?.pushEvent({ type: "timeline", provider: "codex", item: userItem });
+    session?.pushEvent({ type: "timeline", provider: "codex", item: shellItem });
+    releaseHistory.resolve();
+    await hydration;
+    await manager.flush();
+
+    expect(manager.getTimeline(agentId)).toEqual([userItem, shellItem]);
+    await expect(durableTimelineStore.getCommittedRows(agentId)).resolves.toHaveLength(2);
+    expect((await agentStorage.get(agentId))?.lastUserMessageAt).toBeTruthy();
+    expect(onWorkspaceStateMayHaveChanged).toHaveBeenCalledTimes(1);
+    expect(onWorkspaceStateMayHaveChanged).toHaveBeenCalledWith({ cwd: workdir });
+    for (const item of [userItem, shellItem]) {
+      expect(
+        events.filter(
+          (event) =>
+            event.type === "agent_stream" &&
+            event.event.type === "timeline" &&
+            event.event.item.type === item.type,
+        ),
+      ).toHaveLength(1);
+    }
   } finally {
     releaseHistory.resolve();
     await manager.closeAgent(agentId).catch(() => undefined);
@@ -4686,26 +4838,50 @@ test("reload cancels and joins old-incarnation history and ignores old session e
   }
 });
 
-test("a failed durable append is never visible and restart cannot skip or duplicate it", async () => {
+test("write-ahead unprimed state survives a process-death append boundary and forces recovery", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-live-write-recovery-"));
   const agentId = "00000000-0000-4000-8000-000000000187";
   const storagePath = join(workdir, "agents");
   const timelinePath = join(workdir, "timelines");
   const storage = new AgentStorage(storagePath, logger);
-  let rejectWrites = false;
+  const writeStarted = deferred<void>();
+  const abortWrite = deferred<void>();
+  let simulateProcessDeath = false;
   const durableTimelineStore = new FileAgentTimelineStore(timelinePath, logger, {
     writeJson: async (filePath, value) => {
-      if (rejectWrites) throw new Error("injected durable append failure");
+      if (simulateProcessDeath) {
+        writeStarted.resolve();
+        await abortWrite.promise;
+        throw new Error("simulated process death before atomic timeline rename");
+      }
       await writeJsonFileAtomic(filePath, value);
     },
   });
 
+  class DurableFirstSession extends TestAgentSession {
+    override async *streamHistory(): AsyncGenerator<AgentStreamEvent> {
+      yield {
+        type: "timeline",
+        provider: "codex",
+        item: { type: "assistant_message", text: "baseline durable truth" },
+      };
+      yield {
+        type: "timeline",
+        provider: "codex",
+        item: { type: "assistant_message", text: "provider event recovered after crash" },
+      };
+    }
+  }
   class DurableFirstClient extends TestAgentClient {
+    override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+      return new DurableFirstSession(config);
+    }
+
     override async resumeSession(
       _handle: AgentPersistenceHandle,
       config?: Partial<AgentSessionConfig>,
     ): Promise<AgentSession> {
-      return new TestAgentSession({ provider: "codex", cwd: config?.cwd ?? workdir });
+      return new DurableFirstSession({ provider: "codex", cwd: config?.cwd ?? workdir });
     }
   }
   const manager = new AgentManager({
@@ -4726,24 +4902,22 @@ test("a failed durable append is never visible and restart cannot skip or duplic
     await manager.flush();
     expect((await storage.get(agentId))?.historyPrimed).toBe(true);
 
-    rejectWrites = true;
-    await expect(
-      manager.appendTimelineItem(agentId, {
+    simulateProcessDeath = true;
+    const interruptedAppend = manager
+      .appendTimelineItem(agentId, {
         type: "assistant_message",
-        text: "live row whose durable write fails",
-      }),
-    ).rejects.toThrow("injected durable append failure");
-    await manager.flush();
+        text: "provider event recovered after crash",
+      })
+      .catch((error: unknown) => error);
+    await writeStarted.promise;
     expect(manager.getTimeline(agentId)).toEqual([
       { type: "assistant_message", text: "baseline durable truth" },
     ]);
-    expect((await storage.get(agentId))?.historyPrimed).toBe(true);
-    await expect(durableTimelineStore.getCommittedRows(agentId)).resolves.toMatchObject([
-      { seq: 1, item: { text: "baseline durable truth" } },
-    ]);
+    expect((await storage.get(agentId))?.historyPrimed).toBe(false);
+    await expect(
+      new FileAgentTimelineStore(timelinePath, logger).getCommittedRows(agentId),
+    ).resolves.toMatchObject([{ seq: 1, item: { text: "baseline durable truth" } }]);
 
-    rejectWrites = false;
-    await manager.closeAgent(agentId);
     const restartedStorage = new AgentStorage(storagePath, logger);
     const restartedTimelineStore = new FileAgentTimelineStore(timelinePath, logger);
     const restartedManager = new AgentManager({
@@ -4754,39 +4928,31 @@ test("a failed durable append is never visible and restart cannot skip or duplic
       idFactory: () => agentId,
     });
     try {
-      const persisted = await restartedStorage.get(agentId);
-      expect(persisted?.historyPrimed).toBe(true);
-      expect(persisted?.persistence).toBeTruthy();
-      await restartedManager.resumeAgentFromPersistence(
-        persisted!.persistence!,
-        { provider: "codex", cwd: workdir },
-        agentId,
-        {
-          createdAt: new Date(persisted!.createdAt),
-          updatedAt: new Date(persisted!.updatedAt),
-          historyPrimed: persisted!.historyPrimed,
-        },
-      );
-      await restartedManager.appendTimelineItem(agentId, {
-        type: "assistant_message",
-        text: "post-restart durable row",
+      await ensureAgentLoaded(agentId, {
+        agentManager: restartedManager,
+        agentStorage: restartedStorage,
+        logger,
       });
       await restartedManager.flush();
       expect(restartedManager.getTimeline(agentId)).toEqual([
         { type: "assistant_message", text: "baseline durable truth" },
-        { type: "assistant_message", text: "post-restart durable row" },
+        { type: "assistant_message", text: "provider event recovered after crash" },
       ]);
       expect(restartedManager.getAgent(agentId)?.historyPrimed).toBe(true);
       expect((await restartedStorage.get(agentId))?.historyPrimed).toBe(true);
       await expect(restartedTimelineStore.getCommittedRows(agentId)).resolves.toMatchObject([
         { seq: 1, item: { text: "baseline durable truth" } },
-        { seq: 2, item: { text: "post-restart durable row" } },
+        { seq: 2, item: { text: "provider event recovered after crash" } },
       ]);
+
+      abortWrite.resolve();
+      await expect(interruptedAppend).resolves.toBeInstanceOf(Error);
     } finally {
       await restartedManager.closeAgent(agentId).catch(() => undefined);
     }
   } finally {
-    rejectWrites = false;
+    simulateProcessDeath = false;
+    abortWrite.resolve();
     await manager.closeAgent(agentId).catch(() => undefined);
     rmSync(workdir, { recursive: true, force: true });
   }
