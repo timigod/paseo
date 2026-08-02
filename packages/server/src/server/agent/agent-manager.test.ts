@@ -4455,9 +4455,11 @@ test("reload cancels and joins old-incarnation history and ignores old session e
 test("a failed live durable write persists unprimed state and a full replacement clears it", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-live-write-recovery-"));
   const agentId = "00000000-0000-4000-8000-000000000187";
-  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const storagePath = join(workdir, "agents");
+  const timelinePath = join(workdir, "timelines");
+  const storage = new AgentStorage(storagePath, logger);
   let rejectWrites = false;
-  const durableTimelineStore = new FileAgentTimelineStore(join(workdir, "timelines"), logger, {
+  const durableTimelineStore = new FileAgentTimelineStore(timelinePath, logger, {
     writeJson: async (filePath, value) => {
       if (rejectWrites) throw new Error("injected durable append failure");
       await writeJsonFileAtomic(filePath, value);
@@ -4476,6 +4478,13 @@ test("a failed live durable write persists unprimed state and a full replacement
   class RecoveryHistoryClient extends TestAgentClient {
     override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
       return new RecoveryHistorySession(config);
+    }
+
+    override async resumeSession(
+      _handle: AgentPersistenceHandle,
+      config?: Partial<AgentSessionConfig>,
+    ): Promise<AgentSession> {
+      return new RecoveryHistorySession({ provider: "codex", cwd: config?.cwd ?? workdir });
     }
   }
   const manager = new AgentManager({
@@ -4500,15 +4509,64 @@ test("a failed live durable write persists unprimed state and a full replacement
     expect((await storage.get(agentId))?.historyPrimed).toBe(false);
 
     rejectWrites = false;
-    await manager.hydrateTimelineFromProvider(agentId, { force: true });
+    await manager.appendTimelineItem(agentId, {
+      type: "assistant_message",
+      text: "later live row whose durable write succeeds",
+    });
     await manager.flush();
-    expect(manager.getTimeline(agentId)).toEqual([
-      { type: "assistant_message", text: "recovered complete provider history" },
-    ]);
-    expect((await storage.get(agentId))?.historyPrimed).toBe(true);
+    expect((await storage.get(agentId))?.historyPrimed).toBe(false);
     await expect(durableTimelineStore.getCommittedRows(agentId)).resolves.toMatchObject([
-      { seq: 1, item: { text: "recovered complete provider history" } },
+      { seq: 2, item: { text: "later live row whose durable write succeeds" } },
     ]);
+
+    await manager.closeAgent(agentId);
+    const restartedStorage = new AgentStorage(storagePath, logger);
+    const restartedTimelineStore = new FileAgentTimelineStore(timelinePath, logger);
+    const restartedManager = new AgentManager({
+      clients: { codex: new RecoveryHistoryClient() },
+      registry: restartedStorage,
+      durableTimelineStore: restartedTimelineStore,
+      logger,
+      idFactory: () => agentId,
+    });
+    try {
+      const persisted = await restartedStorage.get(agentId);
+      expect(persisted?.historyPrimed).toBe(false);
+      expect(persisted?.persistence).toBeTruthy();
+      await restartedManager.resumeAgentFromPersistence(
+        persisted!.persistence!,
+        { provider: "codex", cwd: workdir },
+        agentId,
+        {
+          createdAt: new Date(persisted!.createdAt),
+          updatedAt: new Date(persisted!.updatedAt),
+          historyPrimed: persisted!.historyPrimed,
+        },
+      );
+      await restartedManager.appendTimelineItem(agentId, {
+        type: "assistant_message",
+        text: "post-restart incremental row",
+      });
+      await restartedManager.flush();
+      expect(restartedManager.getAgent(agentId)?.historyPrimed).toBe(false);
+      expect((await restartedStorage.get(agentId))?.historyPrimed).toBe(false);
+      await expect(restartedTimelineStore.getCommittedRows(agentId)).resolves.toMatchObject([
+        { seq: 2, item: { text: "later live row whose durable write succeeds" } },
+        { seq: 3, item: { text: "post-restart incremental row" } },
+      ]);
+
+      await restartedManager.hydrateTimelineFromProvider(agentId, { force: true });
+      await restartedManager.flush();
+      expect(restartedManager.getTimeline(agentId)).toEqual([
+        { type: "assistant_message", text: "recovered complete provider history" },
+      ]);
+      expect((await restartedStorage.get(agentId))?.historyPrimed).toBe(true);
+      await expect(restartedTimelineStore.getCommittedRows(agentId)).resolves.toMatchObject([
+        { seq: 1, item: { text: "recovered complete provider history" } },
+      ]);
+    } finally {
+      await restartedManager.closeAgent(agentId).catch(() => undefined);
+    }
   } finally {
     rejectWrites = false;
     await manager.closeAgent(agentId).catch(() => undefined);

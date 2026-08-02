@@ -695,7 +695,7 @@ export class AgentManager {
   private readonly coalescerHistoryHydrationTokens = new Map<string, symbol>();
   private readonly durableTimelineWriteTails = new Map<string, Promise<void>>();
   private readonly durableTimelineWriteVersions = new Map<string, number>();
-  private readonly durableTimelineWriteFailures = new Map<string, unknown>();
+  private readonly incompleteDurableTimelineHistories = new Set<string>();
   private readonly durableTimelinePrimingTasks = new Map<string, Promise<void>>();
   private readonly coalescedTimelineWriteTails = new Map<string, Promise<void>>();
   private readonly runs = new AgentRunState();
@@ -1552,6 +1552,7 @@ export class AgentManager {
       labels?: Record<string, string>;
       workspaceId?: string;
       owner?: AgentOwner;
+      historyPrimed?: boolean;
       autoArchiveObligation?: AutoArchiveObligation;
       resumeRunning?: boolean;
     },
@@ -1583,6 +1584,7 @@ export class AgentManager {
       labels?: Record<string, string>;
       workspaceId?: string;
       owner?: AgentOwner;
+      historyPrimed?: boolean;
       autoArchiveObligation?: AutoArchiveObligation;
       resumeRunning?: boolean;
     },
@@ -3589,6 +3591,9 @@ export class AgentManager {
         durableTimelineHasRows,
         options,
       });
+      if (previousStoredRecord?.historyPrimed === false) {
+        this.incompleteDurableTimelineHistories.add(resolvedAgentId);
+      }
 
       this.assertAcceptingAgentRegistrations();
       this.agents.set(resolvedAgentId, managed);
@@ -3885,7 +3890,7 @@ export class AgentManager {
       this.dispatch({ type: "provider_subagent", event });
     }
     this.durableTimelineWriteVersions.delete(agentId);
-    this.durableTimelineWriteFailures.delete(agentId);
+    this.incompleteDurableTimelineHistories.delete(agentId);
     this.durableTimelinePrimingTasks.delete(agentId);
   }
 
@@ -4394,6 +4399,7 @@ export class AgentManager {
 
   private async markHistoryHydrationUnprimed(agent: ActiveManagedAgent): Promise<void> {
     if (this.agents.get(agent.id) !== agent) return;
+    this.incompleteDurableTimelineHistories.add(agent.id);
     agent.historyPrimed = false;
     await this.persistSnapshot(agent);
   }
@@ -5327,9 +5333,8 @@ export class AgentManager {
     this.durableTimelineWriteVersions.set(agentId, version);
     try {
       await this.commitDurableTimelineAppend(agentId, row);
-      this.durableTimelineWriteFailures.delete(agentId);
     } catch (error) {
-      this.durableTimelineWriteFailures.set(agentId, error);
+      this.incompleteDurableTimelineHistories.add(agentId);
       if (agent && this.agents.get(agentId) === agent) {
         agent.historyPrimed = false;
         try {
@@ -5350,6 +5355,7 @@ export class AgentManager {
       agent &&
       this.agents.get(agentId) === agent &&
       this.durableTimelineWriteVersions.get(agentId) === version &&
+      !this.incompleteDurableTimelineHistories.has(agentId) &&
       !this.activeHistoryHydrations.has(agentId)
     ) {
       agent.historyPrimed = true;
@@ -5457,7 +5463,7 @@ export class AgentManager {
     await this.queueDurableTimelineWrite(agentId, async () => {
       await store.bulkInsert(agentId, rows);
     });
-    this.durableTimelineWriteFailures.delete(agentId);
+    this.incompleteDurableTimelineHistories.delete(agentId);
   }
 
   private async replaceCommittedTimeline(
@@ -5469,7 +5475,7 @@ export class AgentManager {
     const result = await this.queueDurableTimelineWrite(agentId, async () =>
       store.replaceCommitted(agentId, rows),
     );
-    this.durableTimelineWriteFailures.delete(agentId);
+    this.incompleteDurableTimelineHistories.delete(agentId);
     return result.epoch;
   }
 
