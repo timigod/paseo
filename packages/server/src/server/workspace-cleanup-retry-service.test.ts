@@ -246,3 +246,32 @@ test("shutdown joins canceled cleanup through process closure and releases once"
   expect(abortCount).toBe(1);
   expect(releaseSubscription).toHaveBeenCalledOnce();
 });
+
+test("shutdown aborts and joins a cleanup that would otherwise never settle", async () => {
+  vi.useFakeTimers();
+  const retryWorktreeCleanup = vi.fn((_target, signal: AbortSignal) => {
+    return new Promise<void>((_resolve, reject) => {
+      signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+    });
+  });
+  const service = new WorkspaceCleanupRetryService({
+    workspaceRegistry: {
+      list: async () => [
+        pendingWorkspace({
+          workspaceId: "ws-permanent-hang",
+          directoryPath: "/worktrees/permanent-hang",
+          incarnationId: "inc-permanent-hang",
+        }),
+      ],
+      subscribeToMutations: () => () => undefined,
+    },
+    retryWorktreeCleanup,
+    logger: createTestLogger(),
+  });
+
+  await service.start();
+  await vi.advanceTimersToNextTimerAsync();
+  expect(retryWorktreeCleanup).toHaveBeenCalledOnce();
+
+  await expect(service.stop()).resolves.toBeUndefined();
+});

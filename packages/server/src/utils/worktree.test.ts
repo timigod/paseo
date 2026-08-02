@@ -3,6 +3,7 @@ import {
   createWorktree as createWorktreePrimitive,
   deriveWorktreeProjectHash,
   deletePaseoWorktree,
+  findNestedLinuxMountPoints,
   getWorktreeCleanupFindArguments,
   getWorktreeCleanupTraversalContract,
   getPaseoWorktreeCleanupMarkerPath,
@@ -250,8 +251,30 @@ describe("paseo worktree manager", () => {
     );
   });
 
-  it("uses the device-checking native traversal on Windows", () => {
-    expect(getWorktreeCleanupTraversalContract("win32")).toEqual({ kind: "windows-native" });
+  it("detects same-device Linux bind mounts from mount identity", () => {
+    const mountInfo = [
+      "25 1 8:1 / / rw,relatime - ext4 /dev/disk rw",
+      "26 25 8:1 /protected /worktrees/project/quarantine/nested rw,relatime - ext4 /dev/disk rw",
+      "27 25 8:1 /other /worktrees/project/sibling rw,relatime - ext4 /dev/disk rw",
+      "28 25 8:1 /other /unrelated/prefix/is/not/quarantine/nested rw,relatime - ext4 /dev/disk rw",
+    ].join("\n");
+
+    expect(findNestedLinuxMountPoints(mountInfo, "/worktrees/project/quarantine")).toEqual([
+      "/worktrees/project/quarantine/nested",
+    ]);
+  });
+
+  it("decodes escaped Linux mount paths before checking the cleanup boundary", () => {
+    const mountInfo =
+      "26 25 8:1 /protected /worktrees/project/cleanup\\040target/nested\\134mount rw - ext4 /dev/disk rw";
+
+    expect(findNestedLinuxMountPoints(mountInfo, "/worktrees/project/cleanup target")).toEqual([
+      "/worktrees/project/cleanup target/nested\\mount",
+    ]);
+  });
+
+  it("fails closed before recursive traversal on Windows", () => {
+    expect(getWorktreeCleanupTraversalContract("win32")).toEqual({ kind: "windows-unsupported" });
     expect(() =>
       getWorktreeCleanupFindArguments("win32", ".active-marker", ".completed-marker"),
     ).toThrow("POSIX cleanup traversal is unavailable on win32");

@@ -23,6 +23,7 @@ import {
   getPaseoWorktreeCleanupCompletedMarkerPath,
   getPaseoWorktreeCleanupMarkerPath,
   getPaseoWorktreeCleanupQuarantinePath,
+  getPaseoWorktreeCleanupReceiptPath,
   type WorktreeConfig,
 } from "../utils/worktree.js";
 import { readPaseoWorktreeIncarnationId } from "../utils/worktree-metadata.js";
@@ -1303,7 +1304,7 @@ describe("archiveByScope", () => {
         expect((await registry.get("ws-completed-schedule-root"))?.cleanupPending).toBeNull();
         expect((await registry.get("ws-completed-schedule-nested"))?.cleanupPending).toBeNull();
       },
-      { timeout: 10_000 },
+      { timeout: 3_000 },
     );
     await service.stop();
 
@@ -1422,7 +1423,12 @@ describe("archiveByScope", () => {
       }),
     ).rejects.toThrow("Worktree cleanup remains");
     expect(
-      existsSync(getPaseoWorktreeCleanupCompletedMarkerPath(quarantinePath, quarantineMarker)),
+      existsSync(
+        getPaseoWorktreeCleanupCompletedMarkerPath(
+          getPaseoWorktreeCleanupReceiptPath(quarantinePath, incarnationId, quarantineMarker),
+          quarantineMarker,
+        ),
+      ),
     ).toBe(true);
     execFileSync("git", ["worktree", "prune", "--expire=now"], { cwd: repoDir, stdio: "pipe" });
     execFileSync("git", ["branch", "-D", slug], { cwd: repoDir, stdio: "pipe" });
@@ -1496,10 +1502,12 @@ describe("archiveByScope", () => {
     });
 
     expect(result.removedDirectory).toBe(true);
-    expect(existsSync(quarantinePath)).toBe(true);
+    expect(existsSync(quarantinePath)).toBe(false);
     expect(
-      existsSync(getPaseoWorktreeCleanupCompletedMarkerPath(quarantinePath, quarantineMarker)),
-    ).toBe(true);
+      existsSync(
+        getPaseoWorktreeCleanupReceiptPath(quarantinePath, incarnationId, quarantineMarker),
+      ),
+    ).toBe(false);
     expect(existsSync(replacement.worktreePath)).toBe(true);
     expect((await registry.get(staleWorkspaceId))?.cleanupPending).toBeNull();
     expect((await registry.get(replacementWorkspaceId))?.archivedAt).toBeNull();
@@ -1561,10 +1569,12 @@ describe("archiveByScope", () => {
     });
 
     expect(result.removedDirectory).toBe(true);
-    expect(existsSync(quarantinePath)).toBe(true);
+    expect(existsSync(quarantinePath)).toBe(false);
     expect(
-      existsSync(getPaseoWorktreeCleanupCompletedMarkerPath(quarantinePath, quarantineMarker)),
-    ).toBe(true);
+      existsSync(
+        getPaseoWorktreeCleanupReceiptPath(quarantinePath, incarnationId, quarantineMarker),
+      ),
+    ).toBe(false);
     expect((await registry.get(workspaceId))?.cleanupPending).toBeNull();
   });
 

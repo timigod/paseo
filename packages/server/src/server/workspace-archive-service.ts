@@ -10,10 +10,12 @@ import type { WorkspaceGitService } from "./workspace-git-service.js";
 import type { ForgeService } from "../services/forge-service.js";
 import {
   deletePaseoWorktree,
+  findPaseoWorktreeCleanupRecoveryPath,
   getPaseoWorktreeCleanupQuarantinePath,
   getPaseoWorktreesRoot,
   hasPaseoWorktreeCleanupQuarantine,
   isPaseoWorktreeCleanupQuarantinePath,
+  isPaseoWorktreeCleanupReceiptPath,
   isPaseoOwnedWorktreeCwd,
   mapWorkspaceCwdToWorktree,
   runWorktreeTeardownCommands,
@@ -666,23 +668,25 @@ async function maybeRemoveDirectoryExclusive(
     return false;
   }
 
-  const authenticatedQuarantinePath = await findAuthenticatedCleanupQuarantine(
+  const authenticatedRecoveryPath = await findAuthenticatedCleanupRecoveryPath(
     backing,
     pendingCleanupTargets,
   );
-  if (authenticatedQuarantinePath && authenticatedQuarantinePath !== backing.path) {
+  if (authenticatedRecoveryPath && authenticatedRecoveryPath !== backing.path) {
     const authority = pendingCleanupTargets[0]!;
     await updatePendingCleanupAfterRelocation(dependencies, pendingCleanupTargets, {
-      remainingPath: authenticatedQuarantinePath,
+      remainingPath: authenticatedRecoveryPath,
       worktreeIncarnationId: authority.worktreeIncarnationId!,
       quarantineMarker: authority.quarantineMarker ?? undefined,
     });
-    backing.path = authenticatedQuarantinePath;
+    backing.path = authenticatedRecoveryPath;
   }
-  const cleanupAlreadyQuarantined = isPaseoWorktreeCleanupQuarantinePath(
-    backing.path,
-    pendingCleanupTargets[0]?.worktreeIncarnationId ?? "",
-  );
+  const cleanupAlreadyQuarantined =
+    isPaseoWorktreeCleanupReceiptPath(backing.path) ||
+    isPaseoWorktreeCleanupQuarantinePath(
+      backing.path,
+      pendingCleanupTargets[0]?.worktreeIncarnationId ?? "",
+    );
 
   const initialIncarnationState = await compareCleanupIncarnation(
     dependencies,
@@ -856,12 +860,19 @@ async function compareCleanupIncarnation(
     return "unverifiable";
   }
   const expectedMarker = [...expectedMarkers][0]!;
-  const requestedQuarantine = isPaseoWorktreeCleanupQuarantinePath(
-    backing.path,
-    expectedIncarnation,
-  );
-  if (requestedQuarantine) {
-    if (!(await pathEntryExists(backing.path))) return "missing";
+  const requestedRecovery =
+    isPaseoWorktreeCleanupReceiptPath(backing.path) ||
+    isPaseoWorktreeCleanupQuarantinePath(backing.path, expectedIncarnation);
+  if (requestedRecovery) {
+    if (!(await pathEntryExists(backing.path))) {
+      return (await compareAuthenticatedQuarantine(
+        backing.path,
+        expectedIncarnation,
+        expectedMarker,
+      )) === "match"
+        ? "match"
+        : "missing";
+    }
     return compareAuthenticatedQuarantine(backing.path, expectedIncarnation, expectedMarker);
   }
   const quarantinePath = getPaseoWorktreeCleanupQuarantinePath(backing.path, expectedIncarnation);
@@ -920,7 +931,7 @@ async function pathEntryExists(entryPath: string): Promise<boolean> {
   }
 }
 
-async function findAuthenticatedCleanupQuarantine(
+async function findAuthenticatedCleanupRecoveryPath(
   backing: BackingDirectory,
   pendingCleanupTargets: PendingCleanupTarget[],
 ): Promise<string | null> {
@@ -940,16 +951,11 @@ async function findAuthenticatedCleanupQuarantine(
   }
   const worktreeIncarnationId = [...expectedIncarnations][0]!;
   const quarantineMarker = [...expectedMarkers][0]!;
-  const quarantinePath = isPaseoWorktreeCleanupQuarantinePath(backing.path, worktreeIncarnationId)
-    ? backing.path
-    : getPaseoWorktreeCleanupQuarantinePath(backing.path, worktreeIncarnationId);
-  return (await hasPaseoWorktreeCleanupQuarantine(
-    quarantinePath,
+  return findPaseoWorktreeCleanupRecoveryPath(
+    backing.path,
     worktreeIncarnationId,
     quarantineMarker,
-  ))
-    ? quarantinePath
-    : null;
+  );
 }
 
 interface PendingCleanupTarget extends PersistedWorkspaceCleanupPending {
