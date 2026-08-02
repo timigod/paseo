@@ -3246,17 +3246,17 @@ async function handleFailedMerge(input: HandleFailedMergeInput): Promise<never> 
 
   const conflictDetected =
     diagnostics.conflictFiles.length > 0 || /CONFLICT|Automatic merge failed/i.test(errorDetails);
+  if (cleanupErrors.length > 0) {
+    throw new MergeCleanupError({
+      baseRef,
+      currentBranch,
+      conflictFiles: diagnostics.conflictFiles,
+      diagnosticErrors: diagnostics.errors,
+      cleanupErrors,
+      operationErrors: [error],
+    });
+  }
   if (conflictDetected) {
-    if (cleanupErrors.length > 0) {
-      throw new MergeCleanupError({
-        baseRef,
-        currentBranch,
-        conflictFiles: diagnostics.conflictFiles,
-        diagnosticErrors: diagnostics.errors,
-        cleanupErrors,
-        operationErrors: [error],
-      });
-    }
     if (direction === "to-base") {
       throw new MergeConflictError({
         baseRef,
@@ -3275,7 +3275,7 @@ async function handleFailedMerge(input: HandleFailedMergeInput): Promise<never> 
     });
   }
 
-  const relatedErrors = [...diagnostics.errors, ...cleanupErrors];
+  const relatedErrors = diagnostics.errors;
   if (relatedErrors.length > 0) {
     throw new AggregateError(
       [error, ...relatedErrors],
@@ -3286,7 +3286,15 @@ async function handleFailedMerge(input: HandleFailedMergeInput): Promise<never> 
   throw error;
 }
 
-function appendMergeCleanupError(primary: unknown, cleanupError: unknown): unknown {
+interface AppendMergeCleanupErrorInput {
+  primary: unknown;
+  cleanupError: unknown;
+  baseRef: string;
+  currentBranch: string;
+}
+
+function appendMergeCleanupError(input: AppendMergeCleanupErrorInput): MergeCleanupError {
+  const { primary, cleanupError } = input;
   if (primary instanceof MergeCleanupError) {
     return new MergeCleanupError({
       baseRef: primary.baseRef,
@@ -3317,8 +3325,12 @@ function appendMergeCleanupError(primary: unknown, cleanupError: unknown): unkno
       operationErrors: [primary.cause ?? primary],
     });
   }
-  return new AggregateError([primary, cleanupError], "Merge and branch restoration both failed", {
-    cause: primary,
+  return new MergeCleanupError({
+    baseRef: input.baseRef,
+    currentBranch: input.currentBranch,
+    conflictFiles: [],
+    cleanupErrors: [cleanupError],
+    operationErrors: [primary],
   });
 }
 
@@ -3443,7 +3455,12 @@ export async function mergeToBase(
           cleanupErrors: [restorationError],
         });
       }
-      operationError = appendMergeCleanupError(operationError, restorationError);
+      operationError = appendMergeCleanupError({
+        primary: operationError,
+        cleanupError: restorationError,
+        baseRef: normalizedBaseRef,
+        currentBranch,
+      });
     }
   }
   if (operationFailed) throw operationError;

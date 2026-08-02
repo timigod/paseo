@@ -12,7 +12,15 @@ import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-type GitFailureMode = "none" | "diagnostic" | "abort" | "abort-noop" | "restore" | "restore-noop";
+type GitFailureMode =
+  | "none"
+  | "diagnostic"
+  | "abort"
+  | "abort-noop"
+  | "generic-cleanup"
+  | "generic-restore"
+  | "restore"
+  | "restore-noop";
 
 function resolveRealGitPath(): string {
   for (const directory of (process.env.PATH ?? "").split(delimiter)) {
@@ -74,6 +82,22 @@ if [ "$PASEO_TEST_GIT_FAILURE" = "abort" ] && [ "$3" = "merge" ] && [ "$4" = "--
 fi
 if [ "$PASEO_TEST_GIT_FAILURE" = "abort-noop" ] && [ "$3" = "merge" ] && [ "$4" = "--abort" ]; then
   exit 0
+fi
+if [ "$PASEO_TEST_GIT_FAILURE" = "generic-cleanup" ] && [ "$3" = "merge" ] && [ "$4" = "feature" ]; then
+  echo "generic merge blocked" >&2
+  exit 76
+fi
+if [ "$PASEO_TEST_GIT_FAILURE" = "generic-cleanup" ] && [ "$3" = "merge" ] && [ "$4" = "--abort" ]; then
+  echo "generic cleanup blocked" >&2
+  exit 77
+fi
+if [ "$PASEO_TEST_GIT_FAILURE" = "generic-restore" ] && [ "$3" = "checkout" ] && [ "$4" = "main" ]; then
+  echo "generic checkout blocked" >&2
+  exit 78
+fi
+if [ "$PASEO_TEST_GIT_FAILURE" = "generic-restore" ] && [ "$3" = "checkout" ] && [ "$4" = "feature" ]; then
+  echo "generic restore blocked" >&2
+  exit 79
 fi
 if [ "$PASEO_TEST_GIT_FAILURE" = "restore" ] && [ "$3" = "checkout" ] && [ "$4" = "feature" ]; then
   echo "restore blocked" >&2
@@ -482,6 +506,43 @@ describe("checkout Git pressure propagation", () => {
     );
   });
 
+  it("types cleanup failure after a generic merge failure", async () => {
+    await withBoundedMergeRepository(
+      { conflicting: false, failureMode: "generic-cleanup" },
+      async (repoDir) => {
+        const { mergeToBase, MergeCleanupError, MergeConflictError } =
+          await import("./checkout-git.js");
+        const { toCheckoutError } = await import("../server/checkout-git-utils.js");
+
+        const failure = await captureFailure(mergeToBase(repoDir, { baseRef: "main" }));
+
+        expect(failure).toBeInstanceOf(MergeCleanupError);
+        expect(failure).not.toBeInstanceOf(MergeConflictError);
+        if (!(failure instanceof MergeCleanupError)) throw failure;
+        expect(failure.conflictFiles).toEqual([]);
+        expect(failure.operationErrors).toEqual([
+          expect.objectContaining({ message: expect.stringContaining("generic merge blocked") }),
+        ]);
+        expect(failure.diagnosticErrors).toEqual([]);
+        expect(failure.cleanupErrors).toEqual([
+          expect.objectContaining({ message: expect.stringContaining("generic cleanup blocked") }),
+        ]);
+        expect(failure.errors).toEqual([
+          ...failure.operationErrors,
+          ...failure.diagnosticErrors,
+          ...failure.cleanupErrors,
+        ]);
+        expect(failure.cause).toBe(failure.operationErrors[0]);
+        expect(toCheckoutError(failure)).toEqual({
+          code: "UNKNOWN",
+          message: expect.stringContaining("checkout may require manual recovery"),
+        });
+        expect(readBranch(repoDir)).toBe("feature");
+        expect(readStatus(repoDir)).toBe("");
+      },
+    );
+  });
+
   it("surfaces merge-from-base abort failure instead of a recoverable conflict", async () => {
     await withBoundedMergeRepository(
       { conflicting: true, failureMode: "abort" },
@@ -577,6 +638,43 @@ describe("checkout Git pressure propagation", () => {
           expect.objectContaining({ message: expect.stringContaining("restore blocked") }),
         ]);
         expect(readBranch(repoDir)).toBe("main");
+      },
+    );
+  });
+
+  it("types restoration failure after a generic merge operation failure", async () => {
+    await withBoundedMergeRepository(
+      { conflicting: false, failureMode: "generic-restore" },
+      async (repoDir) => {
+        const { mergeToBase, MergeCleanupError, MergeConflictError } =
+          await import("./checkout-git.js");
+        const { toCheckoutError } = await import("../server/checkout-git-utils.js");
+
+        const failure = await captureFailure(mergeToBase(repoDir, { baseRef: "main" }));
+
+        expect(failure).toBeInstanceOf(MergeCleanupError);
+        expect(failure).not.toBeInstanceOf(MergeConflictError);
+        if (!(failure instanceof MergeCleanupError)) throw failure;
+        expect(failure.conflictFiles).toEqual([]);
+        expect(failure.operationErrors).toEqual([
+          expect.objectContaining({ message: expect.stringContaining("generic checkout blocked") }),
+        ]);
+        expect(failure.diagnosticErrors).toEqual([]);
+        expect(failure.cleanupErrors).toEqual([
+          expect.objectContaining({ message: expect.stringContaining("generic restore blocked") }),
+        ]);
+        expect(failure.errors).toEqual([
+          ...failure.operationErrors,
+          ...failure.diagnosticErrors,
+          ...failure.cleanupErrors,
+        ]);
+        expect(failure.cause).toBe(failure.operationErrors[0]);
+        expect(toCheckoutError(failure)).toEqual({
+          code: "UNKNOWN",
+          message: expect.stringContaining("checkout may require manual recovery"),
+        });
+        expect(readBranch(repoDir)).toBe("feature");
+        expect(readStatus(repoDir)).toBe("");
       },
     );
   });
