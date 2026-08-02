@@ -347,7 +347,7 @@ export class ProviderSnapshotManager {
   async resolveCreateConfig(
     input: ResolveProviderCreateConfigOptions,
   ): Promise<ResolvedProviderCreateConfig> {
-    const entry = await this.getReadyProvider({
+    const entry = await this.getReadyProviderForCreate({
       cwd: input.cwd,
       provider: input.provider,
       wait: true,
@@ -360,7 +360,7 @@ export class ProviderSnapshotManager {
       featureValues: input.featureValues,
       parent,
       unattended: input.unattended || parent?.isUnattended === true,
-      availableModes: entry.modes ?? [],
+      availableModes: entry.modes,
     });
   }
 
@@ -494,6 +494,35 @@ export class ProviderSnapshotManager {
     input: ProviderSnapshotProviderOptions,
   ): Promise<ProviderSnapshotEntry> {
     const entry = await this.getProvider(input);
+    return this.assertProviderReady(entry);
+  }
+
+  private async getReadyProviderForCreate(
+    input: ProviderSnapshotProviderOptions,
+  ): Promise<ProviderSnapshotEntry> {
+    let entry = await this.getProvider(input);
+    if (entry.enabled && entry.status === "error") {
+      const target = resolveProviderSnapshotTarget(input.cwd);
+      const existingLoad = this.getProviderLoad(target.snapshotCwd, input.provider);
+      if (existingLoad) {
+        await existingLoad.promise;
+      } else {
+        const currentEntry = this.snapshots.get(target.snapshotCwd)?.get(input.provider);
+        if (currentEntry?.enabled && currentEntry.status === "error") {
+          await this.loadProvider({
+            ...target,
+            providers: [input.provider],
+            provider: input.provider,
+            force: true,
+          });
+        }
+      }
+      entry = await this.getProvider({ ...input, wait: false });
+    }
+    return this.assertProviderReady(entry);
+  }
+
+  private assertProviderReady(entry: ProviderSnapshotEntry): ProviderSnapshotEntry {
     if (!entry.enabled) {
       throw new Error(`Provider '${entry.provider}' is disabled`);
     }
@@ -804,7 +833,9 @@ export class ProviderSnapshotManager {
         status: "ready",
         enabled: true,
         models: catalog.models,
-        modes: catalog.modes,
+        ...(catalog.modeDiscoveryError === undefined
+          ? { modes: catalog.modes }
+          : { error: catalog.modeDiscoveryError }),
         fetchedAt: new Date().toISOString(),
       });
     } catch (error) {

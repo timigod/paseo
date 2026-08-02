@@ -903,6 +903,219 @@ describe("ProviderSnapshotManager public surface", () => {
     }
   });
 
+  test("keeps a provider usable while dynamic modes are unknown and preserves explicit modes", async () => {
+    const fetchCatalog = vi.fn(async () => ({
+      models: [{ provider: "codex", id: "gpt-5.4", label: "GPT 5.4" }],
+      modes: [] as AgentMode[],
+      modeDiscoveryError: "OpenCode app.agents timed out after 250ms",
+    }));
+    const manager = new ProviderSnapshotManager({
+      logger: createTestLogger(),
+      extraClients: {
+        codex: createExtraClient("codex", {
+          isAvailable: async () => true,
+          fetchCatalog,
+        }),
+      },
+    });
+
+    try {
+      await expect(
+        manager.resolveCreateConfig({
+          cwd: "/tmp/project",
+          provider: "codex",
+          requestedMode: undefined,
+          featureValues: undefined,
+          parent: null,
+          unattended: false,
+        }),
+      ).resolves.toEqual({ modeId: undefined, featureValues: undefined });
+      await expect(
+        manager.resolveCreateConfig({
+          cwd: "/tmp/project",
+          provider: "codex",
+          requestedMode: "custom-mode",
+          featureValues: undefined,
+          parent: null,
+          unattended: false,
+        }),
+      ).resolves.toEqual({ modeId: "custom-mode", featureValues: undefined });
+
+      const entry = await manager.getProvider({
+        cwd: "/tmp/project",
+        provider: "codex",
+        wait: false,
+      });
+      expect(entry).toMatchObject({
+        status: "ready",
+        models: [{ id: "gpt-5.4" }],
+        error: "OpenCode app.agents timed out after 250ms",
+      });
+      expect(entry.modes).toBeUndefined();
+      expect(fetchCatalog).toHaveBeenCalledTimes(1);
+    } finally {
+      manager.destroy();
+    }
+  });
+
+  test("explicit create refreshes one cached transient provider error and succeeds", async () => {
+    const fetchCatalog = vi
+      .fn()
+      .mockRejectedValueOnce(new Error("cold catalog failure"))
+      .mockResolvedValueOnce({ models: [], modes: [] });
+    const manager = new ProviderSnapshotManager({
+      logger: createTestLogger(),
+      extraClients: {
+        codex: createExtraClient("codex", {
+          isAvailable: async () => true,
+          fetchCatalog,
+        }),
+      },
+    });
+
+    try {
+      await expect(
+        manager.getProvider({ cwd: "/tmp/project", provider: "codex", wait: true }),
+      ).resolves.toMatchObject({ status: "error", error: "cold catalog failure" });
+
+      await expect(
+        manager.resolveCreateConfig({
+          cwd: "/tmp/project",
+          provider: "codex",
+          requestedMode: undefined,
+          featureValues: undefined,
+          parent: null,
+          unattended: false,
+        }),
+      ).resolves.toEqual({ modeId: undefined, featureValues: undefined });
+      expect(fetchCatalog).toHaveBeenCalledTimes(2);
+      expect(fetchCatalog.mock.calls[1]?.[0]).toMatchObject({ force: true });
+    } finally {
+      manager.destroy();
+    }
+  });
+
+  test("concurrent explicit creates share one recovery load after a cached error", async () => {
+    let finishRecovery!: (catalog: { models: AgentModelDefinition[]; modes: AgentMode[] }) => void;
+    const recoveryCatalog = new Promise<{
+      models: AgentModelDefinition[];
+      modes: AgentMode[];
+    }>((finish) => {
+      finishRecovery = finish;
+    });
+    const fetchCatalog = vi
+      .fn()
+      .mockRejectedValueOnce(new Error("cold catalog failure"))
+      .mockImplementationOnce(async () => await recoveryCatalog);
+    const manager = new ProviderSnapshotManager({
+      logger: createTestLogger(),
+      extraClients: {
+        codex: createExtraClient("codex", {
+          isAvailable: async () => true,
+          fetchCatalog,
+        }),
+      },
+    });
+
+    try {
+      await manager.getProvider({ cwd: "/tmp/project", provider: "codex", wait: true });
+      const createInput = {
+        cwd: "/tmp/project",
+        provider: "codex" as const,
+        requestedMode: undefined,
+        featureValues: undefined,
+        parent: null,
+        unattended: false,
+      };
+      const firstCreate = manager.resolveCreateConfig(createInput);
+      const secondCreate = manager.resolveCreateConfig(createInput);
+
+      await vi.waitFor(() => expect(fetchCatalog).toHaveBeenCalledTimes(2));
+      finishRecovery({ models: [], modes: [] });
+
+      await expect(Promise.all([firstCreate, secondCreate])).resolves.toEqual([
+        { modeId: undefined, featureValues: undefined },
+        { modeId: undefined, featureValues: undefined },
+      ]);
+      expect(fetchCatalog).toHaveBeenCalledTimes(2);
+    } finally {
+      manager.destroy();
+    }
+  });
+
+  test("each explicit create performs at most one recovery and reports the latest error", async () => {
+    const fetchCatalog = vi
+      .fn()
+      .mockRejectedValueOnce(new Error("initial catalog failure"))
+      .mockRejectedValueOnce(new Error("first recovery failure"))
+      .mockRejectedValueOnce(new Error("second recovery failure"));
+    const manager = new ProviderSnapshotManager({
+      logger: createTestLogger(),
+      extraClients: {
+        codex: createExtraClient("codex", {
+          isAvailable: async () => true,
+          fetchCatalog,
+        }),
+      },
+    });
+    const createInput = {
+      cwd: "/tmp/project",
+      provider: "codex" as const,
+      requestedMode: undefined,
+      featureValues: undefined,
+      parent: null,
+      unattended: false,
+    };
+
+    try {
+      await manager.getProvider({ cwd: "/tmp/project", provider: "codex", wait: true });
+      await expect(manager.resolveCreateConfig(createInput)).rejects.toThrow(
+        "first recovery failure",
+      );
+      expect(fetchCatalog).toHaveBeenCalledTimes(2);
+
+      await expect(manager.resolveCreateConfig(createInput)).rejects.toThrow(
+        "second recovery failure",
+      );
+      expect(fetchCatalog).toHaveBeenCalledTimes(3);
+    } finally {
+      manager.destroy();
+    }
+  });
+
+  test.each([
+    { label: "disabled", enabled: false, available: true },
+    { label: "unavailable", enabled: true, available: false },
+  ])("does not retry an $label provider during explicit create", async ({ enabled, available }) => {
+    const isAvailable = vi.fn(async () => available);
+    const fetchCatalog = vi.fn(async () => ({ models: [], modes: [] }));
+    const manager = new ProviderSnapshotManager({
+      logger: createTestLogger(),
+      providerOverrides: { codex: { enabled } },
+      extraClients: {
+        codex: createExtraClient("codex", { isAvailable, fetchCatalog }),
+      },
+    });
+
+    try {
+      await manager.getProvider({ cwd: "/tmp/project", provider: "codex", wait: true });
+      await expect(
+        manager.resolveCreateConfig({
+          cwd: "/tmp/project",
+          provider: "codex",
+          requestedMode: undefined,
+          featureValues: undefined,
+          parent: null,
+          unattended: false,
+        }),
+      ).rejects.toThrow(enabled ? "not available" : "disabled");
+      expect(isAvailable).toHaveBeenCalledTimes(enabled ? 1 : 0);
+      expect(fetchCatalog).not.toHaveBeenCalled();
+    } finally {
+      manager.destroy();
+    }
+  });
+
   test("treats an OpenCode parent with auto accept as unattended when resolving an explicit child mode", async () => {
     const openCode = new OpenCodeAgentClient(createTestLogger());
     const modes: AgentMode[] = [

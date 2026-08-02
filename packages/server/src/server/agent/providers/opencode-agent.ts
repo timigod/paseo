@@ -286,6 +286,26 @@ const MCP_ALREADY_PRESENT_ERROR_TOKENS = ["already", "exists", "connected"] as c
 const OPENCODE_PROVIDER_LIST_TIMEOUT_MS = 30_000;
 const OPENCODE_METADATA_CONCURRENCY = 4;
 const openCodeMetadataLimit = pLimit(OPENCODE_METADATA_CONCURRENCY);
+
+function resolveOpenCodeCatalogTimeoutMs(timeoutMs: number | undefined): number {
+  return typeof timeoutMs === "number" && Number.isFinite(timeoutMs) && timeoutMs > 0
+    ? timeoutMs
+    : OPENCODE_PROVIDER_LIST_TIMEOUT_MS;
+}
+
+async function runOpenCodeCatalogRequest<T>(
+  request: (signal: AbortSignal) => Promise<T>,
+  timeoutMs: number,
+  timeoutMessage: string,
+): Promise<T> {
+  const controller = new AbortController();
+  try {
+    return await withTimeout(request(controller.signal), timeoutMs, timeoutMessage);
+  } finally {
+    controller.abort();
+  }
+}
+
 const OPENCODE_HANDLED_BUILTIN_SLASH_COMMANDS: AgentSlashCommand[] = [
   {
     name: "compact",
@@ -1417,11 +1437,12 @@ export class OpenCodeAgentClient implements AgentClient {
       }
 
       const client = this.createOpenCodeClient({ baseUrl: url, directory });
-      const [models, modes] = await Promise.all([
-        this.fetchModelsFromClient(client, directory),
-        this.fetchModesFromClient(client, directory),
+      const timeoutMs = resolveOpenCodeCatalogTimeoutMs(options.timeoutMs);
+      const [models, modesCatalog] = await Promise.all([
+        this.fetchModelsFromClient(client, directory, timeoutMs),
+        this.fetchModesFromClient(client, directory, timeoutMs),
       ]);
-      return { models, modes };
+      return { models, ...modesCatalog };
     } finally {
       await acquisition.release();
     }
@@ -1610,13 +1631,12 @@ export class OpenCodeAgentClient implements AgentClient {
   private async fetchModelsFromClient(
     client: OpencodeClient,
     directory: string,
+    timeoutMs: number,
   ): Promise<AgentModelDefinition[]> {
-    const response = await openCodeMetadataLimit(() =>
-      withTimeout(
-        client.provider.list({ directory }),
-        OPENCODE_PROVIDER_LIST_TIMEOUT_MS,
-        `OpenCode provider.list timed out after ${OPENCODE_PROVIDER_LIST_TIMEOUT_MS / 1000}s - server may not be authenticated or connected to any providers`,
-      ),
+    const response = await runOpenCodeCatalogRequest(
+      (signal) => openCodeMetadataLimit(() => client.provider.list({ directory }, { signal })),
+      timeoutMs,
+      `OpenCode provider.list timed out after ${timeoutMs}ms - server may not be authenticated or connected to any providers`,
     );
 
     if (response.error) {
@@ -1667,25 +1687,39 @@ export class OpenCodeAgentClient implements AgentClient {
   private async fetchModesFromClient(
     client: OpencodeClient,
     directory: string,
-  ): Promise<AgentMode[]> {
-    const response = await openCodeMetadataLimit(() =>
-      withTimeout(
-        client.app.agents({ directory }),
-        10_000,
-        "OpenCode app.agents timed out after 10s",
-      ),
-    );
+    timeoutMs: number,
+  ): Promise<Pick<ProviderCatalog, "modes" | "modeDiscoveryError">> {
+    try {
+      const response = await runOpenCodeCatalogRequest(
+        (signal) => openCodeMetadataLimit(() => client.app.agents({ directory }, { signal })),
+        timeoutMs,
+        `OpenCode app.agents timed out after ${timeoutMs}ms`,
+      );
 
-    if (response.error || !response.data) {
-      // Discovery failed — return an empty list rather than fabricating
-      // modes. OpenCode users can rename or delete any agent (including
-      // "build"/"plan"), so a hardcoded fallback can validate a mode that
-      // does not actually exist, which then fails at prompt time.
-      return [];
+      if (response.error) {
+        throw new Error(
+          `Failed to discover OpenCode modes: ${toDiagnosticErrorMessage(response.error)}`,
+        );
+      }
+      if (!response.data) {
+        throw new Error("Failed to discover OpenCode modes: response contained no agent catalog");
+      }
+
+      const discovered = response.data
+        .filter(isSelectableOpenCodeAgent)
+        .map(mapOpenCodeAgentToMode);
+      return { modes: mergeOpenCodeModes(discovered) };
+    } catch (error) {
+      const modeDiscoveryError = toDiagnosticErrorMessage(error);
+      this.logger.warn(
+        { err: error, directory, timeoutMs },
+        "OpenCode mode discovery degraded; provider models remain available",
+      );
+      // Keep the legacy array shape without claiming the empty list is
+      // authoritative. Snapshot consumers use modeDiscoveryError to preserve
+      // the existing unknown-mode creation contract.
+      return { modes: [], modeDiscoveryError };
     }
-
-    const discovered = response.data.filter(isSelectableOpenCodeAgent).map(mapOpenCodeAgentToMode);
-    return mergeOpenCodeModes(discovered);
   }
   private assertConfig(config: AgentSessionConfig): OpenCodeAgentConfig {
     if (config.provider !== "opencode") {

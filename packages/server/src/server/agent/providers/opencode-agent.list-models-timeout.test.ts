@@ -64,6 +64,96 @@ test("allows a slow provider.list call to succeed instead of failing after 10 se
   expect(openCodeClient.calls.providerList).toHaveLength(1);
 });
 
+test("uses the supplied catalog budget for mode discovery and releases the runtime on timeout", async () => {
+  vi.useFakeTimers();
+
+  const runtime = new TestOpenCodeHarness();
+  const openCodeClient = new TestOpenCodeClient();
+  openCodeClient.providerListResponse = {
+    data: {
+      connected: ["openai"],
+      all: [
+        {
+          id: "openai",
+          name: "OpenAI",
+          models: { "gpt-5.4": { name: "GPT 5.4" } },
+        },
+      ],
+    },
+  };
+  let modeDiscoverySignal: AbortSignal | undefined;
+  openCodeClient.appAgentsImplementation = async (_parameters, options) => {
+    modeDiscoverySignal = (options as { signal?: AbortSignal }).signal;
+    return await new Promise((resolve, reject) => {
+      modeDiscoverySignal?.addEventListener(
+        "abort",
+        () => reject(new Error("OpenCode app.agents aborted")),
+        { once: true },
+      );
+    });
+  };
+  runtime.enqueueClient(openCodeClient);
+
+  const client = new OpenCodeAgentClient(createTestLogger(), undefined, {
+    serverManager: runtime,
+    createClient: runtime.createClient,
+  });
+  const catalogPromise = client.fetchCatalog({
+    scope: "workspace",
+    cwd: "/tmp/opencode-models",
+    force: false,
+    timeoutMs: 250,
+  });
+
+  await vi.advanceTimersByTimeAsync(250);
+
+  await expect(catalogPromise).resolves.toMatchObject({
+    models: [{ id: "openai/gpt-5.4" }],
+    modes: [],
+    modeDiscoveryError: "OpenCode app.agents timed out after 250ms",
+  });
+  expect(modeDiscoverySignal?.aborted).toBe(true);
+  expect(runtime.acquisitions).toEqual([{ kind: "current", releaseCount: 1 }]);
+});
+
+test("keeps models usable and reports degraded mode discovery when app.agents errors", async () => {
+  const runtime = new TestOpenCodeHarness();
+  const openCodeClient = new TestOpenCodeClient();
+  openCodeClient.providerListResponse = {
+    data: {
+      connected: ["openai"],
+      all: [
+        {
+          id: "openai",
+          name: "OpenAI",
+          models: { "gpt-5.4": { name: "GPT 5.4" } },
+        },
+      ],
+    },
+  };
+  openCodeClient.appAgentsResponse = { error: { message: "agent config is still loading" } };
+  runtime.enqueueClient(openCodeClient);
+
+  const client = new OpenCodeAgentClient(createTestLogger(), undefined, {
+    serverManager: runtime,
+    createClient: runtime.createClient,
+  });
+
+  await expect(
+    client.fetchCatalog({
+      scope: "workspace",
+      cwd: "/tmp/opencode-models",
+      force: false,
+      timeoutMs: 500,
+    }),
+  ).resolves.toMatchObject({
+    models: [{ id: "openai/gpt-5.4" }],
+    modes: [],
+    modeDiscoveryError: expect.stringContaining("agent config is still loading"),
+  });
+  expect(runtime.acquisitions).toEqual([{ kind: "current", releaseCount: 1 }]);
+});
+
 test("uses a new server for explicit catalog refresh", async () => {
   const runtime = new TestOpenCodeHarness();
   const openCodeClient = new TestOpenCodeClient();

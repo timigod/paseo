@@ -674,6 +674,12 @@ export type FetchCatalogOptions =
 export interface ProviderCatalog {
   models: AgentModelDefinition[];
   modes: AgentMode[];
+  /**
+   * Mode discovery is optional for provider readiness. When set, `modes` is a
+   * compatibility-safe empty array but must be treated as unknown rather than
+   * as a proven empty catalog.
+   */
+  modeDiscoveryError?: string;
   defaultModeId?: string | null;
 }
 

@@ -106,6 +106,7 @@ export class TestOpenCodeHarness implements OpenCodeServerManagerLike {
 export class TestOpenCodeClient {
   readonly calls = {
     appAgents: [] as unknown[],
+    appAgentsOptions: [] as unknown[],
     commandList: [] as unknown[],
     eventSubscribe: [] as unknown[],
     experimentalSessionList: [] as unknown[],
@@ -130,6 +131,9 @@ export class TestOpenCodeClient {
   };
 
   appAgentsResponse: OpenCodeResponse = { data: [] };
+  appAgentsImplementation:
+    | ((parameters: unknown, options?: unknown) => Promise<OpenCodeResponse>)
+    | null = null;
   commandListResponse: OpenCodeResponse = { data: [] };
   commandListImplementation: ((parameters: unknown) => Promise<OpenCodeResponse>) | null = null;
   eventStream: AsyncIterable<unknown>;
@@ -176,9 +180,12 @@ export class TestOpenCodeClient {
   asSdkClient(): OpencodeClient {
     return {
       app: {
-        agents: async (parameters: unknown) => {
+        agents: async (parameters: unknown, options?: unknown) => {
           this.calls.appAgents.push(parameters);
-          return this.appAgentsResponse;
+          this.calls.appAgentsOptions.push(options);
+          return this.appAgentsImplementation
+            ? await this.appAgentsImplementation(parameters, options)
+            : this.appAgentsResponse;
         },
       },
       command: {
