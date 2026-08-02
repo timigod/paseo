@@ -140,6 +140,64 @@ function restoreAgentMaterialProgressCheckpoint(
       });
 }
 
+function uniqueOrderedTimelineMapping(
+  canonicalRows: readonly AgentTimelineRow[],
+  providerRows: readonly AgentTimelineRow[],
+): number[] | null {
+  const earliest: number[] = [];
+  let cursor = 0;
+  for (const canonicalRow of canonicalRows) {
+    const match = providerRows.findIndex(
+      (providerRow, index) =>
+        index >= cursor && isDeepStrictEqual(providerRow.item, canonicalRow.item),
+    );
+    if (match < 0) return null;
+    earliest.push(match);
+    cursor = match + 1;
+  }
+  const latest = Array.from<number>({ length: canonicalRows.length }).fill(-1);
+  cursor = providerRows.length - 1;
+  for (let index = canonicalRows.length - 1; index >= 0; index -= 1) {
+    for (; cursor >= 0; cursor -= 1) {
+      if (isDeepStrictEqual(providerRows[cursor]?.item, canonicalRows[index]?.item)) {
+        latest[index] = cursor;
+        cursor -= 1;
+        break;
+      }
+    }
+    if (latest[index] < 0) return null;
+  }
+  return latest.every((providerIndex, index) => providerIndex === earliest[index])
+    ? earliest
+    : null;
+}
+
+interface TimelineOverlapLedger {
+  cursor: number;
+  usedProviderIndexes: Set<number>;
+}
+
+function consumeTimelineOccurrence(
+  providerRows: AgentTimelineRow[],
+  ledger: TimelineOverlapLedger,
+  item: AgentTimelineItem,
+  turnId?: string,
+): number | null {
+  const match = providerRows.findIndex(
+    (providerRow, index) =>
+      index >= ledger.cursor &&
+      !ledger.usedProviderIndexes.has(index) &&
+      isDeepStrictEqual(providerRow.item, item),
+  );
+  if (match < 0) return null;
+  ledger.usedProviderIndexes.add(match);
+  ledger.cursor = match + 1;
+  if (turnId !== undefined && providerRows[match]!.turnId === undefined) {
+    providerRows[match] = { ...providerRows[match]!, turnId };
+  }
+  return match;
+}
+
 export class AgentManagerShuttingDownError extends Error {
   constructor() {
     super("Agent manager is shutting down");
@@ -420,6 +478,7 @@ interface ActiveHistoryHydration {
   carriedLiveTimelineRows: AgentTimelineRow[];
   lastProviderHistoryItems: AgentTimelineItem[];
   timelineHistoryOverlapIndex: number;
+  timelineHistoryUsedIndexes: Set<number>;
   carriedProviderSubagentEvents: Array<{
     provider: AgentProvider;
     event: ProviderSubagentInputEvent;
@@ -438,6 +497,8 @@ interface BufferedHistoryHydrationOperation {
   providerSubagentEvent?: { provider: AgentProvider; event: ProviderSubagentInputEvent };
   timelineItem?: AgentTimelineItem;
   timelineTurnId?: string;
+  timelineLedgerAssigned?: boolean;
+  timelineProviderMatchIndex?: number | null;
   eligibleForHistoryOverlap?: boolean;
   resolve?: () => void;
   reject?: (error: unknown) => void;
@@ -2992,6 +3053,7 @@ export class AgentManager {
     agent: ActiveManagedAgent,
     replacementRows: readonly AgentTimelineRow[],
     timelineEpoch: string,
+    rebindUnprovable = false,
   ): MaterialProgressCheckpoint {
     const checkpoint = agent.materialProgress;
     const currentTimelineEpoch = this.timelineStore.getEpoch(agent.id);
@@ -3013,7 +3075,7 @@ export class AgentManager {
         (row) => row.seq >= checkpoint.continuationBoundarySeq! && row.turnId === acceptedTurnId,
       );
     const firstAcceptedTurnRow = replacementRows.find((row) => row.turnId === acceptedTurnId);
-    if (priorAcceptedRows.length > 0 && firstAcceptedTurnRow === undefined) {
+    if (priorAcceptedRows.length > 0 && (rebindUnprovable || firstAcceptedTurnRow === undefined)) {
       return {
         ...checkpoint,
         timelineEpoch,
@@ -4501,6 +4563,7 @@ export class AgentManager {
       agent,
       replacementRows,
       epoch,
+      merged.materialProgressRebindUnprovable,
     );
     this.timelineStore.initialize(agent.id, {
       epoch,
@@ -4709,55 +4772,66 @@ export class AgentManager {
     agentId: string,
     activeHydration: ActiveHistoryHydration,
     incomingHistoryRows: AgentTimelineRow[],
-  ): { historyRows: AgentTimelineRow[]; carriedRows: AgentTimelineRow[] } {
-    const currentRows = this.timelineStore.getRows(agentId);
+  ): {
+    historyRows: AgentTimelineRow[];
+    carriedRows: AgentTimelineRow[];
+    materialProgressRebindUnprovable: boolean;
+  } {
+    const currentRows = this.timelineStore
+      .getRows(agentId)
+      .toSorted((left, right) => left.seq - right.seq);
     const newlyAppliedRows = currentRows.filter(
       (row) => row.seq >= activeHydration.nextUncapturedTimelineSeq,
     );
     const acceptedTurnId = this.agents.get(agentId)?.materialProgress.acceptedTurnId;
-    const acceptedCanonicalRows = acceptedTurnId
+    const priorAcceptedRows = acceptedTurnId
       ? currentRows.filter((row) => row.turnId === acceptedTurnId)
       : [];
-    const candidateCarriedRows: AgentTimelineRow[] = [];
+    const liveCarriedRows: AgentTimelineRow[] = [];
     for (const row of [
-      ...acceptedCanonicalRows,
       ...activeHydration.carriedLiveTimelineRows,
       ...newlyAppliedRows.map((appliedRow) => structuredClone(appliedRow)),
     ]) {
-      if (!candidateCarriedRows.some((candidate) => isDeepStrictEqual(candidate, row))) {
-        candidateCarriedRows.push(structuredClone(row));
+      if (
+        !currentRows.some((candidate) => isDeepStrictEqual(candidate, row)) &&
+        !liveCarriedRows.some((candidate) => isDeepStrictEqual(candidate, row))
+      ) {
+        liveCarriedRows.push(structuredClone(row));
       }
     }
     const historyRows = incomingHistoryRows.map((row) => structuredClone(row));
-    const priorHistoryItems = activeHydration.lastProviderHistoryItems;
-    const hasPriorHistoryPrefix =
-      priorHistoryItems.length <= historyRows.length &&
-      priorHistoryItems.every((item, index) => isDeepStrictEqual(item, historyRows[index]?.item));
-    let historySearchIndex = hasPriorHistoryPrefix ? priorHistoryItems.length : 0;
-    const unmatchedCarriedRows: AgentTimelineRow[] = [];
-    for (let carriedIndex = 0; carriedIndex < candidateCarriedRows.length; carriedIndex += 1) {
-      const carriedRow = candidateCarriedRows[carriedIndex];
-      const matchingHistoryIndices = historyRows.flatMap((row, index) =>
-        index >= historySearchIndex && isDeepStrictEqual(row.item, carriedRow.item) ? [index] : [],
-      );
-      const matchingHistoryIndex = matchingHistoryIndices[0];
-      if (matchingHistoryIndex === undefined) {
-        unmatchedCarriedRows.push(carriedRow);
-      } else {
-        const remainingEquivalentCarriedRows = candidateCarriedRows
-          .slice(carriedIndex)
-          .filter((row) => isDeepStrictEqual(row.item, carriedRow.item)).length;
-        if (
-          matchingHistoryIndices.length === remainingEquivalentCarriedRows &&
-          carriedRow.turnId !== undefined &&
-          historyRows[matchingHistoryIndex].turnId === undefined
-        ) {
-          historyRows[matchingHistoryIndex] = {
-            ...historyRows[matchingHistoryIndex],
-            turnId: carriedRow.turnId,
-          };
+    const canonicalMapping = uniqueOrderedTimelineMapping(currentRows, historyRows);
+    const ledger: TimelineOverlapLedger = {
+      cursor: canonicalMapping ? 0 : historyRows.length,
+      usedProviderIndexes: new Set(),
+    };
+    let acceptedAttributionConflict = false;
+    if (canonicalMapping) {
+      for (let index = 0; index < currentRows.length; index += 1) {
+        const canonicalRow = currentRows[index];
+        const providerIndex = canonicalMapping[index]!;
+        const providerRow = historyRows[providerIndex]!;
+        ledger.usedProviderIndexes.add(providerIndex);
+        ledger.cursor = providerIndex + 1;
+        if (canonicalRow.turnId === undefined) continue;
+        if (providerRow.turnId !== undefined && providerRow.turnId !== canonicalRow.turnId) {
+          if (canonicalRow.turnId === acceptedTurnId) acceptedAttributionConflict = true;
+          continue;
         }
-        historySearchIndex = matchingHistoryIndex + 1;
+        historyRows[providerIndex] = { ...providerRow, turnId: canonicalRow.turnId };
+      }
+    }
+
+    const unmatchedCarriedRows: AgentTimelineRow[] = [];
+    for (const carriedRow of liveCarriedRows) {
+      const match = consumeTimelineOccurrence(
+        historyRows,
+        ledger,
+        carriedRow.item,
+        carriedRow.turnId,
+      );
+      if (match === null) {
+        unmatchedCarriedRows.push(carriedRow);
       }
     }
 
@@ -4769,39 +4843,20 @@ export class AgentManager {
         operation,
       ): operation is BufferedHistoryHydrationOperation & {
         timelineItem: AgentTimelineItem;
-        timelineTurnId: string;
-      } =>
-        operation.timelineItem !== undefined &&
-        operation.timelineTurnId !== undefined &&
-        operation.eligibleForHistoryOverlap === true,
+      } => operation.timelineItem !== undefined && operation.eligibleForHistoryOverlap === true,
     );
-    let bufferedHistorySearchIndex = 0;
-    for (let index = 0; index < bufferedTimelineOperations.length; index += 1) {
-      const operation = bufferedTimelineOperations[index];
-      const matchingHistoryIndices = historyRows.flatMap((row, historyIndex) =>
-        historyIndex >= bufferedHistorySearchIndex &&
-        isDeepStrictEqual(row.item, operation.timelineItem)
-          ? [historyIndex]
-          : [],
+    for (const operation of bufferedTimelineOperations) {
+      const match = consumeTimelineOccurrence(
+        historyRows,
+        ledger,
+        operation.timelineItem,
+        operation.timelineTurnId,
       );
-      const matchingHistoryIndex = matchingHistoryIndices[0];
-      if (matchingHistoryIndex === undefined) continue;
-      const remainingEquivalentOperations = bufferedTimelineOperations
-        .slice(index)
-        .filter((candidate) =>
-          isDeepStrictEqual(candidate.timelineItem, operation.timelineItem),
-        ).length;
-      if (
-        matchingHistoryIndices.length === remainingEquivalentOperations &&
-        historyRows[matchingHistoryIndex].turnId === undefined
-      ) {
-        historyRows[matchingHistoryIndex] = {
-          ...historyRows[matchingHistoryIndex],
-          turnId: operation.timelineTurnId,
-        };
-      }
-      bufferedHistorySearchIndex = matchingHistoryIndex + 1;
+      operation.timelineLedgerAssigned = true;
+      operation.timelineProviderMatchIndex = match;
     }
+    activeHydration.timelineHistoryOverlapIndex = ledger.cursor;
+    activeHydration.timelineHistoryUsedIndexes = ledger.usedProviderIndexes;
     let nextSeq = historyRows.length + 1;
     const carriedRows: AgentTimelineRow[] = [];
     for (const row of unmatchedCarriedRows) {
@@ -4809,7 +4864,12 @@ export class AgentManager {
       carriedRow.seq = nextSeq++;
       carriedRows.push(carriedRow);
     }
-    return { historyRows, carriedRows };
+    return {
+      historyRows,
+      carriedRows,
+      materialProgressRebindUnprovable:
+        priorAcceptedRows.length > 0 && (canonicalMapping === null || acceptedAttributionConflict),
+    };
   }
 
   private mergeCarriedProviderSubagentEvents(
@@ -4856,6 +4916,7 @@ export class AgentManager {
       carriedLiveTimelineRows: [],
       lastProviderHistoryItems: [],
       timelineHistoryOverlapIndex: 0,
+      timelineHistoryUsedIndexes: new Set(),
       carriedProviderSubagentEvents: [],
       lastProviderSubagentHistory: [],
       providerSubagentHistoryOverlapIndex: 0,
@@ -5010,12 +5071,22 @@ export class AgentManager {
   ): boolean {
     if (!operation.eligibleForHistoryOverlap) return false;
     if (operation.timelineItem) {
+      if (operation.timelineLedgerAssigned) {
+        return operation.timelineProviderMatchIndex !== null;
+      }
+      // Attributed live rows must participate before replacement so their turn id can be copied
+      // into the canonical row. A genuinely late attributed row remains unmatched and appends once.
+      if (operation.timelineTurnId !== undefined) return false;
       const match = activeHydration.lastProviderHistoryItems.findIndex(
         (item, index) =>
           index >= activeHydration.timelineHistoryOverlapIndex &&
+          !activeHydration.timelineHistoryUsedIndexes.has(index) &&
           isDeepStrictEqual(item, operation.timelineItem),
       );
+      operation.timelineLedgerAssigned = true;
+      operation.timelineProviderMatchIndex = match < 0 ? null : match;
       if (match >= 0) {
+        activeHydration.timelineHistoryUsedIndexes.add(match);
         activeHydration.timelineHistoryOverlapIndex = match + 1;
         return true;
       }

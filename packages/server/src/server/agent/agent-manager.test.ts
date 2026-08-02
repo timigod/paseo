@@ -4536,7 +4536,85 @@ test("a successor hydration preserves stalled progress when provider history omi
   }
 });
 
-test("ambiguous provider overlap fails material progress rebinding closed", async () => {
+test("one canonical and one buffered identical compaction remain two stalled occurrences", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-hydration-progress-ledger-"));
+  const agentId = "00000000-0000-4000-8000-000000000206";
+  const turnId = "accepted-ledger-turn";
+  const compaction: AgentTimelineItem = { type: "compaction", status: "completed" };
+  const historyStarted = deferred<void>();
+  const releaseHistory = deferred<void>();
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const durableTimelineStore = new FileAgentTimelineStore(join(workdir, "timelines"), logger);
+  let session: TestAgentSession | null = null;
+  let historyGeneration = 0;
+
+  class LedgerHistorySession extends TestAgentSession {
+    override async *streamHistory(): AsyncGenerator<AgentStreamEvent> {
+      historyGeneration += 1;
+      if (historyGeneration === 2) {
+        historyStarted.resolve();
+        await releaseHistory.promise;
+        yield { type: "timeline", provider: "codex", item: compaction };
+      }
+    }
+  }
+  class LedgerHistoryClient extends TestAgentClient {
+    override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+      session = new LedgerHistorySession(config);
+      return session;
+    }
+  }
+  const manager = new AgentManager({
+    clients: { codex: new LedgerHistoryClient() },
+    registry: storage,
+    durableTimelineStore,
+    logger,
+    idFactory: () => agentId,
+  });
+
+  try {
+    const created = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+    const firstHydration = manager.hydrateTimelineFromProvider(created.id, { force: true });
+    session!.pushEvent({ type: "turn_started", provider: "codex", turnId });
+    session!.pushEvent({ type: "timeline", provider: "codex", turnId, item: compaction });
+    session!.pushEvent({
+      type: "usage_updated",
+      provider: "codex",
+      turnId,
+      usage: { inputTokens: 1 },
+    });
+    await firstHydration;
+    expect(manager.getMaterialProgress(created.id)).toMatchObject({
+      state: "warning",
+      completedCompactionsSinceMaterialProgress: 1,
+    });
+
+    const replacement = manager.hydrateTimelineFromProvider(created.id, { force: true });
+    await historyStarted.promise;
+    session!.pushEvent({ type: "timeline", provider: "codex", turnId, item: compaction });
+    releaseHistory.resolve();
+    await replacement;
+    await manager.flush();
+
+    expect(manager.getMaterialProgress(created.id)).toMatchObject({
+      state: "stalled",
+      observedThroughSeq: 2,
+      completedCompactionsSinceMaterialProgress: 2,
+    });
+    const committedRows = await durableTimelineStore.getCommittedRows(agentId);
+    expect(committedRows).toHaveLength(2);
+    expect(committedRows.map((row) => row.turnId)).toEqual([turnId, turnId]);
+    expect(committedRows.map((row) => row.item)).toEqual([compaction, compaction]);
+  } finally {
+    releaseHistory.resolve();
+    await manager.closeAgent(agentId).catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("partial provider cardinality fails stalled material progress rebinding closed", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-hydration-progress-ambiguous-"));
   const agentId = "00000000-0000-4000-8000-000000000205";
   const turnId = "accepted-ambiguous-turn";
@@ -4557,7 +4635,6 @@ test("ambiguous provider overlap fails material progress rebinding closed", asyn
     override async *streamHistory(): AsyncGenerator<AgentStreamEvent> {
       historyGeneration += 1;
       if (historyGeneration === 2) {
-        yield { type: "timeline", provider: "codex", item: compaction };
         yield { type: "timeline", provider: "codex", item: compaction };
       }
     }
@@ -4585,6 +4662,7 @@ test("ambiguous provider overlap fails material progress rebinding closed", asyn
     const firstHydration = manager.hydrateTimelineFromProvider(created.id, { force: true });
     session!.pushEvent({ type: "turn_started", provider: "codex", turnId });
     session!.pushEvent({ type: "timeline", provider: "codex", turnId, item: compaction });
+    session!.pushEvent({ type: "timeline", provider: "codex", turnId, item: compaction });
     session!.pushEvent({
       type: "usage_updated",
       provider: "codex",
@@ -4593,8 +4671,8 @@ test("ambiguous provider overlap fails material progress rebinding closed", asyn
     });
     await firstHydration;
     expect(manager.getMaterialProgress(created.id)).toMatchObject({
-      state: "warning",
-      completedCompactionsSinceMaterialProgress: 1,
+      state: "stalled",
+      completedCompactionsSinceMaterialProgress: 2,
     });
 
     await manager.hydrateTimelineFromProvider(created.id, { force: true });
@@ -4604,22 +4682,104 @@ test("ambiguous provider overlap fails material progress rebinding closed", asyn
       state: "none",
       timelineEpoch: "replacement-ambiguous-epoch",
       continuationBoundarySeq: null,
-      observedThroughSeq: 2,
-      completedCompactionsSinceMaterialProgress: 1,
+      observedThroughSeq: 1,
+      completedCompactionsSinceMaterialProgress: 2,
       reason:
         "Material progress is unavailable because accepted-turn attribution could not be proven after timeline replacement.",
     });
     const committedRows = await durableTimelineStore.getCommittedRows(agentId);
-    expect(committedRows).toHaveLength(2);
+    expect(committedRows).toHaveLength(1);
     expect(committedRows.every((row) => row.turnId === undefined)).toBe(true);
     expect((await storage.get(agentId))?.materialProgress).toMatchObject({
       timelineEpoch: "replacement-ambiguous-epoch",
       continuationBoundarySeq: null,
-      observedThroughSeq: 2,
-      completedCompactionsSinceMaterialProgress: 1,
+      observedThroughSeq: 1,
+      completedCompactionsSinceMaterialProgress: 2,
       unavailableReason:
         "Material progress is unavailable because accepted-turn attribution could not be proven after timeline replacement.",
     });
+  } finally {
+    await manager.closeAgent(agentId).catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("ordered canonical reconciliation preserves cross-turn ids around intervening rows", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-hydration-cross-turn-ledger-"));
+  const agentId = "00000000-0000-4000-8000-000000000207";
+  const firstTurnId = "first-identical-turn";
+  const secondTurnId = "second-identical-turn";
+  const compaction: AgentTimelineItem = { type: "compaction", status: "completed" };
+  const intervening: AgentTimelineItem = {
+    type: "assistant_message",
+    text: "chronological separator",
+  };
+  const providerItems = [compaction, intervening, compaction];
+  const durableTimelineStore = new FileAgentTimelineStore(join(workdir, "timelines"), logger);
+  let session: TestAgentSession | null = null;
+
+  class CrossTurnHistorySession extends TestAgentSession {
+    override async *streamHistory(): AsyncGenerator<AgentStreamEvent> {
+      for (const item of providerItems) {
+        yield { type: "timeline", provider: "codex", item };
+      }
+    }
+  }
+  class CrossTurnHistoryClient extends TestAgentClient {
+    override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+      session = new CrossTurnHistorySession(config);
+      return session;
+    }
+  }
+  const manager = new AgentManager({
+    clients: { codex: new CrossTurnHistoryClient() },
+    durableTimelineStore,
+    logger,
+    idFactory: () => agentId,
+  });
+
+  try {
+    const created = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+    session!.pushEvent({ type: "turn_started", provider: "codex", turnId: firstTurnId });
+    session!.pushEvent({
+      type: "timeline",
+      provider: "codex",
+      turnId: firstTurnId,
+      item: compaction,
+    });
+    session!.pushEvent({ type: "turn_completed", provider: "codex", turnId: firstTurnId });
+    session!.pushEvent({ type: "turn_started", provider: "codex", turnId: secondTurnId });
+    session!.pushEvent({
+      type: "timeline",
+      provider: "codex",
+      turnId: secondTurnId,
+      item: intervening,
+    });
+    session!.pushEvent({
+      type: "timeline",
+      provider: "codex",
+      turnId: secondTurnId,
+      item: compaction,
+    });
+    session!.pushEvent({
+      type: "usage_updated",
+      provider: "codex",
+      turnId: secondTurnId,
+      usage: { inputTokens: 1 },
+    });
+    await manager.flush();
+
+    await manager.hydrateTimelineFromProvider(created.id, { force: true });
+    const committedRows = await durableTimelineStore.getCommittedRows(agentId);
+    expect(committedRows).toHaveLength(3);
+    expect(committedRows.map((row) => row.item)).toEqual(providerItems);
+    expect(committedRows.map((row) => row.turnId)).toEqual([
+      firstTurnId,
+      secondTurnId,
+      secondTurnId,
+    ]);
   } finally {
     await manager.closeAgent(agentId).catch(() => undefined);
     rmSync(workdir, { recursive: true, force: true });
