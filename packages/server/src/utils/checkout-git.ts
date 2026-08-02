@@ -825,10 +825,17 @@ function isNotGitRepositoryError(error: unknown): boolean {
   return error instanceof Error && /not a git repository/i.test(error.message);
 }
 
+function throwIfGitCommandBackpressure(error: unknown): void {
+  if (error instanceof Error && "kind" in error && error.kind === "git-command-backpressure") {
+    throw error;
+  }
+}
+
 async function requireGitRepo(cwd: string): Promise<void> {
   try {
     await runGitCommand(["rev-parse", "--git-dir"], { cwd, envOverlay: READ_ONLY_GIT_ENV });
-  } catch {
+  } catch (error) {
+    throwIfGitCommandBackpressure(error);
     throw new NotGitRepoError(cwd);
   }
 }
@@ -844,7 +851,8 @@ export async function getCurrentBranch(cwd: string): Promise<string | null> {
       return await getRebaseHeadBranch(cwd);
     }
     return branch.length > 0 ? branch : null;
-  } catch {
+  } catch (error) {
+    throwIfGitCommandBackpressure(error);
     return null;
   }
 }
@@ -864,7 +872,8 @@ async function getCurrentHeadSha(cwd: string, context?: CheckoutContext): Promis
     });
     const sha = stdout.trim();
     return sha.length > 0 ? sha : null;
-  } catch {
+  } catch (error) {
+    throwIfGitCommandBackpressure(error);
     return null;
   }
 }
@@ -895,7 +904,8 @@ async function getRebaseHeadBranch(cwd: string): Promise<string | null> {
           return headName.slice("refs/heads/".length) || null;
         }
         return headName || null;
-      } catch {
+      } catch (error) {
+        throwIfGitCommandBackpressure(error);
         return null;
       }
     }),
@@ -912,6 +922,7 @@ async function getWorktreeRoot(cwd: string, context?: CheckoutContext): Promise<
     });
     return parseGitRevParsePath(stdout);
   } catch (error) {
+    throwIfGitCommandBackpressure(error);
     if (!isNotGitRepositoryError(error)) {
       context?.logger?.warn(
         { err: error, cwd },
@@ -1189,7 +1200,8 @@ async function getGitConfigValue(
     });
     const value = stdout.trim();
     return value.length > 0 ? value : null;
-  } catch {
+  } catch (error) {
+    throwIfGitCommandBackpressure(error);
     return null;
   }
 }
@@ -1219,7 +1231,8 @@ async function getGitRemotePushUrl(
     });
     const value = stdout.trim();
     return value.length > 0 ? value : null;
-  } catch {
+  } catch (error) {
+    throwIfGitCommandBackpressure(error);
     return null;
   }
 }
@@ -1300,7 +1313,8 @@ export async function resolveAbsoluteGitDir(cwd: string): Promise<string | null>
     });
     const gitDir = stdout.trim();
     return gitDir.length > 0 ? gitDir : null;
-  } catch {
+  } catch (error) {
+    throwIfGitCommandBackpressure(error);
     return null;
   }
 }
@@ -1312,7 +1326,8 @@ async function resolveGitCommonDir(cwd: string): Promise<string | null> {
       envOverlay: READ_ONLY_GIT_ENV,
     });
     return resolveGitRevParsePath(cwd, stdout);
-  } catch {
+  } catch (error) {
+    throwIfGitCommandBackpressure(error);
     return null;
   }
 }
@@ -1576,7 +1591,8 @@ async function getOriginAheadBehind(
     const ahead = Number.parseInt(aheadRaw ?? "", 10);
     const behind = Number.parseInt(behindRaw ?? "", 10);
     return Number.isNaN(ahead) || Number.isNaN(behind) ? null : { ahead, behind };
-  } catch {
+  } catch (error) {
+    throwIfGitCommandBackpressure(error);
     return null;
   }
 }
@@ -1594,13 +1610,11 @@ async function inspectCheckoutContext(
   cwd: string,
   context?: CheckoutContext,
 ): Promise<CheckoutInspectionContext | null> {
-  const [root, gitCommonDir] = await Promise.all([
-    getWorktreeRoot(cwd, context),
-    resolveGitCommonDir(cwd),
-  ]);
+  const root = await getWorktreeRoot(cwd, context);
   if (!root) {
     return null;
   }
+  const gitCommonDir = await resolveGitCommonDir(cwd);
 
   const repositoryContext: CheckoutContext = { ...context, repositoryCommonDir: gitCommonDir };
   const [currentBranch, remoteUrl, absoluteGitDir] = await Promise.all([
@@ -1781,7 +1795,10 @@ export async function getCheckoutSnapshotFacts(
     cwd,
     inspected.gitCommonDir,
     repositoryContext,
-  ).catch(() => null);
+  ).catch((error) => {
+    throwIfGitCommandBackpressure(error);
+    return null;
+  });
   let comparisonBaseRef: string | null = null;
   if (
     resolvedBaseRef &&
@@ -1792,7 +1809,10 @@ export async function getCheckoutSnapshotFacts(
       cwd,
       resolvedBaseRef,
       repositoryContext,
-    ).catch(() => null);
+    ).catch((error) => {
+      throwIfGitCommandBackpressure(error);
+      return null;
+    });
   }
 
   let branchRemoteName: string | null = null;

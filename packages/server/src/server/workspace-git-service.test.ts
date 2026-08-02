@@ -24,6 +24,7 @@ import {
   type WorkspaceGitRuntimeSnapshot,
 } from "./workspace-git-service.js";
 import { isPlatform } from "../test-utils/platform.js";
+import { GitCommandBackpressureError } from "../utils/run-git-command.js";
 
 const REPO_CWD = path.resolve("/tmp/repo");
 
@@ -532,6 +533,18 @@ describe("WorkspaceGitServiceImpl", () => {
     subscription.unsubscribe();
     fetchDeferred.resolve();
     await flushPromises();
+    service.dispose();
+  });
+
+  test("refresh preserves typed Git pressure instead of reporting success", async () => {
+    const pressure = new GitCommandBackpressureError(8, 64, 8, 64);
+    const service = createService({
+      getCheckoutStatus: vi.fn(async () => {
+        throw pressure;
+      }),
+    });
+
+    await expect(service.refresh(REPO_CWD)).rejects.toBe(pressure);
     service.dispose();
   });
 

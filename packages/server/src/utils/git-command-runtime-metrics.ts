@@ -16,6 +16,7 @@ export interface GitCommandRuntimeMetricsSnapshot {
   submitted: number;
   admitted: number;
   rejected: number;
+  canceled: number;
   started: number;
   completed: number;
   failed: number;
@@ -40,6 +41,7 @@ export class GitCommandRuntimeMetricsWindow {
   private submittedCount = 0;
   private admittedCount = 0;
   private rejectedCount = 0;
+  private canceledCount = 0;
   private startedCount = 0;
   private completedCount = 0;
   private failedCount = 0;
@@ -67,6 +69,13 @@ export class GitCommandRuntimeMetricsWindow {
     this.submittedCount += 1;
     this.rejectedCount += 1;
     this.operationCounts.set(operation, (this.operationCounts.get(operation) ?? 0) + 1);
+  }
+
+  cancel(metric: GitCommandRuntimeMetric): void {
+    if (!this.pendingCommands.delete(metric)) {
+      return;
+    }
+    this.canceledCount += 1;
   }
 
   observeLimiter(active: number, pending: number): void {
@@ -124,6 +133,7 @@ export class GitCommandRuntimeMetricsWindow {
       submitted: this.submittedCount,
       admitted: this.admittedCount,
       rejected: this.rejectedCount,
+      canceled: this.canceledCount,
       started: this.startedCount,
       completed: this.completedCount,
       failed: this.failedCount,
@@ -140,6 +150,7 @@ export class GitCommandRuntimeMetricsWindow {
     this.submittedCount = 0;
     this.admittedCount = 0;
     this.rejectedCount = 0;
+    this.canceledCount = 0;
     this.startedCount = 0;
     this.completedCount = 0;
     this.failedCount = 0;

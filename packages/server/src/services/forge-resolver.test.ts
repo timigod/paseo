@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import { createForgeService } from "./forge-registry.js";
 import { createForgeResolver, forgeForHost, parseRemoteHost } from "./forge-resolver.js";
+import { GitCommandBackpressureError } from "../utils/run-git-command.js";
 
 function createSshHostnameResolver(hostnameByAlias: Record<string, string | null>) {
   return vi.fn(async (host: string): Promise<string | null> => {
@@ -42,6 +43,19 @@ describe("forgeForHost", () => {
 });
 
 describe("createForgeResolver", () => {
+  it("does not cache Git pressure as a missing forge", async () => {
+    const pressure = new GitCommandBackpressureError(8, 64, 8, 64);
+    const resolveRemoteUrl = vi
+      .fn<() => Promise<string | null>>()
+      .mockRejectedValueOnce(pressure)
+      .mockResolvedValueOnce("git@github.com:owner/repo.git");
+    const resolver = createForgeResolver({ resolveRemoteUrl });
+
+    await expect(resolver.resolve("/repo")).rejects.toBe(pressure);
+    await expect(resolver.resolve("/repo")).resolves.toMatchObject({ forge: "github" });
+    expect(resolveRemoteUrl).toHaveBeenCalledTimes(2);
+  });
+
   it("resolves a github.com remote to the github forge", async () => {
     const resolver = createForgeResolver({
       resolveRemoteUrl: async () => "git@github.com:owner/repo.git",

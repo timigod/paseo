@@ -1,6 +1,6 @@
 import { z } from "zod";
 import { findExecutable } from "../executable-resolution/executable-resolution.js";
-import { runGitCommand } from "../utils/run-git-command.js";
+import { runGitCommand, throwIfGitCommandBackpressure } from "../utils/run-git-command.js";
 import { execCommand } from "../utils/spawn.js";
 
 /**
@@ -282,7 +282,8 @@ export async function defaultResolveRemoteUrl(cwd: string): Promise<string | nul
     const { stdout } = await runGitCommand(["config", "--get", "remote.origin.url"], { cwd });
     const url = stdout.trim();
     return url.length > 0 ? url : null;
-  } catch {
+  } catch (error) {
+    throwIfGitCommandBackpressure(error);
     return null;
   }
 }

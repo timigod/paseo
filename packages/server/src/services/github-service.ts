@@ -5,7 +5,7 @@ import {
   parseGitRemoteLocation,
 } from "@getpaseo/protocol/git-remote";
 import { findExecutable } from "../executable-resolution/executable-resolution.js";
-import { runGitCommand } from "../utils/run-git-command.js";
+import { runGitCommand, throwIfGitCommandBackpressure } from "../utils/run-git-command.js";
 import { execCommand } from "../utils/spawn.js";
 import { resolveSshHostname } from "../utils/ssh-hostname.js";
 import {
@@ -1441,7 +1441,10 @@ export function createGitHubService(options: CreateGitHubServiceOptions = {}): G
       const readOptions: ForgeReadOptions = input.force
         ? { force: true, reason: input.reason }
         : { force: false, reason: input.reason };
-      const enterpriseHost = await resolveRepoHostCached(input.cwd).catch(() => null);
+      const enterpriseHost = await resolveRepoHostCached(input.cwd).catch((error) => {
+        throwIfGitCommandBackpressure(error);
+        return null;
+      });
       const query = normalizeGitHubSearchQuery(input.query, enterpriseHost);
       const [issuesResult, prsResult] = await Promise.allSettled([
         shouldFetchIssues
@@ -2452,7 +2455,8 @@ async function resolveGitHubSlugFromOrigin(cwd: string): Promise<string | null> 
       env: { ...process.env, GIT_OPTIONAL_LOCKS: "0" },
       timeout: GIT_ORIGIN_URL_READ_TIMEOUT_MS,
     }));
-  } catch {
+  } catch (error) {
+    throwIfGitCommandBackpressure(error);
     return null;
   }
   return parseGitHubRemoteUrl(stdout.trim())?.repo ?? null;
@@ -3202,7 +3206,8 @@ async function resolveGitHubEnterpriseHost(cwd: string): Promise<string | null> 
       env: { ...process.env, GIT_OPTIONAL_LOCKS: "0" },
       timeout: 5_000,
     }));
-  } catch {
+  } catch (error) {
+    throwIfGitCommandBackpressure(error);
     return null;
   }
 

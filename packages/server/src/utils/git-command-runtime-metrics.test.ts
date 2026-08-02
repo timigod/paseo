@@ -24,6 +24,7 @@ describe("GitCommandRuntimeMetricsWindow", () => {
       submitted: 1,
       admitted: 1,
       rejected: 0,
+      canceled: 0,
       started: 1,
       completed: 1,
       failed: 0,
@@ -95,6 +96,27 @@ describe("GitCommandRuntimeMetricsWindow", () => {
         ["rev-parse", 1],
         ["status", 1],
       ],
+    });
+  });
+
+  test("settles queued cancellation once without recording execution", () => {
+    const { metrics } = createMetricsWindow(1);
+    const canceled = metrics.submit("status");
+
+    metrics.cancel(canceled);
+    metrics.cancel(canceled);
+
+    expect(metrics.snapshotAndReset()).toMatchObject({
+      submitted: 1,
+      admitted: 1,
+      rejected: 0,
+      canceled: 1,
+      started: 0,
+      completed: 0,
+      failed: 0,
+      pending: 0,
+      queueWaitMs: { count: 0 },
+      executionMs: { count: 0 },
     });
   });
 });

@@ -12,9 +12,16 @@ const DEFAULT_TIMEOUT_MS = 30_000;
 const DEFAULT_MAX_OUTPUT_BYTES = 20 * 1024 * 1024; // 20MB
 const DEFAULT_STDERR_LIMIT = 2048;
 const DEFAULT_MAX_PENDING = 64;
+const MAX_GIT_CONCURRENCY = 32;
+const MAX_GIT_PENDING = 1_024;
 
-const gitConcurrency = parseIntegerEnv("PASEO_GIT_CONCURRENCY", 8, 1);
-const gitMaxPending = parseIntegerEnv("PASEO_GIT_MAX_PENDING", DEFAULT_MAX_PENDING, 0);
+const gitConcurrency = parseIntegerEnv("PASEO_GIT_CONCURRENCY", 8, 1, MAX_GIT_CONCURRENCY);
+const gitMaxPending = parseIntegerEnv(
+  "PASEO_GIT_MAX_PENDING",
+  DEFAULT_MAX_PENDING,
+  0,
+  MAX_GIT_PENDING,
+);
 const gitLimit = pLimit(gitConcurrency);
 const gitRuntimeMetrics = new GitCommandRuntimeMetricsWindow(
   gitConcurrency,
@@ -22,6 +29,7 @@ const gitRuntimeMetrics = new GitCommandRuntimeMetricsWindow(
   gitMaxPending,
 );
 const admittedGitCommands = new Set<Promise<unknown>>();
+let gitCommandAdmissionCount = 0;
 
 export interface GitCommandOptions {
   cwd: string;
@@ -74,6 +82,12 @@ export class GitCommandBackpressureError extends Error {
   }
 }
 
+export function throwIfGitCommandBackpressure(error: unknown): void {
+  if (error instanceof GitCommandBackpressureError) {
+    throw error;
+  }
+}
+
 interface GitCommandMetricsState {
   commands: GitCommandMetric[];
   active: number;
@@ -110,10 +124,7 @@ export function stopGitCommandMetrics(): GitCommandMetricsSnapshot {
 }
 
 export function snapshotGitCommandRuntimeMetrics(): GitCommandRuntimeMetricsSnapshot {
-  return gitRuntimeMetrics.snapshotAndReset({
-    active: gitLimit.activeCount,
-    pending: gitLimit.pendingCount,
-  });
+  return gitRuntimeMetrics.snapshotAndReset();
 }
 
 /** Wait for all commands admitted before and during the drain to leave the global executor. */
@@ -170,8 +181,7 @@ function createGitCancellationError(args: readonly string[]): Error {
 function waitForGitCommand<T>(
   task: Promise<T>,
   signal: AbortSignal | undefined,
-  args: readonly string[],
-  hasStarted: () => boolean,
+  cancelQueued: () => Error | null,
 ): Promise<T> {
   if (!signal) return task;
 
@@ -184,11 +194,8 @@ function waitForGitCommand<T>(
       callback();
     };
     const onAbort = () => {
-      // A queued command has no process to join, so it can be canceled
-      // immediately. Once the limiter has started the task, its process owns
-      // settlement and will preserve the cancellation error until `close`.
-      if (hasStarted()) return;
-      finish(() => reject(createGitCancellationError(args)));
+      const error = cancelQueued();
+      if (error) finish(() => reject(error));
     };
     signal.addEventListener("abort", onAbort, { once: true });
     void task.then(
@@ -204,27 +211,41 @@ export function runGitCommand(
   options: GitCommandOptions,
 ): Promise<GitCommandResult> {
   const operation = getGitOperation(args);
-  if (gitLimit.activeCount >= gitConcurrency && gitLimit.pendingCount >= gitMaxPending) {
+  const pending = Math.max(0, gitCommandAdmissionCount - gitLimit.activeCount);
+  if (gitCommandAdmissionCount >= gitConcurrency + gitMaxPending) {
     gitRuntimeMetrics.reject(operation);
-    gitRuntimeMetrics.observeLimiter(gitLimit.activeCount, gitLimit.pendingCount);
+    gitRuntimeMetrics.observeLimiter(gitLimit.activeCount, pending);
     return Promise.reject(
-      new GitCommandBackpressureError(
-        gitLimit.activeCount,
-        gitLimit.pendingCount,
-        gitConcurrency,
-        gitMaxPending,
-      ),
+      new GitCommandBackpressureError(gitLimit.activeCount, pending, gitConcurrency, gitMaxPending),
     );
   }
 
   const runtimeMetric = gitRuntimeMetrics.submit(operation);
-  let started = false;
+  const cancellationError = createGitCancellationError(args);
+  let state: "queued" | "started" | "canceled" = "queued";
+  let admissionReleased = false;
+  gitCommandAdmissionCount += 1;
+  const releaseAdmission = () => {
+    if (admissionReleased) return;
+    admissionReleased = true;
+    gitCommandAdmissionCount = Math.max(0, gitCommandAdmissionCount - 1);
+  };
+  const cancelQueued = (): Error | null => {
+    if (state !== "queued") return null;
+    state = "canceled";
+    gitRuntimeMetrics.cancel(runtimeMetric);
+    releaseAdmission();
+    return cancellationError;
+  };
   const promise = gitLimit(() => {
-    started = true;
+    if (state === "canceled") {
+      throw cancellationError;
+    }
+    state = "started";
     if (options.signal?.aborted) {
       gitRuntimeMetrics.start(runtimeMetric);
       gitRuntimeMetrics.finish(runtimeMetric, { success: false, timedOut: false });
-      throw createGitCancellationError(args);
+      throw cancellationError;
     }
     return new Promise<GitCommandResult>((resolve, reject) => {
       gitRuntimeMetrics.start(runtimeMetric);
@@ -253,15 +274,6 @@ export function runGitCommand(
         logger.trace(traceContext, "Spawning git command");
       }
 
-      // `core.quotepath=false` makes git emit raw UTF-8 paths instead of
-      // octal-escaping non-ASCII bytes (e.g. `测试文件.txt` vs `"\346\265\213..."`).
-      const child = spawnProcess("git", ["-c", "core.quotepath=false", ...args], {
-        cwd: options.cwd,
-        envOverlay,
-        shell: false,
-        stdio: ["ignore", "pipe", "pipe"],
-      });
-
       let settled = false;
       let metricFinished = false;
       let pendingError: Error | null = null;
@@ -287,6 +299,30 @@ export function runGitCommand(
         finishGitCommandMetric(metricsState, metric);
         gitRuntimeMetrics.finish(runtimeMetric, { success: metric.success, timedOut });
       };
+
+      let child: ReturnType<typeof spawnProcess>;
+      try {
+        // `core.quotepath=false` makes git emit raw UTF-8 paths instead of
+        // octal-escaping non-ASCII bytes (e.g. `测试文件.txt` vs `"\346\265\213..."`).
+        child = spawnProcess("git", ["-c", "core.quotepath=false", ...args], {
+          cwd: options.cwd,
+          envOverlay,
+          shell: false,
+          stdio: ["ignore", "pipe", "pipe"],
+        });
+      } catch (error) {
+        finishMetricOnce({
+          args,
+          cwd: options.cwd,
+          startedAtMs: startedAt,
+          durationMs: Date.now() - startedAt,
+          exitCode: null,
+          signal: null,
+          success: false,
+        });
+        reject(error);
+        return;
+      }
 
       const rememberError = (error: Error, timedOut = false) => {
         if (pendingError) return;
@@ -445,11 +481,22 @@ export function runGitCommand(
   });
   admittedGitCommands.add(promise);
   void promise.then(
-    () => admittedGitCommands.delete(promise),
-    () => admittedGitCommands.delete(promise),
+    () => {
+      admittedGitCommands.delete(promise);
+      releaseAdmission();
+      return undefined;
+    },
+    () => {
+      admittedGitCommands.delete(promise);
+      releaseAdmission();
+      return undefined;
+    },
   );
-  gitRuntimeMetrics.observeLimiter(gitLimit.activeCount, gitLimit.pendingCount);
-  return waitForGitCommand(promise, options.signal, args, () => started);
+  gitRuntimeMetrics.observeLimiter(
+    gitLimit.activeCount,
+    Math.max(0, gitCommandAdmissionCount - gitLimit.activeCount),
+  );
+  return waitForGitCommand(promise, options.signal, cancelQueued);
 }
 
 function formatGitCommand(args: readonly string[]): string {
@@ -460,7 +507,11 @@ function getGitOperation(args: string[]): string {
   return args[0] === "-c" ? (args[2] ?? "unknown") : (args[0] ?? "unknown");
 }
 
-function parseIntegerEnv(name: string, fallback: number, minimum: number): number {
-  const parsed = Number.parseInt(process.env[name] ?? "", 10);
-  return Number.isInteger(parsed) && parsed >= minimum ? parsed : fallback;
+function parseIntegerEnv(name: string, fallback: number, minimum: number, maximum: number): number {
+  const raw = process.env[name];
+  if (!raw || !/^\d+$/.test(raw)) {
+    return fallback;
+  }
+  const parsed = Number(raw);
+  return Number.isSafeInteger(parsed) && parsed >= minimum && parsed <= maximum ? parsed : fallback;
 }

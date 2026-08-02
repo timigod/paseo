@@ -8,6 +8,7 @@ interface FakeSpawnBehavior {
   exitCode?: number | null;
   stderrData?: Buffer | string;
   stdoutData?: Buffer | string;
+  throwError?: Error;
 }
 
 interface FakeSpawnController {
@@ -167,6 +168,9 @@ vi.mock("node:child_process", async () => {
     spawn: vi.fn((_command: string, args: string[]) => {
       const behavior = fakeSpawnController.queue.shift() ?? {};
       fakeSpawnController.spawnedArgs.push(args);
+      if (behavior.throwError) {
+        throw behavior.throwError;
+      }
       const child = new FakeChildProcess(behavior);
       fakeSpawnController.processes.push(child);
       return child as unknown as ReturnType<typeof actual.spawn>;
@@ -184,6 +188,13 @@ async function loadRunGitCommand(concurrency: number, maxPending?: number) {
   if (maxPending !== undefined) {
     vi.stubEnv("PASEO_GIT_MAX_PENDING", String(maxPending));
   }
+  return import("./run-git-command.js");
+}
+
+async function loadRunGitCommandEnv(concurrency: string, maxPending: string) {
+  vi.resetModules();
+  vi.stubEnv("PASEO_GIT_CONCURRENCY", concurrency);
+  vi.stubEnv("PASEO_GIT_MAX_PENDING", maxPending);
   return import("./run-git-command.js");
 }
 
@@ -252,6 +263,51 @@ describe("runGitCommand", () => {
     );
   });
 
+  it.each([
+    ["prefix", "8commands"],
+    ["decimal", "8.5"],
+    ["exponent", "1e1"],
+    ["leading whitespace", " 8"],
+    ["trailing whitespace", "8 "],
+    ["unsafe integer", "9007199254740992"],
+    ["zero", "0"],
+    ["negative", "-1"],
+    ["above cap", "33"],
+  ])("falls back for invalid concurrency: %s", async (_label, value) => {
+    const { snapshotGitCommandRuntimeMetrics } = await loadRunGitCommandEnv(value, "64");
+
+    expect(snapshotGitCommandRuntimeMetrics()).toMatchObject({ concurrencyLimit: 8 });
+  });
+
+  it.each([
+    ["prefix", "64commands"],
+    ["decimal", "64.5"],
+    ["exponent", "1e2"],
+    ["leading whitespace", " 64"],
+    ["trailing whitespace", "64 "],
+    ["unsafe integer", "9007199254740992"],
+    ["negative", "-1"],
+    ["above cap", "1025"],
+  ])("falls back for invalid pending limit: %s", async (_label, value) => {
+    const { snapshotGitCommandRuntimeMetrics } = await loadRunGitCommandEnv("8", value);
+
+    expect(snapshotGitCommandRuntimeMetrics()).toMatchObject({ maxPending: 64 });
+  });
+
+  it.each([
+    ["concurrency minimum", "1", "64", { concurrencyLimit: 1, maxPending: 64 }],
+    ["concurrency maximum", "32", "64", { concurrencyLimit: 32, maxPending: 64 }],
+    ["pending minimum", "8", "0", { concurrencyLimit: 8, maxPending: 0 }],
+    ["pending maximum", "8", "1024", { concurrencyLimit: 8, maxPending: 1_024 }],
+  ])("accepts the exact %s", async (_label, concurrency, maxPending, expected) => {
+    const { snapshotGitCommandRuntimeMetrics } = await loadRunGitCommandEnv(
+      concurrency,
+      maxPending,
+    );
+
+    expect(snapshotGitCommandRuntimeMetrics()).toMatchObject(expected);
+  });
+
   it("keeps admitted commands in FIFO order while rejecting excess pressure", async () => {
     const { GitCommandBackpressureError, runGitCommand } = await loadRunGitCommand(1, 3);
     enqueueSpawnBehaviors(...Array.from({ length: 4 }, () => ({ delayMs: 10 })));
@@ -318,7 +374,7 @@ describe("runGitCommand", () => {
   });
 
   it("cancels active and queued git commands without starting the queued process", async () => {
-    const { runGitCommand } = await loadRunGitCommand(1);
+    const { runGitCommand } = await loadRunGitCommand(1, 1);
     const activeController = new AbortController();
     const queuedController = new AbortController();
 
@@ -337,11 +393,17 @@ describe("runGitCommand", () => {
     await expect(queued).rejects.toThrow("Git command canceled: git rev-parse --show-toplevel");
     expect(fakeSpawnController.processes).toHaveLength(1);
 
+    const replacement = runGitCommand(["status", "replacement"], { cwd: process.cwd() });
+
     activeController.abort();
     await expect(active).rejects.toThrow("Git command canceled: git status");
+    await expect(replacement).resolves.toMatchObject({ exitCode: 0 });
     expect(fakeSpawnController.processes[0]?.killSignals).toEqual(["SIGKILL"]);
     await vi.waitFor(() => expect(fakeSpawnController.activeCount).toBe(0));
-    expect(fakeSpawnController.processes).toHaveLength(1);
+    expect(fakeSpawnController.spawnedArgs.map((args) => args.at(-1))).toEqual([
+      "status",
+      "replacement",
+    ]);
 
     const preAbortedController = new AbortController();
     preAbortedController.abort();
@@ -352,7 +414,69 @@ describe("runGitCommand", () => {
       }),
     ).rejects.toThrow("Git command canceled: git status --short");
     await Promise.resolve();
-    expect(fakeSpawnController.processes).toHaveLength(1);
+    expect(fakeSpawnController.processes).toHaveLength(2);
+  });
+
+  it("releases a pre-aborted handoff reservation before the limiter callback runs", async () => {
+    const { runGitCommand, snapshotGitCommandRuntimeMetrics } = await loadRunGitCommand(1, 0);
+    const controller = new AbortController();
+    enqueueSpawnBehaviors({ stdoutData: "replacement" });
+
+    const canceled = runGitCommand(["status", "canceled"], {
+      cwd: process.cwd(),
+      signal: controller.signal,
+    });
+    controller.abort();
+    const replacement = runGitCommand(["status", "replacement"], { cwd: process.cwd() });
+
+    await expect(canceled).rejects.toMatchObject({ name: "AbortError" });
+    await expect(replacement).resolves.toMatchObject({ stdout: "replacement" });
+    expect(fakeSpawnController.spawnedArgs.map((args) => args.at(-1))).toEqual(["replacement"]);
+    expect(snapshotGitCommandRuntimeMetrics()).toMatchObject({
+      admitted: 2,
+      canceled: 1,
+      started: 1,
+      completed: 1,
+      failed: 0,
+      active: 0,
+      pending: 0,
+    });
+  });
+
+  it("settles repeated queued aborts once and never later spawns the command", async () => {
+    const { drainGitCommands, runGitCommand, snapshotGitCommandRuntimeMetrics } =
+      await loadRunGitCommand(1, 1);
+    const activeController = new AbortController();
+    const queuedController = new AbortController();
+    enqueueSpawnBehaviors({ delayMs: 5_000 });
+
+    const active = runGitCommand(["status", "active"], {
+      cwd: process.cwd(),
+      signal: activeController.signal,
+    });
+    await vi.waitFor(() => expect(fakeSpawnController.processes).toHaveLength(1));
+    const queued = runGitCommand(["status", "queued"], {
+      cwd: process.cwd(),
+      signal: queuedController.signal,
+    });
+
+    queuedController.abort();
+    queuedController.abort();
+    await expect(queued).rejects.toMatchObject({ name: "AbortError" });
+    activeController.abort();
+    await expect(active).rejects.toMatchObject({ name: "AbortError" });
+    await drainGitCommands();
+
+    expect(fakeSpawnController.spawnedArgs.map((args) => args.at(-1))).toEqual(["active"]);
+    expect(snapshotGitCommandRuntimeMetrics()).toMatchObject({
+      admitted: 2,
+      canceled: 1,
+      started: 1,
+      completed: 1,
+      failed: 1,
+      active: 0,
+      pending: 0,
+    });
   });
 
   it("keeps an active cancellation pending until the killed process closes", async () => {
@@ -425,6 +549,48 @@ describe("runGitCommand", () => {
       exitCode: 0,
       stdout: "ok",
       truncated: false,
+    });
+  });
+
+  it("settles all metrics when spawn throws synchronously and preserves the error", async () => {
+    const {
+      drainGitCommands,
+      runGitCommand,
+      snapshotGitCommandRuntimeMetrics,
+      startGitCommandMetrics,
+      stopGitCommandMetrics,
+    } = await loadRunGitCommand(1);
+    const spawnError = new TypeError("spawn threw synchronously");
+    startGitCommandMetrics();
+    enqueueSpawnBehaviors({ throwError: spawnError });
+
+    await expect(runGitCommand(["status"], { cwd: process.cwd() })).rejects.toBe(spawnError);
+    await drainGitCommands();
+
+    expect(stopGitCommandMetrics()).toMatchObject({
+      total: 1,
+      failed: 1,
+      maxConcurrent: 1,
+      commands: [
+        expect.objectContaining({
+          args: ["status"],
+          exitCode: null,
+          signal: null,
+          success: false,
+        }),
+      ],
+    });
+    expect(snapshotGitCommandRuntimeMetrics()).toMatchObject({
+      submitted: 1,
+      admitted: 1,
+      canceled: 0,
+      started: 1,
+      completed: 1,
+      failed: 1,
+      active: 0,
+      pending: 0,
+      queueWaitMs: { count: 1 },
+      executionMs: { count: 1 },
     });
   });
 

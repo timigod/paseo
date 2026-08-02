@@ -39,7 +39,7 @@ import {
 } from "../services/forge-resolver.js";
 import { GitHubRateLimitCooldownError } from "../services/github-service.js";
 import { parseGitRevParsePath } from "../utils/git-rev-parse-path.js";
-import { runGitCommand } from "../utils/run-git-command.js";
+import { runGitCommand, throwIfGitCommandBackpressure } from "../utils/run-git-command.js";
 import { listPaseoWorktrees, type PaseoWorktreeInfo } from "../utils/worktree.js";
 import { READ_ONLY_GIT_ENV } from "./checkout-git-utils.js";
 import { deriveProjectSlug } from "./workspace-git-metadata.js";
@@ -875,13 +875,17 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
   async refresh(cwd: string, _options?: { priority?: "normal" | "high" }): Promise<void> {
     cwd = resolve(cwd);
     const target = this.ensureWorkspaceTarget(cwd);
-    await this.refreshWorkspaceTarget(target, {
-      force: false,
-      forceForge: false,
-      includeForge: false,
-      reason: "refresh",
-      notify: true,
-    });
+    await this.refreshWorkspaceTarget(
+      target,
+      {
+        force: false,
+        forceForge: false,
+        includeForge: false,
+        reason: "refresh",
+        notify: true,
+      },
+      true,
+    );
     this.scheduleWorkspaceObservationSetup(target);
   }
 
@@ -2137,6 +2141,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
   private async refreshWorkspaceTarget(
     target: WorkspaceGitTarget,
     request: WorkspaceGitRefreshRequest,
+    propagateBackpressure = false,
   ): Promise<void> {
     if (target.closed || this.workspaceTargets.get(target.cwd) !== target) {
       return;
@@ -2146,6 +2151,9 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     } catch (error) {
       if (target.closed && isAbortError(error)) {
         return;
+      }
+      if (propagateBackpressure) {
+        throwIfGitCommandBackpressure(error);
       }
       this.logger.warn(
         { err: error, cwd: target.cwd, reason: request.reason },

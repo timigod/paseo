@@ -17,6 +17,7 @@ import {
 } from "./github-service.js";
 import { isPlatform } from "../test-utils/platform.js";
 import { CheckoutPrStatusResponseSchema } from "@getpaseo/protocol/messages";
+import { GitCommandBackpressureError } from "../utils/run-git-command.js";
 
 const EXPECTED_GITHUB_FAST_POLL_MS = 20_000;
 const EXPECTED_GITHUB_SLOW_POLL_MS = 120_000;
@@ -3884,6 +3885,24 @@ describe("ForgeService", () => {
         ],
       },
     ]);
+  });
+
+  it("preserves Git pressure while resolving the repository host for search", async () => {
+    const pressure = new GitCommandBackpressureError(8, 64, 8, 64);
+    const runner = createRunner([]);
+    const service = createGitHubService({
+      runner: runner.runner,
+      resolveGhPath: async () => "/usr/bin/gh",
+      resolveRepoHost: async () => {
+        throw pressure;
+      },
+      now: () => 100,
+    });
+
+    await expect(
+      service.searchIssuesAndPrs({ cwd: "/repo", query: "cache", limit: 5 }),
+    ).rejects.toBe(pressure);
+    expect(runner.calls).toEqual([]);
   });
 
   it("treats a GitHub issue or PR URL as a search for that number", async () => {
