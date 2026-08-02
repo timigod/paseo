@@ -444,8 +444,9 @@ wins when another host uses the same text as its endpoint.
 
 When `fleet run` uses an idempotency key, the CLI persists the fully resolved create intent and the
 daemon identity before creation. A retry can follow a changed endpoint for the same configured host,
-but it fails closed if that endpoint now reaches a different daemon or the original host was removed.
-Use a new idempotency key when intentionally changing the prompt, model, workspace source, or host.
+but a saved endpoint selector cannot select a different current host. The retry fails closed if the
+current endpoint reaches a different daemon or the original host was removed. Use a new idempotency
+key when intentionally changing the prompt, model, workspace source, or host.
 
 `fleet status --json` and `fleet doctor --json` are safe-by-default summaries. They include logical
 host IDs, health booleans, aggregate agent and permission counts, and generic issue categories. They

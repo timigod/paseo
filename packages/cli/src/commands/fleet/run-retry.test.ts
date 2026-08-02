@@ -199,6 +199,33 @@ describe("fleet run retry affinity", () => {
     });
   });
 
+  it("rejects a stored endpoint selector that is now another host's exact ID", async () => {
+    const originalOwner = fleetHost({ endpoint: "builder-b" });
+    const configPath = await createFleetConfig([originalOwner]);
+    configureRunMocks();
+    const options = { ...runOptions, host: "builder-b" };
+
+    await runFleetRunCommand(undefined, options, {} as Parameters<typeof runFleetRunCommand>[2]);
+    await writeFleetConfig(
+      configPath,
+      [
+        fleetHost({ endpoint: "builder-a.internal:7777" }),
+        fleetHost({
+          id: "builder-b",
+          name: "Builder B",
+          endpoint: "builder-b.internal:6767",
+          hostnamePrefixes: ["builder-b"],
+        }),
+      ],
+      "gpt-original",
+    );
+
+    await expect(
+      runFleetRunCommand(undefined, options, {} as Parameters<typeof runFleetRunCommand>[2]),
+    ).rejects.toMatchObject({ code: "FLEET_KEY_HOST_CONFLICT" });
+    expect(mocks.runAgentRunIntent).toHaveBeenCalledTimes(1);
+  });
+
   it("routes a claimed affinity to its exact host ID when an earlier endpoint collides", async () => {
     const endpointShadow = fleetHost({
       id: "builder-shadow",
@@ -243,6 +270,32 @@ describe("fleet run retry affinity", () => {
 
     await expect(
       runFleetRunCommand(undefined, runOptions, {} as Parameters<typeof runFleetRunCommand>[2]),
+    ).rejects.toMatchObject({ code: "FLEET_AFFINITY_HOST_MISSING" });
+    expect(mocks.runAgentRunIntent).toHaveBeenCalledTimes(1);
+  });
+
+  it("fails closed when the owner is replaced during an existing retry", async () => {
+    const configPath = await createFleetConfig([fleetHost()]);
+    configureRunMocks();
+    const options = { ...runOptions, host: undefined };
+    await runFleetRunCommand(undefined, options, {} as Parameters<typeof runFleetRunCommand>[2]);
+    mocks.getOrCreateCliClientId.mockImplementationOnce(async () => {
+      await writeFleetConfig(
+        configPath,
+        [
+          fleetHost({
+            id: "builder-replacement",
+            name: "Builder Replacement",
+            hostnamePrefixes: ["builder-replacement"],
+          }),
+        ],
+        "gpt-original",
+      );
+      return "caller-1";
+    });
+
+    await expect(
+      runFleetRunCommand(undefined, options, {} as Parameters<typeof runFleetRunCommand>[2]),
     ).rejects.toMatchObject({ code: "FLEET_AFFINITY_HOST_MISSING" });
     expect(mocks.runAgentRunIntent).toHaveBeenCalledTimes(1);
   });

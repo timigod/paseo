@@ -98,6 +98,17 @@ function requireFleetHost(value: string | undefined, hosts: readonly FleetHost[]
   return host;
 }
 
+function matchesFleetAffinitySelector(
+  value: string,
+  owner: FleetHost,
+  hosts: readonly FleetHost[],
+): boolean {
+  const currentHost = findFleetHost(value, hosts);
+  return currentHost
+    ? matchesFleetHostId(owner, currentHost.id)
+    : findFleetHost(value, [owner]) !== null;
+}
+
 async function runFleetStatusCommand(): Promise<ListResult<FleetHostSummary>> {
   const statuses = await collectFleetStatus(loadFleetConfig());
   return {
@@ -136,14 +147,18 @@ export async function runFleetRunCommand(
   const callerId = idempotencyKey ? await getOrCreateCliClientId() : null;
   const existingAffinity =
     idempotencyKey && callerId ? await loadFleetAffinity({ callerId, idempotencyKey }) : null;
-  if (existingAffinity && options.host && !findFleetHost(options.host, [existingAffinity.host])) {
+  if (
+    existingAffinity &&
+    options.host &&
+    !matchesFleetAffinitySelector(options.host, existingAffinity.host, loadFleetConfig().hosts)
+  ) {
     throw {
       code: "FLEET_KEY_HOST_CONFLICT",
       message: `Idempotency key is owned by ${existingAffinity.host.id}, not pinned host ${options.host}`,
     } satisfies CommandError;
   }
   if (existingAffinity && idempotencyKey) {
-    const currentHost = findFleetHostById(existingAffinity.host.id, config.hosts);
+    const currentHost = findFleetHostById(existingAffinity.host.id, loadFleetConfig().hosts);
     if (!currentHost) {
       throw {
         code: "FLEET_AFFINITY_HOST_MISSING",
