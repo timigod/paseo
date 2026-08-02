@@ -255,6 +255,7 @@ describe("AgentStorage", () => {
     expect(persisted?.seenMaterialProgressFingerprints).toHaveLength(256);
     expect(persisted?.seenMaterialProgressFingerprints[0]).toBe("write:proof-44");
     expect(persisted?.seenMaterialProgressFingerprints.at(-1)).toBe("write:proof-299");
+    expect(persisted?.seenMaterialProgressFingerprintBloom).toEqual(expect.any(String));
   });
 
   test("applySnapshot keeps featureValues absent when they were never set", async () => {

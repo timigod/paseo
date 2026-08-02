@@ -11,6 +11,7 @@ import {
   type Session as OpenCodeSession,
   type TextPartInput as OpenCodeTextPartInput,
 } from "@opencode-ai/sdk/v2/client";
+import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import { createPathEquivalenceMatcher } from "../../../utils/path.js";
 import pLimit from "p-limit";
@@ -2759,7 +2760,7 @@ function createDeferred<T>(): Deferred<T> {
 
 type OpenCodeTurnState =
   | { status: "idle" }
-  | { status: "running"; turnId: string }
+  | { status: "running"; turnId: string; userMessageId: string | null }
   | { status: "stopping"; stop: OpenCodeStop };
 
 type OpenCodeRunnerStatus = "idle" | "busy" | "retry";
@@ -3242,7 +3243,8 @@ class OpenCodeAgentSession implements AgentSession {
     }
 
     const turnId = this.createTurnId();
-    this.turnState = { status: "running", turnId };
+    const userMessageId = `msg_${randomUUID().replaceAll("-", "")}`;
+    this.turnState = { status: "running", turnId, userMessageId };
     this.notifySubscribers({ type: "turn_started", provider: "opencode" }, turnId);
 
     const slashCommand = await this.resolveSlashCommandInvocation(prompt);
@@ -3289,6 +3291,7 @@ class OpenCodeAgentSession implements AgentSession {
         .command({
           sessionID: this.sessionId,
           directory: this.config.cwd,
+          messageID: userMessageId,
           command: slashCommand.commandName,
           arguments: slashCommand.args ?? "",
           ...(this.config.model ? { model: this.config.model } : {}),
@@ -3354,6 +3357,7 @@ class OpenCodeAgentSession implements AgentSession {
           const promptResponse = await this.client.session.promptAsync({
             sessionID: this.sessionId,
             directory: this.config.cwd,
+            messageID: userMessageId,
             parts,
             ...(options?.outputSchema
               ? {
@@ -3801,7 +3805,7 @@ class OpenCodeAgentSession implements AgentSession {
 
   private startAutonomousTurn(): string {
     const turnId = this.createTurnId();
-    this.turnState = { status: "running", turnId };
+    this.turnState = { status: "running", turnId, userMessageId: null };
     this.runningToolCalls.clear();
     this.subAgentsByCallId.clear();
     this.subAgentCallIdByChildSessionId.clear();
@@ -4003,7 +4007,7 @@ class OpenCodeAgentSession implements AgentSession {
   }
 
   async *streamHistory(): AsyncGenerator<AgentStreamEvent> {
-    const activeTurnId = this.activeForegroundTurnId;
+    const activeTurn = this.turnState.status === "running" ? this.turnState : null;
     const sessionResponse = await this.client.session.get({
       sessionID: this.sessionId,
       directory: this.config.cwd,
@@ -4022,16 +4026,20 @@ class OpenCodeAgentSession implements AgentSession {
       sessionResponse.error ? null : sessionResponse.data?.revert,
     );
     const activeAssistantMessageId =
-      activeTurnId && this.activeForegroundTurnId === activeTurnId
+      activeTurn?.userMessageId &&
+      this.turnState.status === "running" &&
+      this.turnState.turnId === activeTurn.turnId &&
+      this.turnState.userMessageId === activeTurn.userMessageId
         ? messages.findLast(
             (message) =>
-              message.info.role === "assistant" && message.info.time?.completed === undefined,
+              message.info.role === "assistant" &&
+              message.info.parentID === activeTurn.userMessageId,
           )?.info.id
         : undefined;
     for (const message of messages) {
       for (const event of buildOpenCodeReplayTimelineEvents(message)) {
-        yield activeTurnId && message.info.id === activeAssistantMessageId
-          ? { ...event, turnId: activeTurnId }
+        yield activeTurn && message.info.id === activeAssistantMessageId
+          ? { ...event, turnId: activeTurn.turnId }
           : event;
       }
     }

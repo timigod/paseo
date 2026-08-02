@@ -1719,73 +1719,112 @@ describe("OpenCode adapter startTurn error handling", () => {
     ]);
   });
 
-  test("streamHistory attributes an in-progress material tool to the active OpenCode turn", async () => {
-    const openCode = new TestOpenCodeClient();
-    openCode.sessionPromptAsyncEvents = [];
-    openCode.sessionGetResponse = {
-      data: { id: "ses_unit_test", directory: "/tmp/test", revert: undefined },
-    };
-    openCode.sessionMessagesResponse = {
-      data: [
-        {
+  test.each(["foreground-first", "foreground-last"] as const)(
+    "streamHistory attributes only the correlated in-progress assistant when it is %s",
+    async (order) => {
+      const openCode = new TestOpenCodeClient();
+      openCode.sessionPromptAsyncEvents = [];
+      openCode.sessionGetResponse = {
+        data: { id: "ses_unit_test", directory: "/tmp/test", revert: undefined },
+      };
+      const session = new __openCodeInternals.OpenCodeAgentSession(
+        { provider: "opencode", cwd: "/tmp/test" },
+        openCode.asSdkClient(),
+        "ses_unit_test",
+        createTestLogger(),
+      );
+
+      try {
+        const { turnId } = await session.startTurn("make the change");
+        const promptCall = openCode.calls.sessionPromptAsync[0] as { messageID?: unknown };
+        expect(promptCall.messageID).toEqual(expect.any(String));
+        const foregroundUserMessageId = promptCall.messageID as string;
+        const foregroundAssistant = {
           info: {
-            id: "msg_assistant_running",
+            id: "msg_foreground_assistant_running",
             sessionID: "ses_unit_test",
             role: "assistant",
+            parentID: foregroundUserMessageId,
             time: { created: 1778762475884 },
           },
           parts: [
             {
-              id: "part_apply_patch_running",
+              id: "part_foreground_apply_patch_running",
               sessionID: "ses_unit_test",
-              messageID: "msg_assistant_running",
+              messageID: "msg_foreground_assistant_running",
               type: "tool",
               tool: "apply_patch",
-              callID: "call_apply_patch_running",
+              callID: "call_foreground_apply_patch_running",
               state: {
                 status: "completed",
                 input: {
                   patchText:
-                    "*** Begin Patch\n*** Add File: /tmp/test/proof.txt\n+proof\n*** End Patch",
+                    "*** Begin Patch\n*** Add File: /tmp/test/foreground.txt\n+foreground\n*** End Patch",
                 },
-                output: "Success. Updated the following files:\nA /tmp/test/proof.txt",
+                output: "Success. Updated the following files:\nA /tmp/test/foreground.txt",
               },
             },
           ],
-        },
-      ],
-    };
-    const session = new __openCodeInternals.OpenCodeAgentSession(
-      { provider: "opencode", cwd: "/tmp/test" },
-      openCode.asSdkClient(),
-      "ses_unit_test",
-      createTestLogger(),
-    );
+        };
+        const unrelatedAssistant = {
+          info: {
+            id: "msg_unrelated_assistant_running",
+            sessionID: "ses_unit_test",
+            role: "assistant",
+            parentID: "msg_unrelated_user",
+            time: { created: 1778762475885 },
+          },
+          parts: [
+            {
+              id: "part_unrelated_apply_patch_running",
+              sessionID: "ses_unit_test",
+              messageID: "msg_unrelated_assistant_running",
+              type: "tool",
+              tool: "apply_patch",
+              callID: "call_unrelated_apply_patch_running",
+              state: {
+                status: "completed",
+                input: {
+                  patchText:
+                    "*** Begin Patch\n*** Add File: /tmp/test/unrelated.txt\n+unrelated\n*** End Patch",
+                },
+                output: "Success. Updated the following files:\nA /tmp/test/unrelated.txt",
+              },
+            },
+          ],
+        };
+        openCode.sessionMessagesResponse = {
+          data:
+            order === "foreground-first"
+              ? [foregroundAssistant, unrelatedAssistant]
+              : [unrelatedAssistant, foregroundAssistant],
+        };
+        const history: AgentStreamEvent[] = [];
+        for await (const event of session.streamHistory()) {
+          history.push(event);
+        }
 
-    try {
-      const { turnId } = await session.startTurn("make the change");
-      const history: AgentStreamEvent[] = [];
-      for await (const event of session.streamHistory()) {
-        history.push(event);
+        const tools = history.flatMap((event) =>
+          event.type === "timeline" && event.item.type === "tool_call"
+            ? [
+                {
+                  callId: event.item.callId,
+                  detailType: event.item.detail.type,
+                  turnId: "turnId" in event ? event.turnId : undefined,
+                },
+              ]
+            : [],
+        );
+        const toolsByCallId = Object.fromEntries(tools.map((tool) => [tool.callId, tool]));
+        expect(toolsByCallId).toMatchObject({
+          call_foreground_apply_patch_running: { detailType: "edit", turnId },
+          call_unrelated_apply_patch_running: { detailType: "edit", turnId: undefined },
+        });
+      } finally {
+        await session.close();
       }
-
-      expect(history).toEqual([
-        expect.objectContaining({
-          type: "timeline",
-          provider: "opencode",
-          turnId,
-          item: expect.objectContaining({
-            type: "tool_call",
-            callId: "call_apply_patch_running",
-            status: "completed",
-            detail: expect.objectContaining({ type: "edit" }),
-          }),
-        }),
-      ]);
-    } finally {
-      await session.close();
-    }
-  });
+    },
+  );
 
   test("streamHistory maps persisted OpenCode tool parts through canonical detail branches", async () => {
     const patchText = [

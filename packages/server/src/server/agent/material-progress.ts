@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import stripAnsi from "strip-ansi";
 import { z } from "zod";
 import type { MaterialProgressPayload } from "../messages.js";
 import type { ToolCallDetail, ToolCallTimelineItem } from "./agent-sdk-types.js";
@@ -17,6 +18,12 @@ export interface MaterialProgressCheckpoint {
   lastMaterialProgressAt: string | null;
   lastMaterialProgressKind: MaterialProgressKind | null;
   seenMaterialProgressFingerprints: string[];
+  /**
+   * Fixed-size Bloom filter for fingerprints evicted from the exact recent window.
+   * Bloom membership can return a false positive and suppress genuinely new progress,
+   * but it cannot grow with the timeline and resets at each accepted continuation.
+   */
+  seenMaterialProgressFingerprintBloom?: string;
   trailingAssistantFingerprint: string | null;
   trailingAssistantHasConcreteText: boolean;
   trailingAssistantAt: string | null;
@@ -32,6 +39,12 @@ const MaterialProgressKindSchema = z.enum([
   "assistant_result",
 ]);
 
+export const MATERIAL_PROGRESS_FINGERPRINT_LIMIT = 256;
+const MATERIAL_PROGRESS_FINGERPRINT_BLOOM_BYTES = 4096;
+const MATERIAL_PROGRESS_FINGERPRINT_BLOOM_HASHES = 6;
+const MATERIAL_PROGRESS_FINGERPRINT_BLOOM_ENCODED_LENGTH =
+  Math.ceil(MATERIAL_PROGRESS_FINGERPRINT_BLOOM_BYTES / 3) * 4;
+
 export const MaterialProgressCheckpointSchema: z.ZodType<MaterialProgressCheckpoint> = z.object({
   timelineEpoch: z.string(),
   continuationBoundarySeq: z.number().int().positive().nullable(),
@@ -42,6 +55,10 @@ export const MaterialProgressCheckpointSchema: z.ZodType<MaterialProgressCheckpo
   lastMaterialProgressAt: z.string().nullable(),
   lastMaterialProgressKind: MaterialProgressKindSchema.nullable(),
   seenMaterialProgressFingerprints: z.array(z.string()),
+  seenMaterialProgressFingerprintBloom: z
+    .string()
+    .length(MATERIAL_PROGRESS_FINGERPRINT_BLOOM_ENCODED_LENGTH)
+    .optional(),
   trailingAssistantFingerprint: z.string().nullable(),
   trailingAssistantHasConcreteText: z.boolean(),
   trailingAssistantAt: z.string().nullable(),
@@ -59,8 +76,6 @@ type EvidenceDetail = Extract<ToolCallDetail, { type: "read" | "search" | "fetch
 type SearchDetail = Extract<EvidenceDetail, { type: "search" }>;
 type ShellDetail = Extract<ToolCallDetail, { type: "shell" }>;
 type PlanDetail = Extract<ToolCallDetail, { type: "plan" }>;
-
-export const MATERIAL_PROGRESS_FINGERPRINT_LIMIT = 256;
 
 // Checkpoint arrays are immutable, so their identity can cache membership across timeline rows.
 const fingerprintIndexes = new WeakMap<string[], ReadonlySet<string>>();
@@ -98,10 +113,68 @@ function fingerprintIndex(fingerprints: string[]): ReadonlySet<string> {
   return created;
 }
 
-function boundedFingerprints(fingerprints: string[]): string[] {
-  return fingerprints.length > MATERIAL_PROGRESS_FINGERPRINT_LIMIT
-    ? fingerprints.slice(-MATERIAL_PROGRESS_FINGERPRINT_LIMIT)
-    : fingerprints;
+function decodeFingerprintBloom(value: string | undefined): Uint8Array | null {
+  if (!value) return null;
+  const decoded = Buffer.from(value, "base64");
+  return decoded.length === MATERIAL_PROGRESS_FINGERPRINT_BLOOM_BYTES
+    ? new Uint8Array(decoded)
+    : null;
+}
+
+function fingerprintBloomBitIndexes(fingerprint: string): number[] {
+  const hash = createHash("sha256").update(fingerprint).digest();
+  const bitCount = MATERIAL_PROGRESS_FINGERPRINT_BLOOM_BYTES * 8;
+  return Array.from(
+    { length: MATERIAL_PROGRESS_FINGERPRINT_BLOOM_HASHES },
+    (_, index) => hash.readUInt32BE(index * 4) % bitCount,
+  );
+}
+
+function addFingerprintToBloom(bloom: Uint8Array, fingerprint: string): void {
+  for (const bitIndex of fingerprintBloomBitIndexes(fingerprint)) {
+    bloom[Math.floor(bitIndex / 8)]! |= 1 << (bitIndex % 8);
+  }
+}
+
+function fingerprintBloomMayContain(value: string | undefined, fingerprint: string): boolean {
+  const bloom = decodeFingerprintBloom(value);
+  if (!bloom) return false;
+  return fingerprintBloomBitIndexes(fingerprint).every(
+    (bitIndex) => (bloom[Math.floor(bitIndex / 8)]! & (1 << (bitIndex % 8))) !== 0,
+  );
+}
+
+function encodeFingerprintBloom(bloom: Uint8Array): string {
+  return Buffer.from(bloom).toString("base64");
+}
+
+export function boundMaterialProgressCheckpoint(
+  checkpoint: MaterialProgressCheckpoint,
+): MaterialProgressCheckpoint {
+  const retainedFingerprints = checkpoint.seenMaterialProgressFingerprints.slice(
+    -MATERIAL_PROGRESS_FINGERPRINT_LIMIT,
+  );
+  const evictedCount =
+    checkpoint.seenMaterialProgressFingerprints.length - retainedFingerprints.length;
+  const existingBloom = decodeFingerprintBloom(checkpoint.seenMaterialProgressFingerprintBloom);
+  const bloomIsValid =
+    checkpoint.seenMaterialProgressFingerprintBloom === undefined || existingBloom !== null;
+  if (evictedCount === 0 && bloomIsValid) {
+    return checkpoint;
+  }
+
+  const bloom = existingBloom ?? new Uint8Array(MATERIAL_PROGRESS_FINGERPRINT_BLOOM_BYTES);
+  for (let index = 0; index < evictedCount; index += 1) {
+    addFingerprintToBloom(bloom, checkpoint.seenMaterialProgressFingerprints[index]!);
+  }
+  const { seenMaterialProgressFingerprintBloom: _discardedBloom, ...rest } = checkpoint;
+  return {
+    ...rest,
+    seenMaterialProgressFingerprints: retainedFingerprints,
+    ...(evictedCount > 0 || existingBloom
+      ? { seenMaterialProgressFingerprintBloom: encodeFingerprintBloom(bloom) }
+      : {}),
+  };
 }
 
 function shellWords(command: string): string[] {
@@ -243,7 +316,7 @@ function runsVerificationCommand(command: string): boolean {
   return finalStatusSequence.split(/&&/).some(isVerificationCommandSegment);
 }
 
-function hasConcreteText(value: unknown): boolean {
+function hasConcreteText(value: unknown): value is string {
   return typeof value === "string" && value.trim().length > 0;
 }
 
@@ -320,9 +393,29 @@ function evidenceEvent(detail: EvidenceDetail): MaterialProgressEvent | null {
   }
 }
 
+function hasAuthoritativeVerificationFailure(output: string): boolean {
+  const plainOutput = stripAnsi(output);
+  return plainOutput.split(/\r?\n/).some((line) => {
+    const trimmed = line.trim();
+    return (
+      /^(?:Test Files|Test Suites|Tests):?\s+[1-9]\d*\s+failed\b/.test(trimmed) ||
+      /^FAIL\s+\S/.test(trimmed) ||
+      /^(?:npm ERR!|npm error)\b.*(?:failed|error)\b/i.test(trimmed) ||
+      /\berror TS\d+:/.test(trimmed) ||
+      /^Found\s+[1-9]\d*\s+errors?\b/.test(trimmed) ||
+      /^[1-9]\d*\s+problems?\s+\([1-9]\d*\s+errors?\b/.test(trimmed) ||
+      /^(?:Build failed|Failed to compile|error during build)\b/i.test(trimmed) ||
+      /^ERROR in\s+\S/.test(trimmed)
+    );
+  });
+}
+
 function verificationEvent(detail: ShellDetail): MaterialProgressEvent | null {
   const { command, cwd, output, exitCode } = detail;
-  return exitCode === 0 && hasConcreteText(output) && runsVerificationCommand(command)
+  return exitCode === 0 &&
+    hasConcreteText(output) &&
+    runsVerificationCommand(command) &&
+    !hasAuthoritativeVerificationFailure(output)
     ? progressEvent("verification", { command, cwd, output, exitCode })
     : null;
 }
@@ -411,10 +504,7 @@ export function restoreMaterialProgressCheckpoint(
         "Persisted material progress could not be proven to match the restored timeline.",
     });
   }
-  const restoredFingerprints = boundedFingerprints(checkpoint.seenMaterialProgressFingerprints);
-  return restoredFingerprints === checkpoint.seenMaterialProgressFingerprints
-    ? checkpoint
-    : { ...checkpoint, seenMaterialProgressFingerprints: restoredFingerprints };
+  return boundMaterialProgressCheckpoint(checkpoint);
 }
 
 export function invalidateMaterialProgressCheckpoint(input: {
@@ -475,21 +565,35 @@ function recordMaterialEvent(
 ): MaterialProgressCheckpoint {
   if (
     !event ||
-    fingerprintIndex(checkpoint.seenMaterialProgressFingerprints).has(event.fingerprint)
+    fingerprintIndex(checkpoint.seenMaterialProgressFingerprints).has(event.fingerprint) ||
+    fingerprintBloomMayContain(checkpoint.seenMaterialProgressFingerprintBloom, event.fingerprint)
   ) {
     return checkpoint;
   }
   const retainedFingerprintCount = MATERIAL_PROGRESS_FINGERPRINT_LIMIT - 1;
   const nextFingerprints =
     checkpoint.seenMaterialProgressFingerprints.slice(-retainedFingerprintCount);
+  const evictedFingerprint =
+    checkpoint.seenMaterialProgressFingerprints.length >= MATERIAL_PROGRESS_FINGERPRINT_LIMIT
+      ? checkpoint.seenMaterialProgressFingerprints[0]
+      : undefined;
   nextFingerprints.push(event.fingerprint);
   fingerprintIndexes.set(nextFingerprints, new Set(nextFingerprints));
+  let nextBloom = checkpoint.seenMaterialProgressFingerprintBloom;
+  if (evictedFingerprint) {
+    const bloom =
+      decodeFingerprintBloom(nextBloom) ??
+      new Uint8Array(MATERIAL_PROGRESS_FINGERPRINT_BLOOM_BYTES);
+    addFingerprintToBloom(bloom, evictedFingerprint);
+    nextBloom = encodeFingerprintBloom(bloom);
+  }
   return {
     ...checkpoint,
     completedCompactionsSinceMaterialProgress: 0,
     lastMaterialProgressAt: validTimestamp(timestamp),
     lastMaterialProgressKind: event.kind,
     seenMaterialProgressFingerprints: nextFingerprints,
+    ...(nextBloom ? { seenMaterialProgressFingerprintBloom: nextBloom } : {}),
   };
 }
 

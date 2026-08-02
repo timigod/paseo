@@ -142,6 +142,10 @@ describe("material progress checkpoint", () => {
     ["build", "npm run build:server", "server build completed"],
     ["check", "cargo check", "Finished dev profile"],
     ["chained-test", "npm test && echo tests complete", "12 tests passed\ntests complete"],
+    ["vitest-prose", "npm test", "12 tests passed\nThe fail-safe behavior remains covered."],
+    ["jest", "npx jest", "Test Suites: 2 passed, 2 total\nTests: 12 passed, 12 total"],
+    ["typecheck", "npm run typecheck", "Found 0 errors."],
+    ["lint", "npm run lint", "0 problems (0 errors, 0 warnings)"],
   ])("counts successful %s command output as verification", (_kind, command, output) => {
     const checkpoint = applyRows([
       row(1, {
@@ -157,6 +161,34 @@ describe("material progress checkpoint", () => {
     expect(materialProgressPayload(checkpoint)).toMatchObject({
       state: "progressing",
       lastMaterialProgressKind: "verification",
+    });
+  });
+
+  it.each([
+    ["vitest", "npx vitest run", "Test Files  1 failed | 2 passed (3)"],
+    ["jest", "npx jest", "Test Suites: 1 failed, 2 passed, 3 total"],
+    ["npm", "npm test", "npm error Lifecycle script `test` failed with error:"],
+    ["typecheck", "npm run typecheck", "src/main.ts(1,1): error TS2322: Type mismatch"],
+    ["lint", "npm run lint", "2 problems (2 errors, 0 warnings)"],
+    ["build", "npm run build", "Build failed with 1 error:"],
+    ["standard-fail", "npm test", "FAIL src/main.test.ts"],
+  ])("rejects %s failure output even when the exit code is zero", (_kind, command, output) => {
+    const checkpoint = applyRows([
+      row(1, { type: "compaction", status: "completed" }),
+      row(2, {
+        type: "tool_call",
+        callId: `failed-verification-${_kind}`,
+        name: "shell",
+        status: "completed",
+        error: null,
+        detail: { type: "shell", command, output, exitCode: 0 },
+      }),
+    ]);
+
+    expect(materialProgressPayload(checkpoint)).toMatchObject({
+      state: "warning",
+      completedCompactionsSinceMaterialProgress: 1,
+      lastMaterialProgressKind: null,
     });
   });
 
@@ -425,22 +457,27 @@ describe("material progress checkpoint", () => {
       row(258, { type: "compaction", status: "completed" }),
       "epoch-1",
     );
-    checkpoint = advanceMaterialProgressCheckpoint(
-      checkpoint,
-      row(259, {
-        type: "tool_call",
-        callId: "write-2-replayed",
-        name: "write",
-        status: "completed",
-        error: null,
-        detail: { type: "write", filePath: "proof.txt", content: "proof-2" },
-      }),
-      "epoch-1",
-    );
-    expect(materialProgressPayload(checkpoint)).toMatchObject({
-      state: "warning",
-      completedCompactionsSinceMaterialProgress: 1,
-    });
+    for (const [seq, proof] of [
+      [259, "proof-1"],
+      [260, "proof-2"],
+    ] as const) {
+      checkpoint = advanceMaterialProgressCheckpoint(
+        checkpoint,
+        row(seq, {
+          type: "tool_call",
+          callId: `write-${proof}-replayed`,
+          name: "write",
+          status: "completed",
+          error: null,
+          detail: { type: "write", filePath: "proof.txt", content: proof },
+        }),
+        "epoch-1",
+      );
+      expect(materialProgressPayload(checkpoint)).toMatchObject({
+        state: "warning",
+        completedCompactionsSinceMaterialProgress: 1,
+      });
+    }
   });
 
   it("bounds fingerprint history restored from an older checkpoint", () => {
