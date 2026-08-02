@@ -845,7 +845,7 @@ describe("WorkspaceGitServiceImpl", () => {
     );
 
     await vi.waitFor(() => {
-      expect(getCheckoutSnapshotFacts).toHaveBeenCalledTimes(workspaceCount * 2);
+      expect(getCheckoutSnapshotFacts).toHaveBeenCalledTimes(workspaceCount + 1);
       expect(getCheckoutStatus).toHaveBeenCalledTimes(workspaceCount * 2);
     });
     expect(maxActiveFactsReads).toBeLessThanOrEqual(

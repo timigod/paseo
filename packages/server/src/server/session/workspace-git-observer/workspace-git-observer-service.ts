@@ -48,6 +48,7 @@ export interface WorkspaceGitObserverService {
   handleBranchSnapshot(cwd: string, branchName: string | null): void;
   getMetrics(): WorkspaceGitObserverMetrics;
   removeForWorkspaceId(workspaceId: string): void;
+  reset(): void;
   dispose(): void;
 }
 
@@ -79,6 +80,7 @@ export function createWorkspaceGitObserverService(deps: {
   const watchTargets = new Map<string, WorkspaceGitWatchTarget>();
   const workspaceStates = new Map<string, WorkspaceGitWatchState>();
   const subscriptions = new Map<string, () => void>();
+  let generation = 0;
 
   function descriptorStateKey(workspace: WorkspaceDescriptorPayload | null): string {
     if (!workspace) {
@@ -178,8 +180,10 @@ export function createWorkspaceGitObserverService(deps: {
     }
 
     let subscription: ReturnType<WorkspaceGitService["registerWorkspace"]>;
+    const observerGeneration = generation;
     try {
       subscription = workspaceGitService.registerWorkspace({ cwd: normalizedCwd }, (snapshot) => {
+        if (observerGeneration !== generation) return;
         handleBranchSnapshot(normalizedCwd, snapshot.git.currentBranch ?? null);
         void emitWorkspaceUpdateForCwd(normalizedCwd).catch((error) => {
           logger.warn(
@@ -207,8 +211,20 @@ export function createWorkspaceGitObserverService(deps: {
   }
 
   async function syncObserverForWorkspace(workspace: PersistedWorkspaceRecord): Promise<void> {
+    const observerGeneration = generation;
     const descriptor = await describeWorkspaceRecordWithGitData(workspace);
+    if (observerGeneration !== generation) return;
     syncObservers([descriptor]);
+  }
+
+  function reset(): void {
+    generation += 1;
+    for (const unsubscribe of subscriptions.values()) {
+      unsubscribe();
+    }
+    subscriptions.clear();
+    watchTargets.clear();
+    workspaceStates.clear();
   }
 
   return {
@@ -216,7 +232,9 @@ export function createWorkspaceGitObserverService(deps: {
     syncObserverForWorkspace,
 
     async warmGitData(workspace) {
+      const observerGeneration = generation;
       await syncObserverForWorkspace(workspace);
+      if (observerGeneration !== generation) return;
       await emitWorkspaceUpdateForWorkspaceId(workspace.workspaceId);
     },
 
@@ -256,13 +274,10 @@ export function createWorkspaceGitObserverService(deps: {
 
     removeForWorkspaceId,
 
+    reset,
+
     dispose() {
-      for (const unsubscribe of subscriptions.values()) {
-        unsubscribe();
-      }
-      subscriptions.clear();
-      watchTargets.clear();
-      workspaceStates.clear();
+      reset();
     },
   };
 }

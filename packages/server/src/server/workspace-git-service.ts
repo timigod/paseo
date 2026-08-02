@@ -356,6 +356,8 @@ interface WorkspaceGitServiceOptions {
 interface WorkspaceGitTarget {
   cwd: string;
   listeners: Set<WorkspaceGitListener>;
+  /** Forge status is loaded and polled only after an explicit forge-bearing snapshot read. */
+  forgePollingEnabled: boolean;
   observationWatcherGeneration: WorkspaceGitWatcherGeneration | null;
   debounceTimer: NodeJS.Timeout | null;
   pendingDebounceRequest: WorkspaceGitRefreshRequest | null;
@@ -670,6 +672,18 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     const request = this.normalizeRefreshRequest(options, "getSnapshot", true);
     const target = this.ensureWorkspaceTarget(cwd);
     if (!request.force && target.latestSnapshot) {
+      if (request.includeForge && !target.forgePollingEnabled) {
+        // Promote forge refresh in the background without turning an already-rendered
+        // workspace read into a wait behind an unrelated self-heal generation.
+        void this.requestWorkspaceSnapshot(target, request).catch((error) => {
+          if (!isAbortError(error)) {
+            this.logger.warn(
+              { err: error, cwd: target.cwd, reason: request.reason },
+              "Failed to promote workspace forge polling",
+            );
+          }
+        });
+      }
       return target.latestSnapshot;
     }
 
@@ -1217,6 +1231,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     const target: WorkspaceGitTarget = {
       cwd,
       listeners: new Set(),
+      forgePollingEnabled: false,
       observationWatcherGeneration: null,
       debounceTimer: null,
       pendingDebounceRequest: null,
@@ -1258,7 +1273,10 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
       void this.refreshWorkspaceTarget(target, {
         force: false,
         forceForge: false,
-        includeForge: true,
+        // Inventory subscriptions need local Git state, but eagerly resolving and polling
+        // the forge for every historical workspace creates an unbounded remote workload.
+        // A detail read with includeForge=true promotes the target to forge polling.
+        includeForge: false,
         reason: "initial",
         notify: true,
       });
@@ -1803,6 +1821,12 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     if (!target.selfHealTimer) {
       target.selfHealTimer = setInterval(() => {
         this.scheduleWorkspaceObservationSetup(target);
+        // Do not enqueue a second full refresh behind every cold-start refresh. The
+        // observation setup already performs the mandatory post-install reconciliation;
+        // self-heal begins only after that bootstrap has completed.
+        if (!target.observationSetupComplete) {
+          return;
+        }
         if (target.repoGitRoot) {
           const repositoryKey = this.normalizeRepositoryKey(target.repoGitRoot);
           const nowMs = this.deps.now().getTime();
@@ -1836,7 +1860,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
   }
 
   private updateForgePrStatusPollForTarget(target: WorkspaceGitTarget): void {
-    if (target.listeners.size === 0) {
+    if (target.listeners.size === 0 || !target.forgePollingEnabled) {
       this.stopForgePrStatusPollForTarget(target);
       return;
     }
@@ -2281,6 +2305,11 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
       return Promise.reject(createWorkspaceGitAbortError("Workspace Git target is closed"));
     }
 
+    const promotesForgePolling = request.includeForge && !target.forgePollingEnabled;
+    if (request.includeForge) {
+      target.forgePollingEnabled = true;
+    }
+
     if (target.refreshState.status === "in-flight") {
       const state = target.refreshState;
       if (state.queued) {
@@ -2304,6 +2333,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
 
     if (
       !request.force &&
+      !promotesForgePolling &&
       request.bypassMinGap !== true &&
       request.afterGitReadSequence === undefined &&
       this.shouldThrottleNonForcedRefresh(target)

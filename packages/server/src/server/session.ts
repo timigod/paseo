@@ -5801,11 +5801,58 @@ export class Session {
     }
   }
 
+  private shouldObserveFetchedWorkspaces(
+    subscriptionId: string | null,
+    continuingSubscriptionId: string | null,
+    filter: Extract<SessionInboundMessage, { type: "fetch_workspaces_request" }>["filter"],
+  ): boolean {
+    const activeSubscription = this.workspaceUpdatesSubscription;
+    if (subscriptionId) {
+      return activeSubscription?.subscriptionId === subscriptionId;
+    }
+    return (
+      continuingSubscriptionId !== null &&
+      activeSubscription?.subscriptionId === continuingSubscriptionId &&
+      equal(activeSubscription.filter, filter)
+    );
+  }
+
+  private captureContinuingWorkspaceSubscriptionId(subscriptionId: string | null): string | null {
+    if (subscriptionId) return null;
+    return this.workspaceUpdatesSubscription?.subscriptionId ?? null;
+  }
+
+  private beginWorkspaceSubscription(
+    subscriptionId: string,
+    filter: FetchWorkspacesRequestFilter | undefined,
+  ): void {
+    const existingSubscription = this.workspaceUpdatesSubscription;
+    const replacesObserverSet =
+      existingSubscription === null ||
+      existingSubscription.subscriptionId !== subscriptionId ||
+      !equal(existingSubscription.filter, filter);
+    // A genuinely new subscription owns a fresh observer set. A reconnecting app
+    // reuses its stable subscription id, so preserve that set instead of cold-starting
+    // the full Git inventory again.
+    if (replacesObserverSet) {
+      this.workspaceGitObserver.reset();
+    }
+    this.workspaceUpdatesSubscription = {
+      subscriptionId,
+      filter,
+      isBootstrapping: true,
+      pendingUpdatesByWorkspaceId: new Map(),
+      lastEmittedByWorkspaceId: new Map(),
+      visibleEmptyProjectIds: new Set(),
+    };
+  }
+
   private async handleFetchWorkspacesRequest(
     request: Extract<SessionInboundMessage, { type: "fetch_workspaces_request" }>,
   ): Promise<void> {
     const requestedSubscriptionId = request.subscribe?.subscriptionId?.trim();
     const subscriptionId = resolveSubscriptionId(request.subscribe, requestedSubscriptionId);
+    const continuingSubscriptionId = this.captureContinuingWorkspaceSubscriptionId(subscriptionId);
 
     try {
       this.sessionLogger.debug(
@@ -5819,14 +5866,7 @@ export class Session {
         "fetch_workspaces_request_received",
       );
       if (subscriptionId) {
-        this.workspaceUpdatesSubscription = {
-          subscriptionId,
-          filter: request.filter,
-          isBootstrapping: true,
-          pendingUpdatesByWorkspaceId: new Map(),
-          lastEmittedByWorkspaceId: new Map(),
-          visibleEmptyProjectIds: new Set(),
-        };
+        this.beginWorkspaceSubscription(subscriptionId, request.filter);
       }
 
       const payload = await this.listFetchWorkspacesEntries(request);
@@ -5834,11 +5874,13 @@ export class Session {
       // must not retain live filesystem observers for the websocket reconnect grace period.
       // The app subscribes on page one and continues later pages without repeating
       // `subscribe`, so a same-filter request also contributes to that active subscription.
-      const contributesToWorkspaceSubscription =
-        subscriptionId !== null ||
-        (this.workspaceUpdatesSubscription !== null &&
-          equal(this.workspaceUpdatesSubscription.filter, request.filter));
-      if (contributesToWorkspaceSubscription) {
+      if (
+        this.shouldObserveFetchedWorkspaces(
+          subscriptionId,
+          continuingSubscriptionId,
+          request.filter,
+        )
+      ) {
         this.workspaceGitObserver.syncObservers(payload.entries);
       }
       this.sessionLogger.debug(
@@ -5853,6 +5895,7 @@ export class Session {
       const snapshot = this.buildBootstrapSnapshot(payload.entries);
       this.seedWorkspaceSubscriptionSnapshot(
         subscriptionId,
+        continuingSubscriptionId,
         request.filter,
         payload.entries,
         payload.emptyProjects,
@@ -5941,14 +5984,16 @@ export class Session {
 
   private seedWorkspaceSubscriptionSnapshot(
     subscriptionId: string | null,
+    continuingSubscriptionId: string | null,
     filter: FetchWorkspacesRequestFilter | undefined,
     entries: FetchWorkspacesResponseEntry[],
     emptyProjects: WorkspaceProjectDescriptorPayload[],
   ): void {
+    if (!this.shouldObserveFetchedWorkspaces(subscriptionId, continuingSubscriptionId, filter)) {
+      return;
+    }
     const subscription = this.workspaceUpdatesSubscription;
     if (!subscription) return;
-    if (subscriptionId && subscription.subscriptionId !== subscriptionId) return;
-    if (!subscriptionId && !equal(subscription.filter, filter)) return;
     for (const entry of entries) {
       subscription.lastEmittedByWorkspaceId.set(entry.id, {
         kind: "upsert",

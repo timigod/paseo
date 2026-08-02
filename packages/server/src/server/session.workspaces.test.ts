@@ -7422,6 +7422,243 @@ test("later pages of a subscribed workspace inventory retain live git observers"
   });
 });
 
+test("replacing a workspace subscription releases the previous observer generation", async () => {
+  const registerCalls: string[] = [];
+  const unsubscribeCalls: string[] = [];
+  const workspaceGitService = createNoopWorkspaceGitService({
+    registerWorkspace: ({ cwd }) => {
+      const normalizedCwd = path.resolve(cwd);
+      registerCalls.push(normalizedCwd);
+      return { unsubscribe: () => unsubscribeCalls.push(normalizedCwd) };
+    },
+  });
+  const session = asTestSession(createSessionForWorkspaceTests({ workspaceGitService }));
+  const descriptorFor = (id: string, cwd: string): WorkspaceDescriptorPayload =>
+    ({
+      id,
+      projectId: `project-${id}`,
+      projectDisplayName: id,
+      projectRootPath: cwd,
+      workspaceDirectory: cwd,
+      projectKind: "git",
+      workspaceKind: "local_checkout",
+      name: id,
+      status: "done",
+      activityAt: null,
+      diffStat: null,
+    }) as WorkspaceDescriptorPayload;
+  session.listFetchWorkspacesEntries = async (request: unknown) => {
+    const query = (request as { filter?: { query?: string } }).filter?.query ?? "unknown";
+    return {
+      entries: [descriptorFor(`workspace-${query}`, `/tmp/subscription-${query}`)],
+      emptyProjects: [],
+      pageInfo: { nextCursor: null, prevCursor: null, hasMore: false },
+    };
+  };
+
+  await session.handleMessage({
+    type: "fetch_workspaces_request",
+    requestId: "req-subscription-a",
+    filter: { query: "a" },
+    subscribe: { subscriptionId: "subscription-a" },
+  });
+  await session.handleMessage({
+    type: "fetch_workspaces_request",
+    requestId: "req-subscription-b",
+    filter: { query: "b" },
+    subscribe: { subscriptionId: "subscription-b" },
+  });
+
+  expect(registerCalls).toEqual([
+    path.resolve("/tmp/subscription-a"),
+    path.resolve("/tmp/subscription-b"),
+  ]);
+  expect(unsubscribeCalls).toEqual([path.resolve("/tmp/subscription-a")]);
+});
+
+test("reusing the same workspace subscription preserves its warm observer set", async () => {
+  const registerCalls: string[] = [];
+  const unsubscribeCalls: string[] = [];
+  const workspaceGitService = createNoopWorkspaceGitService({
+    registerWorkspace: ({ cwd }) => {
+      const normalizedCwd = path.resolve(cwd);
+      registerCalls.push(normalizedCwd);
+      return { unsubscribe: () => unsubscribeCalls.push(normalizedCwd) };
+    },
+  });
+  const session = asTestSession(createSessionForWorkspaceTests({ workspaceGitService }));
+  const descriptor = {
+    id: "workspace-warm",
+    projectId: "project-warm",
+    projectDisplayName: "warm",
+    projectRootPath: "/tmp/subscription-warm",
+    workspaceDirectory: "/tmp/subscription-warm",
+    projectKind: "git",
+    workspaceKind: "local_checkout",
+    name: "warm",
+    status: "done",
+    activityAt: null,
+    diffStat: null,
+  } as WorkspaceDescriptorPayload;
+  session.listFetchWorkspacesEntries = async () => ({
+    entries: [descriptor],
+    emptyProjects: [],
+    pageInfo: { nextCursor: null, prevCursor: null, hasMore: false },
+  });
+
+  for (const requestId of ["req-warm-first", "req-warm-reconnect"]) {
+    await session.handleMessage({
+      type: "fetch_workspaces_request",
+      requestId,
+      subscribe: { subscriptionId: "stable-app-subscription" },
+    });
+  }
+
+  expect(registerCalls).toEqual([path.resolve("/tmp/subscription-warm")]);
+  expect(unsubscribeCalls).toEqual([]);
+});
+
+test("a superseded workspace subscription response cannot install stale observers", async () => {
+  const registerCalls: string[] = [];
+  const workspaceGitService = createNoopWorkspaceGitService({
+    registerWorkspace: ({ cwd }) => {
+      registerCalls.push(path.resolve(cwd));
+      return { unsubscribe: () => {} };
+    },
+  });
+  const session = asTestSession(createSessionForWorkspaceTests({ workspaceGitService }));
+  const firstListing = deferred<ListFetchResult>();
+  const descriptor = (id: string, cwd: string): WorkspaceDescriptorPayload =>
+    ({
+      id,
+      projectId: `project-${id}`,
+      projectDisplayName: id,
+      projectRootPath: cwd,
+      workspaceDirectory: cwd,
+      projectKind: "git",
+      workspaceKind: "local_checkout",
+      name: id,
+      status: "done",
+      activityAt: null,
+      diffStat: null,
+    }) as WorkspaceDescriptorPayload;
+  session.listFetchWorkspacesEntries = async (request: unknown) => {
+    const requestId = (request as { requestId?: string }).requestId;
+    if (requestId === "req-stale-subscription-a") return firstListing.promise;
+    return {
+      entries: [descriptor("workspace-b", "/tmp/stale-subscription-b")],
+      emptyProjects: [],
+      pageInfo: { nextCursor: null, prevCursor: null, hasMore: false },
+    };
+  };
+
+  const staleRequest = session.handleMessage({
+    type: "fetch_workspaces_request",
+    requestId: "req-stale-subscription-a",
+    filter: { query: "a" },
+    subscribe: { subscriptionId: "stale-subscription-a" },
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  await session.handleMessage({
+    type: "fetch_workspaces_request",
+    requestId: "req-winning-subscription-b",
+    filter: { query: "b" },
+    subscribe: { subscriptionId: "winning-subscription-b" },
+  });
+  firstListing.resolve({
+    entries: [descriptor("workspace-a", "/tmp/stale-subscription-a")],
+    emptyProjects: [],
+    pageInfo: { nextCursor: null, prevCursor: null, hasMore: false },
+  });
+  await staleRequest;
+
+  expect(registerCalls).toEqual([path.resolve("/tmp/stale-subscription-b")]);
+});
+
+test("a superseded same-filter later page cannot join the replacement subscription", async () => {
+  const registerCalls: string[] = [];
+  const unsubscribeCalls: string[] = [];
+  const workspaceGitService = createNoopWorkspaceGitService({
+    registerWorkspace: ({ cwd }) => {
+      const normalizedCwd = path.resolve(cwd);
+      registerCalls.push(normalizedCwd);
+      return { unsubscribe: () => unsubscribeCalls.push(normalizedCwd) };
+    },
+  });
+  const session = asTestSession(createSessionForWorkspaceTests({ workspaceGitService }));
+  const staleLaterPage = deferred<ListFetchResult>();
+  const descriptor = (id: string, cwd: string): WorkspaceDescriptorPayload =>
+    ({
+      id,
+      projectId: `project-${id}`,
+      projectDisplayName: id,
+      projectRootPath: cwd,
+      workspaceDirectory: cwd,
+      projectKind: "git",
+      workspaceKind: "local_checkout",
+      name: id,
+      status: "done",
+      activityAt: null,
+      diffStat: null,
+    }) as WorkspaceDescriptorPayload;
+  session.listFetchWorkspacesEntries = async (request: unknown) => {
+    const requestId = (request as { requestId?: string }).requestId;
+    if (requestId === "req-same-filter-a-later") return staleLaterPage.promise;
+    const isReplacement = requestId === "req-same-filter-b-first";
+    return {
+      entries: [
+        descriptor(
+          isReplacement ? "workspace-b" : "workspace-a-first",
+          isReplacement ? "/tmp/same-filter-b" : "/tmp/same-filter-a-first",
+        ),
+      ],
+      emptyProjects: [],
+      pageInfo: { nextCursor: null, prevCursor: null, hasMore: false },
+    };
+  };
+
+  await session.handleMessage({
+    type: "fetch_workspaces_request",
+    requestId: "req-same-filter-a-first",
+    filter: { query: "same" },
+    subscribe: { subscriptionId: "same-filter-subscription-a" },
+  });
+  const stalePageRequest = session.handleMessage({
+    type: "fetch_workspaces_request",
+    requestId: "req-same-filter-a-later",
+    filter: { query: "same" },
+    page: { limit: 200, cursor: "stale-a-cursor" },
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  await session.handleMessage({
+    type: "fetch_workspaces_request",
+    requestId: "req-same-filter-b-first",
+    filter: { query: "same" },
+    subscribe: { subscriptionId: "same-filter-subscription-b" },
+  });
+  staleLaterPage.resolve({
+    entries: [descriptor("workspace-a-later", "/tmp/same-filter-a-later")],
+    emptyProjects: [{ projectId: "stale-empty-project-a" }],
+    pageInfo: { nextCursor: null, prevCursor: null, hasMore: false },
+  });
+  await stalePageRequest;
+
+  expect(registerCalls).toEqual([
+    path.resolve("/tmp/same-filter-a-first"),
+    path.resolve("/tmp/same-filter-b"),
+  ]);
+  expect(unsubscribeCalls).toEqual([path.resolve("/tmp/same-filter-a-first")]);
+  const activeSubscription = session.workspaceUpdatesSubscription as {
+    subscriptionId: string;
+    lastEmittedByWorkspaceId: Map<string, unknown>;
+    visibleEmptyProjectIds: Set<string>;
+  };
+  expect(activeSubscription.subscriptionId).toBe("same-filter-subscription-b");
+  expect(activeSubscription.lastEmittedByWorkspaceId.has("workspace-b")).toBe(true);
+  expect(activeSubscription.lastEmittedByWorkspaceId.has("workspace-a-later")).toBe(false);
+  expect(activeSubscription.visibleEmptyProjectIds.has("stale-empty-project-a")).toBe(false);
+});
+
 test("fetch_workspaces_response serves 120 cached snapshots while git refreshes are blocked", async () => {
   const emitted: SessionOutboundMessage[] = [];
   const blockedRefresh = deferred<WorkspaceGitRuntimeSnapshot>();

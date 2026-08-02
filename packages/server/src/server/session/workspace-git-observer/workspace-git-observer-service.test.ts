@@ -56,6 +56,7 @@ function flushMicrotasks(): Promise<void> {
 
 function buildHarness(opts: { emitCwdRejects?: boolean } = {}) {
   const listeners = new Map<string, WorkspaceGitListener>();
+  const registeredListeners: WorkspaceGitListener[] = [];
   const registerCalls: string[] = [];
   const unsubscribeCalls: string[] = [];
   const emitCwdCalls: string[] = [];
@@ -65,11 +66,13 @@ function buildHarness(opts: { emitCwdRejects?: boolean } = {}) {
   const warnCalls: unknown[][] = [];
   const describeCalls: PersistedWorkspaceRecord[] = [];
   let describeResult: WorkspaceDescriptorPayload | null = null;
+  let describePromise: Promise<WorkspaceDescriptorPayload> | null = null;
 
   const workspaceGitService: Pick<WorkspaceGitService, "registerWorkspace"> = {
     registerWorkspace({ cwd }, listener) {
       registerCalls.push(cwd);
       listeners.set(cwd, listener);
+      registeredListeners.push(listener);
       return {
         unsubscribe() {
           unsubscribeCalls.push(cwd);
@@ -83,6 +86,7 @@ function buildHarness(opts: { emitCwdRejects?: boolean } = {}) {
     workspaceGitService,
     describeWorkspaceRecordWithGitData: async (workspace) => {
       describeCalls.push(workspace);
+      if (describePromise) return describePromise;
       if (!describeResult) {
         throw new Error("describeResult not set");
       }
@@ -125,8 +129,12 @@ function buildHarness(opts: { emitCwdRejects?: boolean } = {}) {
     branchChanges,
     warnCalls,
     describeCalls,
+    registeredListeners,
     setDescribeResult: (descriptor: WorkspaceDescriptorPayload) => {
       describeResult = descriptor;
+    },
+    setDescribePromise: (promise: Promise<WorkspaceDescriptorPayload>) => {
+      describePromise = promise;
     },
   };
 }
@@ -333,6 +341,58 @@ describe("recordDescriptorState", () => {
 });
 
 describe("teardown", () => {
+  test("reset removes the current generation and permits a fresh subscription", () => {
+    const h = buildHarness();
+    h.service.syncObservers([makeDescriptor({ id: "ws1", workspaceDirectory: WS1 })]);
+
+    h.service.reset();
+
+    expect(h.unsubscribeCalls).toEqual([WS1]);
+    expect(h.service.getMetrics()).toEqual({
+      watchedDirectoryCount: 0,
+      workspaceRecordCount: 0,
+      subscriptionCount: 0,
+    });
+
+    h.service.syncObservers([makeDescriptor({ id: "ws2", workspaceDirectory: WS2 })]);
+    expect(h.registerCalls).toEqual([WS1, WS2]);
+  });
+
+  test("reset prevents a deferred descriptor from registering into the next generation", async () => {
+    const h = buildHarness();
+    let resolveDescriptor!: (descriptor: WorkspaceDescriptorPayload) => void;
+    const descriptor = new Promise<WorkspaceDescriptorPayload>((resolveDescriptorPromise) => {
+      resolveDescriptor = resolveDescriptorPromise;
+    });
+    h.setDescribePromise(descriptor);
+
+    const pendingSync = h.service.syncObserverForWorkspace(makeRecord("ws1"));
+    h.service.reset();
+    resolveDescriptor(makeDescriptor({ id: "ws1", workspaceDirectory: WS1 }));
+    await pendingSync;
+
+    expect(h.registerCalls).toEqual([]);
+    expect(h.service.getMetrics()).toEqual({
+      watchedDirectoryCount: 0,
+      workspaceRecordCount: 0,
+      subscriptionCount: 0,
+    });
+  });
+
+  test("a captured callback from an earlier generation is inert after reset", async () => {
+    const h = buildHarness();
+    h.service.syncObservers([makeDescriptor({ id: "ws1", workspaceDirectory: WS1 })]);
+    const staleListener = h.registeredListeners[0];
+
+    h.service.reset();
+    staleListener(makeSnapshot(WS1, "stale-feature"));
+    await flushMicrotasks();
+
+    expect(h.branchChanges).toEqual([]);
+    expect(h.emitCwdCalls).toEqual([]);
+    expect(h.statusCalls).toEqual([]);
+  });
+
   test("removeForWorkspaceId unsubscribes the matching observer", () => {
     const h = buildHarness();
     h.service.syncObservers([makeDescriptor({ id: "ws1", workspaceDirectory: WS1 })]);
