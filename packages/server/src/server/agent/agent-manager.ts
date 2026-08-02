@@ -4314,9 +4314,10 @@ export class AgentManager {
 
   trackBackgroundTask(task: Promise<void>): void {
     this.backgroundTasks.add(task);
-    void task.finally(() => {
+    const clear = () => {
       this.backgroundTasks.delete(task);
-    });
+    };
+    void task.then(clear, clear);
   }
 
   private trackStartedAgentRuntime(

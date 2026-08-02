@@ -1412,6 +1412,36 @@ test("flush waits for rejected session cleanup that starts after shutdown", asyn
   expect(manager.listAgents()).toEqual([]);
 });
 
+test("background task rejection does not create an unhandled derived rejection", async () => {
+  const manager = new AgentManager({ clients: {}, logger });
+  const task = deferred<void>();
+  const unhandled: unknown[] = [];
+  const onUnhandled = (reason: unknown) => {
+    unhandled.push(reason);
+  };
+  process.on("unhandledRejection", onUnhandled);
+
+  try {
+    manager.trackBackgroundTask(task.promise);
+    let flushResolved = false;
+    const flushing = manager.flushForShutdown().then(() => {
+      flushResolved = true;
+      return undefined;
+    });
+    await Promise.resolve();
+
+    expect(flushResolved).toBe(false);
+    task.reject(new Error("background task failed"));
+    await flushing;
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(unhandled).toEqual([]);
+    await expect(manager.flushForShutdown()).resolves.toBeUndefined();
+  } finally {
+    process.off("unhandledRejection", onUnhandled);
+  }
+});
+
 test("does not persist an initializing session after shutdown closes it", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-shutdown-register-test-"));
   const storage = new AgentStorage(join(workdir, "agents"), logger);
