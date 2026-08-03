@@ -201,6 +201,7 @@ async function main(): Promise<void> {
                 : `Recovered owned stale worker PID ${recoveryReceipt.workerPid} (${recoveryReceipt.status})`,
             fields: recoveryReceipt,
           },
+    serviceManaged: workerEnv.PASEO_SERVICE_MANAGED === "1",
     logFile: supervisorLogFile,
     onWorkerReady: async ({ listen }) => {
       await updatePidLock(paseoHome, { listen }, { ownerPid: process.pid });
