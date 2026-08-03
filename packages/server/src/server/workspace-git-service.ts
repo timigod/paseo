@@ -1898,7 +1898,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
       remoteUrl,
       target: pollTarget,
     });
-    const pollGeneration = target.factsGeneration;
+    const pollGeneration = target.repositoryFactsGeneration;
     const previousPollKey = target.forgePrStatusPollKey;
     const previousPollGeneration = target.forgePrStatusPollGeneration;
     if (

@@ -1,53 +1,63 @@
 import { execFile } from "node:child_process";
-import { promisify } from "node:util";
-import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import path from "node:path";
-import { afterEach, expect, it, vi } from "vitest";
+import { join } from "node:path";
+import { pathToFileURL } from "node:url";
+import { promisify } from "node:util";
+import { afterEach, describe, expect, test } from "vitest";
 
-const directories: string[] = [];
+import { getOrCreateCliClientId } from "./client-id.js";
+
 const execFileAsync = promisify(execFile);
+const temporaryDirectories: string[] = [];
 
 afterEach(async () => {
-  vi.resetModules();
-  delete process.env.PASEO_HOME;
-  await Promise.all(directories.splice(0).map((directory) => rm(directory, { recursive: true })));
+  await Promise.all(
+    temporaryDirectories.splice(0).map((directory) => rm(directory, { recursive: true })),
+  );
 });
 
-it("concurrent first use converges on one owner-only CLI identity", async () => {
-  const paseoHome = await mkdtemp(path.join(tmpdir(), "paseo-cli-client-id-"));
-  directories.push(paseoHome);
-  process.env.PASEO_HOME = paseoHome;
-  const { getOrCreateCliClientId } = await import("./client-id.js");
+describe("getOrCreateCliClientId", () => {
+  test("reuses one identifier for concurrent connections in this process", async () => {
+    const [first, second] = await Promise.all([getOrCreateCliClientId(), getOrCreateCliClientId()]);
 
-  const identities = await Promise.all(Array.from({ length: 20 }, () => getOrCreateCliClientId()));
-  const filePath = path.join(paseoHome, "cli-client-id");
+    expect(first).toMatch(/^cid_[0-9a-f]{32}$/);
+    expect(second).toBe(first);
+  });
 
-  expect(new Set(identities).size).toBe(1);
-  expect(await readFile(filePath, "utf8")).toBe(identities[0]);
-  expect((await stat(filePath)).mode & 0o777).toBe(0o600);
-});
+  test("gives separate OS processes distinct identifiers and ignores a stale persisted id", async () => {
+    const paseoHome = await mkdtemp(join(tmpdir(), "paseo-cli-client-id-"));
+    temporaryDirectories.push(paseoHome);
+    const staleClientId = "cid_stale_cross_process_identity";
+    await writeFile(join(paseoHome, "cli-client-id"), staleClientId, { mode: 0o600 });
 
-it("simultaneous CLI processes converge on one private identity", async () => {
-  const paseoHome = await mkdtemp(path.join(tmpdir(), "paseo-cli-client-id-processes-"));
-  directories.push(paseoHome);
-  const moduleUrl = new URL("./client-id.ts", import.meta.url).href;
-  const script = `import { getOrCreateCliClientId } from ${JSON.stringify(moduleUrl)}; process.stdout.write(await getOrCreateCliClientId());`;
+    const moduleUrl = pathToFileURL(join(import.meta.dirname, "client-id.ts")).href;
+    const readClientId = [
+      `import { getOrCreateCliClientId } from ${JSON.stringify(moduleUrl)};`,
+      "process.stdout.write(await getOrCreateCliClientId());",
+    ].join("\n");
+    const childOptions = {
+      env: { ...process.env, PASEO_HOME: paseoHome },
+      encoding: "utf8" as const,
+    };
 
-  const results = await Promise.all(
-    Array.from({ length: 8 }, () =>
+    const [first, second] = await Promise.all([
       execFileAsync(
         process.execPath,
-        ["--import", "tsx", "--input-type=module", "--eval", script],
-        { env: { ...process.env, PASEO_HOME: paseoHome } },
+        ["--import", "tsx", "--input-type=module", "--eval", readClientId],
+        childOptions,
       ),
-    ),
-  );
-  const identities = results.map(({ stdout }) => stdout);
-  const filePath = path.join(paseoHome, "cli-client-id");
+      execFileAsync(
+        process.execPath,
+        ["--import", "tsx", "--input-type=module", "--eval", readClientId],
+        childOptions,
+      ),
+    ]);
 
-  expect(new Set(identities).size).toBe(1);
-  expect(await readFile(filePath, "utf8")).toBe(identities[0]);
-  expect((await stat(paseoHome)).mode & 0o777).toBe(0o700);
-  expect((await stat(filePath)).mode & 0o777).toBe(0o600);
+    expect(first.stdout).toMatch(/^cid_[0-9a-f]{32}$/);
+    expect(second.stdout).toMatch(/^cid_[0-9a-f]{32}$/);
+    expect(first.stdout).not.toBe(staleClientId);
+    expect(second.stdout).not.toBe(staleClientId);
+    expect(second.stdout).not.toBe(first.stdout);
+  });
 });
