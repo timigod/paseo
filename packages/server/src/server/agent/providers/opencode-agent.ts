@@ -2984,6 +2984,8 @@ type OpenCodeTurnState =
       userMessageId: string | null;
       submission: OpenCodeTurnSubmission;
       acceptance: OpenCodeTurnAcceptance;
+      /** A non-command turn cannot complete until it emits real assistant text. */
+      hasAssistantOutput: boolean;
       /**
        * Stream event revision observed when the prompt/command left the daemon.
        * Terminals received at or before this boundary belong to a prior turn
@@ -2992,9 +2994,9 @@ type OpenCodeTurnState =
       dispatchStreamEventRevision: number | null;
       /**
        * A terminal received after dispatch was discarded because the submission
-       * was not yet accepted. Slash-command reconciliation uses this to confirm
-       * idle via session status instead of waiting for a terminal that will
-       * never be re-delivered.
+       * was not yet eligible to settle. Slash-command reconciliation uses this
+       * to confirm idle via session status instead of waiting for a terminal
+       * that will never be re-delivered.
        */
       postDispatchTerminalDiscarded: boolean;
     }
@@ -3396,6 +3398,7 @@ class OpenCodeAgentSession implements AgentSession {
       userMessageId,
       submission: "pending",
       acceptance: "activity",
+      hasAssistantOutput: false,
       dispatchStreamEventRevision: null,
       postDispatchTerminalDiscarded: false,
     };
@@ -3895,6 +3898,7 @@ class OpenCodeAgentSession implements AgentSession {
       return;
     }
     this.acceptForegroundSubmissionFromEvent(event, turnId);
+    this.recordForegroundAssistantOutput(foregroundEvents, turnId);
     this.traceOpenCode("provider.opencode.parsed_event", {
       turnId,
       n: eventCount,
@@ -4005,6 +4009,7 @@ class OpenCodeAgentSession implements AgentSession {
       userMessageId: null,
       submission: "accepted",
       acceptance: "activity",
+      hasAssistantOutput: false,
       dispatchStreamEventRevision: null,
       postDispatchTerminalDiscarded: false,
     };
@@ -4089,6 +4094,28 @@ class OpenCodeAgentSession implements AgentSession {
     this.markForegroundSubmissionAccepted(turnId, "activity");
   }
 
+  private recordForegroundAssistantOutput(
+    events: readonly AgentStreamEvent[],
+    turnId: string,
+  ): void {
+    const running = this.turnState;
+    if (
+      running.status !== "running" ||
+      running.turnId !== turnId ||
+      running.submission !== "accepted" ||
+      running.hasAssistantOutput ||
+      !events.some(
+        (event) =>
+          event.type === "timeline" &&
+          event.item.type === "assistant_message" &&
+          event.item.text.trim().length > 0,
+      )
+    ) {
+      return;
+    }
+    this.turnState = { ...running, hasAssistantOutput: true };
+  }
+
   private discardEventBeforeSubmissionAcceptance(
     event: OpenCodeEvent,
     eventCount: number,
@@ -4140,17 +4167,30 @@ class OpenCodeAgentSession implements AgentSession {
     const receivedBeforeDispatch =
       running.dispatchStreamEventRevision !== null &&
       streamEventRevision <= running.dispatchStreamEventRevision;
-    if (!receivedBeforeDispatch && running.submission === "accepted") {
+    const completionBeforeAssistantOutput =
+      running.acceptance === "activity" &&
+      running.userMessageId !== null &&
+      !running.hasAssistantOutput &&
+      (event.type === "session.idle" || event.type === "session.status");
+    if (
+      !receivedBeforeDispatch &&
+      running.submission === "accepted" &&
+      !completionBeforeAssistantOutput
+    ) {
       return false;
     }
     if (!receivedBeforeDispatch) {
       this.turnState = { ...running, postDispatchTerminalDiscarded: true };
     }
+    let reason = "foreground_completion_before_assistant_output";
+    if (receivedBeforeDispatch) {
+      reason = "foreground_terminal_before_dispatch";
+    } else if (running.submission !== "accepted") {
+      reason = "foreground_submission_unaccepted";
+    }
     this.traceOpenCode("provider.opencode.event.skip", {
       n: eventCount,
-      reason: receivedBeforeDispatch
-        ? "foreground_terminal_before_dispatch"
-        : "foreground_submission_unaccepted",
+      reason,
       type: event.type,
     });
     return true;

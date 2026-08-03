@@ -106,16 +106,6 @@ function providerAssistantMessages(events: AgentStreamEvent[], text: string): Ag
   );
 }
 
-function completedTurnIds(events: readonly AgentStreamEvent[]): Array<string | undefined> {
-  const turnIds: Array<string | undefined> = [];
-  for (const event of events) {
-    if (event.type === "turn_completed") {
-      turnIds.push("turnId" in event ? event.turnId : undefined);
-    }
-  }
-  return turnIds;
-}
-
 type TurnEventSignature = [type: AgentStreamEvent["type"], turnId: string | undefined];
 
 function turnEventSignatures(events: AgentStreamEvent[]): TurnEventSignature[] {
@@ -491,6 +481,97 @@ describe("OpenCodeAgentClient adapter smoke tests", () => {
     await session.close();
     rmSync(cwd, { recursive: true, force: true });
   }, 120_000);
+
+  test("keeps a continuation open after its persisted user echo until assistant output", async () => {
+    const sessionId = "ses_continuation_output_gate";
+    const { parent, openCode } = await createParentSession(sessionId, (client) => {
+      client.sessionPromptAsyncEvents = assistantTurnEvents({ sessionId, text: "FIRST_OK" });
+    });
+    const events: AgentStreamEvent[] = [];
+    const unsubscribe = parent.subscribe((event) => events.push(event));
+    const completedTurns = () => events.filter((event) => event.type === "turn_completed");
+
+    try {
+      await parent.startTurn("first prompt");
+      await vi.waitFor(() => {
+        expect(completedTurns()).toEqual([
+          expect.objectContaining({ type: "turn_completed", turnId: "opencode-turn-0" }),
+        ]);
+      });
+
+      openCode.sessionPromptAsyncEvents = [
+        { type: "session.idle", properties: { sessionID: sessionId } },
+        {
+          type: "todo.updated",
+          properties: {
+            sessionID: sessionId,
+            todos: [{ content: "Continuation activity observed", status: "pending" }],
+          },
+        },
+      ];
+      await parent.startTurn("CONTINUED");
+      await vi.waitFor(() => {
+        expect(events).toContainEqual({
+          type: "timeline",
+          provider: "opencode",
+          turnId: "opencode-turn-1",
+          item: {
+            type: "todo",
+            items: [{ text: "Continuation activity observed", completed: false }],
+          },
+        });
+      });
+
+      expect(completedTurns()).toHaveLength(1);
+      await expect(parent.startTurn("must still be busy")).rejects.toThrow(
+        "A foreground turn is already active",
+      );
+
+      const continuationCall = openCode.calls.sessionPromptAsync[1] as { messageID: string };
+      openCode.emitEvent({
+        type: "message.updated",
+        properties: {
+          info: {
+            id: "msg_continuation_assistant",
+            sessionID: sessionId,
+            role: "assistant",
+            parentID: continuationCall.messageID,
+          },
+        },
+      });
+      openCode.emitEvent({
+        type: "message.part.delta",
+        properties: {
+          sessionID: sessionId,
+          messageID: "msg_continuation_assistant",
+          partID: "prt_continuation_text",
+          field: "text",
+          delta: "CONTINUATION_OK",
+        },
+      });
+      openCode.emitEvent({ type: "session.idle", properties: { sessionID: sessionId } });
+
+      await vi.waitFor(() => {
+        expect(completedTurns()).toEqual([
+          expect.objectContaining({ type: "turn_completed", turnId: "opencode-turn-0" }),
+          expect.objectContaining({ type: "turn_completed", turnId: "opencode-turn-1" }),
+        ]);
+      });
+      expect(events).toContainEqual({
+        type: "timeline",
+        provider: "opencode",
+        turnId: "opencode-turn-1",
+        item: {
+          type: "assistant_message",
+          text: "CONTINUATION_OK",
+          messageId: "msg_continuation_assistant",
+        },
+      });
+    } finally {
+      unsubscribe();
+      await parent.close();
+    }
+  });
 
   test("completed and structured assistant messages preserve OpenCode message IDs", async () => {
     const cwd = tmpCwd();
@@ -1067,9 +1148,10 @@ describe("OpenCodeAgentClient adapter smoke tests", () => {
         });
 
         openCode.echoPromptUserMessage = true;
-        openCode.sessionPromptAsyncEvents = [
-          { type: "session.idle", properties: { sessionID: sessionId } },
-        ];
+        openCode.sessionPromptAsyncEvents = assistantTurnEvents({
+          sessionId,
+          text: "replacement response",
+        });
         await expect(parent.startTurn("replacement continuation")).resolves.toEqual({
           turnId: "opencode-turn-1",
         });
@@ -1358,6 +1440,7 @@ describe("OpenCode adapter startTurn error handling", () => {
   test("dynamically adds injected MCP servers without config-backed connect", async () => {
     const runtime = new TestOpenCodeHarness();
     const openCodeClient = new TestOpenCodeClient();
+    openCodeClient.sessionPromptAsyncEvents = assistantTurnEvents();
     runtime.enqueueClient(openCodeClient);
     const cwd = tmpCwd();
     const client = new OpenCodeAgentClient(createTestLogger(), undefined, {
@@ -2429,69 +2512,6 @@ describe("OpenCode adapter startTurn error handling", () => {
       await session.startTurn("second");
       expect(openCode.calls.sessionAbort).toHaveLength(2);
       expect(openCode.calls.sessionPromptAsync).toHaveLength(2);
-    } finally {
-      await session.close();
-    }
-  });
-
-  test("keeps a continuation active until OpenCode starts and finishes its new run", async () => {
-    const { parent: session, openCode } = await createParentSession("ses_continuation");
-    openCode.sessionPromptAsyncEvents = [];
-    const events: AgentStreamEvent[] = [];
-    session.subscribe((event) => events.push(event));
-
-    const emitStatus = (type: "busy" | "idle") => {
-      openCode.emitEvent({
-        type: "session.status",
-        properties: { sessionID: "ses_continuation", status: { type } },
-      });
-    };
-
-    try {
-      const first = await session.startTurn("first");
-      emitStatus("busy");
-      emitStatus("idle");
-      await vi.waitFor(() => {
-        expect(completedTurnIds(events)).toEqual([first.turnId]);
-      });
-
-      const second = await session.startTurn("second");
-      emitStatus("idle");
-      openCode.emitEvent({
-        type: "session.created",
-        properties: {
-          info: {
-            id: "ses_continuation_drain_marker",
-            parentID: "ses_continuation",
-            title: "Drain marker",
-            directory: "/workspace/repo",
-          },
-        },
-      });
-      await vi.waitFor(() => {
-        expect(events).toContainEqual({
-          type: "provider_subagent",
-          provider: "opencode",
-          event: {
-            type: "upsert",
-            id: "ses_continuation_drain_marker",
-            status: "running",
-            cwd: "/workspace/repo",
-            title: "Drain marker",
-          },
-        });
-      });
-
-      expect(completedTurnIds(events)).toEqual([first.turnId]);
-      await expect(session.startTurn("third")).rejects.toThrow(
-        "A foreground turn is already active",
-      );
-
-      emitStatus("busy");
-      emitStatus("idle");
-      await vi.waitFor(() => {
-        expect(completedTurnIds(events)).toEqual([first.turnId, second.turnId]);
-      });
     } finally {
       await session.close();
     }
