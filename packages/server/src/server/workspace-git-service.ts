@@ -1,4 +1,4 @@
-import { realpathSync, watch, type FSWatcher } from "node:fs";
+import { realpathSync, watch as watchFileSystem, type FSWatcher } from "node:fs";
 import { readFile, readdir } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { LRUCache } from "lru-cache";
@@ -322,7 +322,7 @@ function isAbortError(error: unknown): boolean {
 }
 
 interface WorkspaceGitServiceDependencies {
-  watch: typeof watch;
+  watch: typeof watchFileSystem | null;
   readdir: typeof readdir;
   getCheckoutSnapshotFacts: typeof getCheckoutSnapshotFacts;
   getCheckoutStatus: typeof getCheckoutStatus;
@@ -350,6 +350,7 @@ interface WorkspaceGitServiceOptions {
   logger: pino.Logger;
   paseoHome: string;
   worktreesRoot?: string;
+  platform?: NodeJS.Platform;
   deps?: Partial<WorkspaceGitServiceDependencies>;
 }
 
@@ -437,9 +438,11 @@ interface WorkspaceForgePrStatusPollTarget {
   headRepositoryOwner?: string;
 }
 
-function buildDefaultWorkspaceGitServiceDeps(): WorkspaceGitServiceDependencies {
+function buildDefaultWorkspaceGitServiceDeps(
+  platform: NodeJS.Platform,
+): WorkspaceGitServiceDependencies {
   return {
-    watch,
+    watch: platform === "darwin" ? null : watchFileSystem,
     readdir,
     getCheckoutSnapshotFacts,
     getCheckoutStatus,
@@ -460,8 +463,9 @@ function buildDefaultWorkspaceGitServiceDeps(): WorkspaceGitServiceDependencies 
 
 function resolveWorkspaceGitServiceDeps(
   deps: Partial<WorkspaceGitServiceDependencies> | undefined,
+  platform: NodeJS.Platform,
 ): WorkspaceGitServiceDependencies {
-  return { ...buildDefaultWorkspaceGitServiceDeps(), ...deps };
+  return { ...buildDefaultWorkspaceGitServiceDeps(platform), ...deps };
 }
 
 function incrementCount(counts: Map<string, number>, key: string): void {
@@ -560,7 +564,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     this.logger = options.logger.child({ module: "workspace-git-service" });
     this.paseoHome = options.paseoHome;
     this.worktreesRoot = options.worktreesRoot;
-    this.deps = resolveWorkspaceGitServiceDeps(options.deps);
+    this.deps = resolveWorkspaceGitServiceDeps(options.deps, options.platform ?? process.platform);
     this.forgeResolver = createForgeResolver({
       createService: (forge) => this.deps.forgeOverrides?.[forge] ?? createForgeService(forge),
     });
@@ -1657,6 +1661,10 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     if (target.observationWatcherGeneration) {
       return target.observationWatcherGeneration;
     }
+    const watch = this.deps.watch;
+    if (!watch) {
+      return null;
+    }
 
     const watchPaths = [
       { path: join(gitDir, "HEAD"), recursive: false, invalidatesRepositoryFacts: false },
@@ -1672,7 +1680,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     for (const watchSpec of watchPaths) {
       let watcher: FSWatcher | null = null;
       const startWatcher = (recursive: boolean): FSWatcher =>
-        this.deps.watch(watchSpec.path, { recursive }, (_eventType, filename) => {
+        watch(watchSpec.path, { recursive }, (_eventType, filename) => {
           if (
             watchSpec.filename &&
             filename !== null &&
@@ -2059,7 +2067,8 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     watchPath: string,
     shouldTryRecursive: boolean,
   ): boolean {
-    if (target.closed || this.disposed || target.watchedPaths.has(watchPath)) {
+    const watch = this.deps.watch;
+    if (!watch || target.closed || this.disposed || target.watchedPaths.has(watchPath)) {
       return false;
     }
 
@@ -2080,7 +2089,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
       }
     };
     const createWatcher = (recursive: boolean): FSWatcher =>
-      this.deps.watch(watchPath, { recursive }, () => {
+      watch(watchPath, { recursive }, () => {
         onChange();
       });
 

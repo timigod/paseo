@@ -3,6 +3,20 @@ import os from "node:os";
 import path, { join } from "node:path";
 import type { FSWatcher } from "node:fs";
 import type pino from "pino";
+
+const nodeFsMocks = vi.hoisted(() => ({
+  watch: vi.fn(() => {
+    const watcher = { close: vi.fn(), on: vi.fn() };
+    watcher.on.mockReturnValue(watcher);
+    return watcher;
+  }),
+}));
+
+vi.mock("node:fs", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs")>();
+  return { ...actual, watch: nodeFsMocks.watch };
+});
+
 import type { ForgeService } from "../services/forge-service.js";
 import {
   createGitHubService,
@@ -266,6 +280,7 @@ function createGitHubServiceStub(): ForgeService {
 }
 
 interface CreateServiceTestOptions {
+  platform?: NodeJS.Platform;
   getCheckoutStatus?: ReturnType<typeof vi.fn>;
   getCheckoutSnapshotFacts?: ReturnType<typeof vi.fn>;
   getCheckoutShortstat?: ReturnType<typeof vi.fn>;
@@ -307,10 +322,22 @@ function buildDefaultTestServiceDeps() {
 }
 
 function createService(options?: CreateServiceTestOptions) {
+  const { platform, ...deps } = options ?? {};
   return new WorkspaceGitServiceImpl({
     logger: createLogger() as unknown as pino.Logger,
     paseoHome: "/tmp/paseo-test",
-    deps: { ...buildDefaultTestServiceDeps(), ...options },
+    platform,
+    deps: { ...buildDefaultTestServiceDeps(), ...deps },
+  });
+}
+
+function createServiceWithDefaultWatch(platform: NodeJS.Platform) {
+  const { watch: _watch, ...deps } = buildDefaultTestServiceDeps();
+  return new WorkspaceGitServiceImpl({
+    logger: createLogger() as unknown as pino.Logger,
+    paseoHome: "/tmp/paseo-test",
+    platform,
+    deps,
   });
 }
 
@@ -321,6 +348,77 @@ describe("WorkspaceGitServiceImpl", () => {
 
   afterEach(() => {
     vi.useRealTimers();
+    nodeFsMocks.watch.mockClear();
+  });
+
+  test("default darwin observation never calls native watch and keeps refresh fallbacks active", async () => {
+    const service = createServiceWithDefaultWatch("darwin");
+    const workspaceListener = vi.fn();
+    const workspaceSubscription = service.registerWorkspace({ cwd: REPO_CWD }, workspaceListener);
+
+    await vi.waitFor(() => expect(service.peekSnapshot(REPO_CWD)).not.toBeNull());
+    await flushPromises();
+    service.onWorkspaceStateMayHaveChanged(REPO_CWD);
+    await vi.advanceTimersByTimeAsync(1_000);
+    await flushPromises();
+
+    const workingTreeListener = vi.fn();
+    const workingTreeSubscription = await service.requestWorkingTreeWatch(
+      REPO_CWD,
+      workingTreeListener,
+    );
+
+    expect(nodeFsMocks.watch).not.toHaveBeenCalled();
+
+    await vi.advanceTimersByTimeAsync(5_000);
+    await flushPromises();
+
+    expect(workingTreeListener).toHaveBeenCalledTimes(1);
+
+    await vi.advanceTimersByTimeAsync(WORKSPACE_GIT_SELF_HEAL_INTERVAL_MS - 6_000);
+    await flushPromises();
+
+    expect(service.getMetrics().workspaceRefreshCountByReason).toMatchObject({
+      initial: 1,
+      "external-state-change": 1,
+      "self-heal-git": 1,
+    });
+    expect(workspaceListener).toHaveBeenCalledTimes(2);
+    expect(nodeFsMocks.watch).not.toHaveBeenCalled();
+
+    workingTreeSubscription.unsubscribe();
+    workspaceSubscription.unsubscribe();
+    service.dispose();
+  });
+
+  test("explicitly injected darwin watch handles metadata and working-tree observation", async () => {
+    const injectedWatch = vi.fn(() => createWatcher());
+    const service = createService({ platform: "darwin", watch: injectedWatch });
+    const workspaceSubscription = service.registerWorkspace({ cwd: REPO_CWD }, vi.fn());
+
+    await vi.waitFor(() => expect(injectedWatch).toHaveBeenCalledTimes(3));
+    const workingTreeSubscription = await service.requestWorkingTreeWatch(REPO_CWD, vi.fn());
+
+    expect(injectedWatch).toHaveBeenCalledTimes(5);
+    expect(nodeFsMocks.watch).not.toHaveBeenCalled();
+
+    workingTreeSubscription.unsubscribe();
+    workspaceSubscription.unsubscribe();
+    service.dispose();
+  });
+
+  test("default non-darwin watch handles metadata and working-tree observation", async () => {
+    const service = createServiceWithDefaultWatch("linux");
+    const workspaceSubscription = service.registerWorkspace({ cwd: REPO_CWD }, vi.fn());
+
+    await vi.waitFor(() => expect(nodeFsMocks.watch).toHaveBeenCalledTimes(3));
+    const workingTreeSubscription = await service.requestWorkingTreeWatch(REPO_CWD, vi.fn());
+
+    expect(nodeFsMocks.watch).toHaveBeenCalledTimes(5);
+
+    workingTreeSubscription.unsubscribe();
+    workspaceSubscription.unsubscribe();
+    service.dispose();
   });
 
   test("registerWorkspace returns a subscription without an initial snapshot contract", async () => {
