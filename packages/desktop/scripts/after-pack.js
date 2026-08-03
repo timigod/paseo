@@ -8,6 +8,7 @@ const {
   resolveValidatedMacBuildMode,
 } = require("./packaged-runtime-gate.js");
 const { smokePackagedDesktopApp } = require("./smoke-packaged-desktop-app.js");
+const { assertPackagedArchiveExactSource } = require("./build-provenance-gate.js");
 
 const EXECUTABLE_NAME = "Paseo";
 
@@ -117,6 +118,14 @@ exports.default = async function afterPack(context) {
   const arch = resolveElectronBuilderTargetArch(context.arch);
   const isMac = platform === "darwin" || platform === "mas";
   const macBuildMode = isMac ? resolveValidatedMacBuildMode(process.env) : undefined;
+
+  const resourcesDir = isMac
+    ? path.join(context.appOutDir, `${EXECUTABLE_NAME}.app`, "Contents", "Resources")
+    : path.join(context.appOutDir, "resources");
+  assertPackagedArchiveExactSource({
+    archivePath: path.join(resourcesDir, "app.asar"),
+    workspaceRoot: path.resolve(__dirname, "..", "..", ".."),
+  });
 
   pruneNativeModules(context.appOutDir, platform, arch);
 

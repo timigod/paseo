@@ -321,6 +321,38 @@ The GitHub Release body is populated automatically by the `Release Notes Sync` w
 - The public `/changelog` page renders `CHANGELOG.md` as-is, so the in-flight `-beta.N` entry shows there once it lands on `main` — that's intended, it's where beta users check what's coming. Only the **download target** stays pinned to the latest stable; the download links read GitHub's releases API, not the changelog, so a `-beta.N` heading on top never affects them.
 - The website itself is deployed by `Deploy Website` (Cloudflare Workers), which redeploys on `release: published` for non-prerelease releases and on pushes to `main` that touch `CHANGELOG.md` or `packages/website/**`.
 
+## Desktop build provenance
+
+Desktop packaging enforces an exact-source contract so a packaged app can never
+silently carry stale server or CLI dist (which once shipped from a source
+commit it did not match):
+
+- `npm run build:server:clean` finishes by stamping
+  `packages/server/dist/build-receipt.json` and
+  `packages/cli/dist/build-receipt.json` with the Git commit it built from
+  (`scripts/build-receipt.cjs`). The incremental `npm run build:server` deletes
+  the receipts instead — only a clean full build certifies dist.
+- `packages/desktop/scripts/run-electron-builder.js` refuses to package when
+  the tree has uncommitted changes or when either receipt is missing, dirty,
+  or disagrees with `HEAD`. The only tolerated tracked change is the release
+  workflow's version stamp in `packages/desktop/package.json` (version field
+  only).
+- The electron-builder `afterPack`/`afterSign` hooks
+  (`packages/desktop/scripts/build-provenance-gate.js`) re-verify on every
+  platform that the receipts inside the produced `app.asar` are byte-identical
+  to the clean-build receipts, so bypassing the wrapper only moves the same
+  failure into the hooks.
+- To prove which commit an installed (signed) bundle was built from before
+  activating it:
+
+  ```bash
+  node packages/desktop/scripts/build-provenance-gate.js read "/Applications/Paseo.app" --expect-commit <sha>
+  ```
+
+If packaging fails with a provenance error, commit (or drop) the local
+changes and rerun `npm run build:server:clean` at the commit you intend to
+ship. Do not work around the gate by invoking electron-builder directly.
+
 ## Fixing a failed release build
 
 **NEVER bump the version to fix a build problem.** New versions are reserved for meaningful product changes (features, fixes, improvements). Build/CI failures are fixed on the current version.

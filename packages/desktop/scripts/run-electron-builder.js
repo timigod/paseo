@@ -1,4 +1,5 @@
 const { spawnSync } = require("node:child_process");
+const path = require("node:path");
 
 const UNSIGNED_MAC_BUILD_ENV = "PASEO_DESKTOP_UNSIGNED_MAC";
 const INTERNAL_MAC_BUILD_MODE_ENV = "PASEO_INTERNAL_MAC_BUILD_MODE";
@@ -163,6 +164,11 @@ function resolveExtraBuilderArgs(env, builderArgs = [], hostPlatform = process.p
 function main() {
   const builderArgs = process.argv.slice(2);
   const { childEnv, extraArgs, macBuildMode } = resolveBuilderPlan(process.env, builderArgs);
+  // Refuse to package a dirty tree or a dist that was not clean-built at HEAD.
+  // The afterPack/afterSign hooks re-verify the receipts inside app.asar, so
+  // bypassing this wrapper only moves the same failure into the hooks.
+  const { assertWorkspaceExactSource } = require("./build-provenance-gate.js");
+  assertWorkspaceExactSource({ workspaceRoot: path.resolve(__dirname, "..", "..", "..") });
   if (macBuildMode === MAC_BUILD_MODE.UNSIGNED) {
     console.error(
       `[run-electron-builder] explicit unsigned mac build: applying ${extraArgs.join(" ")} and disabling signing identity auto-discovery`,
