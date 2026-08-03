@@ -4,6 +4,7 @@ import { createTestLogger } from "../../../test-utils/test-logger.js";
 import type { AgentStreamEvent } from "../agent-sdk-types.js";
 import { OpenCodeAgentClient } from "./opencode-agent.js";
 import {
+  busyEvent,
   idleEvent,
   TestOpenCodeClient,
   TestOpenCodeHarness,
@@ -18,7 +19,7 @@ function mockOpenCodeClient(options: MockOpenCodeClientOptions = {}) {
   const runtime = new TestOpenCodeHarness();
   const openCodeClient = new TestOpenCodeClient();
   openCodeClient.appAgentsResponse = { data: options.agents ?? [] };
-  openCodeClient.sessionPromptAsyncEvents = options.events ?? [idleEvent()];
+  openCodeClient.sessionPromptAsyncEvents = [busyEvent(), ...(options.events ?? [idleEvent()])];
   openCodeClient.providerListResponse = {
     data: {
       connected: ["openai"],

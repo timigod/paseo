@@ -13,6 +13,7 @@ import {
 } from "./opencode-agent.js";
 import { streamSession } from "./test-utils/session-stream-adapter.js";
 import {
+  busyEvent,
   TestOpenCodeClient,
   TestOpenCodeHarness,
 } from "./opencode/test-utils/test-opencode-harness.js";
@@ -105,6 +106,16 @@ function providerAssistantMessages(events: AgentStreamEvent[], text: string): Ag
   );
 }
 
+function completedTurnIds(events: readonly AgentStreamEvent[]): Array<string | undefined> {
+  const turnIds: Array<string | undefined> = [];
+  for (const event of events) {
+    if (event.type === "turn_completed") {
+      turnIds.push("turnId" in event ? event.turnId : undefined);
+    }
+  }
+  return turnIds;
+}
+
 type TurnEventSignature = [type: AgentStreamEvent["type"], turnId: string | undefined];
 
 function turnEventSignatures(events: AgentStreamEvent[]): TurnEventSignature[] {
@@ -147,6 +158,7 @@ function assistantTurnEvents({
   text?: string;
 } = {}): unknown[] {
   return [
+    busyEvent(sessionId),
     {
       type: "message.updated",
       properties: {
@@ -485,6 +497,7 @@ describe("OpenCodeAgentClient adapter smoke tests", () => {
     const runtime = new TestOpenCodeHarness();
     const openCodeClient = new TestOpenCodeClient();
     openCodeClient.sessionPromptAsyncEvents = [
+      busyEvent(),
       {
         type: "message.updated",
         properties: {
@@ -1305,6 +1318,16 @@ describe("OpenCode adapter startTurn error handling", () => {
       {
         directory: "/tmp/test",
         payload: {
+          type: "session.status",
+          properties: {
+            sessionID: "ses_unit_test",
+            status: { type: "busy" },
+          },
+        },
+      },
+      {
+        directory: "/tmp/test",
+        payload: {
           type: "message.updated",
           properties: {
             info: {
@@ -1396,6 +1419,16 @@ describe("OpenCode adapter startTurn error handling", () => {
             partID: "prt_other",
             field: "text",
             delta: "ignore me",
+          },
+        },
+      },
+      {
+        directory: "/tmp/test",
+        payload: {
+          type: "session.status",
+          properties: {
+            sessionID: "ses_unit_test",
+            status: { type: "busy" },
           },
         },
       },
@@ -2241,6 +2274,69 @@ describe("OpenCode adapter startTurn error handling", () => {
     }
   });
 
+  test("keeps a continuation active until OpenCode starts and finishes its new run", async () => {
+    const { parent: session, openCode } = await createParentSession("ses_continuation");
+    openCode.sessionPromptAsyncEvents = [];
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+
+    const emitStatus = (type: "busy" | "idle") => {
+      openCode.emitEvent({
+        type: "session.status",
+        properties: { sessionID: "ses_continuation", status: { type } },
+      });
+    };
+
+    try {
+      const first = await session.startTurn("first");
+      emitStatus("busy");
+      emitStatus("idle");
+      await vi.waitFor(() => {
+        expect(completedTurnIds(events)).toEqual([first.turnId]);
+      });
+
+      const second = await session.startTurn("second");
+      emitStatus("idle");
+      openCode.emitEvent({
+        type: "session.created",
+        properties: {
+          info: {
+            id: "ses_continuation_drain_marker",
+            parentID: "ses_continuation",
+            title: "Drain marker",
+            directory: "/workspace/repo",
+          },
+        },
+      });
+      await vi.waitFor(() => {
+        expect(events).toContainEqual({
+          type: "provider_subagent",
+          provider: "opencode",
+          event: {
+            type: "upsert",
+            id: "ses_continuation_drain_marker",
+            status: "running",
+            cwd: "/workspace/repo",
+            title: "Drain marker",
+          },
+        });
+      });
+
+      expect(completedTurnIds(events)).toEqual([first.turnId]);
+      await expect(session.startTurn("third")).rejects.toThrow(
+        "A foreground turn is already active",
+      );
+
+      emitStatus("busy");
+      emitStatus("idle");
+      await vi.waitFor(() => {
+        expect(completedTurnIds(events)).toEqual([first.turnId, second.turnId]);
+      });
+    } finally {
+      await session.close();
+    }
+  });
+
   test("does not send a prompt while the previous provider turn is still stopping", async () => {
     vi.useFakeTimers();
     const { parent: session, openCode } = await createParentSession("ses_unit_test");
@@ -2883,8 +2979,8 @@ describe("OpenCode provider subagent contract", () => {
 
     for (const event of [
       ...assistantTurnEvents({ sessionId: "ses_child_external", text: "child says hi" }).slice(
-        0,
-        2,
+        1,
+        3,
       ),
       {
         type: "session.status",

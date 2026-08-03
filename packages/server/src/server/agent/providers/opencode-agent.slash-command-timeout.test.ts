@@ -98,7 +98,9 @@ describe("OpenCodeAgentSession slash command timeout handling", () => {
     const session = await client.createSession({ provider: "opencode", cwd: "/tmp" });
 
     const runPromise = session.run("/help");
-    await Promise.resolve();
+    await nextTick();
+    await nextTick();
+    expect(openCodeClient.calls.sessionCommand).toHaveLength(1);
     idleEventGate.resolve();
 
     await expect(runPromise).resolves.toMatchObject({

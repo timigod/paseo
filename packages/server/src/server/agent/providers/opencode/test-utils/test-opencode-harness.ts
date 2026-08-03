@@ -161,7 +161,7 @@ export class TestOpenCodeClient {
     data: { id: "session-1", directory: "/workspace/repo", title: null },
   };
   sessionMessagesResponse: OpenCodeResponse = { data: [] };
-  sessionPromptAsyncEvents: unknown[] = [idleEvent()];
+  sessionPromptAsyncEvents: unknown[] = [busyEvent(), idleEvent()];
   sessionPromptAsyncResponse: OpenCodeResponse = {};
   sessionStatusResponse: OpenCodeResponse = { data: {} };
   sessionSummarizeEvents: unknown[] = [idleEvent()];
@@ -399,5 +399,12 @@ export function idleEvent(): unknown {
   return {
     type: "session.idle",
     properties: { sessionID: "session-1" },
+  };
+}
+
+export function busyEvent(sessionId = "session-1"): unknown {
+  return {
+    type: "session.status",
+    properties: { sessionID: sessionId, status: { type: "busy" } },
   };
 }

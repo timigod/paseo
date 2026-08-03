@@ -2974,7 +2974,12 @@ function createDeferred<T>(): Deferred<T> {
 
 type OpenCodeTurnState =
   | { status: "idle" }
-  | { status: "running"; turnId: string; userMessageId: string | null }
+  | {
+      status: "running";
+      turnId: string;
+      userMessageId: string | null;
+      acceptsSessionIdle: boolean;
+    }
   | { status: "stopping"; idle: Deferred<void> };
 
 function unwrapOpenCodeGlobalEvent(event: unknown): OpenCodeEvent | null {
@@ -3365,11 +3370,15 @@ class OpenCodeAgentSession implements AgentSession {
 
     const turnId = this.createTurnId();
     const userMessageId = `msg_${randomUUID().replaceAll("-", "")}`;
-    this.turnState = { status: "running", turnId, userMessageId };
+    this.turnState = { status: "running", turnId, userMessageId, acceptsSessionIdle: false };
     this.notifySubscribers({ type: "turn_started", provider: "opencode" }, turnId);
 
     const slashCommand = await this.resolveSlashCommandInvocation(prompt);
     if (slashCommand) {
+      if (this.turnState.status === "running" && this.turnState.turnId === turnId) {
+        // Slash commands can legitimately complete without a busy status.
+        this.turnState.acceptsSessionIdle = true;
+      }
       if (slashCommand.commandName === "compact" || slashCommand.commandName === "summarize") {
         this.suppressAssistantMessagesUntilIdle.active = true;
         void this.client.session
@@ -3794,18 +3803,7 @@ class OpenCodeAgentSession implements AgentSession {
     if (!event) {
       return;
     }
-    if (
-      this.turnState.status === "stopping" &&
-      getOpenCodeEventSessionId(event) === this.sessionId
-    ) {
-      if (isOpenCodeTerminalEvent(event, this.sessionId)) {
-        this.finishStoppingTurn();
-      }
-      this.traceOpenCode("provider.opencode.event.skip", {
-        n: eventCount,
-        reason: "turn_stopping",
-        type: event.type,
-      });
+    if (this.shouldSkipTurnLifecycleEvent(event, eventCount)) {
       return;
     }
     const translated = await this.translateEvent(event);
@@ -3858,6 +3856,42 @@ class OpenCodeAgentSession implements AgentSession {
     }
   }
 
+  private shouldSkipTurnLifecycleEvent(event: OpenCodeEvent, eventCount: number): boolean {
+    if (getOpenCodeEventSessionId(event) !== this.sessionId) {
+      return false;
+    }
+    if (this.turnState.status === "stopping") {
+      if (isOpenCodeTerminalEvent(event, this.sessionId)) {
+        this.finishStoppingTurn();
+      }
+      this.traceOpenCode("provider.opencode.event.skip", {
+        n: eventCount,
+        reason: "turn_stopping",
+        type: event.type,
+      });
+      return true;
+    }
+    const activeTurn = this.turnState;
+    if (activeTurn.status !== "running") {
+      return false;
+    }
+    const statusType = event.type === "session.status" ? event.properties.status.type : undefined;
+    if (statusType === "busy" || statusType === "retry") {
+      activeTurn.acceptsSessionIdle = true;
+      return false;
+    }
+    if (activeTurn.acceptsSessionIdle || (event.type !== "session.idle" && statusType !== "idle")) {
+      return false;
+    }
+    this.traceOpenCode("provider.opencode.event.skip", {
+      turnId: activeTurn.turnId,
+      n: eventCount,
+      reason: "idle_before_run_start",
+      type: event.type,
+    });
+    return true;
+  }
+
   private emitBackgroundPermissionRequests(events: readonly AgentStreamEvent[]): void {
     for (const event of events) {
       if (event.type === "permission_requested") {
@@ -3901,7 +3935,12 @@ class OpenCodeAgentSession implements AgentSession {
 
   private startAutonomousTurn(): string {
     const turnId = this.createTurnId();
-    this.turnState = { status: "running", turnId, userMessageId: null };
+    this.turnState = {
+      status: "running",
+      turnId,
+      userMessageId: null,
+      acceptsSessionIdle: true,
+    };
     this.runningToolCalls.clear();
     this.subAgentsByCallId.clear();
     this.subAgentCallIdByChildSessionId.clear();

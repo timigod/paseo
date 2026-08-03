@@ -3,6 +3,7 @@ import { describe, expect, test } from "vitest";
 import { createTestLogger } from "../../../test-utils/test-logger.js";
 import { OpenCodeAgentClient } from "./opencode-agent.js";
 import {
+  busyEvent,
   idleEvent,
   TestOpenCodeClient,
   TestOpenCodeHarness,
@@ -11,7 +12,7 @@ import {
 function mockOpenCodeClient(events: unknown[]) {
   const runtime = new TestOpenCodeHarness();
   const openCodeClient = new TestOpenCodeClient();
-  openCodeClient.sessionPromptAsyncEvents = events;
+  openCodeClient.sessionPromptAsyncEvents = [busyEvent(), ...events];
   runtime.enqueueClient(openCodeClient);
 
   return { openCodeClient, runtime };
