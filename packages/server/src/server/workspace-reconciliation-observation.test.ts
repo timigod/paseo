@@ -11,6 +11,7 @@ import {
   createPersistedWorkspaceRecord,
   FileBackedProjectRegistry,
   FileBackedWorkspaceRegistry,
+  type PersistedProjectRecord,
   type PersistedWorkspaceRecord,
 } from "./workspace-registry.js";
 import {
@@ -33,6 +34,7 @@ afterEach(() => {
 interface ProjectSpec {
   id: string;
   root: string;
+  kind?: PersistedProjectRecord["kind"];
   workspaces?: Array<{ id: string; cwd: string }>;
   archived?: boolean;
 }
@@ -164,6 +166,7 @@ class ObservedPlacements {
   private readonly workspaces: ObservedWorkspaceRegistry;
   private readonly clock = new TestClock();
   private readonly watches: RootWatch[] = [];
+  private readonly watchAttemptPaths: string[] = [];
   private readonly checkoutByCwd = new Map<string, ProjectCheckoutLitePayload>();
   private readonly rootByProjectId = new Map<string, string>();
   private readonly failedWatchRoots = new Set<string>();
@@ -184,6 +187,7 @@ class ObservedPlacements {
       logger,
     );
     const watchProjectRoot: ProjectRootWatch = (rootPath, _options, onChange, onError) => {
+      this.watchAttemptPaths.push(rootPath);
       if (this.failedWatchRoots.delete(rootPath)) throw new Error("root unavailable");
       const watch = { rootPath, onChange, onError, closed: false };
       this.watches.push(watch);
@@ -327,15 +331,21 @@ class ObservedPlacements {
     return this.clock.pendingCount;
   }
 
+  get watchAttempts(): string[] {
+    return this.watchAttemptPaths.map((rootPath) => path.relative(this.home, rootPath));
+  }
+
   private async seed(spec: ProjectSpec): Promise<void> {
     const rootPath = this.absolute(spec.root);
     mkdirSync(rootPath, { recursive: true });
     this.rootByProjectId.set(spec.id, rootPath);
+    const kind = spec.kind ?? "non_git";
+    if (kind === "git") this.makeProjectGit(spec.id);
     await this.projects.upsert(
       createPersistedProjectRecord({
         projectId: spec.id,
         rootPath,
-        kind: "non_git",
+        kind,
         displayName: spec.id,
         createdAt: TIMESTAMP,
         updatedAt: TIMESTAMP,
@@ -390,19 +400,19 @@ class ObservedPlacements {
 }
 
 describe("observed workspace placement", () => {
-  test("installs and publishes a new project before add resolves without Git feedback", async () => {
+  test("publishes a new non-Git project without attempting an optional root watch", async () => {
     const observed = new ObservedPlacements([]);
     await observed.start();
+    observed.failNextWatch("new");
 
     await observed.add({ id: "project-new", root: "new" });
-    await observed.advanceBy(DEBOUNCE_MS);
 
-    expect(observed.watchedRoots()).toEqual(["new"]);
+    expect(observed.watchAttempts).toEqual([]);
+    expect(observed.watchedRoots()).toEqual([]);
     expect(observed.projectUpdates).toEqual([
       { kind: "upsert", project: expect.objectContaining({ projectId: "project-new" }) },
     ]);
     expect(observed.lifecycle).toEqual([
-      "watch installed:new",
       "project published:upsert:project-new",
       "registry mutation resolved:project-new",
     ]);
@@ -410,12 +420,47 @@ describe("observed workspace placement", () => {
     observed.dispose();
   });
 
+  test("skips optional non-Git root watches during start and retains periodic convergence", async () => {
+    const observed = new ObservedPlacements([
+      {
+        id: "project-protected",
+        root: "protected",
+        kind: "non_git",
+        workspaces: [{ id: "workspace-protected", cwd: "protected" }],
+      },
+    ]);
+    observed.failNextWatch("protected");
+
+    await observed.start();
+
+    expect(observed.watchAttempts).toEqual([]);
+    expect(observed.pendingTimers).toBe(1);
+
+    observed.makeProjectGit("project-protected");
+    await observed.advanceBy(RESCAN_INTERVAL_MS);
+
+    expect(observed.watchAttempts).toEqual([]);
+    expect(observed.watchedRoots()).toEqual([]);
+    expect(await observed.placement("workspace-protected")).toMatchObject({
+      kind: "local_checkout",
+      branch: "main",
+    });
+
+    await observed.advanceBy(RESCAN_INTERVAL_MS);
+    expect(observed.watchAttempts).toEqual(["protected"]);
+    expect(observed.watchedRoots()).toEqual([]);
+
+    await observed.advanceBy(RESCAN_INTERVAL_MS);
+    expect(observed.watchedRoots()).toEqual(["protected"]);
+    observed.dispose();
+  });
+
   test("deduplicates active root watches and tears them down on archive and remove", async () => {
     const observed = new ObservedPlacements([
-      { id: "project-one", root: "repo" },
-      { id: "project-duplicate", root: "repo" },
-      { id: "project-remove", root: "other" },
-      { id: "project-archived", root: "archived", archived: true },
+      { id: "project-one", root: "repo", kind: "git" },
+      { id: "project-duplicate", root: "repo", kind: "git" },
+      { id: "project-remove", root: "other", kind: "git" },
+      { id: "project-archived", root: "archived", kind: "git", archived: true },
     ]);
 
     await observed.start();
@@ -438,7 +483,7 @@ describe("observed workspace placement", () => {
   });
 
   test("filters unrelated files and coalesces Git change bursts", async () => {
-    const observed = new ObservedPlacements([{ id: "project-one", root: "repo" }]);
+    const observed = new ObservedPlacements([{ id: "project-one", root: "repo", kind: "git" }]);
     await observed.start();
 
     observed.change("repo", "README.md");
@@ -455,8 +500,8 @@ describe("observed workspace placement", () => {
 
   test("recovers errored and temporarily unavailable watchers on the periodic pass", async () => {
     const observed = new ObservedPlacements([
-      { id: "project-errored", root: "errored" },
-      { id: "project-unavailable", root: "unavailable" },
+      { id: "project-errored", root: "errored", kind: "git" },
+      { id: "project-unavailable", root: "unavailable", kind: "git" },
     ]);
     observed.failNextWatch("unavailable");
     await observed.start();
@@ -473,7 +518,12 @@ describe("observed workspace placement", () => {
 
   test("archives missing workspace directories on the periodic pass", async () => {
     const observed = new ObservedPlacements([
-      { id: "project-one", root: "repo", workspaces: [{ id: "workspace-one", cwd: "repo" }] },
+      {
+        id: "project-one",
+        root: "repo",
+        kind: "git",
+        workspaces: [{ id: "workspace-one", cwd: "repo" }],
+      },
     ]);
     await observed.start();
     await observed.deleteWorkspaceDirectory("workspace-one");
@@ -487,7 +537,12 @@ describe("observed workspace placement", () => {
 
   test("preserves a periodic full pass queued behind metadata reconciliation", async () => {
     const observed = new ObservedPlacements([
-      { id: "project-one", root: "repo", workspaces: [{ id: "workspace-one", cwd: "repo" }] },
+      {
+        id: "project-one",
+        root: "repo",
+        kind: "git",
+        workspaces: [{ id: "workspace-one", cwd: "repo" }],
+      },
     ]);
     await observed.start();
     const metadataRead = observed.holdNextReconciliation();
@@ -509,7 +564,12 @@ describe("observed workspace placement", () => {
 
   test("contains a failed reconciliation and converges on the next change", async () => {
     const observed = new ObservedPlacements([
-      { id: "project-one", root: "repo", workspaces: [{ id: "workspace-one", cwd: "repo" }] },
+      {
+        id: "project-one",
+        root: "repo",
+        kind: "git",
+        workspaces: [{ id: "workspace-one", cwd: "repo" }],
+      },
     ]);
     await observed.start();
     observed.makeProjectGit("project-one", "main");
@@ -534,6 +594,7 @@ describe("observed workspace placement", () => {
       {
         id: "project-one",
         root: "repo",
+        kind: "git",
         workspaces: [
           { id: "workspace-one", cwd: "repo" },
           { id: "workspace-two", cwd: "repo/feature" },
@@ -565,7 +626,12 @@ describe("observed workspace placement", () => {
     expect(mutation.watchedRoots()).toEqual([]);
 
     const reconciliation = new ObservedPlacements([
-      { id: "project-one", root: "repo", workspaces: [{ id: "workspace-one", cwd: "repo" }] },
+      {
+        id: "project-one",
+        root: "repo",
+        kind: "git",
+        workspaces: [{ id: "workspace-one", cwd: "repo" }],
+      },
     ]);
     await reconciliation.start();
     reconciliation.makeProjectGit("project-one");

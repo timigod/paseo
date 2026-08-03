@@ -159,9 +159,7 @@ export class WorkspaceReconciliationService {
     this.unsubscribeRegistry =
       this.projectRegistry.subscribeToMutations?.(async (mutation) => {
         try {
-          // Project creation does not resolve until its root watch is installed,
-          // closing the git-init race for newly added empty projects.
-          await this.syncProjectRootWatches();
+          if (!this.reconciling) await this.syncProjectRootWatches();
           if (this.disposed) return;
           if (mutation.kind === "upsert" && mutation.project && !mutation.project.archivedAt) {
             this.onProjectUpdate?.({ kind: "upsert", project: mutation.project });
@@ -423,11 +421,13 @@ export class WorkspaceReconciliationService {
     if (this.disposed) return;
     const projects = await this.projectRegistry.list();
     if (this.disposed) return;
-    const activeProjects = projects.filter((project) => !project.archivedAt);
+    const observedProjects = projects.filter(
+      (project) => !project.archivedAt && project.kind === "git",
+    );
 
     for (let index = this.watchers.length - 1; index >= 0; index -= 1) {
       const target = this.watchers[index]!;
-      const stillActive = activeProjects.some((project) =>
+      const stillActive = observedProjects.some((project) =>
         areEquivalentPaths(project.rootPath, target.rootPath),
       );
       if (stillActive) continue;
@@ -435,7 +435,7 @@ export class WorkspaceReconciliationService {
       this.watchers.splice(index, 1);
     }
 
-    for (const project of activeProjects) {
+    for (const project of observedProjects) {
       const alreadyWatching = this.watchers.some((target) =>
         areEquivalentPaths(target.rootPath, project.rootPath),
       );

@@ -55,12 +55,15 @@ The heart of Paseo. A Node.js process that:
 All paths are under `packages/server/src/`.
 
 Project identity is daemon-global rather than session-owned. After registry bootstrap, the daemon's
-project Git observer keeps one non-recursive watch on each lexically equivalent active project root
-and listens only for the root `.git` entry, with a slow rescan as a missed-event fallback. It runs
-for empty projects and without connected clients, then fans metadata changes through the WebSocket
-server to capability-aware sessions. It deliberately does not use the broad recursive working-tree
-watcher or the per-session Git observer: those are checkout/status mechanisms and intentionally do
-not retain non-Git directories.
+project Git observer keeps one non-recursive watch on each lexically equivalent active Git project
+root and listens only for the root `.git` entry. Persisted non-Git roots are not watched during
+startup because opening an optional root watch can block on protected directories; a slow rescan is
+the durable path for detecting `.git` creation and other missed events. Non-Git roots never enter
+the root watcher; after a rescan reclassifies one as Git, a later pass installs the Git watch.
+Observation runs without connected clients and fans metadata changes through the WebSocket server
+to capability-aware sessions. It deliberately does not use the broad recursive working-tree watcher
+or the per-session Git observer: those are checkout/status mechanisms and intentionally do not
+retain non-Git directories.
 
 **Key modules:**
 
