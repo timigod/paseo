@@ -40,13 +40,13 @@ export async function runArchiveCommand(
   options: WorktreeArchiveOptions,
   _command: Command,
 ): Promise<WorktreeArchiveCommandResult> {
-  return runArchiveCommandWithDeps(nameArg, options, { connectToDaemon });
+  return runArchiveCommandWithDeps(nameArg, options, { connectToDaemon, cwd: process.cwd });
 }
 
 export async function runArchiveCommandWithDeps(
   nameArg: string,
   options: WorktreeArchiveOptions,
-  deps: { connectToDaemon: typeof connectToDaemon },
+  deps: { connectToDaemon: typeof connectToDaemon; cwd?: () => string },
 ): Promise<WorktreeArchiveCommandResult> {
   const host = getDaemonHost({ host: options.host });
 
@@ -75,7 +75,7 @@ export async function runArchiveCommandWithDeps(
 
   try {
     // Get the list of worktrees first to resolve the name
-    const listResponse = await client.getPaseoWorktreeList({});
+    const listResponse = await client.getPaseoWorktreeList({ cwd: (deps.cwd ?? process.cwd)() });
 
     if (listResponse.error) {
       const error: CommandError = {

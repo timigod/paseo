@@ -29,6 +29,29 @@ function createFakeDaemonClient(
 // worktree-session.test.ts prove real filesystem removal end-to-end.
 
 describe("runArchiveCommand", () => {
+  it("lists worktrees from the caller repository context", async () => {
+    const listCalls: Array<Parameters<DaemonClient["getPaseoWorktreeList"]>[0]> = [];
+    const fakeClient = createFakeDaemonClient({
+      getPaseoWorktreeList: async (input) => {
+        listCalls.push(input);
+        return { worktrees: [], error: null, requestId: "req-list" };
+      },
+    });
+
+    await expect(
+      runArchiveCommandWithDeps(
+        "missing",
+        {},
+        {
+          connectToDaemon: async () => fakeClient,
+          cwd: () => "/repo/project",
+        },
+      ),
+    ).rejects.toMatchObject({ code: "WORKTREE_NOT_FOUND" });
+
+    expect(listCalls).toEqual([{ cwd: "/repo/project" }]);
+  });
+
   it("sends scope worktree when archiving by worktree path", async () => {
     const worktreePath = "/tmp/paseo-home/worktrees/repo/feature";
     const archiveCalls: Array<{
