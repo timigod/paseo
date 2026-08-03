@@ -23,6 +23,7 @@ import {
   resolveWorktreeRuntimeEnv,
   type WorktreeSetupCommandProgressEvent,
   runWorktreeSetupCommands,
+  WorktreeCleanupRelocatedError,
   type CreateWorktreeOptions,
   type WorktreeConfig,
 } from "./worktree";
@@ -1938,6 +1939,162 @@ wait "$child_pid"
       const helperChildPid = Number(readFileSync(helperChildPidPath, "utf8"));
       expect(() => process.kill(helperPid, 0)).toThrow();
       expect(() => process.kill(helperChildPid, 0)).toThrow();
+    });
+
+    it("runs the cleanup helper as Node when the daemon runtime is an Electron binary", async () => {
+      const created = await createLegacyWorktreeForTest({
+        branchName: "cleanup-electron-runtime",
+        cwd: repoDir,
+        baseBranch: "main",
+        worktreeSlug: "cleanup-electron-runtime",
+        paseoHome,
+      });
+      const incarnationId = readPaseoWorktreeIncarnationId(created.worktreePath)!;
+      const quarantineMarker = "00000000-0000-4000-8000-000000000061";
+      const envSnapshotPath = join(tempDir, "electron-runtime-env.txt");
+      const runtimePath = join(tempDir, "fake-electron-runtime.sh");
+      // Mirrors the packaged desktop daemon: the runtime only executes the
+      // "-e" script under ELECTRON_RUN_AS_NODE=1; otherwise it boots the
+      // desktop app, which prints startup logs to stdout instead.
+      writeFileSync(
+        runtimePath,
+        `#!/bin/sh
+/usr/bin/env > ${JSON.stringify(envSnapshotPath)}
+if [ "$ELECTRON_RUN_AS_NODE" != "1" ]; then
+  echo "21:51:04.840 [login-shell-env] start { shell: '/bin/zsh' }"
+  exit 0
+fi
+exec ${JSON.stringify(process.execPath)} "$@"
+`,
+      );
+      chmodSync(runtimePath, 0o755);
+
+      const previousLocale = process.env.LC_ALL;
+      process.env.LC_ALL = "C.UTF-8";
+      try {
+        await deletePaseoWorktree({
+          cwd: repoDir,
+          worktreePath: created.worktreePath,
+          teardownCwds: [],
+          paseoHome,
+          expectedWorktreeIncarnationId: incarnationId,
+          expectedQuarantineMarker: quarantineMarker,
+          cleanupHelperExecutable: runtimePath,
+        });
+      } finally {
+        if (previousLocale === undefined) delete process.env.LC_ALL;
+        else process.env.LC_ALL = previousLocale;
+      }
+
+      const quarantinePath = getPaseoWorktreeCleanupQuarantinePath(
+        created.worktreePath,
+        incarnationId,
+      );
+      expect(existsSync(created.worktreePath)).toBe(false);
+      expect(existsSync(quarantinePath)).toBe(false);
+      const envSnapshot = readFileSync(envSnapshotPath, "utf8");
+      expect(envSnapshot).toContain("ELECTRON_RUN_AS_NODE=1");
+      expect(envSnapshot).not.toContain("LC_ALL=");
+    });
+
+    it("completes cleanup when the helper runtime prints locale noise on stdout", async () => {
+      const created = await createLegacyWorktreeForTest({
+        branchName: "cleanup-stdout-noise",
+        cwd: repoDir,
+        baseBranch: "main",
+        worktreeSlug: "cleanup-stdout-noise",
+        paseoHome,
+      });
+      const incarnationId = readPaseoWorktreeIncarnationId(created.worktreePath)!;
+      const quarantineMarker = "00000000-0000-4000-8000-000000000062";
+      const runtimePath = join(tempDir, "noisy-runtime.sh");
+      writeFileSync(
+        runtimePath,
+        `#!/bin/sh
+echo "warning: setlocale: LC_ALL: cannot change locale (C.UTF-8)"
+exec ${JSON.stringify(process.execPath)} "$@"
+`,
+      );
+      chmodSync(runtimePath, 0o755);
+
+      await deletePaseoWorktree({
+        cwd: repoDir,
+        worktreePath: created.worktreePath,
+        teardownCwds: [],
+        paseoHome,
+        expectedWorktreeIncarnationId: incarnationId,
+        expectedQuarantineMarker: quarantineMarker,
+        cleanupHelperExecutable: runtimePath,
+      });
+
+      const quarantinePath = getPaseoWorktreeCleanupQuarantinePath(
+        created.worktreePath,
+        incarnationId,
+      );
+      const receiptPath = getPaseoWorktreeCleanupReceiptPath(
+        quarantinePath,
+        incarnationId,
+        quarantineMarker,
+      );
+      expect(existsSync(created.worktreePath)).toBe(false);
+      expect(existsSync(quarantinePath)).toBe(false);
+      expect(existsSync(receiptPath)).toBe(false);
+    });
+
+    it("fails closed with diagnosable detail when the receipt channel is corrupted", async () => {
+      const created = await createLegacyWorktreeForTest({
+        branchName: "cleanup-corrupt-receipt",
+        cwd: repoDir,
+        baseBranch: "main",
+        worktreeSlug: "cleanup-corrupt-receipt",
+        paseoHome,
+      });
+      const incarnationId = readPaseoWorktreeIncarnationId(created.worktreePath)!;
+      const quarantineMarker = "00000000-0000-4000-8000-000000000063";
+      const runtimePath = join(tempDir, "corrupt-receipt-runtime.sh");
+      writeFileSync(
+        runtimePath,
+        `#!/bin/sh
+echo "PASEO_CLEANUP_BOGUS_RECEIPT" >&3
+exit 0
+`,
+      );
+      chmodSync(runtimePath, 0o755);
+
+      const failure = await deletePaseoWorktree({
+        cwd: repoDir,
+        worktreePath: created.worktreePath,
+        teardownCwds: [],
+        paseoHome,
+        expectedWorktreeIncarnationId: incarnationId,
+        expectedQuarantineMarker: quarantineMarker,
+        cleanupHelperExecutable: runtimePath,
+      }).then(
+        () => null,
+        (error: unknown) => error,
+      );
+
+      expect(failure).toBeInstanceOf(WorktreeCleanupRelocatedError);
+      const cause = (failure as WorktreeCleanupRelocatedError).cause as Error;
+      expect(cause.name).toBe("WorktreeCleanupAuthorityError");
+      expect(cause.message).toContain("Cleanup helper emitted invalid output");
+      expect(cause.message).toContain("PASEO_CLEANUP_BOGUS_RECEIPT");
+
+      const quarantinePath = getPaseoWorktreeCleanupQuarantinePath(
+        created.worktreePath,
+        incarnationId,
+      );
+      expect(existsSync(quarantinePath)).toBe(true);
+
+      await deletePaseoWorktree({
+        cwd: repoDir,
+        worktreePath: created.worktreePath,
+        teardownCwds: [],
+        paseoHome,
+        expectedWorktreeIncarnationId: incarnationId,
+        expectedQuarantineMarker: quarantineMarker,
+      });
+      expect(existsSync(quarantinePath)).toBe(false);
     });
 
     it("does not follow a symlink installed after cleanup is pinned", async () => {

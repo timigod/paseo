@@ -12,7 +12,9 @@ import {
 import { copyFile, lstat, readdir, rename, stat, writeFile } from "fs/promises";
 import { join, basename, dirname, isAbsolute, relative, resolve, sep } from "path";
 import { spawn } from "node:child_process";
+import { once } from "node:events";
 import net from "node:net";
+import { Readable } from "node:stream";
 import { createHash, randomUUID } from "node:crypto";
 import stripAnsi from "strip-ansi";
 import {
@@ -69,12 +71,19 @@ const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3
 const POSIX_CLEANUP_READY = "PASEO_CLEANUP_READY";
 const POSIX_CLEANUP_COMPLETED = "PASEO_CLEANUP_COMPLETED";
 const POSIX_CLEANUP_DONE = "PASEO_CLEANUP_DONE ";
+// Receipt messages travel on a dedicated pipe, never stdout: the runtime that
+// hosts the helper (Node, or Electron under ELECTRON_RUN_AS_NODE) may print
+// locale warnings or other noise to stdout, and that noise must not be able to
+// corrupt or forge protocol receipts.
+const POSIX_CLEANUP_RECEIPT_FD = 3;
 const DEFAULT_CLEANUP_HELPER_TIMEOUT_MS = 120_000;
 const POSIX_PINNED_CLEANUP_SCRIPT = String.raw`
 "use strict";
 const fs = require("node:fs");
 const path = require("node:path");
 const { spawnSync } = require("node:child_process");
+
+const RECEIPT_FD = ${POSIX_CLEANUP_RECEIPT_FD};
 
 const expectedIdentity = process.argv[1];
 const activeMarkerName = process.argv[2];
@@ -241,7 +250,7 @@ function beginRemoval() {
     if (initialMarkerState === "active") {
       fail("AUTHORITY", "Cleanup receipt has an active marker");
     }
-    process.stdout.write(${JSON.stringify(`${POSIX_CLEANUP_COMPLETED}\n`)});
+    fs.writeSync(RECEIPT_FD, ${JSON.stringify(`${POSIX_CLEANUP_COMPLETED}\n`)});
     phase = "relocate";
     return;
   }
@@ -264,7 +273,7 @@ function beginRemoval() {
   if (completedEntries.length !== 1 || completedEntries[0] !== completedMarkerName) {
     fail("REMOVE", "Pinned cleanup directory did not remain marker-only");
   }
-  process.stdout.write(${JSON.stringify(`${POSIX_CLEANUP_COMPLETED}\n`)});
+  fs.writeSync(RECEIPT_FD, ${JSON.stringify(`${POSIX_CLEANUP_COMPLETED}\n`)});
   phase = "relocate";
 }
 
@@ -314,7 +323,7 @@ function relocateAndFinalize() {
   } catch (error) {
     if (!error || error.code !== "ENOENT") throw error;
   }
-  process.stdout.write(${JSON.stringify(POSIX_CLEANUP_DONE)} + JSON.stringify(receiptPath) + "\n");
+  fs.writeSync(RECEIPT_FD, ${JSON.stringify(POSIX_CLEANUP_DONE)} + JSON.stringify(receiptPath) + "\n");
   process.exit(0);
 }
 
@@ -324,7 +333,7 @@ validatePinnedDirectory(
   startsInReceipt,
 );
 validateRecoveryRoot();
-process.stdout.write(${JSON.stringify(`${POSIX_CLEANUP_READY}\n`)});
+fs.writeSync(RECEIPT_FD, ${JSON.stringify(`${POSIX_CLEANUP_READY}\n`)});
 process.stdin.setEncoding("utf8");
 let command = "";
 let phase = "remove";
@@ -1523,6 +1532,7 @@ export interface DeletePaseoWorktreeOptions {
   onCleanupDirectoryCompleted?: (quarantinePath: string) => void | Promise<void>;
   cleanupFaultPoint?: WorktreeCleanupFaultPoint;
   cleanupFindExecutable?: string;
+  cleanupHelperExecutable?: string;
   cleanupHelperTimeoutMs?: number;
   signal?: AbortSignal;
   recheck?: () => void | Promise<void>;
@@ -1649,6 +1659,7 @@ export async function deletePaseoWorktree({
   onCleanupDirectoryCompleted,
   cleanupFaultPoint,
   cleanupFindExecutable,
+  cleanupHelperExecutable,
   cleanupHelperTimeoutMs,
   signal,
   recheck,
@@ -1711,6 +1722,7 @@ export async function deletePaseoWorktree({
     onCleanupDirectoryCompleted,
     cleanupFaultPoint,
     cleanupFindExecutable,
+    cleanupHelperExecutable,
     cleanupHelperTimeoutMs,
     signal,
     recheck,
@@ -1820,6 +1832,7 @@ async function removeQuarantinedWorktree(input: {
   onCleanupDirectoryCompleted?: (quarantinePath: string) => void | Promise<void>;
   cleanupFaultPoint?: WorktreeCleanupFaultPoint;
   cleanupFindExecutable?: string;
+  cleanupHelperExecutable?: string;
   cleanupHelperTimeoutMs?: number;
   signal?: AbortSignal;
   recheck?: () => void | Promise<void>;
@@ -1853,6 +1866,7 @@ async function removeQuarantinedWorktree(input: {
         onDirectoryCompleted: input.onCleanupDirectoryCompleted,
         faultPoint: input.cleanupFaultPoint,
         findExecutable: input.cleanupFindExecutable,
+        helperExecutable: input.cleanupHelperExecutable,
         helperTimeoutMs: input.cleanupHelperTimeoutMs,
         signal: input.signal,
         recheck: input.recheck,
@@ -2262,6 +2276,7 @@ async function removeDirectoryWithRetries(input: {
   onDirectoryCompleted?: (quarantinePath: string) => void | Promise<void>;
   faultPoint?: WorktreeCleanupFaultPoint;
   findExecutable?: string;
+  helperExecutable?: string;
   helperTimeoutMs?: number;
   signal?: AbortSignal;
   recheck?: () => void | Promise<void>;
@@ -2285,6 +2300,7 @@ async function removeDirectoryWithRetries(input: {
         onDirectoryCompleted: input.onDirectoryCompleted,
         faultPoint: input.faultPoint,
         findExecutable: input.findExecutable,
+        helperExecutable: input.helperExecutable,
         helperTimeoutMs: input.helperTimeoutMs,
         signal: input.signal,
         recheck: input.recheck,
@@ -2354,6 +2370,7 @@ interface RemovePinnedDirectoryInput {
   onDirectoryCompleted?: (quarantinePath: string) => void | Promise<void>;
   faultPoint?: WorktreeCleanupFaultPoint;
   findExecutable?: string;
+  helperExecutable?: string;
   helperTimeoutMs?: number;
   signal?: AbortSignal;
   recheck?: () => void | Promise<void>;
@@ -2452,8 +2469,15 @@ function handleCleanupHelperProtocolLine(context: CleanupHelperProtocolContext):
     return;
   }
   authorizeCleanupHelperOperation(context, async () => {
-    throw new WorktreeCleanupAuthorityError("Cleanup helper emitted invalid output");
+    throw new WorktreeCleanupAuthorityError(
+      `Cleanup helper emitted invalid output: ${formatCleanupHelperNoise(line)}`,
+    );
   });
+}
+
+function formatCleanupHelperNoise(value: string): string {
+  const trimmed = value.length > 256 ? `${value.slice(0, 256)}…` : value;
+  return JSON.stringify(trimmed);
 }
 
 interface PreparedPinnedCleanupHelper {
@@ -2539,7 +2563,7 @@ async function removePinnedDirectory(input: RemovePinnedDirectoryInput): Promise
     findArguments,
   } = await preparePinnedCleanupHelper(input);
   const child = spawn(
-    process.execPath,
+    input.helperExecutable ?? process.execPath,
     [
       "-e",
       POSIX_PINNED_CLEANUP_SCRIPT,
@@ -2557,14 +2581,20 @@ async function removePinnedDirectory(input: RemovePinnedDirectoryInput): Promise
     ],
     {
       cwd: input.path,
-      env: {},
-      stdio: ["pipe", "pipe", "pipe"],
+      // The helper env stays hermetic (no NODE_OPTIONS, no inherited locale),
+      // but must carry the Electron-as-Node switch: the packaged desktop
+      // daemon runs under the Electron helper binary, and without this flag
+      // that binary boots the full desktop app instead of executing the
+      // script. Plain Node ignores the variable.
+      env: { ELECTRON_RUN_AS_NODE: "1" },
+      stdio: ["pipe", "pipe", "pipe", "pipe"],
       windowsHide: true,
     },
   );
   child.stdin.on("error", () => undefined);
 
-  let stdoutBuffer = "";
+  let receiptBuffer = "";
+  let stdoutNoiseTail = "";
   let stderr = "";
   let launchError: Error | null = null;
   const protocolState: CleanupHelperProtocolState = {
@@ -2574,28 +2604,37 @@ async function removePinnedDirectory(input: RemovePinnedDirectoryInput): Promise
     authorizationError: null,
     authorizationTask: Promise.resolve(),
   };
-  let requestStop: (reason: CleanupHelperStopReason) => void = () => undefined;
-  const stopRequested = new Promise<CleanupHelperStopReason>((resolvePromise) => {
-    let requested = false;
-    requestStop = (reason) => {
-      if (requested) return;
-      requested = true;
-      resolvePromise(reason);
-    };
+  const stopController = new AbortController();
+  let requestedStopReason: CleanupHelperStopReason | null = null;
+  const stopRequested = once(stopController.signal, "abort").then(() => {
+    if (requestedStopReason === null) {
+      throw new Error("Cleanup helper stop signal did not preserve its reason");
+    }
+    return requestedStopReason;
   });
+  const requestStop = (reason: CleanupHelperStopReason) => {
+    if (requestedStopReason !== null) return;
+    requestedStopReason = reason;
+    stopController.abort();
+  };
   let timeout: NodeJS.Timeout | null = null;
   const armTimeout = (timeoutMs: number) => {
     if (timeout) clearTimeout(timeout);
     timeout = setTimeout(() => requestStop("timeout"), timeoutMs);
   };
 
-  child.stdout.setEncoding("utf8");
-  child.stdout.on("data", (chunk: string) => {
-    stdoutBuffer += chunk;
-    let newlineIndex = stdoutBuffer.indexOf("\n");
+  const receiptChannel = child.stdio[POSIX_CLEANUP_RECEIPT_FD];
+  if (!(receiptChannel instanceof Readable)) {
+    child.kill("SIGKILL");
+    throw new Error("Cleanup helper receipt channel is unavailable");
+  }
+  receiptChannel.setEncoding("utf8");
+  receiptChannel.on("data", (chunk: string) => {
+    receiptBuffer += chunk;
+    let newlineIndex = receiptBuffer.indexOf("\n");
     while (newlineIndex !== -1) {
-      const line = stdoutBuffer.slice(0, newlineIndex);
-      stdoutBuffer = stdoutBuffer.slice(newlineIndex + 1);
+      const line = receiptBuffer.slice(0, newlineIndex);
+      receiptBuffer = receiptBuffer.slice(newlineIndex + 1);
       handleCleanupHelperProtocolLine({
         line,
         input,
@@ -2607,8 +2646,12 @@ async function removePinnedDirectory(input: RemovePinnedDirectoryInput): Promise
         requestStop,
         sendCommand: (command) => child.stdin.write(command),
       });
-      newlineIndex = stdoutBuffer.indexOf("\n");
+      newlineIndex = receiptBuffer.indexOf("\n");
     }
+  });
+  child.stdout.setEncoding("utf8");
+  child.stdout.on("data", (chunk: string) => {
+    stdoutNoiseTail = (stdoutNoiseTail + chunk).slice(-2048);
   });
   child.stderr.setEncoding("utf8");
   child.stderr.on("data", (chunk: string) => {
@@ -2663,7 +2706,7 @@ async function removePinnedDirectory(input: RemovePinnedDirectoryInput): Promise
     !protocolState.completed ||
     !protocolState.completedPath
   ) {
-    throwPinnedCleanupProcessError(stderr, exit);
+    throwPinnedCleanupProcessError(stderr, exit, stdoutNoiseTail);
   }
   const remainingPath = await findRemainingPinnedCleanupPath(input);
   if (remainingPath) {
@@ -2725,6 +2768,7 @@ async function assertPinnedCleanupDirectory(input: {
 function throwPinnedCleanupProcessError(
   stderr: string,
   exit: { code: number | null; signal: NodeJS.Signals | null },
+  stdoutNoiseTail: string,
 ): never {
   const detail = stderr.trim() || `helper exited with ${exit.signal ?? exit.code ?? "no status"}`;
   if (detail.startsWith("AUTHORITY:")) {
@@ -2736,7 +2780,12 @@ function throwPinnedCleanupProcessError(
   if (detail.startsWith("FAULT:")) {
     throw new WorktreeCleanupFaultError(detail.slice("FAULT:".length));
   }
-  throw new Error(`Pinned worktree cleanup failed: ${detail}`);
+  const noise = stdoutNoiseTail.trim();
+  throw new Error(
+    `Pinned worktree cleanup failed: ${detail}${
+      noise ? ` (helper stdout: ${formatCleanupHelperNoise(noise)})` : ""
+    }`,
+  );
 }
 
 /**
