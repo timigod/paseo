@@ -114,6 +114,23 @@ function createWorktreeCreationJournalStub() {
   };
 }
 
+function createProjectForWorktreeList(options: {
+  projectId: string;
+  rootPath: string;
+  kind?: PersistedProjectRecord["kind"];
+  archivedAt?: string;
+}): PersistedProjectRecord {
+  return createPersistedProjectRecord({
+    projectId: options.projectId,
+    rootPath: options.rootPath,
+    kind: options.kind ?? "git",
+    displayName: path.basename(options.rootPath),
+    createdAt: "2026-04-12T00:00:00.000Z",
+    updatedAt: "2026-04-12T00:00:00.000Z",
+    archivedAt: options.archivedAt,
+  });
+}
+
 function createWorkflowForRequestTest(options: {
   paseoHome: string;
   createPaseoWorktree?: CreatePaseoWorktreeFn;
@@ -420,12 +437,15 @@ describe("handlePaseoWorktreeListRequest", () => {
         },
       ]),
     };
+    const projectRegistry = { list: vi.fn(async () => []) };
 
     await handlePaseoWorktreeListRequest(
       {
         emit: (message) => emitted.push(message),
         paseoHome: "/tmp/paseo-home",
         workspaceGitService: workspaceGitService as unknown as WorkspaceGitService,
+        projectRegistry,
+        sessionLogger: createLogger(),
       },
       {
         type: "paseo_worktree_list_request",
@@ -436,6 +456,7 @@ describe("handlePaseoWorktreeListRequest", () => {
 
     expect(workspaceGitService.listWorktrees).toHaveBeenCalledTimes(1);
     expect(workspaceGitService.listWorktrees).toHaveBeenCalledWith("/tmp/repo");
+    expect(projectRegistry.list).not.toHaveBeenCalled();
     expect(emitted).toContainEqual({
       type: "paseo_worktree_list_response",
       payload: {
@@ -449,6 +470,163 @@ describe("handlePaseoWorktreeListRequest", () => {
         ],
         error: null,
         requestId: "request-worktrees",
+      },
+    });
+  });
+
+  test("lists registered project worktrees when the process cwd is outside Git", async () => {
+    const daemonCwd = realpathSync.native(
+      mkdtempSync(path.join(tmpdir(), "worktree-list-daemon-cwd-")),
+    );
+    const repoDir = path.join(daemonCwd, "registered-repo");
+    const managedWorktree = path.join(daemonCwd, "managed-worktree");
+    const originalCwd = process.cwd();
+    const emitted: SessionOutboundMessage[] = [];
+    const workspaceGitService = {
+      resolveRepoRoot: vi.fn(async () => repoDir),
+      listWorktrees: vi.fn(async () => [
+        {
+          path: managedWorktree,
+          createdAt: "2026-04-12T00:00:00.000Z",
+          branchName: "feature",
+          head: "abc123",
+        },
+      ]),
+    };
+    const project = createProjectForWorktreeList({
+      projectId: "prj-worktree-list",
+      rootPath: repoDir,
+    });
+
+    try {
+      process.chdir(daemonCwd);
+      await handlePaseoWorktreeListRequest(
+        {
+          emit: (message) => emitted.push(message),
+          paseoHome: path.join(daemonCwd, ".paseo"),
+          workspaceGitService: workspaceGitService as unknown as WorkspaceGitService,
+          projectRegistry: { list: async () => [project] },
+          sessionLogger: createLogger(),
+        },
+        {
+          type: "paseo_worktree_list_request",
+          requestId: "request-all-worktrees",
+        },
+      );
+
+      expect(workspaceGitService.resolveRepoRoot).toHaveBeenCalledWith(repoDir);
+      expect(workspaceGitService.listWorktrees).toHaveBeenCalledWith(repoDir);
+      expect(emitted).toContainEqual({
+        type: "paseo_worktree_list_response",
+        payload: {
+          worktrees: [
+            {
+              worktreePath: managedWorktree,
+              createdAt: "2026-04-12T00:00:00.000Z",
+              branchName: "feature",
+              head: "abc123",
+            },
+          ],
+          error: null,
+          requestId: "request-all-worktrees",
+        },
+      });
+    } finally {
+      process.chdir(originalCwd);
+      rmSync(daemonCwd, { recursive: true, force: true });
+    }
+  });
+
+  test("deduplicates repositories and isolates unavailable registered projects", async () => {
+    const emitted: SessionOutboundMessage[] = [];
+    const logger = createLogger();
+    const projects = [
+      createProjectForWorktreeList({
+        projectId: "prj-repo-a",
+        rootPath: "/tmp/repo-a",
+      }),
+      createProjectForWorktreeList({
+        projectId: "prj-repo-a-package",
+        rootPath: "/tmp/repo-a/packages/app",
+      }),
+      createProjectForWorktreeList({
+        projectId: "prj-repo-b",
+        rootPath: "/tmp/repo-b",
+      }),
+      createProjectForWorktreeList({
+        projectId: "prj-stale",
+        rootPath: "/tmp/stale-repo",
+      }),
+      createProjectForWorktreeList({
+        projectId: "prj-archived",
+        rootPath: "/tmp/archived-repo",
+        archivedAt: "2026-04-13T00:00:00.000Z",
+      }),
+      createProjectForWorktreeList({
+        projectId: "prj-directory",
+        rootPath: "/tmp/directory",
+        kind: "non_git",
+      }),
+    ];
+    const workspaceGitService = {
+      resolveRepoRoot: vi.fn(async (projectRoot: string) => {
+        if (projectRoot === "/tmp/stale-repo") {
+          throw new Error("repository is unavailable");
+        }
+        return projectRoot.startsWith("/tmp/repo-a") ? "/tmp/repo-a" : projectRoot;
+      }),
+      listWorktrees: vi.fn(async (repoRoot: string) => {
+        if (repoRoot === "/tmp/repo-b") {
+          throw new Error("worktree inventory failed");
+        }
+        return [
+          {
+            path: "/tmp/paseo-home/worktrees/repo-a/feature",
+            createdAt: "2026-04-12T00:00:00.000Z",
+            branchName: "feature",
+            head: "abc123",
+          },
+        ];
+      }),
+    };
+
+    await handlePaseoWorktreeListRequest(
+      {
+        emit: (message) => emitted.push(message),
+        workspaceGitService: workspaceGitService as unknown as WorkspaceGitService,
+        projectRegistry: { list: async () => projects },
+        sessionLogger: logger,
+      },
+      {
+        type: "paseo_worktree_list_request",
+        requestId: "request-available-worktrees",
+      },
+    );
+
+    expect(workspaceGitService.resolveRepoRoot.mock.calls).toEqual([
+      ["/tmp/repo-a"],
+      ["/tmp/repo-a/packages/app"],
+      ["/tmp/repo-b"],
+      ["/tmp/stale-repo"],
+    ]);
+    expect(workspaceGitService.listWorktrees.mock.calls).toEqual([
+      ["/tmp/repo-a"],
+      ["/tmp/repo-b"],
+    ]);
+    expect(logger.warn).toHaveBeenCalledTimes(2);
+    expect(emitted).toContainEqual({
+      type: "paseo_worktree_list_response",
+      payload: {
+        worktrees: [
+          {
+            worktreePath: "/tmp/paseo-home/worktrees/repo-a/feature",
+            createdAt: "2026-04-12T00:00:00.000Z",
+            branchName: "feature",
+            head: "abc123",
+          },
+        ],
+        error: null,
+        requestId: "request-available-worktrees",
       },
     });
   });

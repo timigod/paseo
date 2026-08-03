@@ -4933,6 +4933,8 @@ export class Session {
         emit: (message) => this.emit(message),
         paseoHome: this.paseoHome,
         workspaceGitService: this.workspaceGitService,
+        projectRegistry: this.projectRegistry,
+        sessionLogger: this.sessionLogger,
       },
       msg,
     );
