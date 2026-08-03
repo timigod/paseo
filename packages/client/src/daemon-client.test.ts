@@ -5807,6 +5807,68 @@ test("waitForFinish with timeout=0 omits timeoutMs and has no client deadline", 
   }
 });
 
+test("archiveWorkspace has no client deadline while workspace setup settles", async () => {
+  useHeartbeatClock();
+  try {
+    const logger = createMockLogger();
+    const mock = createMockTransport();
+    const client = new DaemonClient({
+      url: "ws://test",
+      clientId: "clsk_archive_wait_test",
+      logger,
+      reconnect: { enabled: false },
+      transportFactory: () => mock.transport,
+    });
+    clients.push(client);
+
+    const connectPromise = client.connect();
+    mock.triggerOpen();
+    await connectPromise;
+
+    const archivePromise = client.archiveWorkspace("workspace-with-running-setup", "req-archive");
+    expect(parseSentFrame(mock.sent[0])).toEqual({
+      type: "archive_workspace_request",
+      workspaceId: "workspace-with-running-setup",
+      requestId: "req-archive",
+    });
+
+    let settled: "pending" | "resolved" | "rejected" = "pending";
+    void archivePromise.then(
+      () => {
+        settled = "resolved";
+        return null;
+      },
+      () => {
+        settled = "rejected";
+        return null;
+      },
+    );
+
+    await vi.advanceTimersByTimeAsync(5 * 60 * 1000);
+    expect(settled).toBe("pending");
+
+    mock.triggerMessage(
+      wrapSessionMessage({
+        type: "archive_workspace_response",
+        payload: {
+          requestId: "req-archive",
+          workspaceId: "workspace-with-running-setup",
+          archivedAt: "2026-08-03T10:45:00.000Z",
+          error: null,
+        },
+      }),
+    );
+
+    await expect(archivePromise).resolves.toMatchObject({
+      workspaceId: "workspace-with-running-setup",
+      archivedAt: "2026-08-03T10:45:00.000Z",
+      error: null,
+    });
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
 test("finishAgent requires daemon support before dispatching the request", async () => {
   const mock = createMockTransport();
   const client = new DaemonClient({

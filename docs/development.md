@@ -423,6 +423,8 @@ Worktree-scope archive resolves the requested backing directory once, then uses 
 
 Archive lifecycle presentation is also part of the destructive request's latency boundary. Emit the temporary `archivingAt` state from the session's cached workspace payload and emit the final removal directly; do not rebuild workspace descriptors or hydrate Git state merely to acknowledge an archive that has already passed its destructive safety checks.
 
+Workspace archive has no fixed client RPC deadline because it may need to wait for an already-running workspace setup before deletion is safe. Caller cancellation still ends the request and revokes destructive authority; a generic client timeout must not disconnect an otherwise-valid caller midway through the server-owned lifecycle.
+
 ```bash
 npm run cli -- ls -a -g              # List all agents globally
 npm run cli -- ls -a -g --json       # Same, as JSON
