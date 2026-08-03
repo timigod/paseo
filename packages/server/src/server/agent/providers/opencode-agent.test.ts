@@ -547,6 +547,29 @@ describe("OpenCodeAgentClient adapter smoke tests", () => {
         type: "message.updated",
         properties: {
           info: {
+            id: "msg_stale_user_echo",
+            sessionID: sessionId,
+            role: "user",
+          },
+        },
+      });
+      openCode.emitEvent({
+        type: "message.part.updated",
+        properties: {
+          part: {
+            id: "prt_stale_user_echo",
+            sessionID: sessionId,
+            messageID: "msg_stale_user_echo",
+            type: "text",
+            text: "STALE_USER_ECHO",
+            time: { start: 1, end: 2 },
+          },
+        },
+      });
+      openCode.emitEvent({
+        type: "message.updated",
+        properties: {
+          info: {
             id: "msg_continuation_assistant",
             sessionID: sessionId,
             role: "assistant",
@@ -582,6 +605,14 @@ describe("OpenCodeAgentClient adapter smoke tests", () => {
           messageId: "msg_continuation_assistant",
         },
       });
+      expect(
+        events.filter(
+          (event) =>
+            event.type === "timeline" &&
+            event.item.type === "user_message" &&
+            event.item.messageId === "msg_stale_user_echo",
+        ),
+      ).toEqual([]);
     } finally {
       unsubscribe();
       await parent.close();
@@ -3416,17 +3447,11 @@ describe("OpenCode provider subagent contract", () => {
 
   test("does not start a new autonomous turn when post-turn user message updates arrive for an already emitted message", async () => {
     const { parent, openCode } = await createParentSession("ses_parent_post_turn");
-    openCode.sessionPromptAsyncEvents = [
-      ...userMessageEvents({
-        sessionId: "ses_parent_post_turn",
-        messageId: "msg_user_1",
-        text: "Hello OpenCode",
-      }),
-      ...assistantTurnEvents({
-        sessionId: "ses_parent_post_turn",
-        text: "Response from OpenCode",
-      }),
-    ];
+    openCode.promptUserMessageIds = ["msg_user_1"];
+    openCode.sessionPromptAsyncEvents = assistantTurnEvents({
+      sessionId: "ses_parent_post_turn",
+      text: "Response from OpenCode",
+    });
     const events: AgentStreamEvent[] = [];
     const streamDrained = createTestDeferred<void>();
     parent.subscribe((event) => {
