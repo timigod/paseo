@@ -132,6 +132,55 @@ describe("ProviderSnapshotManager public surface", () => {
     }
   });
 
+  test("observational and Claude-only reads leave OpenCode cold", async () => {
+    const cwd = "/tmp/project";
+    const fetchClaudeCatalog = vi.fn(async () => ({
+      models: [{ provider: "claude", id: "claude-opus-4.6", label: "Claude Opus 4.6" }],
+      modes: [] as AgentMode[],
+    }));
+    const isOpenCodeAvailable = vi.fn(async () => true);
+    const fetchOpenCodeCatalog = vi.fn(async () => ({
+      models: [{ provider: "opencode", id: "openai/gpt-5.4", label: "GPT 5.4" }],
+      modes: [] as AgentMode[],
+    }));
+    const manager = new ProviderSnapshotManager({
+      logger: createTestLogger(),
+      extraClients: {
+        claude: createExtraClient("claude", {
+          isAvailable: async () => true,
+          fetchCatalog: fetchClaudeCatalog,
+        }),
+        opencode: createExtraClient("opencode", {
+          isAvailable: isOpenCodeAvailable,
+          fetchCatalog: fetchOpenCodeCatalog,
+        }),
+      },
+    });
+
+    try {
+      const observed = manager.getSnapshot(cwd);
+      expect(observed.find((entry) => entry.provider === "opencode")).toMatchObject({
+        status: "loading",
+        label: "OpenCode",
+      });
+
+      const listed = await manager.listProviders({ cwd, wait: true });
+      expect(listed.find((entry) => entry.provider === "opencode")?.status).toBe("loading");
+
+      await expect(
+        manager.listProviders({ cwd, providers: ["claude"], wait: true }),
+      ).resolves.toMatchObject([{ provider: "claude", status: "ready" }]);
+      expect(manager.getSnapshot(cwd).find((entry) => entry.provider === "opencode")?.status).toBe(
+        "loading",
+      );
+      expect(fetchClaudeCatalog).toHaveBeenCalledTimes(1);
+      expect(isOpenCodeAvailable).not.toHaveBeenCalled();
+      expect(fetchOpenCodeCatalog).not.toHaveBeenCalled();
+    } finally {
+      manager.destroy();
+    }
+  });
+
   test("providerOverrides with enabled:false marks the provider as unavailable without probing", async () => {
     const isAvailable = vi.fn(async () => true);
     const fetchCatalog = vi.fn(async () => ({

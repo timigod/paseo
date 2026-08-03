@@ -298,7 +298,7 @@ export class ProviderSnapshotManager {
 
   async listProviders(input: ProviderSnapshotReadOptions = {}): Promise<ProviderSnapshotEntry[]> {
     const target = resolveProviderSnapshotTarget(input.cwd);
-    if (input.wait) {
+    if (input.wait && input.providers) {
       await this.warmUpSnapshotForCwd({ cwd: input.cwd, providers: input.providers });
     }
     const providerFilter = input.providers ? new Set(input.providers) : null;
@@ -484,10 +484,6 @@ export class ProviderSnapshotManager {
   }
 
   private getSnapshotForTarget(target: ProviderSnapshotTarget): ProviderSnapshotEntry[] {
-    const providersToWarm = this.resolveProvidersToWarm(target.snapshotCwd);
-    if (providersToWarm.length > 0) {
-      void this.warmUp(target, providersToWarm);
-    }
     return entriesToArray(this.getOrCreateSnapshot(target.snapshotCwd));
   }
 
@@ -604,7 +600,7 @@ export class ProviderSnapshotManager {
       const definition = this.providerRegistry[provider];
       entries.set(provider, {
         provider,
-        status: "loading",
+        status: definition?.enabled === false ? "unavailable" : "loading",
         enabled: definition?.enabled ?? true,
         source: this.getProviderSource(provider),
         label: definition?.label,
