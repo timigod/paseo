@@ -17,8 +17,10 @@ import { AgentStorage } from "./agent-storage.js";
 import { toAgentPayload } from "./agent-projections.js";
 import { PARENT_AGENT_ID_LABEL } from "@getpaseo/protocol/agent-labels";
 import { formatSystemNotificationPrompt } from "./agent-prompt.js";
+import { ensureAgentLoaded } from "./agent-loading.js";
 import type { StoredAgentRecord } from "./agent-storage.js";
 import type {
+  AgentCapabilityFlags,
   AgentClient,
   AgentCreateSessionOptions,
   AgentFeature,
@@ -111,7 +113,7 @@ function expectArchivedAgentRecord(
 
 class TestAgentClient implements AgentClient {
   readonly provider = "codex" as const;
-  readonly capabilities = TEST_CAPABILITIES;
+  readonly capabilities: AgentCapabilityFlags = TEST_CAPABILITIES;
   readonly createdConfigs: AgentSessionConfig[] = [];
   readonly resumeOverrides: Array<Partial<AgentSessionConfig> | undefined> = [];
 
@@ -293,6 +295,13 @@ class NativeArchiveRecordingClient extends TestAgentClient {
       throw this.unarchiveFailure;
     }
   }
+}
+
+class ResumableNativeArchiveRecordingClient extends NativeArchiveRecordingClient {
+  override readonly capabilities: AgentCapabilityFlags = {
+    ...TEST_CAPABILITIES,
+    supportsSessionPersistence: true,
+  };
 }
 
 class EnvProbeAgentClient extends TestAgentClient {

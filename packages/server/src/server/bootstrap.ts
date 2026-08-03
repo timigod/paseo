@@ -172,6 +172,7 @@ import {
   createAgentCommand,
   type CreateAgentCommandDependencies,
 } from "./agent/create-agent/create.js";
+import { IdleAgentRuntimeCollector } from "./agent/idle-agent-runtime-collector.js";
 
 const MAX_MCP_DEBUG_BATCH_ITEMS = 10;
 const REDACTED_LOG_VALUE = "[redacted]";
@@ -1069,6 +1070,12 @@ export async function createPaseoDaemon(
     archiveWorkspace: archiveScheduleWorkspaceExternal,
   });
   await scheduleService.start();
+  const idleAgentRuntimeCollector = new IdleAgentRuntimeCollector({
+    agentManager,
+    scheduleService,
+    logger,
+  });
+  idleAgentRuntimeCollector.start();
   agentManager.setAgentArchivedCallback(async (agentId) => {
     try {
       await scheduleService.completeForAgent(agentId);
@@ -1442,6 +1449,7 @@ export async function createPaseoDaemon(
   };
 
   const stop = async () => {
+    await idleAgentRuntimeCollector.stop();
     scriptHealthMonitor.stop();
     // Freeze both ingress and registration before taking the agent closure snapshot.
     wsServer?.prepareForShutdown();
