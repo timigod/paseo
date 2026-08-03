@@ -1115,9 +1115,10 @@ export async function createPaseoDaemon(
     logger,
   });
   logger.info({ elapsed: elapsed() }, "Workspace registries bootstrapped");
-  const teardownArchivedWorkspaceRuntime = (workspaceId: string): void => {
+  const teardownArchivedWorkspaceRuntime = async (workspaceId: string): Promise<void> => {
     scriptRuntimeStore.removeForWorkspace(workspaceId);
     releaseWorkspaceServicePortPlan(workspaceId);
+    await wsServer?.syncServiceRouteObserversForExternalWorkspaceIds([workspaceId]);
   };
   const workspaceReconciliation = new WorkspaceReconciliationService({
     serverId,
@@ -1158,7 +1159,7 @@ export async function createPaseoDaemon(
     });
     if (!existingWorkspace || existingWorkspace.archivedAt) return;
     await recheck?.();
-    teardownArchivedWorkspaceRuntime(workspaceId);
+    await teardownArchivedWorkspaceRuntime(workspaceId);
   };
   // external path→workspace adapter, not ownership: archive-by-path requests that
   // arrive with a worktree path and no workspaceId (old clients / CLI).
@@ -1656,6 +1657,9 @@ export async function createPaseoDaemon(
       // status updates fan out to every connected client.
       emit: (message) => wsServer?.broadcast(wrapSessionMessage(message)),
       spawnWorkspaceScript,
+      onServiceRuntimeChanged: (workspaceId) =>
+        wsServer?.syncServiceRouteObserversForExternalWorkspaceIds([workspaceId]) ??
+        Promise.resolve(),
       globalServicePorts: loadPersistedConfig(config.paseoHome).worktrees?.servicePorts,
     }),
     markWorkspaceArchiving: markWorkspaceArchivingExternal,

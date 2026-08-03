@@ -780,6 +780,7 @@ export class Session {
   private readonly getDaemonTcpHost: (() => string | null) | null;
   private readonly serviceProxyPublicBaseUrl: string | null;
   private readonly resolveScriptHealth: ((hostname: string) => ScriptHealthState | null) | null;
+  private readonly syncServiceRouteObservers: SessionOptions["syncServiceRouteObservers"];
   private readonly terminalController: TerminalSessionController;
   private inflightRequests = 0;
   private peakInflightRequests = 0;
@@ -1083,6 +1084,7 @@ export class Session {
     this.getDaemonTcpHost = getDaemonTcpHost ?? null;
     this.serviceProxyPublicBaseUrl = serviceProxyPublicBaseUrl ?? null;
     this.resolveScriptHealth = resolveScriptHealth ?? null;
+    this.syncServiceRouteObservers = syncServiceRouteObservers;
     this.workspaceScripts = createWorkspaceScriptsService({
       serviceProxy: this.serviceProxy,
       scriptRuntimeStore: this.scriptRuntimeStore,
@@ -1099,7 +1101,7 @@ export class Session {
       emit: (message) => this.emit(message),
       spawnWorkspaceScript,
       onServiceRuntimeChanged: (workspaceId) =>
-        syncServiceRouteObservers?.([workspaceId]) ?? Promise.resolve(),
+        this.syncServiceRouteObserversForWorkspaceIds([workspaceId]),
       globalServicePorts: loadPersistedConfig(this.paseoHome).worktrees?.servicePorts,
     });
     this.subscribeToOptionalManagers();
@@ -5553,6 +5555,11 @@ export class Session {
     this.workspaceGitObserver.removeForWorkspaceId(workspaceId);
     this.scriptRuntimeStore?.removeForWorkspace(workspaceId);
     releaseWorkspaceServicePortPlan(workspaceId);
+    await this.syncServiceRouteObserversForWorkspaceIds([workspaceId]);
+  }
+
+  private syncServiceRouteObserversForWorkspaceIds(workspaceIds: Iterable<string>): Promise<void> {
+    return this.syncServiceRouteObservers?.(workspaceIds) ?? Promise.resolve();
   }
 
   private async emitWorkspaceUpdatesForWorkspaceIds(

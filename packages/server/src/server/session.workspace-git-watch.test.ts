@@ -129,6 +129,7 @@ function createSessionForWorkspaceGitWatchTests(options?: {
   serviceProxy?: ServiceProxySubsystem;
   scriptRuntimeStore?: WorkspaceScriptRuntimeStore;
   workspaceSetupSnapshots?: Map<string, WorkspaceSetupSnapshot>;
+  syncServiceRouteObservers?: (workspaceIds: Iterable<string>) => Promise<void>;
 }): {
   session: Session;
   emitted: Array<{ type: string; payload: unknown }>;
@@ -269,6 +270,7 @@ function createSessionForWorkspaceGitWatchTests(options?: {
     scriptRuntimeStore: options?.scriptRuntimeStore,
     workspaceSetupSnapshots: options?.workspaceSetupSnapshots,
     onBranchChanged: options?.onBranchChanged,
+    syncServiceRouteObservers: options?.syncServiceRouteObservers,
     getDaemonTcpPort: () => 6767,
   });
 
@@ -522,6 +524,53 @@ describe("workspace git watch targets", () => {
     await session.cleanup();
   });
 
+  test("disposing the daemon service-route observer prevents a deferred registration", async () => {
+    const projects = new Map<string, ReturnType<typeof createPersistedProjectRecord>>();
+    const workspaces = new Map<string, ReturnType<typeof createPersistedWorkspaceRecord>>();
+    seedGitWorkspace({
+      projects,
+      workspaces,
+      projectId: "proj-deferred",
+      workspaceId: "ws-deferred",
+      cwd: "/tmp/deferred-service-route",
+      name: "main",
+    });
+    const workspace = workspaces.get("ws-deferred")!;
+
+    const runtimeStore = new WorkspaceScriptRuntimeStore();
+    runtimeStore.set({
+      workspaceId: "ws-deferred",
+      scriptName: "app",
+      type: "service",
+      lifecycle: "running",
+      terminalId: "term-deferred",
+      exitCode: null,
+    });
+    let resolveWorkspace!: (value: typeof workspace) => void;
+    const workspaceRead = new Promise<typeof workspace>((resolvePromise) => {
+      resolveWorkspace = resolvePromise;
+    });
+    const registerWorkspace = vi.fn(() => ({ unsubscribe: vi.fn() }));
+    const observer = new ServiceRouteWorkspaceObserver({
+      workspaceGitService: {
+        peekSnapshot: vi.fn(() => null),
+        registerWorkspace,
+      },
+      workspaceRegistry: { get: async () => workspaceRead },
+      runtimeStore,
+      onBranchChanged: vi.fn(),
+      logger: createTestLogger(),
+    });
+
+    const sync = observer.syncWorkspaceIds(["ws-deferred"]);
+    await Promise.resolve();
+    observer.dispose();
+    resolveWorkspace(workspace);
+    await sync;
+
+    expect(registerWorkspace).not.toHaveBeenCalled();
+  });
+
   test("archiving a workspace clears its script runtime entries by opaque workspace id", async () => {
     const runtimeStore = new WorkspaceScriptRuntimeStore();
     runtimeStore.set({
@@ -533,9 +582,13 @@ describe("workspace git watch targets", () => {
       exitCode: null,
     });
 
-    const { session, projects, workspaces } = createSessionForWorkspaceGitWatchTests({
-      scriptRuntimeStore: runtimeStore,
-    });
+    let serviceRouteObserver: ServiceRouteWorkspaceObserver | null = null;
+    const { session, projects, workspaces, workspaceGitService, subscriptions } =
+      createSessionForWorkspaceGitWatchTests({
+        scriptRuntimeStore: runtimeStore,
+        syncServiceRouteObservers: (workspaceIds) =>
+          serviceRouteObserver?.syncWorkspaceIds(workspaceIds) ?? Promise.resolve(),
+      });
     seedGitWorkspace({
       projects,
       workspaces,
@@ -544,13 +597,26 @@ describe("workspace git watch targets", () => {
       cwd: "/tmp/repo",
       name: "main",
     });
+    serviceRouteObserver = new ServiceRouteWorkspaceObserver({
+      workspaceGitService,
+      workspaceRegistry: {
+        get: async (workspaceId) => workspaces.get(workspaceId) ?? null,
+      },
+      runtimeStore,
+      onBranchChanged: vi.fn(),
+      logger: createTestLogger(),
+    });
+    await serviceRouteObserver.syncWorkspaceIds(["ws-10"]);
+    expect(subscriptions).toHaveLength(1);
 
     await asInternals<{ archiveWorkspaceRecord: (workspaceId: string) => Promise<void> }>(
       session,
     ).archiveWorkspaceRecord("ws-10");
 
     expect(runtimeStore.listForWorkspace("ws-10")).toEqual([]);
+    expect(subscriptions[0]?.unsubscribe).toHaveBeenCalledTimes(1);
 
+    serviceRouteObserver.dispose();
     await session.cleanup();
   });
 

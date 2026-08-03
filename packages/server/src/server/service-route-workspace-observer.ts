@@ -23,6 +23,7 @@ export class ServiceRouteWorkspaceObserver {
   private readonly targets = new Map<string, ServiceRouteWatchTarget>();
   private readonly workspaces = new Map<string, ServiceRouteWorkspaceState>();
   private queue: Promise<void> = Promise.resolve();
+  private disposed = false;
 
   constructor(
     private readonly options: {
@@ -39,8 +40,10 @@ export class ServiceRouteWorkspaceObserver {
   ) {}
 
   syncWorkspaceIds(workspaceIds: Iterable<string>): Promise<void> {
+    if (this.disposed) return Promise.resolve();
     const uniqueWorkspaceIds = Array.from(new Set(workspaceIds));
     const run = this.queue.then(async () => {
+      if (this.disposed) return;
       for (const workspaceId of uniqueWorkspaceIds) {
         await this.syncWorkspaceId(workspaceId);
       }
@@ -56,6 +59,8 @@ export class ServiceRouteWorkspaceObserver {
   }
 
   dispose(): void {
+    if (this.disposed) return;
+    this.disposed = true;
     for (const target of this.targets.values()) {
       target.unsubscribe();
     }
@@ -64,6 +69,7 @@ export class ServiceRouteWorkspaceObserver {
   }
 
   private async syncWorkspaceId(workspaceId: string): Promise<void> {
+    if (this.disposed) return;
     const hasRunningService = this.options.runtimeStore
       .listForWorkspace(workspaceId)
       .some((entry) => entry.type === "service" && entry.lifecycle === "running");
@@ -73,6 +79,7 @@ export class ServiceRouteWorkspaceObserver {
     }
 
     const workspace = await this.options.workspaceRegistry.get(workspaceId);
+    if (this.disposed) return;
     const stillHasRunningService = this.options.runtimeStore
       .listForWorkspace(workspaceId)
       .some((entry) => entry.type === "service" && entry.lifecycle === "running");
@@ -90,6 +97,7 @@ export class ServiceRouteWorkspaceObserver {
 
     let target = this.targets.get(cwd);
     if (!target) {
+      if (this.disposed) return;
       const workspaceIdsForTarget = new Set<string>();
       target = {
         workspaceIds: workspaceIdsForTarget,
@@ -117,6 +125,7 @@ export class ServiceRouteWorkspaceObserver {
   }
 
   private handleSnapshot(cwd: string, snapshot: WorkspaceGitRuntimeSnapshot): void {
+    if (this.disposed) return;
     const target = this.targets.get(resolve(cwd));
     if (!target) return;
     const branchName = snapshot.git.currentBranch ?? null;
