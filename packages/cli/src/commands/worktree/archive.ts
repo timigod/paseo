@@ -35,6 +35,22 @@ export interface WorktreeArchiveOptions extends CommandOptions {
 
 export type WorktreeArchiveCommandResult = SingleResult<WorktreeArchiveResult>;
 
+function assertArchiveRemoved(
+  response: Awaited<ReturnType<DaemonClient["archivePaseoWorktree"]>>,
+  worktreePath: string,
+): void {
+  if (response.cleanupPending || response.removedDirectory === false) {
+    const error: CommandError = {
+      code: response.cleanupPending ? "WORKTREE_CLEANUP_PENDING" : "WORKTREE_NOT_REMOVED",
+      message: response.cleanupPending
+        ? "Worktree archive was accepted, but physical cleanup is still pending"
+        : "Worktree archive completed without removing the backing directory",
+      details: `The worktree remains at ${worktreePath}; inspect its ownership and cleanup receipt before retrying.`,
+    };
+    throw error;
+  }
+}
+
 export async function runArchiveCommand(
   nameArg: string,
   options: WorktreeArchiveOptions,
@@ -116,6 +132,7 @@ export async function runArchiveCommandWithDeps(
       };
       throw error;
     }
+    assertArchiveRemoved(response, worktree.worktreePath);
 
     const worktreeName = path.basename(worktree.worktreePath) || nameArg;
 

@@ -166,6 +166,36 @@ describe("runArchiveCommand", () => {
     ).rejects.toMatchObject({ code: "SELF_ARCHIVE_BLOCKED" });
   });
 
+  it("does not claim success when the backing directory remains", async () => {
+    const worktreePath = "/tmp/paseo-home/worktrees/repo/feature";
+    const fakeClient = createFakeDaemonClient({
+      getPaseoWorktreeList: async () => ({
+        worktrees: [
+          {
+            worktreePath,
+            branchName: "feature",
+            head: "abc123",
+            createdAt: "2026-04-12T00:00:00.000Z",
+          },
+        ],
+        error: null,
+        requestId: "req-list",
+      }),
+      archivePaseoWorktree: async () => ({
+        success: true,
+        removedAgents: [],
+        removedDirectory: false,
+        cleanupPending: false,
+        error: null,
+        requestId: "req-archive",
+      }),
+    });
+
+    await expect(
+      runArchiveCommandWithDeps("feature", {}, { connectToDaemon: async () => fakeClient }),
+    ).rejects.toMatchObject({ code: "WORKTREE_NOT_REMOVED" });
+  });
+
   it("archives by matching branch name when no directory name matches", async () => {
     const worktreePath = "/tmp/paseo-home/worktrees/repo/feature-branch";
     const archiveCalls: Array<{
