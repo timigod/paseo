@@ -18,7 +18,12 @@ import type {
   SessionOutboundMessage,
   WorkspaceDescriptorPayload,
 } from "@getpaseo/protocol/messages";
-import { AgentFinishRequestError, DaemonClient, DaemonRpcError } from "./daemon-client.js";
+import {
+  AgentFinishRequestError,
+  DaemonClient,
+  DaemonRpcError,
+  DaemonShutdownRejectedError,
+} from "./daemon-client.js";
 import type {
   FetchAgentTimelineCursor,
   FetchAgentTimelineDirection,
@@ -26,7 +31,7 @@ import type {
   FetchAgentTimelineProjection,
 } from "./daemon-client.js";
 
-export { AgentFinishRequestError, DaemonClient, DaemonRpcError };
+export { AgentFinishRequestError, DaemonClient, DaemonRpcError, DaemonShutdownRejectedError };
 export type {
   DaemonClientConfig,
   DaemonEvent,

@@ -2,6 +2,7 @@ import { spawnSync, type ChildProcess } from "node:child_process";
 import { existsSync, readFileSync, unlinkSync } from "node:fs";
 import { createRequire } from "node:module";
 import path from "node:path";
+import { DaemonShutdownRejectedError } from "@getpaseo/client";
 import { loadConfig, resolvePaseoHome, spawnProcess } from "@getpaseo/server";
 import treeKill from "tree-kill";
 import { tryConnectToDaemon } from "../../utils/client.js";
@@ -26,6 +27,7 @@ export interface LocalDaemonPidInfo {
   uid?: number;
   listen?: string;
   desktopManaged?: boolean;
+  serviceManaged?: boolean;
 }
 
 export interface LocalDaemonState {
@@ -53,7 +55,26 @@ export interface StopLocalDaemonOptions {
   killTimeoutMs?: number;
   force?: boolean;
   platform?: NodeJS.Platform;
+  /** Operator opt-in required to stop a service-managed daemon. */
+  serviceMaintenance?: boolean;
 }
+
+/**
+ * Thrown instead of stopping a daemon whose lifecycle an external service manager
+ * owns. Never escalate past this — `--force` escalates a stop that was allowed,
+ * it does not authorize one that was refused.
+ */
+export class ServiceManagedDaemonError extends Error {
+  readonly code = "DAEMON_SERVICE_MANAGED";
+
+  constructor(message: string) {
+    super(message);
+    this.name = "ServiceManagedDaemonError";
+  }
+}
+
+export const SERVICE_MANAGED_DAEMON_MESSAGE =
+  "This daemon's lifecycle is owned by an external service manager.";
 
 export interface StopLocalDaemonResult {
   action: "stopped" | "not_running";
@@ -259,6 +280,7 @@ function readPidFile(pidPath: string): LocalDaemonPidInfo | null {
       uid: typeof parsed.uid === "number" ? parsed.uid : undefined,
       listen: resolveListenField(parsed.listen, parsed.sockPath),
       desktopManaged: parsed.desktopManaged === true ? true : undefined,
+      serviceManaged: parsed.serviceManaged === true ? true : undefined,
     };
   } catch {
     return null;
@@ -676,7 +698,8 @@ export function startLocalDaemonForeground(
 async function requestLifecycleShutdown(
   state: LocalDaemonState,
   timeoutMs: number,
-  platform: NodeJS.Platform = process.platform,
+  platform: NodeJS.Platform | undefined,
+  serviceMaintenance: boolean,
 ): Promise<LifecycleShutdownAttempt> {
   const host = resolveTcpHostFromListen(state.listen);
   if (!host) {
@@ -697,13 +720,23 @@ async function requestLifecycleShutdown(
   }
 
   try {
-    const response = await client.shutdownServer({ timeout: Math.min(remainingTimeoutMs(), 5000) });
+    const response = await client.shutdownServer({
+      timeout: Math.min(remainingTimeoutMs(), 5000),
+      ...(serviceMaintenance ? { serviceMaintenance: true } : {}),
+    });
     // COMPAT(shutdownTermination): added in v0.2.5, remove fallback after 2027-02-02.
     return {
       requested: true,
-      termination: response.termination ?? (platform === "win32" ? "forceful" : "graceful"),
+      termination:
+        response.termination ??
+        ((platform ?? process.platform) === "win32" ? "forceful" : "graceful"),
     };
   } catch (error) {
+    // A refusal is an answer, not an unreachable daemon. Escalating to a signal
+    // here would defeat the fence the daemon just applied.
+    if (error instanceof DaemonShutdownRejectedError) {
+      throw new ServiceManagedDaemonError(SERVICE_MANAGED_DAEMON_MESSAGE);
+    }
     return {
       requested: false,
       reason: `daemon lifecycle shutdown request failed (${getErrorMessage(
@@ -715,12 +748,30 @@ async function requestLifecycleShutdown(
   }
 }
 
+/**
+ * The pid lock is authoritative when the websocket is unreachable, so this runs
+ * before connecting. Without it the RPC would fail and the stop would fall
+ * through to signalling the supervisor the service manager is responsible for.
+ */
+function assertServiceManagedStopAllowed(
+  state: LocalDaemonState,
+  serviceMaintenance: boolean,
+): void {
+  if (state.pidInfo?.serviceManaged === true && !serviceMaintenance) {
+    throw new ServiceManagedDaemonError(SERVICE_MANAGED_DAEMON_MESSAGE);
+  }
+}
+
 export async function stopLocalDaemon(
   options: StopLocalDaemonOptions = {},
 ): Promise<StopLocalDaemonResult> {
   const timeoutMs = options.timeoutMs ?? DEFAULT_STOP_TIMEOUT_MS;
   const killTimeoutMs = options.killTimeoutMs ?? DEFAULT_KILL_TIMEOUT_MS;
   const state = resolveLocalDaemonState({ home: options.home });
+  const serviceMaintenance = options.serviceMaintenance === true;
+
+  assertServiceManagedStopAllowed(state, serviceMaintenance);
+
   const deadline = Date.now() + timeoutMs;
   const remainingTimeoutMs = () => Math.max(1, deadline - Date.now());
 
@@ -728,6 +779,7 @@ export async function stopLocalDaemon(
     state,
     remainingTimeoutMs(),
     options.platform,
+    serviceMaintenance,
   );
   const lifecycleRequested = shutdownAttempt.requested;
   const lifecycleForced = shutdownAttempt.requested && shutdownAttempt.termination === "forceful";

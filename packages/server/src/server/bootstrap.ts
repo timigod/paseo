@@ -407,6 +407,14 @@ export interface PaseoDaemonConfig {
   paseoHome: string;
   daemonVersion?: string;
   desktopManaged?: boolean;
+  /**
+   * An external service manager (launchd, systemd, Docker, a Windows service)
+   * owns this daemon's lifecycle. Declared by `PASEO_SERVICE_MANAGED=1`; it
+   * fences the client shutdown RPC so routine orchestration cannot take the
+   * host down. Independent of `desktopManaged`, which only marks who spawned
+   * the process.
+   */
+  serviceManaged?: boolean;
   worktreesRoot?: string;
   corsAllowedOrigins: string[];
   allowedHosts?: HostnamesConfig;
@@ -1982,6 +1990,7 @@ export async function createPaseoDaemon(
                 worktreesRoot: config.worktreesRoot,
                 appBaseUrl: config.appBaseUrl,
                 desktopManaged: config.desktopManaged === true,
+                serviceManaged: config.serviceManaged === true,
                 shutdownTermination: config.shutdownTermination ?? "graceful",
                 relay: {
                   enabled: relayEnabled,

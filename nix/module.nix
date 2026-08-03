@@ -233,6 +233,9 @@ in
         NODE_ENV = "production";
         PASEO_HOME = cfg.dataDir;
         PASEO_LISTEN = "${cfg.listenAddress}:${toString cfg.port}";
+        # systemd owns this daemon's lifecycle. Without this a client shutdown RPC
+        # exits 0, which Restart=on-failure will not recover.
+        PASEO_SERVICE_MANAGED = "1";
       } // lib.optionalAttrs cfg.inheritUserEnvironment (
         let
           # Match dataDir's convention. We can't read users.users.<name>.home
