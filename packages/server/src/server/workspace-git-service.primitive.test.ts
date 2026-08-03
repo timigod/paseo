@@ -2083,11 +2083,102 @@ describe("WorkspaceGitServiceImpl D2 read methods", () => {
       await expect(service.getCheckoutDiff(siblingCwd, { mode: "base" })).resolves.toEqual({
         diff: "base:develop",
       });
-      expect(getCheckoutDiff).toHaveBeenCalledTimes(3);
+      await expect(service.getCheckoutDiff(REPO_CWD, { mode: "base" })).resolves.toEqual({
+        diff: "base:develop",
+      });
+      expect(getCheckoutDiff).toHaveBeenCalledTimes(4);
       expect(loadDefaultBranch).toHaveBeenCalledTimes(2);
     } finally {
       staleSiblingDiff.resolve({ diff: "base:stale-outer" });
       staleRepositoryFact.resolve("main");
+      service.dispose();
+    }
+  });
+
+  test("unknown-cwd invalidation fences an in-flight public snapshot load", async () => {
+    const commonDir = join(REPO_CWD, ".git");
+    const staleRepositoryFact = createDeferred<string>();
+    const freshRepositoryFact = createDeferred<string>();
+    const loadDefaultBranch = vi
+      .fn<() => Promise<string>>()
+      .mockImplementationOnce(() => staleRepositoryFact.promise)
+      .mockImplementationOnce(() => freshRepositoryFact.promise);
+    const getCheckoutSnapshotFacts = vi.fn(async (cwd: string, context?: CheckoutContext) => {
+      const defaultBranch = await context?.repositoryFacts?.read(
+        commonDir,
+        "default-branch",
+        loadDefaultBranch,
+      );
+      return createCheckoutFacts(cwd, {
+        gitCommonDir: commonDir,
+        resolvedBaseRef: defaultBranch ?? null,
+      });
+    });
+    const getCheckoutStatus = vi.fn(async (cwd: string, context?: CheckoutContext) =>
+      createCheckoutStatus(cwd, {
+        baseRef: context?.facts?.resolvedBaseRef ?? null,
+      }),
+    );
+    const service = createService({ getCheckoutSnapshotFacts, getCheckoutStatus });
+
+    const originalSnapshot = service.getSnapshot(REPO_CWD, { includeForge: false });
+    await vi.waitFor(() => expect(loadDefaultBranch).toHaveBeenCalledTimes(1));
+
+    try {
+      service.onWorkspaceStateMayHaveChanged("/tmp/unmapped-snapshot-sibling");
+      const snapshotReread = service.getSnapshot(REPO_CWD, { includeForge: false });
+
+      staleRepositoryFact.resolve("main");
+      await vi.waitFor(() => expect(loadDefaultBranch).toHaveBeenCalledTimes(2));
+      freshRepositoryFact.resolve("develop");
+
+      await expect(originalSnapshot).resolves.toMatchObject({ git: { baseRef: "develop" } });
+      await expect(snapshotReread).resolves.toMatchObject({ git: { baseRef: "develop" } });
+      expect(service.peekSnapshot(REPO_CWD)).toMatchObject({ git: { baseRef: "develop" } });
+    } finally {
+      staleRepositoryFact.resolve("main");
+      freshRepositoryFact.resolve("develop");
+      service.dispose();
+    }
+  });
+
+  test("unknown-cwd invalidation marks a public snapshot cache entry stale", async () => {
+    const commonDir = join(REPO_CWD, ".git");
+    const loadDefaultBranch = vi
+      .fn<() => Promise<string>>()
+      .mockResolvedValueOnce("main")
+      .mockResolvedValueOnce("develop");
+    const getCheckoutSnapshotFacts = vi.fn(async (cwd: string, context?: CheckoutContext) => {
+      const defaultBranch = await context?.repositoryFacts?.read(
+        commonDir,
+        "default-branch",
+        loadDefaultBranch,
+      );
+      return createCheckoutFacts(cwd, {
+        gitCommonDir: commonDir,
+        resolvedBaseRef: defaultBranch ?? null,
+      });
+    });
+    const getCheckoutStatus = vi.fn(async (cwd: string, context?: CheckoutContext) =>
+      createCheckoutStatus(cwd, {
+        baseRef: context?.facts?.resolvedBaseRef ?? null,
+      }),
+    );
+    const service = createService({ getCheckoutSnapshotFacts, getCheckoutStatus });
+
+    try {
+      await expect(service.getSnapshot(REPO_CWD, { includeForge: false })).resolves.toMatchObject({
+        git: { baseRef: "main" },
+      });
+
+      service.onWorkspaceStateMayHaveChanged("/tmp/unmapped-cached-snapshot-sibling");
+
+      expect(service.peekSnapshot(REPO_CWD)).toBeNull();
+      await expect(service.getSnapshot(REPO_CWD, { includeForge: false })).resolves.toMatchObject({
+        git: { baseRef: "develop" },
+      });
+      expect(loadDefaultBranch).toHaveBeenCalledTimes(2);
+    } finally {
       service.dispose();
     }
   });
