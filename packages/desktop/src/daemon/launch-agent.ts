@@ -66,6 +66,8 @@ export function createPaseoLaunchAgentPlist(input: {
   <dict>
     <key>PASEO_DESKTOP_MANAGED</key>
     <string>1</string>
+    <key>PASEO_SERVICE_MANAGED</key>
+    <string>1</string>
     <key>PASEO_CLI</key>
     ${text(cliPath)}
     <key>PASEO_WEB_UI_ENABLED</key>

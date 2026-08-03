@@ -45,6 +45,7 @@ import { getDesktopSettingsStore } from "../settings/desktop-settings-electron.j
 import { isRunningUnderARM64Translation } from "../system/arm64-translation.js";
 import { getDesktopAppLogs } from "../diagnostics/app-logs.js";
 import { tailFile } from "../diagnostics/tail-file.js";
+import { isDesktopQuitOwnedDaemonLock } from "./quit-lifecycle.js";
 
 const DAEMON_LOG_FILENAME = "daemon.log";
 const STARTUP_POLL_INTERVAL_MS = 200;
@@ -132,8 +133,12 @@ function logFilePath(): string {
 export function isDesktopManagedDaemonRunningSync(): boolean {
   try {
     const raw = readFileSync(path.join(getPaseoHome(), "paseo.pid"), "utf-8");
-    const lock = JSON.parse(raw) as { pid?: unknown; desktopManaged?: unknown };
-    if (lock.desktopManaged !== true) return false;
+    const lock = JSON.parse(raw) as {
+      pid?: unknown;
+      desktopManaged?: unknown;
+      serviceManaged?: unknown;
+    };
+    if (!isDesktopQuitOwnedDaemonLock(lock)) return false;
     if (typeof lock.pid !== "number" || !Number.isInteger(lock.pid)) return false;
     return isProcessRunning(lock.pid);
   } catch {

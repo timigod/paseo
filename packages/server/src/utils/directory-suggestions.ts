@@ -25,6 +25,7 @@ export interface SearchDirectoryEntriesOptions {
   rootAliases?: string[];
   blankQueryBehavior?: BlankQueryBehavior;
   traversableHiddenDirectoryNames?: readonly string[];
+  nonTraversableRootDirectoryNames?: readonly string[];
   limit?: number;
   maxDepth?: number;
   maxEntriesScanned?: number;
@@ -92,6 +93,15 @@ export const WORKSPACE_SEARCH_HIDDEN_DIRECTORIES = [
   ".opencode",
   ".paseo",
   ".vscode",
+] as const;
+export const MACOS_PROTECTED_HOME_DIRECTORIES = [
+  "Desktop",
+  "Documents",
+  "Downloads",
+  "Library",
+  "Movies",
+  "Music",
+  "Pictures",
 ] as const;
 const IGNORED_DIRECTORY_NAMES = new Set([
   "node_modules",
@@ -161,6 +171,7 @@ function buildSearchInput(
     matchMode: options.matchMode ?? "fuzzy",
     pathFormat: options.pathFormat,
     hiddenDirectoryNames: new Set(options.traversableHiddenDirectoryNames ?? []),
+    nonTraversableRootDirectoryNames: new Set(options.nonTraversableRootDirectoryNames ?? []),
     limit: normalizeLimit(options.limit),
     maxDepth: options.maxDepth ?? DEFAULT_MAX_DEPTH,
     maxEntriesScanned: options.maxEntriesScanned ?? DEFAULT_MAX_ENTRIES_SCANNED,
@@ -192,6 +203,7 @@ interface SearchInput {
   matchMode: DirectorySuggestionMatchMode;
   pathFormat: DirectorySuggestionPathFormat;
   hiddenDirectoryNames: Set<string>;
+  nonTraversableRootDirectoryNames: Set<string>;
   limit: number;
   maxDepth: number;
   maxEntriesScanned: number;
@@ -255,6 +267,7 @@ async function* walkBranch(
   yield entry;
   if (
     entry.kind !== "directory" ||
+    (entry.depth === 1 && input.nonTraversableRootDirectoryNames.has(entry.name)) ||
     visited.has(entry.resolvedPath) ||
     entry.depth >= input.maxDepth
   )

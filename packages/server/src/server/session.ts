@@ -229,6 +229,7 @@ import {
 } from "./session/agent-updates/agent-updates-service.js";
 import { expandTilde } from "../utils/path.js";
 import {
+  MACOS_PROTECTED_HOME_DIRECTORIES,
   searchDirectoryEntries,
   WORKSPACE_SEARCH_HIDDEN_DIRECTORIES,
 } from "../utils/directory-suggestions.js";
@@ -4943,6 +4944,10 @@ export class Session {
         traversableHiddenDirectoryNames: searchesWorkspace
           ? WORKSPACE_SEARCH_HIDDEN_DIRECTORIES
           : [],
+        nonTraversableRootDirectoryNames:
+          !searchesWorkspace && process.platform === "darwin"
+            ? MACOS_PROTECTED_HOME_DIRECTORIES
+            : [],
         confidentResultScanThreshold: searchesWorkspace ? undefined : 5_000,
         includeFiles,
         includeDirectories,

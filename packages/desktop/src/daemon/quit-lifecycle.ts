@@ -35,6 +35,13 @@ export function shouldStopDesktopManagedDaemonOnQuit(settings: QuitLifecycleSett
   return !settings.daemon.keepRunningAfterQuit;
 }
 
+export function isDesktopQuitOwnedDaemonLock(lock: {
+  desktopManaged?: unknown;
+  serviceManaged?: unknown;
+}): boolean {
+  return lock.desktopManaged === true && lock.serviceManaged !== true;
+}
+
 export async function stopDesktopManagedDaemonOnQuitIfNeeded(
   deps: StopOnQuitDeps,
 ): Promise<boolean> {

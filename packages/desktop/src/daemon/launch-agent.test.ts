@@ -34,6 +34,7 @@ describe("Paseo launch agent", () => {
     );
     expect(plist).not.toContain("<key>PATH</key>");
     expect(plist).toContain("<key>KeepAlive</key>");
+    expect(plist).toContain("<key>PASEO_SERVICE_MANAGED</key>");
   });
 
   it("updates only the owned service file atomically", () => {

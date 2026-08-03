@@ -117,6 +117,41 @@ describe("searchDirectoryEntries", () => {
     });
   });
 
+  it("does not enter protected root directories during an implicit tree search", async () => {
+    mkdirSync(path.join(searchRoot, "Documents", "private-project"), { recursive: true });
+    mkdirSync(path.join(searchRoot, "projects", "public-project"), { recursive: true });
+
+    const implicitResults = await searchDirectoryEntries({
+      root: searchRoot,
+      query: "project",
+      pathFormat: "relative",
+      includeFiles: false,
+      includeDirectories: true,
+      nonTraversableRootDirectoryNames: ["Documents"],
+    });
+    expect(implicitResults).toContainEqual({
+      path: "projects/public-project",
+      kind: "directory",
+    });
+    expect(implicitResults).not.toContainEqual({
+      path: "Documents/private-project",
+      kind: "directory",
+    });
+
+    await expect(
+      searchDirectoryEntries({
+        root: searchRoot,
+        query: "~/Documents/",
+        pathFormat: "relative",
+        includeFiles: false,
+        includeDirectories: true,
+        pathQueryPolicy: "rooted",
+        rootAliases: ["~"],
+        nonTraversableRootDirectoryNames: ["Documents"],
+      }),
+    ).resolves.toEqual([{ path: "Documents/private-project", kind: "directory" }]);
+  });
+
   it("configures raw blank queries independently from explicit root aliases", async () => {
     const rootEntries = [
       { path: "projects", kind: "directory" as const },

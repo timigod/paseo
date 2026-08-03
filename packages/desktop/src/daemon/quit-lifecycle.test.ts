@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import { DEFAULT_DESKTOP_SETTINGS } from "../settings/desktop-settings";
 import {
   createQuitLifecycle,
+  isDesktopQuitOwnedDaemonLock,
   shouldStopDesktopManagedDaemonOnQuit,
   stopDesktopManagedDaemonOnQuitIfNeeded,
 } from "./quit-lifecycle";
@@ -29,6 +30,14 @@ function waitForQuitLifecycle(): Promise<void> {
 }
 
 describe("quit-lifecycle", () => {
+  it("never treats a service-managed daemon as desktop-owned on quit", () => {
+    expect(isDesktopQuitOwnedDaemonLock({ desktopManaged: true })).toBe(true);
+    expect(isDesktopQuitOwnedDaemonLock({ desktopManaged: true, serviceManaged: true })).toBe(
+      false,
+    );
+    expect(isDesktopQuitOwnedDaemonLock({ serviceManaged: true })).toBe(false);
+  });
+
   it("stops by default and only keeps running when keepRunningAfterQuit is enabled", () => {
     expect(shouldStopDesktopManagedDaemonOnQuit(SETTINGS_STOP_ON_QUIT)).toBe(true);
     expect(shouldStopDesktopManagedDaemonOnQuit(SETTINGS_KEEP_RUNNING)).toBe(false);
