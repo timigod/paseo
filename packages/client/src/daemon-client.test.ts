@@ -5806,3 +5806,117 @@ test("waitForFinish with timeout=0 omits timeoutMs and has no client deadline", 
     vi.useRealTimers();
   }
 });
+
+test("finishAgent requires daemon support before dispatching the request", async () => {
+  const mock = createMockTransport();
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "finish_feature_gate_unit_test",
+    transportFactory: () => mock.transport,
+    reconnect: { enabled: false },
+  });
+  clients.push(client);
+  const connecting = client.connect();
+  mock.triggerOpen();
+  await connecting;
+
+  await expect(
+    client.finishAgent({ agentId: "agent-1", idempotencyKey: "finish-agent-1" }),
+  ).rejects.toThrow("Update the host to use one-request agent finish.");
+  expect(client.supportsAgentFinish()).toBe(false);
+  expect(mock.sent).toEqual([]);
+});
+
+test("finishAgent sends one idempotent request and resolves the durable outcome", async () => {
+  const mock = createMockTransport();
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "finish_unit_test",
+    transportFactory: () => mock.transport,
+    reconnect: { enabled: false },
+  });
+  clients.push(client);
+  const connecting = client.connect();
+  mock.triggerOpen({ features: { agentFinish: true } });
+  await connecting;
+
+  const finishPromise = client.finishAgent({
+    agentId: "agent-1",
+    idempotencyKey: "finish-agent-1",
+    force: true,
+    keepWorktree: false,
+  });
+  await Promise.resolve();
+  expect(mock.sent).toHaveLength(1);
+  const request = parseSentFrame(mock.sent[0]);
+  expect(request).toEqual(
+    expect.objectContaining({
+      type: "agent.finish.request",
+      agentId: "agent-1",
+      idempotencyKey: "finish-agent-1",
+      force: true,
+      keepWorktree: false,
+    }),
+  );
+
+  mock.triggerMessage(
+    wrapSessionMessage({
+      type: "agent.finish.response",
+      payload: {
+        requestId: request.requestId,
+        agentId: "agent-1",
+        ok: true,
+        error: null,
+        errorCode: null,
+        archivedAt: "2026-08-03T00:00:00.000Z",
+        worktree: "released",
+      },
+    }),
+  );
+
+  await expect(finishPromise).resolves.toEqual({
+    archivedAt: "2026-08-03T00:00:00.000Z",
+    worktree: "released",
+  });
+});
+
+test("finishAgent surfaces daemon refusals with their error code", async () => {
+  const mock = createMockTransport();
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "finish_refusal_unit_test",
+    transportFactory: () => mock.transport,
+    reconnect: { enabled: false },
+  });
+  clients.push(client);
+  const connecting = client.connect();
+  mock.triggerOpen({ features: { agentFinish: true } });
+  await connecting;
+
+  const finishPromise = client.finishAgent({
+    agentId: "agent-1",
+    idempotencyKey: "finish-agent-1",
+  });
+  await Promise.resolve();
+  const request = parseSentFrame(mock.sent[0]);
+  mock.triggerMessage(
+    wrapSessionMessage({
+      type: "agent.finish.response",
+      payload: {
+        requestId: request.requestId,
+        agentId: "agent-1",
+        ok: false,
+        error: "Worktree has uncommitted changes",
+        errorCode: "WORKTREE_DIRTY",
+        archivedAt: null,
+        worktree: null,
+      },
+    }),
+  );
+
+  await expect(finishPromise).rejects.toMatchObject({
+    name: "AgentFinishRequestError",
+    code: "WORKTREE_DIRTY",
+    message: "Worktree has uncommitted changes",
+  });
+});

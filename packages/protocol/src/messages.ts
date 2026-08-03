@@ -1534,6 +1534,36 @@ export const AgentDetachResponseMessageSchema = z.object({
   payload: AgentActionResponsePayloadSchema,
 });
 
+// One-request durable finish: archive the agent and release its exclusively
+// owned Paseo worktree. The idempotency key is required — the daemon persists
+// the authorized target before side effects so a retry with the same key
+// resumes or replays instead of re-deciding.
+export const AgentFinishRequestMessageSchema = z.object({
+  type: z.literal("agent.finish.request"),
+  agentId: z.string().min(1),
+  idempotencyKey: z.string().min(1).max(200),
+  force: z.boolean().optional(),
+  keepWorktree: z.boolean().optional(),
+  requestId: z.string(),
+});
+
+export const AgentFinishWorktreeOutcomeSchema = z.enum(["released", "kept", "not_paseo_owned"]);
+
+export const AgentFinishResponsePayloadSchema = z.object({
+  requestId: z.string(),
+  agentId: z.string(),
+  ok: z.boolean(),
+  error: z.string().nullable(),
+  errorCode: z.string().nullable().optional(),
+  archivedAt: z.string().nullable().optional(),
+  worktree: AgentFinishWorktreeOutcomeSchema.nullable().optional(),
+});
+
+export const AgentFinishResponseMessageSchema = z.object({
+  type: z.literal("agent.finish.response"),
+  payload: AgentFinishResponsePayloadSchema,
+});
+
 export const AgentRewindModeSchema = z.enum(["conversation", "files", "both"]);
 
 export const AgentRewindRequestMessageSchema = z.object({
@@ -2548,6 +2578,7 @@ export const SessionInboundMessageSchema = z.discriminatedUnion("type", [
   SetAgentThinkingRequestMessageSchema,
   SetAgentFeatureRequestMessageSchema,
   AgentDetachRequestMessageSchema,
+  AgentFinishRequestMessageSchema,
   AgentRewindRequestMessageSchema,
   AgentPermissionResponseMessageSchema,
   CheckoutStatusRequestSchema,
@@ -2890,6 +2921,8 @@ export const ServerInfoStatusPayloadSchema = z
         agentArchiveCaller: z.boolean().optional(),
         // COMPAT(createAgentIdempotency): added in v0.2.6, remove gate after 2027-02-02.
         createAgentIdempotency: z.boolean().optional(),
+        // COMPAT(agentFinish): added in v0.2.5, drop the gate when floor >= v0.2.5.
+        agentFinish: z.boolean().optional(),
       })
       .optional(),
   })
@@ -5339,6 +5372,7 @@ export const SessionOutboundMessageSchema = z.discriminatedUnion("type", [
   SetAgentThinkingResponseMessageSchema,
   SetAgentFeatureResponseMessageSchema,
   AgentDetachResponseMessageSchema,
+  AgentFinishResponseMessageSchema,
   AgentRewindResponseMessageSchema,
   UpdateAgentResponseMessageSchema,
   ProjectRenameResponseSchema,

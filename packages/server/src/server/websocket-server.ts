@@ -8,6 +8,7 @@ import type { AgentManager, AgentMetricsSnapshot } from "./agent/agent-manager.j
 import type { AgentStorage } from "./agent/agent-storage.js";
 import type { CreateAgentLifecycleDispatch } from "./agent/create-agent-lifecycle-dispatch.js";
 import { CreateAgentRequestStore } from "./agent/create-agent-request-store.js";
+import { FinishAgentRequestStore } from "./agent/finish-agent-request-store.js";
 import type { DownloadTokenStore } from "./file-download/token-store.js";
 import type { TerminalManager } from "../terminal/terminal-manager.js";
 import type pino from "pino";
@@ -612,6 +613,7 @@ export class VoiceAssistantWebSocketServer {
   private readonly workspaceSetupSnapshots = new Map<string, WorkspaceSetupSnapshot>();
   private readonly providerSnapshotManager: ProviderSnapshotManager;
   private readonly createAgentRequestStore: CreateAgentRequestStore;
+  private readonly finishAgentRequestStore: FinishAgentRequestStore;
   private onLifecycleIntent!: ((intent: SessionLifecycleIntent) => void) | null;
   private onBranchChanged!:
     | ((workspaceId: string, oldBranch: string | null, newBranch: string | null) => void)
@@ -701,6 +703,10 @@ export class VoiceAssistantWebSocketServer {
       hasAgent: async (agentId) =>
         this.agentManager.getAgent(agentId) !== null ||
         (await this.agentStorage.get(agentId)) !== null,
+    });
+    this.finishAgentRequestStore = new FinishAgentRequestStore({
+      paseoHome,
+      daemonId: this.serverId,
     });
     this.projectRegistry = projectRegistry ?? createNoopProjectRegistry();
     this.workspaceRegistry = workspaceRegistry ?? createNoopWorkspaceRegistry();
@@ -1447,6 +1453,7 @@ export class VoiceAssistantWebSocketServer {
       agentStorage: this.agentStorage,
       createAgentLifecycleDispatch: this.createAgentLifecycleDispatch,
       createAgentRequestStore: this.createAgentRequestStore,
+      finishAgentRequestStore: this.finishAgentRequestStore,
       projectRegistry: this.projectRegistry,
       workspaceRegistry: this.workspaceRegistry,
       chatService: this.chatService,
@@ -1719,6 +1726,8 @@ export class VoiceAssistantWebSocketServer {
         agentArchiveCaller: true,
         // COMPAT(createAgentIdempotency): added in v0.2.6, remove gate after 2027-02-02.
         createAgentIdempotency: true,
+        // COMPAT(agentFinish): added in v0.2.5, drop the gate when floor >= v0.2.5.
+        agentFinish: true,
       },
     };
   }

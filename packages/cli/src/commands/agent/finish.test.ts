@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import { AgentFinishRequestError } from "@getpaseo/client";
 import { runFinishCommand } from "./finish.js";
 
 const agent = {
@@ -15,6 +16,10 @@ const agent = {
 function installClient(overrides: Record<string, unknown> = {}) {
   const archivedAgent = { ...agent, archivedAt: "2026-07-30T00:00:00.000Z" };
   return {
+    // COMPAT(agentFinish): legacy-path tests emulate an old daemon without the
+    // one-request finish RPC; drop with the multi-request path.
+    supportsAgentFinish: vi.fn().mockReturnValue(false),
+    finishAgent: vi.fn().mockRejectedValue(new Error("not supported by this daemon")),
     fetchAgent: vi
       .fn()
       .mockResolvedValueOnce({ agent })
@@ -154,5 +159,93 @@ describe("runFinishCommand", () => {
         recovery: expect.any(String),
       }),
     });
+  });
+
+  it("uses the one-request durable finish RPC when the daemon supports it", async () => {
+    const { connectToDaemon } = await import("../../utils/client.js");
+    const client = installClient({
+      supportsAgentFinish: vi.fn().mockReturnValue(true),
+      finishAgent: vi.fn().mockResolvedValue({
+        archivedAt: "2026-08-03T00:00:00.000Z",
+        worktree: "released",
+      }),
+    });
+    vi.mocked(connectToDaemon).mockResolvedValue(client as never);
+
+    const result = await runFinishCommand("agent-1", {}, {} as never);
+
+    expect(result.data).toMatchObject({
+      status: "finished",
+      agent: "archived",
+      workspace: "released",
+      worktree: "released",
+    });
+    expect(client.finishAgent).toHaveBeenCalledTimes(1);
+    expect(client.finishAgent).toHaveBeenCalledWith({
+      agentId: "agent-1",
+      idempotencyKey: "finish-agent-1",
+    });
+    // The daemon owns resolution and release; the CLI must not orchestrate.
+    expect(client.getPaseoWorktreeList).not.toHaveBeenCalled();
+    expect(client.archiveAgent).not.toHaveBeenCalled();
+    expect(client.archivePaseoWorktree).not.toHaveBeenCalled();
+  });
+
+  it("forwards force, keep-worktree, and a custom idempotency key to the finish RPC", async () => {
+    const { connectToDaemon } = await import("../../utils/client.js");
+    const client = installClient({
+      supportsAgentFinish: vi.fn().mockReturnValue(true),
+      finishAgent: vi.fn().mockResolvedValue({
+        archivedAt: "2026-08-03T00:00:00.000Z",
+        worktree: "kept",
+      }),
+    });
+    vi.mocked(connectToDaemon).mockResolvedValue(client as never);
+
+    const result = await runFinishCommand(
+      "agent-1",
+      { force: true, keepWorktree: true, idempotencyKey: "fleet-finish-7" },
+      {} as never,
+    );
+
+    expect(client.finishAgent).toHaveBeenCalledWith({
+      agentId: "agent-1",
+      idempotencyKey: "fleet-finish-7",
+      force: true,
+      keepWorktree: true,
+    });
+    expect(result.data).toMatchObject({ workspace: "kept", worktree: "kept" });
+  });
+
+  it("surfaces a daemon finish refusal with its code and idempotent retry guidance", async () => {
+    const { connectToDaemon } = await import("../../utils/client.js");
+    const client = installClient({
+      supportsAgentFinish: vi.fn().mockReturnValue(true),
+      finishAgent: vi
+        .fn()
+        .mockRejectedValue(
+          new AgentFinishRequestError("Worktree has uncommitted changes", "WORKTREE_DIRTY"),
+        ),
+    });
+    vi.mocked(connectToDaemon).mockResolvedValue(client as never);
+
+    await expect(runFinishCommand("agent-1", {}, {} as never)).rejects.toMatchObject({
+      code: "WORKTREE_DIRTY",
+      message: "Worktree has uncommitted changes",
+      details: expect.stringContaining("finish-agent-1"),
+    });
+  });
+
+  it("rejects a malformed idempotency key before sending the finish request", async () => {
+    const { connectToDaemon } = await import("../../utils/client.js");
+    const client = installClient({
+      supportsAgentFinish: vi.fn().mockReturnValue(true),
+    });
+    vi.mocked(connectToDaemon).mockResolvedValue(client as never);
+
+    await expect(
+      runFinishCommand("agent-1", { idempotencyKey: "-bad key" }, {} as never),
+    ).rejects.toMatchObject({ code: "INVALID_IDEMPOTENCY_KEY" });
+    expect(client.finishAgent).not.toHaveBeenCalled();
   });
 });

@@ -923,6 +923,28 @@ type CorrelatedResponsePayload<TType extends CorrelatedResponseType> = Extract<
   { type: TType }
 >["payload"];
 
+export interface FinishAgentOptions {
+  agentId: string;
+  idempotencyKey: string;
+  force?: boolean;
+  keepWorktree?: boolean;
+}
+
+export interface FinishAgentResult {
+  archivedAt: string;
+  worktree: "released" | "kept" | "not_paseo_owned";
+}
+
+export class AgentFinishRequestError extends Error {
+  constructor(
+    message: string,
+    readonly code: string | null,
+  ) {
+    super(message);
+    this.name = "AgentFinishRequestError";
+  }
+}
+
 export class DaemonRpcError extends Error {
   readonly requestId: string;
   readonly requestType?: string;
@@ -2477,6 +2499,36 @@ export class DaemonClient {
     if (!payload.accepted) {
       throw new Error(payload.error ?? "detachAgent rejected");
     }
+  }
+
+  supportsAgentFinish(): boolean {
+    // COMPAT(agentFinish): added in v0.2.5, drop the gate when floor >= v0.2.5.
+    return this.lastServerInfoMessage?.features?.agentFinish === true;
+  }
+
+  async finishAgent(options: FinishAgentOptions): Promise<FinishAgentResult> {
+    if (!this.supportsAgentFinish()) {
+      throw new Error("Update the host to use one-request agent finish.");
+    }
+    const payload = await this.sendNamespacedCorrelatedSessionRequest<"agent.finish.response">({
+      message: {
+        type: "agent.finish.request",
+        agentId: options.agentId,
+        idempotencyKey: options.idempotencyKey,
+        ...(options.force !== undefined ? { force: options.force } : {}),
+        ...(options.keepWorktree !== undefined ? { keepWorktree: options.keepWorktree } : {}),
+      },
+    });
+    if (!payload.ok) {
+      throw new AgentFinishRequestError(
+        payload.error ?? "finishAgent rejected",
+        payload.errorCode ?? null,
+      );
+    }
+    if (!payload.archivedAt || !payload.worktree) {
+      throw new Error("finishAgent response is missing its outcome");
+    }
+    return { archivedAt: payload.archivedAt, worktree: payload.worktree };
   }
 
   async updateAgent(

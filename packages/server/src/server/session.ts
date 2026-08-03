@@ -90,6 +90,9 @@ import {
   fingerprintCreateAgentRequest,
   type CreateAgentRequestContext,
 } from "./agent/create-agent-request-store.js";
+import { FinishAgentRequestStore } from "./agent/finish-agent-request-store.js";
+import { FinishAgentRefusedError, runFinishAgentCommand } from "./agent/finish-agent.js";
+import { archiveCommand as archiveWorktreeCommand } from "./worktree/commands.js";
 import { resolveCreateAgentIntent, type CreateAgentIntent } from "./agent/create-agent/intent.js";
 import {
   archiveAgentCommand,
@@ -518,6 +521,7 @@ export interface SessionOptions {
   agentStorage: AgentStorage;
   createAgentLifecycleDispatch: CreateAgentLifecycleDispatch;
   createAgentRequestStore?: CreateAgentRequestStore;
+  finishAgentRequestStore?: FinishAgentRequestStore;
   projectRegistry: ProjectRegistry;
   workspaceRegistry: WorkspaceRegistry;
   filesystem?: SessionFileSystem;
@@ -597,6 +601,16 @@ function resolveCreateAgentRequestStore(options: SessionOptions): CreateAgentReq
     hasAgent: async (agentId) =>
       options.agentManager.getAgent(agentId) !== null ||
       (await options.agentStorage.get(agentId)) !== null,
+  });
+}
+
+function resolveFinishAgentRequestStore(options: SessionOptions): FinishAgentRequestStore {
+  if (options.finishAgentRequestStore) {
+    return options.finishAgentRequestStore;
+  }
+  return new FinishAgentRequestStore({
+    paseoHome: options.paseoHome,
+    daemonId: options.serverId,
   });
 }
 
@@ -738,6 +752,7 @@ export class Session {
   private agentManager: AgentManager;
   private readonly agentStorage: AgentStorage;
   private readonly createAgentRequestStore: CreateAgentRequestStore;
+  private readonly finishAgentRequestStore: FinishAgentRequestStore;
   private readonly projectRegistry: ProjectRegistry;
   private readonly workspaceRegistry: WorkspaceRegistry;
   private readonly filesystem: SessionFileSystem;
@@ -894,6 +909,7 @@ export class Session {
     this.agentManager = agentManager;
     this.agentStorage = agentStorage;
     this.createAgentRequestStore = resolveCreateAgentRequestStore(options);
+    this.finishAgentRequestStore = resolveFinishAgentRequestStore(options);
     this.projectRegistry = projectRegistry;
     this.workspaceRegistry = workspaceRegistry;
     this.filesystem = filesystem ?? nodeSessionFileSystem;
@@ -2163,6 +2179,8 @@ export class Session {
         return this.handleDeleteAgentRequest(msg.agentId, msg.requestId, source);
       case "archive_agent_request":
         return this.handleArchiveAgentRequest(msg.agentId, msg.requestId, source);
+      case "agent.finish.request":
+        return this.handleAgentFinishRequest(msg, source);
       case "close_items_request":
         return this.handleCloseItemsRequest(msg, source);
       case "update_agent_request":
@@ -2698,6 +2716,175 @@ export class Session {
     }
 
     return { agentId, archivedAt };
+  }
+
+  private async handleAgentFinishRequest(
+    msg: Extract<SessionInboundMessage, { type: "agent.finish.request" }>,
+    source?: object,
+  ): Promise<void> {
+    const caller = this.getDestructiveCaller(source);
+    this.sessionLogger.info(
+      { agentId: msg.agentId, requestId: msg.requestId, idempotencyKey: msg.idempotencyKey },
+      `Finishing agent ${msg.agentId}`,
+    );
+    try {
+      const outcome = await runFinishAgentCommand(
+        {
+          store: this.finishAgentRequestStore,
+          getLiveAgent: (agentId) => {
+            const agent = this.agentManager.getAgent(agentId);
+            if (!agent) {
+              return null;
+            }
+            return {
+              cwd: agent.cwd,
+              workspaceId: agent.workspaceId ?? null,
+              running: agent.lifecycle === "running" || this.agentManager.hasInFlightRun(agentId),
+              requiresAttention: agent.attention.requiresAttention,
+              pendingPermissionCount: this.agentManager.getPendingPermissions(agentId).length,
+            };
+          },
+          getStoredAgent: async (agentId) => {
+            const record = await this.agentStorage.get(agentId);
+            if (!record) {
+              return null;
+            }
+            return {
+              cwd: record.cwd,
+              workspaceId: record.workspaceId ?? null,
+              archivedAt: record.archivedAt ?? null,
+              lastStatus: record.lastStatus ?? null,
+              requiresAttention: record.requiresAttention === true,
+            };
+          },
+          listOtherActiveAgentCwds: async (agentId) => {
+            const liveAgents = this.agentManager
+              .listAgents()
+              .filter((agent) => agent.id !== agentId)
+              .map((agent) => agent.cwd);
+            const liveIds = new Set(this.agentManager.listAgents().map((agent) => agent.id));
+            const storedAgents = (await this.agentStorage.list())
+              .filter(
+                (record) => record.id !== agentId && !record.archivedAt && !liveIds.has(record.id),
+              )
+              .map((record) => record.cwd);
+            return [...liveAgents, ...storedAgents];
+          },
+          listOtherActiveWorkspaceCwds: async (workspaceId) => {
+            const workspaces = await this.listActiveWorkspaceRefs();
+            return workspaces
+              .filter((workspace) => workspace.workspaceId !== workspaceId)
+              .map((workspace) => workspace.cwd);
+          },
+          listPaseoWorktrees: async (cwd) => {
+            try {
+              const worktrees = await this.workspaceGitService.listWorktrees(cwd);
+              return worktrees.map((worktree) => worktree.path);
+            } catch {
+              // A missing or non-git cwd (already-released worktree) has no
+              // Paseo worktrees to resolve; refusals still fire on live paths.
+              return [];
+            }
+          },
+          isWorktreeDirty: async (worktreePath) => {
+            const snapshot = await this.workspaceGitService.getSnapshot(worktreePath);
+            return snapshot.git.isDirty;
+          },
+          worktreeStillPresent: async (worktreePath) => {
+            try {
+              await stat(worktreePath);
+              return true;
+            } catch {
+              return false;
+            }
+          },
+          archiveAgent: async (agentId) => {
+            return this.archiveAgentForClose(agentId, caller, "agent.finish");
+          },
+          releaseWorktree: async (worktreePath) => {
+            const result = await archiveWorktreeCommand(
+              {
+                paseoHome: this.paseoHome,
+                paseoWorktreesBaseRoot: this.worktreesRoot,
+                github: this.github,
+                workspaceGitService: this.workspaceGitService,
+                agentManager: this.agentManager,
+                agentStorage: this.agentStorage,
+                findWorkspaceIdForCwd: (cwd) => this.findWorkspaceIdForCwd(cwd),
+                listActiveWorkspaces: () => this.listActiveWorkspaceRefs(),
+                getWorkspaceMembershipVersion: () =>
+                  this.workspaceRegistry.getMembershipVersion?.() ?? 0,
+                getTerminalMembershipVersion: () => this.terminalController.getMembershipVersion(),
+                archiveWorkspaceRecord: (workspaceId, recheck) =>
+                  this.archiveWorkspaceRecord(workspaceId, undefined, recheck),
+                workspaceRegistry: this.workspaceRegistry,
+                emitWorkspaceUpdatesForWorkspaceIds: (workspaceIds) =>
+                  this.emitWorkspaceUpdatesForWorkspaceIds(workspaceIds),
+                markWorkspaceArchiving: (workspaceIds, archivingAt) =>
+                  this.markWorkspaceArchiving(workspaceIds, archivingAt),
+                clearWorkspaceArchiving: (workspaceIds) =>
+                  this.clearWorkspaceArchiving(workspaceIds),
+                killTerminalsForWorkspace: (workspaceId, recheck) =>
+                  this.terminalController.killTerminalsForWorkspace(workspaceId, recheck),
+                sessionLogger: this.sessionLogger,
+              },
+              {
+                requestId: msg.requestId,
+                worktreePath,
+                scope: "worktree",
+                caller,
+              },
+            );
+            if (!result.ok) {
+              throw new Error(`Worktree release failed: ${result.message}`);
+            }
+          },
+        },
+        {
+          agentId: msg.agentId,
+          idempotencyKey: msg.idempotencyKey,
+          callerId: this.clientId,
+          force: msg.force === true,
+          keepWorktree: msg.keepWorktree === true,
+        },
+      );
+      this.emit({
+        type: "agent.finish.response",
+        payload: {
+          requestId: msg.requestId,
+          agentId: msg.agentId,
+          ok: true,
+          error: null,
+          errorCode: null,
+          archivedAt: outcome.archivedAt,
+          worktree: outcome.worktree,
+        },
+      });
+    } catch (error) {
+      const message = getErrorMessageOr(error, "Failed to finish agent");
+      this.sessionLogger.error(
+        { err: error, agentId: msg.agentId, requestId: msg.requestId },
+        "Failed to finish agent",
+      );
+      let errorCode: string | null = null;
+      if (error instanceof FinishAgentRefusedError) {
+        errorCode = error.code;
+      } else if (error && typeof error === "object" && "code" in error) {
+        errorCode = typeof error.code === "string" ? error.code : null;
+      }
+      this.emit({
+        type: "agent.finish.response",
+        payload: {
+          requestId: msg.requestId,
+          agentId: msg.agentId,
+          ok: false,
+          error: message,
+          errorCode,
+          archivedAt: null,
+          worktree: null,
+        },
+      });
+    }
   }
 
   private async handleDetachAgentRequest(agentId: string, requestId: string): Promise<void> {

@@ -1,5 +1,6 @@
 import path from "node:path";
 import type { Command } from "commander";
+import { AgentFinishRequestError } from "@getpaseo/client";
 import type { AgentSnapshotPayload } from "@getpaseo/protocol/messages";
 import { connectToDaemon, getDaemonHost } from "../../utils/client.js";
 import { fetchAllAgents, fetchAllWorkspaces } from "../../utils/inventory.js";
@@ -13,6 +14,7 @@ import type {
 export interface AgentFinishOptions extends CommandOptions {
   force?: boolean;
   keepWorktree?: boolean;
+  idempotencyKey?: string;
   host?: string;
 }
 
@@ -43,7 +45,11 @@ export function addFinishOptions(command: Command): Command {
     .description("Archive an agent and release its exclusively owned Paseo workspace")
     .argument("<id>", "Agent ID, prefix, or name")
     .option("--force", "Interrupt and finish a running agent")
-    .option("--keep-worktree", "Archive the agent but retain its managed worktree");
+    .option("--keep-worktree", "Archive the agent but retain its managed worktree")
+    .option(
+      "--idempotency-key <key>",
+      "Retry-safe finish key; retries with the same key resume or replay the original finish",
+    );
 }
 
 function isWithin(root: string, candidate: string): boolean {
@@ -113,6 +119,69 @@ async function resolveExclusiveWorktreePath(
   return hasOtherAgent || hasOtherWorkspace ? null : worktree.worktreePath;
 }
 
+const FINISH_IDEMPOTENCY_KEY_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$/;
+
+async function finishAgentAtomically(
+  client: ConnectedDaemonClient,
+  agent: AgentSnapshotPayload,
+  options: AgentFinishOptions,
+): Promise<SingleResult<AgentFinishResult>> {
+  const idempotencyKey = options.idempotencyKey?.trim() || `finish-${agent.id}`;
+  if (!FINISH_IDEMPOTENCY_KEY_PATTERN.test(idempotencyKey)) {
+    throw {
+      code: "INVALID_IDEMPOTENCY_KEY",
+      message:
+        "Idempotency key must start with a letter or digit and use only letters, digits, ., _, :, /, or - (max 200 chars)",
+    } satisfies CommandError;
+  }
+
+  let outcome: Awaited<ReturnType<ConnectedDaemonClient["finishAgent"]>>;
+  try {
+    outcome = await client.finishAgent({
+      agentId: agent.id,
+      idempotencyKey,
+      ...(options.force !== undefined ? { force: options.force } : {}),
+      ...(options.keepWorktree !== undefined ? { keepWorktree: options.keepWorktree } : {}),
+    });
+  } catch (error) {
+    if (error instanceof AgentFinishRequestError) {
+      throw {
+        code: error.code ?? "FINISH_FAILED",
+        message: error.message,
+        details: `Retry paseo agent finish ${agent.id} with the same idempotency key ${idempotencyKey}; the daemon resumes from its durable finish receipt.`,
+      } satisfies CommandError;
+    }
+    throw error;
+  }
+
+  const workspaceId = agent.workspaceId ?? null;
+  let workspace: AgentFinishResult["workspace"] = "not_present";
+  if (outcome.worktree === "released") workspace = "released";
+  else if (workspaceId) workspace = "kept";
+  let worktree: AgentFinishResult["worktree"] = "not-paseo-owned";
+  if (outcome.worktree === "released") worktree = "released";
+  else if (outcome.worktree === "kept") worktree = "kept";
+
+  return {
+    type: "single",
+    data: {
+      agentId: agent.id,
+      status: "finished",
+      agent: "archived",
+      workspace,
+      worktree,
+      detail:
+        outcome.worktree === "released"
+          ? "Archived agent and released its exclusively owned Paseo worktree."
+          : "Archived agent; no exclusively owned Paseo worktree was released.",
+    },
+    schema: finishSchema,
+  };
+}
+
+// COMPAT(agentFinish): added in v0.2.5, drop this multi-request path when the
+// daemon floor >= v0.2.5. Old daemons cannot run the one-request durable
+// finish RPC, so the CLI keeps orchestrating archive + worktree release here.
 async function finishConnectedAgent(
   client: ConnectedDaemonClient,
   agent: AgentSnapshotPayload,
@@ -212,6 +281,9 @@ export async function runFinishCommand(
       } satisfies CommandError;
     }
 
+    if (client.supportsAgentFinish()) {
+      return await finishAgentAtomically(client, agent, options);
+    }
     return await finishConnectedAgent(client, agent, options);
   } finally {
     await client.close().catch(() => {});
