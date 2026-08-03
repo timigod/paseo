@@ -348,21 +348,59 @@ export class ProviderSnapshotManager {
   async resolveCreateConfig(
     input: ResolveProviderCreateConfigOptions,
   ): Promise<ResolvedProviderCreateConfig> {
-    const entry = await this.getReadyProviderForCreate({
-      cwd: input.cwd,
-      provider: input.provider,
-      wait: true,
-    });
     const definition = this.requireProvider(input.provider);
     const parent = input.parent ? this.resolveParent(input.parent) : null;
+    const availableModes = await this.resolveCreateAvailableModes(input, parent);
     return definition.resolveCreateConfig({
       provider: input.provider,
       requestedMode: input.requestedMode,
       featureValues: input.featureValues,
       parent,
       unattended: input.unattended || parent?.isUnattended === true,
-      availableModes: entry.modes,
+      availableModes,
     });
+  }
+
+  // The mode catalog is only load-bearing for a create when an omitted mode
+  // must be derived from it: unattended-mode mapping or parent inheritance.
+  // Every other create shape resolves from what the snapshot already knows —
+  // a ready catalog still validates explicit modes fail-closed, while pending
+  // or failed discovery degrades to the documented modes-unknown semantics
+  // (explicit selections pass through verbatim) instead of delaying or
+  // failing the create. Discovery keeps warming in the background so the
+  // snapshot converges without the create waiting on it.
+  private async resolveCreateAvailableModes(
+    input: ResolveProviderCreateConfigOptions,
+    parent: AgentCreateConfigParent | null,
+  ): Promise<AgentMode[] | undefined> {
+    const needsModeCatalog =
+      input.requestedMode === undefined && (parent !== null || input.unattended);
+    if (needsModeCatalog) {
+      const entry = await this.getReadyProviderForCreate({
+        cwd: input.cwd,
+        provider: input.provider,
+        wait: true,
+      });
+      return entry.modes;
+    }
+
+    const definition = this.requireProvider(input.provider);
+    if (!definition.enabled) {
+      throw new Error(`Provider '${input.provider}' is disabled`);
+    }
+    const target = resolveProviderSnapshotTarget(input.cwd);
+    const entry = this.snapshots.get(target.snapshotCwd)?.get(input.provider);
+    if (entry?.status === "ready") {
+      return entry.modes;
+    }
+    if (entry?.status === "unavailable") {
+      throw new Error(`Provider '${entry.provider}' is not available`);
+    }
+    const providersToWarm = this.resolveProvidersToWarm(target.snapshotCwd, [input.provider]);
+    if (providersToWarm.length > 0) {
+      void this.warmUp(target, providersToWarm);
+    }
+    return undefined;
   }
 
   async getProviderDiagnostic(provider: AgentProvider): Promise<ProviderDiagnosticResult> {

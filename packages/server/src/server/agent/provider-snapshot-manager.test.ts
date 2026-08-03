@@ -1145,7 +1145,7 @@ describe("ProviderSnapshotManager public surface", () => {
     }
   });
 
-  test("explicit create refreshes one cached transient provider error and succeeds", async () => {
+  test("unattended create without a mode refreshes one cached transient provider error and succeeds", async () => {
     const fetchCatalog = vi
       .fn()
       .mockRejectedValueOnce(new Error("cold catalog failure"))
@@ -1172,7 +1172,7 @@ describe("ProviderSnapshotManager public surface", () => {
           requestedMode: undefined,
           featureValues: undefined,
           parent: null,
-          unattended: false,
+          unattended: true,
         }),
       ).resolves.toEqual({ modeId: undefined, featureValues: undefined });
       expect(fetchCatalog).toHaveBeenCalledTimes(2);
@@ -1182,7 +1182,7 @@ describe("ProviderSnapshotManager public surface", () => {
     }
   });
 
-  test("concurrent explicit creates share one recovery load after a cached error", async () => {
+  test("concurrent unattended creates share one recovery load after a cached error", async () => {
     let finishRecovery!: (catalog: { models: AgentModelDefinition[]; modes: AgentMode[] }) => void;
     const recoveryCatalog = new Promise<{
       models: AgentModelDefinition[];
@@ -1212,7 +1212,7 @@ describe("ProviderSnapshotManager public surface", () => {
         requestedMode: undefined,
         featureValues: undefined,
         parent: null,
-        unattended: false,
+        unattended: true,
       };
       const firstCreate = manager.resolveCreateConfig(createInput);
       const secondCreate = manager.resolveCreateConfig(createInput);
@@ -1230,7 +1230,7 @@ describe("ProviderSnapshotManager public surface", () => {
     }
   });
 
-  test("each explicit create performs at most one recovery and reports the latest error", async () => {
+  test("each unattended create performs at most one recovery and reports the latest error", async () => {
     const fetchCatalog = vi
       .fn()
       .mockRejectedValueOnce(new Error("initial catalog failure"))
@@ -1251,7 +1251,7 @@ describe("ProviderSnapshotManager public surface", () => {
       requestedMode: undefined,
       featureValues: undefined,
       parent: null,
-      unattended: false,
+      unattended: true,
     };
 
     try {
@@ -1273,7 +1273,7 @@ describe("ProviderSnapshotManager public surface", () => {
   test.each([
     { label: "disabled", enabled: false, available: true },
     { label: "unavailable", enabled: true, available: false },
-  ])("does not retry an $label provider during explicit create", async ({ enabled, available }) => {
+  ])("does not retry an $label provider during create", async ({ enabled, available }) => {
     const isAvailable = vi.fn(async () => available);
     const fetchCatalog = vi.fn(async () => ({ models: [], modes: [] }));
     const manager = new ProviderSnapshotManager({
@@ -1300,6 +1300,255 @@ describe("ProviderSnapshotManager public surface", () => {
       expect(fetchCatalog).not.toHaveBeenCalled();
     } finally {
       manager.destroy();
+    }
+  });
+
+  test("explicit OpenCode create resolves immediately while app.agents discovery hangs", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    const runtime = new TestOpenCodeHarness();
+    const openCodeClient = new TestOpenCodeClient();
+    openCodeClient.providerListResponse = {
+      data: {
+        connected: ["openai"],
+        all: [
+          {
+            id: "openai",
+            name: "OpenAI",
+            models: { "gpt-5.6-terra": { name: "GPT 5.6 Terra" } },
+          },
+        ],
+      },
+    };
+    openCodeClient.appAgentsImplementation = async (_parameters, options) => {
+      const signal = (options as { signal?: AbortSignal } | undefined)?.signal;
+      return await new Promise((_finish, reject) => {
+        signal?.addEventListener("abort", () => reject(new Error("app.agents aborted")), {
+          once: true,
+        });
+      });
+    };
+    runtime.enqueueClient(openCodeClient);
+    const openCodeAgentClient = new OpenCodeAgentClient(createTestLogger(), undefined, {
+      serverManager: runtime,
+      createClient: runtime.createClient,
+    });
+    vi.spyOn(openCodeAgentClient, "isAvailable").mockResolvedValue(true);
+    const manager = new ProviderSnapshotManager({
+      logger: createTestLogger(),
+      refreshTimeoutMs: 60_000,
+      extraClients: {
+        opencode: openCodeAgentClient,
+      },
+    });
+
+    try {
+      const createPromise = manager.resolveCreateConfig({
+        cwd: "/tmp/project",
+        provider: "opencode",
+        requestedMode: "orchestrator",
+        featureValues: undefined,
+        parent: null,
+        unattended: false,
+      });
+      const createdOrBlocked = Promise.race([
+        createPromise.then((resolved) => ({ type: "created" as const, resolved })),
+        new Promise<{ type: "blocked" }>((finish) => {
+          setTimeout(() => finish({ type: "blocked" }), 5);
+        }),
+      ]);
+      await vi.advanceTimersByTimeAsync(5);
+      // The requested runtime comes back verbatim: no wait on the 60000ms
+      // catalog budget and no substitution with the provider default mode.
+      await expect(createdOrBlocked).resolves.toEqual({
+        type: "created",
+        resolved: { modeId: "orchestrator", featureValues: undefined },
+      });
+
+      // Discovery still runs in the background, degrades at its own budget,
+      // and releases the acquired server instead of leaking it.
+      await vi.waitFor(() => expect(openCodeClient.calls.appAgents).toHaveLength(1), {
+        interval: 1,
+        timeout: 100,
+      });
+      await vi.advanceTimersByTimeAsync(60_000);
+      const entry = await manager.getProvider({
+        cwd: "/tmp/project",
+        provider: "opencode",
+        wait: false,
+      });
+      expect(entry).toMatchObject({
+        status: "ready",
+        models: [{ id: "openai/gpt-5.6-terra" }],
+        error: expect.stringContaining("app.agents"),
+      });
+      expect(entry.modes).toBeUndefined();
+      expect(runtime.acquisitions).toEqual([{ kind: "current", releaseCount: 1 }]);
+    } finally {
+      manager.destroy();
+      vi.useRealTimers();
+    }
+  });
+
+  test("explicit mode create succeeds without a recovery refresh after discovery failed", async () => {
+    const fetchCatalog = vi.fn().mockRejectedValue(new Error("cold catalog failure"));
+    const manager = new ProviderSnapshotManager({
+      logger: createTestLogger(),
+      extraClients: {
+        codex: createExtraClient("codex", {
+          isAvailable: async () => true,
+          fetchCatalog,
+        }),
+      },
+    });
+
+    try {
+      await expect(
+        manager.getProvider({ cwd: "/tmp/project", provider: "codex", wait: true }),
+      ).resolves.toMatchObject({ status: "error", error: "cold catalog failure" });
+
+      await expect(
+        manager.resolveCreateConfig({
+          cwd: "/tmp/project",
+          provider: "codex",
+          requestedMode: "custom-mode",
+          featureValues: undefined,
+          parent: null,
+          unattended: false,
+        }),
+      ).resolves.toEqual({ modeId: "custom-mode", featureValues: undefined });
+      expect(fetchCatalog).toHaveBeenCalledTimes(1);
+    } finally {
+      manager.destroy();
+    }
+  });
+
+  test("explicit mode create validates fail-closed against a ready catalog", async () => {
+    const modes: AgentMode[] = [
+      { id: "build", label: "Build" },
+      { id: "plan", label: "Plan" },
+    ];
+    const manager = new ProviderSnapshotManager({
+      logger: createTestLogger(),
+      extraClients: {
+        codex: createExtraClient("codex", {
+          isAvailable: async () => true,
+          fetchCatalog: async () => ({ models: [] as AgentModelDefinition[], modes }),
+        }),
+      },
+    });
+
+    try {
+      await manager.getProvider({ cwd: "/tmp/project", provider: "codex", wait: true });
+      await expect(
+        manager.resolveCreateConfig({
+          cwd: "/tmp/project",
+          provider: "codex",
+          requestedMode: "plan",
+          featureValues: undefined,
+          parent: null,
+          unattended: false,
+        }),
+      ).resolves.toEqual({ modeId: "plan", featureValues: undefined });
+      await expect(
+        manager.resolveCreateConfig({
+          cwd: "/tmp/project",
+          provider: "codex",
+          requestedMode: "made-up-mode",
+          featureValues: undefined,
+          parent: null,
+          unattended: false,
+        }),
+      ).rejects.toThrow("Invalid mode 'made-up-mode'");
+    } finally {
+      manager.destroy();
+    }
+  });
+
+  test("omitted-mode create without parent or unattended intent does not wait on a hanging catalog", async () => {
+    let finishCatalog!: (catalog: { models: AgentModelDefinition[]; modes: AgentMode[] }) => void;
+    const fetchCatalog = vi.fn(
+      async () =>
+        await new Promise<{ models: AgentModelDefinition[]; modes: AgentMode[] }>((finish) => {
+          finishCatalog = finish;
+        }),
+    );
+    const manager = new ProviderSnapshotManager({
+      logger: createTestLogger(),
+      extraClients: {
+        codex: createExtraClient("codex", {
+          isAvailable: async () => true,
+          fetchCatalog,
+        }),
+      },
+    });
+    const createInput = {
+      cwd: "/tmp/project",
+      provider: "codex" as const,
+      requestedMode: undefined,
+      featureValues: undefined,
+      parent: null,
+      unattended: false,
+    };
+
+    try {
+      await expect(manager.resolveCreateConfig(createInput)).resolves.toEqual({
+        modeId: undefined,
+        featureValues: undefined,
+      });
+      await expect(manager.resolveCreateConfig(createInput)).resolves.toEqual({
+        modeId: undefined,
+        featureValues: undefined,
+      });
+      // Both creates share the single background discovery load.
+      await vi.waitFor(() => expect(fetchCatalog).toHaveBeenCalledTimes(1));
+    } finally {
+      manager.destroy();
+    }
+    // A late catalog resolution after destroy must be inert.
+    finishCatalog({ models: [], modes: [] });
+    await new Promise((finish) => setImmediate(finish));
+  });
+
+  test("unattended create without an explicit mode still waits for mode discovery", async () => {
+    vi.useFakeTimers();
+    const manager = new ProviderSnapshotManager({
+      logger: createTestLogger(),
+      refreshTimeoutMs: TEST_REFRESH_TIMEOUT_MS,
+      extraClients: {
+        codex: createExtraClient("codex", {
+          isAvailable: async () => true,
+          fetchCatalog: async () => new Promise(() => {}),
+        }),
+      },
+    });
+
+    try {
+      const createPromise = manager.resolveCreateConfig({
+        cwd: "/tmp/project",
+        provider: "codex",
+        requestedMode: undefined,
+        featureValues: undefined,
+        parent: null,
+        unattended: true,
+      });
+      const createdOrBlocked = Promise.race([
+        createPromise.then(() => ({ type: "created" as const })),
+        new Promise<{ type: "blocked" }>((finish) => {
+          setTimeout(() => finish({ type: "blocked" }), 5);
+        }),
+      ]);
+      await vi.advanceTimersByTimeAsync(5);
+      await expect(createdOrBlocked).resolves.toEqual({ type: "blocked" });
+
+      await vi.advanceTimersByTimeAsync(TEST_REFRESH_TIMEOUT_MS);
+      await vi.advanceTimersByTimeAsync(TEST_REFRESH_TIMEOUT_MS);
+      await expect(createPromise).rejects.toThrow(
+        `Timed out refreshing Codex after ${TEST_REFRESH_TIMEOUT_MS}ms`,
+      );
+    } finally {
+      manager.destroy();
+      vi.useRealTimers();
     }
   });
 
