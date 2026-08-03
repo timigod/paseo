@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { AsyncLocalStorage } from "node:async_hooks";
 import type { Dir, Stats } from "node:fs";
 import { opendir, stat } from "node:fs/promises";
 import { resolve } from "node:path";
@@ -326,6 +327,12 @@ export interface ReleaseWorkspaceIfUnownedOptions {
   workspaceId: string;
   finishedAgentId: string;
   release: () => Promise<void>;
+}
+
+interface WorkspaceAgentRegistrationState {
+  count: number;
+  settled: Promise<void>;
+  resolveSettled: () => void;
 }
 
 export interface WaitForAgentOptions {
@@ -683,7 +690,8 @@ export class AgentManager {
   private readonly inFlightAgentArchives = new Map<string, Promise<{ archivedAt: string }>>();
   private readonly retainedAgentRuntimeCleanups = new Set<AgentSession>();
   private retainedAgentRuntimeCleanupRetry: Promise<void> | null = null;
-  private readonly workspaceAgentRegistrations = new Map<string, number>();
+  private readonly workspaceAgentRegistrations = new Map<string, WorkspaceAgentRegistrationState>();
+  private readonly workspaceAgentRegistrationContext = new AsyncLocalStorage<Set<string>>();
   private readonly releasingWorkspaces = new Set<string>();
   private readonly agentStreamCoalescer: AgentStreamCoalescer;
   private mcpBaseUrl: string | null;
@@ -1181,10 +1189,8 @@ export class AgentManager {
     agentId: string | undefined,
     options: CreateAgentOptions,
   ): Promise<ManagedAgent> {
-    return this.trackAgentRegistrationOperation(() =>
-      this.trackWorkspaceAgentRegistration(options.workspaceId, () =>
-        this.createAgentInternal(config, agentId, options),
-      ),
+    return this.runWorkspaceAgentRegistration(options.workspaceId, () =>
+      this.createAgentInternal(config, agentId, options),
     );
   }
 
@@ -1251,10 +1257,8 @@ export class AgentManager {
     },
     resumeOptions?: AgentResumeSessionOptions,
   ): Promise<ManagedAgent> {
-    return this.trackAgentRegistrationOperation(() =>
-      this.trackWorkspaceAgentRegistration(options?.workspaceId, () =>
-        this.resumeAgentFromPersistenceInternal(handle, overrides, agentId, options, resumeOptions),
-      ),
+    return this.runWorkspaceAgentRegistration(options?.workspaceId, () =>
+      this.resumeAgentFromPersistenceInternal(handle, overrides, agentId, options, resumeOptions),
     );
   }
 
@@ -1316,10 +1320,8 @@ export class AgentManager {
     workspaceId: string;
     labels?: Record<string, string>;
   }): Promise<ManagedAgent> {
-    return this.trackAgentRegistrationOperation(() =>
-      this.trackWorkspaceAgentRegistration(input.workspaceId, () =>
-        this.importProviderSessionInternal(input),
-      ),
+    return this.runWorkspaceAgentRegistration(input.workspaceId, () =>
+      this.importProviderSessionInternal(input),
     );
   }
 
@@ -1402,7 +1404,7 @@ export class AgentManager {
     overrides?: Partial<AgentSessionConfig>,
     options?: { rehydrateFromDisk?: boolean },
   ): Promise<ManagedAgent> {
-    return this.trackAgentRegistrationOperation(() =>
+    return this.runWorkspaceAgentRegistration(this.agents.get(agentId)?.workspaceId, () =>
       this.reloadAgentSessionInternal(agentId, overrides, options),
     );
   }
@@ -1708,17 +1710,16 @@ export class AgentManager {
 
   async releaseWorkspaceIfUnowned(options: ReleaseWorkspaceIfUnownedOptions): Promise<boolean> {
     const { workspaceId, finishedAgentId } = options;
-    // Registration and release claim opposing state before their first await, so
-    // JavaScript run-to-completion makes this ownership handoff atomic.
-    if (
-      this.releasingWorkspaces.has(workspaceId) ||
-      (this.workspaceAgentRegistrations.get(workspaceId) ?? 0) > 0
-    ) {
+    if (this.releasingWorkspaces.has(workspaceId)) {
       return false;
     }
 
+    // Claim release before waiting so later registrations cannot barge ahead of
+    // it. Registrations that already hold the claim may finish nested work.
     this.releasingWorkspaces.add(workspaceId);
     try {
+      await this.workspaceAgentRegistrations.get(workspaceId)?.settled;
+
       if (this.hasOtherLiveAgentInWorkspace(workspaceId, finishedAgentId)) {
         return false;
       }
@@ -2085,15 +2086,37 @@ export class AgentManager {
       return false;
     }
 
+    return this.runWorkspaceAgentRegistration(record.workspaceId, () =>
+      this.runWorkspaceAgentRegistration(updates?.workspaceId, () =>
+        this.unarchiveSnapshotInternal(agentId, updates),
+      ),
+    );
+  }
+
+  private async unarchiveSnapshotInternal(
+    agentId: string,
+    updates?: { workspaceId?: string; labels?: AgentLabelPatch },
+  ): Promise<boolean> {
+    const registry = this.requireRegistry();
+    const record = await registry.get(agentId);
+    if (!record || !record.archivedAt) {
+      return false;
+    }
+
     await this.unarchiveNativeSession(record.provider, record.persistence);
 
-    await registry.upsert({
-      ...record,
-      ...(updates?.workspaceId ? { workspaceId: updates.workspaceId } : {}),
-      ...(updates?.labels ? { labels: applyLabelPatch(record.labels, updates.labels) } : {}),
-      archivedAt: null,
-      updatedAt: new Date().toISOString(),
-    });
+    try {
+      await registry.upsert({
+        ...record,
+        ...(updates?.workspaceId ? { workspaceId: updates.workspaceId } : {}),
+        ...(updates?.labels ? { labels: applyLabelPatch(record.labels, updates.labels) } : {}),
+        archivedAt: null,
+        updatedAt: new Date().toISOString(),
+      });
+    } catch (error) {
+      await this.archiveNativeSessionBestEffort(record.provider, record.persistence);
+      throw error;
+    }
 
     if (this.getAgent(agentId)) {
       this.notifyAgentState(agentId);
@@ -4531,7 +4554,10 @@ export class AgentManager {
   }
 
   private trackAgentRegistrationOperation<T>(operation: () => Promise<T>): Promise<T> {
-    const result = this.runAgentRegistrationOperation(operation);
+    return this.trackAgentRegistrationPromise(this.runAgentRegistrationOperation(operation));
+  }
+
+  private trackAgentRegistrationPromise<T>(result: Promise<T>): Promise<T> {
     const settled = result.then(
       () => undefined,
       () => undefined,
@@ -4551,6 +4577,21 @@ export class AgentManager {
     return await operation();
   }
 
+  runWorkspaceAgentRegistration<T>(
+    workspaceId: string | undefined,
+    register: () => Promise<T>,
+  ): Promise<T> {
+    let registration: Promise<T>;
+    try {
+      registration = this.trackWorkspaceAgentRegistration(workspaceId, () =>
+        this.runAgentRegistrationOperation(register),
+      );
+    } catch (error) {
+      registration = Promise.reject(error);
+    }
+    return this.trackAgentRegistrationPromise(registration);
+  }
+
   private trackWorkspaceAgentRegistration<T>(
     workspaceId: string | undefined,
     register: () => Promise<T>,
@@ -4558,17 +4599,31 @@ export class AgentManager {
     if (!workspaceId) {
       return register();
     }
+    const activeWorkspaces = this.workspaceAgentRegistrationContext.getStore();
+    if (activeWorkspaces?.has(workspaceId)) {
+      return register();
+    }
     if (this.releasingWorkspaces.has(workspaceId)) {
       return Promise.reject(new Error(`Workspace ${workspaceId} is being released`));
     }
 
-    this.workspaceAgentRegistrations.set(
-      workspaceId,
-      (this.workspaceAgentRegistrations.get(workspaceId) ?? 0) + 1,
-    );
+    let state = this.workspaceAgentRegistrations.get(workspaceId);
+    if (!state) {
+      let resolveSettled!: () => void;
+      const settled = new Promise<void>((settle) => {
+        resolveSettled = settle;
+      });
+      state = { count: 0, settled, resolveSettled };
+      this.workspaceAgentRegistrations.set(workspaceId, state);
+    }
+    state.count += 1;
+
     let registration: Promise<T>;
     try {
-      registration = register();
+      registration = this.workspaceAgentRegistrationContext.run(
+        new Set([...(activeWorkspaces ?? []), workspaceId]),
+        register,
+      );
     } catch (error) {
       this.finishWorkspaceAgentRegistration(workspaceId);
       throw error;
@@ -4577,11 +4632,14 @@ export class AgentManager {
   }
 
   private finishWorkspaceAgentRegistration(workspaceId: string): void {
-    const remaining = (this.workspaceAgentRegistrations.get(workspaceId) ?? 1) - 1;
-    if (remaining === 0) {
+    const state = this.workspaceAgentRegistrations.get(workspaceId);
+    if (!state) {
+      return;
+    }
+    state.count -= 1;
+    if (state.count === 0) {
       this.workspaceAgentRegistrations.delete(workspaceId);
-    } else {
-      this.workspaceAgentRegistrations.set(workspaceId, remaining);
+      state.resolveSettled();
     }
   }
 
