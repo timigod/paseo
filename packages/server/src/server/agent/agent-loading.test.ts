@@ -22,6 +22,17 @@ import { createTestAgentClients } from "../test-utils/fake-agent-client.js";
 import { OmpAgentClient } from "./providers/omp/agent.js";
 import { FakeOmp } from "./providers/omp/test-utils/fake-omp.js";
 
+function deferred<T>(): {
+  promise: Promise<T>;
+  resolve: (value: T | PromiseLike<T>) => void;
+} {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>((resolvePromise) => {
+    resolve = resolvePromise;
+  });
+  return { promise, resolve };
+}
+
 test("loads archived history after its cwd is removed and active records interactively", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "agent-loading-purpose-"));
   const archivedCwd = path.join(root, "archived-workspace");
@@ -476,6 +487,125 @@ test("unarchive send closes and replaces a history-only loader before starting a
     expect(manager.getAgent(agent.id)?.sessionExecutionMode).toBe("interactive");
     expect((await storage.get(agent.id))?.archivedAt).toBeNull();
   } finally {
+    await manager.closeAgent(agentId).catch(() => undefined);
+    await manager.flush().catch(() => undefined);
+    await storage.flush().catch(() => undefined);
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("three concurrent loaders converge on one interactive session across unarchive", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "agent-loading-unarchive-single-flight-"));
+  const cwd = path.join(root, "workspace");
+  await mkdir(cwd);
+  const logger = createTestLogger();
+  const storage = new AgentStorage(path.join(root, "agents"), logger);
+  const baseClient = createTestAgentClients().codex;
+  if (!baseClient) {
+    throw new Error("expected Codex test client");
+  }
+
+  const historyStarted = deferred<void>();
+  const historyAllowed = deferred<void>();
+  const actions: string[] = [];
+  let historyLoadCount = 0;
+  let interactiveResumeCount = 0;
+  const client: AgentClient = {
+    provider: baseClient.provider,
+    capabilities: baseClient.capabilities,
+    createSession: baseClient.createSession.bind(baseClient),
+    resumeSession: async (handle, overrides, launchContext) => {
+      interactiveResumeCount += 1;
+      actions.push("interactive-resume");
+      return await baseClient.resumeSession(handle, overrides, launchContext);
+    },
+    loadHistorySession: async (handle) => {
+      historyLoadCount += 1;
+      actions.push("history-load");
+      return {
+        provider: "codex",
+        id: handle.sessionId,
+        capabilities: baseClient.capabilities,
+        streamHistory: async function* () {
+          historyStarted.resolve();
+          await historyAllowed.promise;
+          yield {
+            type: "timeline",
+            provider: "codex",
+            item: { type: "assistant_message", text: "persisted response" },
+          } satisfies AgentStreamEvent;
+        },
+        describePersistence: () => handle,
+        close: async () => {
+          actions.push("history-close");
+        },
+      };
+    },
+    fetchCatalog: baseClient.fetchCatalog.bind(baseClient),
+    isAvailable: baseClient.isAvailable.bind(baseClient),
+    unarchiveNativeSession: async () => {
+      actions.push("native-unarchive");
+    },
+  };
+  const manager = new AgentManager({ clients: { codex: client }, registry: storage, logger });
+  const agentId = "00000000-0000-4000-8000-000000000310";
+
+  try {
+    const agent = await manager.createAgent({ provider: "codex", cwd }, agentId, {
+      workspaceId: "workspace-unarchive-single-flight",
+    });
+    await manager.archiveAgent(agent.id);
+
+    const firstLoad = ensureAgentLoaded(agent.id, {
+      agentManager: manager,
+      agentStorage: storage,
+      logger,
+    });
+    await historyStarted.promise;
+    const secondLoad = ensureAgentLoaded(agent.id, {
+      agentManager: manager,
+      agentStorage: storage,
+      logger,
+    });
+    const thirdLoad = ensureAgentLoaded(agent.id, {
+      agentManager: manager,
+      agentStorage: storage,
+      logger,
+    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    const unarchive = manager.unarchiveSnapshot(agent.id);
+    historyAllowed.resolve();
+    const [first, second, third, didUnarchive] = await Promise.all([
+      firstLoad,
+      secondLoad,
+      thirdLoad,
+      unarchive,
+    ]);
+
+    expect(didUnarchive).toBe(true);
+    expect([first, second, third].map((snapshot) => snapshot.sessionExecutionMode)).toEqual([
+      "interactive",
+      "interactive",
+      "interactive",
+    ]);
+    const sessions = [first, second, third].map((snapshot) =>
+      snapshot.lifecycle === "closed" ? null : snapshot.session,
+    );
+    expect(new Set(sessions).size).toBe(1);
+    const current = manager.getAgent(agent.id);
+    expect(current?.sessionExecutionMode).toBe("interactive");
+    expect(sessions[0]).toBe(current?.lifecycle === "closed" ? null : current?.session);
+    expect(historyLoadCount).toBe(1);
+    expect(interactiveResumeCount).toBe(1);
+    expect(actions).toEqual([
+      "history-load",
+      "history-close",
+      "native-unarchive",
+      "interactive-resume",
+    ]);
+  } finally {
+    historyAllowed.resolve();
     await manager.closeAgent(agentId).catch(() => undefined);
     await manager.flush().catch(() => undefined);
     await storage.flush().catch(() => undefined);

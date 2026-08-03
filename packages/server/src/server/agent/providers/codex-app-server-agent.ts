@@ -5,9 +5,7 @@ import {
   type AgentClient,
   type AgentCreateSessionOptions,
   type AgentFeature,
-  type AgentHistoryLoader,
   type AgentLaunchContext,
-  type AgentResumeSessionOptions,
   type AgentMode,
   type AgentModelDefinition,
   type McpServerConfig,
@@ -3175,7 +3173,6 @@ export class CodexAppServerAgentSession implements AgentSession {
     private readonly goalsEnabled: boolean = false,
     private readonly autoReviewEnabled: boolean = false,
     private readonly agentId?: string,
-    private readonly initialResumePurpose: "interactive" | "history" = "interactive",
   ) {
     this.logger = logger.child({
       module: "agent",
@@ -3226,16 +3223,11 @@ export class CodexAppServerAgentSession implements AgentSession {
       await this.client.request("initialize", buildCodexAppServerInitializeParams());
       this.client.notify("initialized", {});
 
-      const historyOnly = this.initialResumePurpose === "history";
-      if (!historyOnly) {
-        await this.loadCollaborationModes();
-        await this.loadSkills();
-      }
+      await this.loadCollaborationModes();
+      await this.loadSkills();
 
       if (this.currentThreadId) {
-        if (!historyOnly) {
-          await this.ensureThreadLoaded();
-        }
+        await this.ensureThreadLoaded();
         await this.loadPersistedHistory();
       }
 
@@ -6333,7 +6325,6 @@ export class CodexAppServerAgentClient implements AgentClient {
     handle: { sessionId: string; metadata?: Record<string, unknown> },
     overrides?: Partial<AgentSessionConfig>,
     launchContext?: AgentLaunchContext,
-    options?: AgentResumeSessionOptions,
   ): Promise<AgentSession> {
     const storedConfig = (handle.metadata ?? {}) as Partial<AgentSessionConfig>;
     const merged: AgentSessionConfig = {
@@ -6355,28 +6346,9 @@ export class CodexAppServerAgentClient implements AgentClient {
       goalsEnabled,
       autoReviewEnabled,
       launchContext?.agentId,
-      options?.purpose ?? "interactive",
     );
     await session.connect();
     return session;
-  }
-
-  async loadHistorySession(
-    handle: AgentPersistenceHandle,
-    overrides?: Partial<AgentSessionConfig>,
-  ): Promise<AgentHistoryLoader> {
-    const session = await this.resumeSession(handle, overrides, undefined, { purpose: "history" });
-    return {
-      provider: session.provider,
-      id: session.id,
-      capabilities: session.capabilities,
-      get features() {
-        return session.features;
-      },
-      streamHistory: () => session.streamHistory(),
-      describePersistence: () => session.describePersistence(),
-      close: () => session.close(),
-    };
   }
 
   async listImportableSessions(

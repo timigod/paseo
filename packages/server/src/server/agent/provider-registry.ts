@@ -434,7 +434,7 @@ function wrapClientProvider(
           launchContext,
         ),
       ),
-    resumeSession: async (handle, overrides, launchContext, options) =>
+    resumeSession: async (handle, overrides, launchContext) =>
       wrapSessionProvider(
         provider,
         await inner.resumeSession(
@@ -449,7 +449,6 @@ function wrapClientProvider(
               }
             : undefined,
           launchContext,
-          options,
         ),
       ),
     loadHistorySession: loadHistorySession

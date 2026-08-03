@@ -10,13 +10,14 @@ import {
   isStoredAgentProviderAvailable,
   toAgentPersistenceHandle,
 } from "../persistence-hooks.js";
-
-interface PendingAgentInitialization {
-  promise: Promise<ManagedAgent>;
-  options: { broadcastTimeline: boolean };
-}
-
-const pendingAgentInitializations = new Map<string, PendingAgentInitialization>();
+import {
+  claimPendingAgentInitialization,
+  clearPendingAgentInitialization,
+  getPendingAgentInitialization,
+  hasAgentInteractiveTransition,
+  type PendingAgentInitialization,
+  waitForAgentInteractiveTransition,
+} from "./agent-load-coordinator.js";
 
 export type AgentLoaderManager = Pick<
   AgentManager,
@@ -65,115 +66,137 @@ export async function ensureAgentLoaded(
   deps: EnsureAgentLoadedDeps,
 ): Promise<ManagedAgent> {
   while (true) {
+    await waitForAgentInteractiveTransition(agentId);
     await deps.agentManager.waitForAgentClose?.(agentId);
 
-    const inflight = pendingAgentInitializations.get(agentId);
+    const inflight = getPendingAgentInitialization(agentId);
     if (inflight) {
       inflight.options.broadcastTimeline ||= deps.broadcastTimeline === true;
-      const initialized = await inflight.promise;
-      const reusable = await reuseLoadedAgent(initialized, agentId, deps);
-      if (reusable) {
-        return reusable;
-      }
-      if (pendingAgentInitializations.get(agentId) === inflight) {
-        pendingAgentInitializations.delete(agentId);
-      }
+      await inflight.promise;
       continue;
     }
 
-    // The close barrier and the runtime lookup cannot be made atomic across an
-    // await. Re-read both pieces of state synchronously so a close that starts
-    // in that gap is joined on the next pass instead of returning its runtime.
     const initializationState = deps.agentManager.getAgentInitializationState(agentId);
     if (initializationState.closeInFlight) {
       continue;
     }
-    if (initializationState.agent) {
-      const reusable = await reuseLoadedAgent(initializationState.agent, agentId, deps);
+    const existing = initializationState.agent;
+    if (existing) {
+      const reusable = await reuseLoadedAgent(existing, agentId, deps);
       if (reusable) {
-        return reusable;
+        await waitForAgentInteractiveTransition(agentId);
+        if (hasAgentInteractiveTransition(agentId)) {
+          continue;
+        }
+        const current = deps.agentManager.getAgentInitializationState(agentId);
+        if (current.closeInFlight) {
+          continue;
+        }
+        if (current.agent) {
+          return current.agent;
+        }
       }
       continue;
     }
-    break;
-  }
 
-  const pendingOptions = {
-    broadcastTimeline: deps.broadcastTimeline === true,
-  };
-  const initPromise = (async () => {
-    const record = await deps.agentStorage.get(agentId);
-    if (!record) {
-      throw new Error(`Agent not found: ${agentId}`);
+    // A close or transition may have started after the first barriers. Claim
+    // initialization only after checking both again, then let every caller
+    // converge through the claimed promise and the current manager snapshot.
+    await deps.agentManager.waitForAgentClose?.(agentId);
+    await waitForAgentInteractiveTransition(agentId);
+    const latestState = deps.agentManager.getAgentInitializationState(agentId);
+    if (getPendingAgentInitialization(agentId) || latestState.closeInFlight || latestState.agent) {
+      continue;
     }
 
-    const validProviders = deps.validProviders ?? deps.agentManager.getRegisteredProviderIds();
-    if (!isStoredAgentProviderAvailable(record, validProviders)) {
+    let resolveInitialization!: (agent: ManagedAgent) => void;
+    let rejectInitialization!: (error: unknown) => void;
+    const promise = new Promise<ManagedAgent>((resolve, reject) => {
+      resolveInitialization = resolve;
+      rejectInitialization = reject;
+    });
+    const pending: PendingAgentInitialization = {
+      promise,
+      options: { broadcastTimeline: deps.broadcastTimeline === true },
+    };
+    if (!claimPendingAgentInitialization(agentId, pending)) {
+      continue;
+    }
+
+    try {
+      resolveInitialization(await initializeAgent(agentId, deps, pending));
+      await promise;
+    } catch (error) {
+      rejectInitialization(error);
+      await promise.catch(() => undefined);
+      throw error;
+    } finally {
+      clearPendingAgentInitialization(agentId, pending);
+    }
+  }
+}
+
+async function initializeAgent(
+  agentId: string,
+  deps: EnsureAgentLoadedDeps,
+  pending: PendingAgentInitialization,
+): Promise<ManagedAgent> {
+  const record = await deps.agentStorage.get(agentId);
+  if (!record) {
+    throw new Error(`Agent not found: ${agentId}`);
+  }
+
+  const validProviders = deps.validProviders ?? deps.agentManager.getRegisteredProviderIds();
+  if (!isStoredAgentProviderAvailable(record, validProviders)) {
+    throw new Error(`Agent ${agentId} references unavailable provider '${record.provider}'`);
+  }
+
+  const handle = toAgentPersistenceHandle(validProviders, record.persistence);
+  let snapshot: ManagedAgent;
+  if (record.archivedAt) {
+    if (!handle) {
+      throw new Error(`Archived agent ${agentId} has no persisted session history`);
+    }
+    snapshot = await deps.agentManager.loadAgentHistoryFromPersistence(
+      handle,
+      buildConfigOverrides(record),
+      agentId,
+      extractTimestamps(record),
+    );
+    deps.logger.info(
+      { agentId, provider: record.provider },
+      "Agent history loaded from persistence",
+    );
+  } else if (handle) {
+    snapshot = await deps.agentManager.resumeAgentFromPersistence(
+      handle,
+      buildConfigOverrides(record),
+      agentId,
+      {
+        ...extractTimestamps(record),
+        autoArchiveObligation: record.autoArchiveObligation,
+        resumeRunning: record.lastStatus === "running",
+      },
+    );
+    deps.logger.info({ agentId, provider: record.provider }, "Agent resumed from persistence");
+  } else {
+    const config = buildSessionConfig(record, { validProviders });
+    if (!config) {
       throw new Error(`Agent ${agentId} references unavailable provider '${record.provider}'`);
     }
-
-    const handle = toAgentPersistenceHandle(validProviders, record.persistence);
-
-    let snapshot: ManagedAgent;
-    if (record.archivedAt) {
-      if (!handle) {
-        throw new Error(`Archived agent ${agentId} has no persisted session history`);
-      }
-      snapshot = await deps.agentManager.loadAgentHistoryFromPersistence(
-        handle,
-        buildConfigOverrides(record),
-        agentId,
-        extractTimestamps(record),
-      );
-      deps.logger.info(
-        { agentId, provider: record.provider },
-        "Agent history loaded from persistence",
-      );
-    } else if (handle) {
-      snapshot = await deps.agentManager.resumeAgentFromPersistence(
-        handle,
-        buildConfigOverrides(record),
-        agentId,
-        {
-          ...extractTimestamps(record),
-          autoArchiveObligation: record.autoArchiveObligation,
-          resumeRunning: record.lastStatus === "running",
-        },
-      );
-      deps.logger.info({ agentId, provider: record.provider }, "Agent resumed from persistence");
-    } else {
-      const config = buildSessionConfig(record, {
-        validProviders,
-      });
-      if (!config) {
-        throw new Error(`Agent ${agentId} references unavailable provider '${record.provider}'`);
-      }
-      snapshot = await deps.agentManager.createAgent(config, agentId, {
-        labels: record.labels,
-        workspaceId: record.workspaceId,
-        owner: record.owner,
-        autoArchiveObligation: record.autoArchiveObligation,
-      });
-      deps.logger.info({ agentId, provider: record.provider }, "Agent created from stored config");
-    }
-
-    await deps.agentManager.hydrateTimelineFromProvider(agentId, {
-      broadcast: () => pendingOptions.broadcastTimeline,
+    snapshot = await deps.agentManager.createAgent(config, agentId, {
+      labels: record.labels,
+      workspaceId: record.workspaceId,
+      owner: record.owner,
+      autoArchiveObligation: record.autoArchiveObligation,
     });
-    return deps.agentManager.getAgent(agentId) ?? snapshot;
-  })();
-
-  const pending: PendingAgentInitialization = { promise: initPromise, options: pendingOptions };
-  pendingAgentInitializations.set(agentId, pending);
-
-  try {
-    return await initPromise;
-  } finally {
-    const current = pendingAgentInitializations.get(agentId);
-    if (current === pending) {
-      pendingAgentInitializations.delete(agentId);
-    }
+    deps.logger.info({ agentId, provider: record.provider }, "Agent created from stored config");
   }
+
+  await deps.agentManager.hydrateTimelineFromProvider(agentId, {
+    broadcast: () => pending.options.broadcastTimeline,
+  });
+  return deps.agentManager.getAgent(agentId) ?? snapshot;
 }
 
 async function reuseLoadedAgent(

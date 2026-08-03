@@ -25,7 +25,6 @@ import {
   type AgentClient,
   type AgentCreateSessionOptions,
   type AgentHistoryLoader,
-  type AgentResumeSessionOptions,
   type AgentFeature,
   type AgentLaunchContext,
   type AgentSlashCommand,
@@ -111,6 +110,7 @@ import {
   type MaterialProgressCheckpoint,
   type MaterialProgressTurnOutcome,
 } from "./material-progress.js";
+import { runAgentInteractiveTransition } from "./agent-load-coordinator.js";
 
 const RELOAD_SESSION_CLOSE_TIMEOUT_MS = 3_000;
 const INTERRUPT_SESSION_TIMEOUT_MS = 2_000;
@@ -1763,11 +1763,7 @@ export class AgentManager {
     overrides?: Partial<AgentSessionConfig>,
     agentId?: string,
     options?: PersistenceRegistrationOptions,
-    resumeOptions?: AgentResumeSessionOptions,
   ): Promise<ManagedAgent> {
-    if (resumeOptions?.purpose === "history") {
-      return this.loadAgentHistoryFromPersistence(handle, overrides, agentId, options);
-    }
     return this.trackWorkspaceAgentRegistration(options?.workspaceId, () =>
       this.trackAgentRegistrationOperation(
         (reservation) =>
@@ -2827,7 +2823,16 @@ export class AgentManager {
     }
   }
 
-  async unarchiveSnapshot(
+  unarchiveSnapshot(
+    agentId: string,
+    updates?: { workspaceId?: string; labels?: AgentLabelPatch },
+  ): Promise<boolean> {
+    return runAgentInteractiveTransition(agentId, () =>
+      this.unarchiveSnapshotWithWorkspaceRegistration(agentId, updates),
+    );
+  }
+
+  private async unarchiveSnapshotWithWorkspaceRegistration(
     agentId: string,
     updates?: { workspaceId?: string; labels?: AgentLabelPatch },
   ): Promise<boolean> {
