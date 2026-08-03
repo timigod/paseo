@@ -88,28 +88,9 @@ export function selectFleetHost(input: {
     getFleetFreeSlots(observation) > 0;
   const candidates = routeDomain.filter(isEligible);
 
-  if (idempotencyKey) {
-    const ordered = [...candidates].sort((left, right) =>
-      left.host.id.localeCompare(right.host.id),
-    );
-    if (ordered.length === 0) {
-      throw commandError("FLEET_NO_ELIGIBLE_HOST", "No fleet host can route this keyed run");
-    }
-    const digest = createHash("sha256").update(idempotencyKey).digest();
-    const keyed = ordered[digest.readUInt32BE(0) % ordered.length]!;
-    if (pinnedHost && pinnedHost.id !== keyed.host.id) {
-      throw commandError(
-        "FLEET_KEY_HOST_CONFLICT",
-        `Idempotency key routes to ${keyed.host.id}, not pinned host ${pinnedHost.id}`,
-      );
-    }
-    return {
-      host: keyed.host,
-      cwd: sourceHost ? translateFleetCwd(cwd, sourceHost, keyed.host) : cwd,
-      reason: "idempotency_key",
-    };
-  }
-
+  // An explicit pin is more specific than deterministic keyed routing, so it decides the host for
+  // a key that has not been bound yet. Only an already-persisted affinity can contradict a pin,
+  // and that conflict is detected against the stored owner before routing ever runs.
   if (pinnedHost) {
     const match = candidates.find(({ host }) => host.id === pinnedHost.id);
     if (!match) {
@@ -122,6 +103,22 @@ export function selectFleetHost(input: {
       host: match.host,
       cwd: sourceHost ? translateFleetCwd(cwd, sourceHost, match.host) : cwd,
       reason: "pinned",
+    };
+  }
+
+  if (idempotencyKey) {
+    const ordered = [...candidates].sort((left, right) =>
+      left.host.id.localeCompare(right.host.id),
+    );
+    if (ordered.length === 0) {
+      throw commandError("FLEET_NO_ELIGIBLE_HOST", "No fleet host can route this keyed run");
+    }
+    const digest = createHash("sha256").update(idempotencyKey).digest();
+    const keyed = ordered[digest.readUInt32BE(0) % ordered.length]!;
+    return {
+      host: keyed.host,
+      cwd: sourceHost ? translateFleetCwd(cwd, sourceHost, keyed.host) : cwd,
+      reason: "idempotency_key",
     };
   }
 

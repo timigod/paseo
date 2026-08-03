@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { selectFleetHost, selectFleetWorkspaceHost, type FleetHostObservation } from "./routing.js";
-import type { FleetHost } from "./topology.js";
+import { translateFleetCwd, type FleetHost } from "./topology.js";
 
 const builderA: FleetHost = {
   id: "builder-a",
@@ -145,7 +145,7 @@ describe("fleet routing", () => {
     expect(retry.reason).toBe("idempotency_key");
   });
 
-  it("rejects a host pin that contradicts deterministic keyed routing", () => {
+  it("binds a brand-new key to the pinned host over deterministic keyed routing", () => {
     const unpinned = selectFleetHost({
       observations: [observed(builderA), observed(builderB)],
       cwd: "/srv/code/project",
@@ -157,17 +157,35 @@ describe("fleet routing", () => {
     });
     const contradictoryHost = unpinned.host.id === builderA.id ? builderB : builderA;
 
+    const plan = selectFleetHost({
+      observations: [observed(builderA), observed(builderB)],
+      cwd: "/srv/code/project",
+      sourceHost: builderA,
+      localHost: builderA,
+      pinnedHost: contradictoryHost,
+      requiresLocalContext: false,
+      idempotencyKey: "fleet-create-1",
+    });
+
+    expect(plan).toEqual({
+      host: contradictoryHost,
+      cwd: translateFleetCwd("/srv/code/project", builderA, contradictoryHost),
+      reason: "pinned",
+    });
+  });
+
+  it("rejects a keyed run pinned to a host without capacity", () => {
     expect(() =>
       selectFleetHost({
-        observations: [observed(builderA), observed(builderB)],
+        observations: [observed(builderA), observed(builderB, { activeAgents: builderB.capacity })],
         cwd: "/srv/code/project",
         sourceHost: builderA,
         localHost: builderA,
-        pinnedHost: contradictoryHost,
+        pinnedHost: builderB,
         requiresLocalContext: false,
         idempotencyKey: "fleet-create-1",
       }),
-    ).toThrow(expect.objectContaining({ code: "FLEET_KEY_HOST_CONFLICT" }));
+    ).toThrow(expect.objectContaining({ code: "FLEET_PINNED_HOST_INELIGIBLE" }));
   });
 
   it("routes an existing workspace to its inventory-proved owner even when full", () => {

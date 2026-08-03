@@ -2,7 +2,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { FleetHost } from "./topology.js";
+import { translateFleetCwd, type FleetHost } from "./topology.js";
 
 const mocks = vi.hoisted(() => ({
   collectFleetStatus: vi.fn(),
@@ -36,6 +36,7 @@ vi.mock("./run.js", () => ({
 
 import { claimFleetAffinity } from "./affinity.js";
 import { runFleetRunCommand } from "./index.js";
+import { selectFleetHost } from "./routing.js";
 
 const directories: string[] = [];
 const originalFleetConfig = process.env.PASEO_FLEET_CONFIG;
@@ -161,7 +162,73 @@ const runOptions = {
   host: "builder-a.internal:6767",
 };
 
+// Resolves the host deterministic keyed routing picks with no pin, so a pinned regression can pin
+// the other host and stay meaningful if the hash or the host set ever changes.
+function deterministicKeyedHostId(hosts: readonly FleetHost[], idempotencyKey: string): string {
+  return selectFleetHost({
+    observations: hosts.map((host) => ({
+      host,
+      reachable: true,
+      providerReady: true,
+      agentInventoryReady: true,
+      workspaceInventoryReady: true,
+      activeAgents: 0,
+      runtimeCapacity: null,
+      workspaceIds: [],
+    })),
+    cwd: "/srv/code/project",
+    sourceHost: hosts[0] ?? null,
+    localHost: null,
+    pinnedHost: null,
+    requiresLocalContext: false,
+    idempotencyKey,
+  }).host.id;
+}
+
 describe("fleet run retry affinity", () => {
+  it("binds a brand-new key to the pinned host and then fails closed on a contradictory pin", async () => {
+    const builderB = fleetHost({
+      id: "builder-b",
+      name: "Builder B",
+      endpoint: "builder-b.internal:6767",
+      codeRoot: "/opt/code",
+      hostnamePrefixes: ["builder-b"],
+    });
+    const hosts = [fleetHost(), builderB];
+    await createFleetConfig(hosts);
+    configureRunMocks();
+    const pinned = hosts.find(({ id }) => id !== deterministicKeyedHostId(hosts, "create-1"));
+    expect(pinned).toBeDefined();
+
+    await runFleetRunCommand(
+      undefined,
+      { ...runOptions, host: pinned!.endpoint },
+      {} as Parameters<typeof runFleetRunCommand>[2],
+    );
+
+    // The pin decides the host, and cwd is still translated into that host's code root.
+    expect(mocks.prepareAgentRunIntent).toHaveBeenCalledWith(
+      "original prompt",
+      expect.objectContaining({
+        host: pinned!.endpoint,
+        cwd: translateFleetCwd("/srv/code/project", hosts[0]!, pinned!),
+      }),
+    );
+    expect(mocks.runAgentRunIntent).toHaveBeenCalledWith(
+      expect.objectContaining({ host: pinned!.endpoint, idempotencyKey: "create-1" }),
+    );
+
+    const other = hosts.find(({ id }) => id !== pinned!.id)!;
+    await expect(
+      runFleetRunCommand(
+        undefined,
+        { ...runOptions, host: other.endpoint },
+        {} as Parameters<typeof runFleetRunCommand>[2],
+      ),
+    ).rejects.toMatchObject({ code: "FLEET_KEY_HOST_CONFLICT" });
+    expect(mocks.runAgentRunIntent).toHaveBeenCalledTimes(1);
+  });
+
   it("accepts the original endpoint selector after drift and preserves the resolved intent", async () => {
     const configPath = await createFleetConfig([fleetHost()]);
     const intent = configureRunMocks();
