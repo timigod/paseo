@@ -2943,15 +2943,13 @@ describe("create_agent MCP tool", () => {
         listActiveWorkspaces.mockResolvedValueOnce([]);
       });
       workspaceGitService.getSnapshot.mockClear();
+      workspaceGitService.getSnapshot.mockImplementation(() => new Promise(() => {}));
 
       await archiveTool.handler({
         workspaceId: "ws-archive-tool-worktree",
       });
 
-      expect(workspaceGitService.getSnapshot).toHaveBeenCalledWith(repoDir, {
-        force: true,
-        reason: "archive-worktree",
-      });
+      expect(workspaceGitService.getSnapshot).not.toHaveBeenCalled();
       expect(archiveWorkspaceRecord).toHaveBeenCalledWith(
         "ws-archive-tool-worktree",
         expect.any(Function),
