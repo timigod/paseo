@@ -252,6 +252,7 @@ function resolveMaxActiveAgentRuntimes(value: number | undefined): number | null
 
 interface NormalizeConfigOptions {
   resolveDefaultModel?: boolean;
+  validateCwd?: boolean;
   env?: Record<string, string>;
 }
 
@@ -1474,7 +1475,7 @@ export class AgentManager {
         config,
         resolvedAgentId,
         agentIncarnation,
-        options?.env,
+        { env: options?.env },
       );
       this.requireEnabledProvider(storedConfig.provider);
       const client = await this.requireAvailableClient({
@@ -1762,6 +1763,7 @@ export class AgentManager {
         mergedConfig,
         resolvedAgentId,
         agentIncarnation,
+        { validateCwd: resumeOptions?.purpose !== "history" },
       );
 
       const client = this.requireClient(handle.provider);
@@ -6467,6 +6469,8 @@ export class AgentManager {
     // Always resolve cwd to absolute path for consistent history file lookup
     if (normalized.cwd) {
       normalized.cwd = resolve(normalized.cwd);
+    }
+    if (normalized.cwd && options.validateCwd !== false) {
       try {
         const cwdStats = await stat(normalized.cwd);
         if (!cwdStats.isDirectory()) {
@@ -6544,9 +6548,9 @@ export class AgentManager {
     config: AgentSessionConfig,
     agentId: string,
     agentIncarnation: string,
-    env?: Record<string, string>,
+    options: NormalizeConfigOptions = {},
   ): Promise<PreparedSessionConfig> {
-    const storedConfig = await this.normalizeConfig(stripInternalPaseoMcpServer(config), { env });
+    const storedConfig = await this.normalizeConfig(stripInternalPaseoMcpServer(config), options);
     const launchConfig = this.applyDaemonAppendSystemPrompt(
       withRuntimePaseoMcpServer({
         config: storedConfig,

@@ -3098,6 +3098,35 @@ test("createAgent fails when cwd does not exist", async () => {
   ).rejects.toThrow("Working directory does not exist");
 });
 
+test("reloadAgentSession fails when the agent cwd no longer exists", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "agent-manager-reload-cwd-"));
+  const storageRoot = mkdtempSync(join(tmpdir(), "agent-manager-reload-storage-"));
+  const storage = new AgentStorage(join(storageRoot, "agents"), logger);
+  const manager = new AgentManager({
+    clients: {
+      codex: new TestAgentClient(),
+    },
+    registry: storage,
+    logger,
+  });
+
+  const agent = await manager.createAgent({ provider: "codex", cwd }, undefined, {
+    workspaceId: undefined,
+  });
+  rmSync(cwd, { recursive: true, force: true });
+
+  try {
+    await expect(manager.reloadAgentSession(agent.id)).rejects.toThrow(
+      `Working directory does not exist: ${cwd}`,
+    );
+  } finally {
+    await manager.closeAgent(agent.id);
+    await manager.flush();
+    await storage.flush();
+    rmSync(storageRoot, { recursive: true, force: true });
+  }
+});
+
 test("createAgent reports configured providers when provider is unknown", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-test-"));
   const storagePath = join(workdir, "agents");
