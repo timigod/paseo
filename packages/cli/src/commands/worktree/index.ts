@@ -31,7 +31,9 @@ export function createWorktreeCommand(): Command {
     worktree
       .command("archive")
       .description("Archive a worktree (removes worktree and associated branch)")
-      .argument("<name>", "Worktree name or branch name"),
+      .argument("<name>", "Worktree name or branch name")
+      .option("--cwd <path>", "Directory within the repository to match")
+      .option("--repo-root <path>", "Repository root to match (takes precedence over --cwd)"),
   ).action(withOutput(runArchiveCommand));
 
   return worktree;

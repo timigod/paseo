@@ -474,6 +474,40 @@ describe("handlePaseoWorktreeListRequest", () => {
     });
   });
 
+  test("prefers repoRoot when both explicit selectors are supplied", async () => {
+    const emitted: SessionOutboundMessage[] = [];
+    const workspaceGitService = {
+      listWorktrees: vi.fn().mockResolvedValue([]),
+    };
+    const projectRegistry = { list: vi.fn(async () => []) };
+
+    await handlePaseoWorktreeListRequest(
+      {
+        emit: (message) => emitted.push(message),
+        workspaceGitService: workspaceGitService as unknown as WorkspaceGitService,
+        projectRegistry,
+        sessionLogger: createLogger(),
+      },
+      {
+        type: "paseo_worktree_list_request",
+        cwd: "/tmp/cwd-repository",
+        repoRoot: "/tmp/selected-repository",
+        requestId: "request-selected-worktrees",
+      },
+    );
+
+    expect(workspaceGitService.listWorktrees).toHaveBeenCalledWith("/tmp/selected-repository");
+    expect(projectRegistry.list).not.toHaveBeenCalled();
+    expect(emitted).toContainEqual({
+      type: "paseo_worktree_list_response",
+      payload: {
+        worktrees: [],
+        error: null,
+        requestId: "request-selected-worktrees",
+      },
+    });
+  });
+
   test("lists registered project worktrees when the process cwd is outside Git", async () => {
     const daemonCwd = realpathSync.native(
       mkdtempSync(path.join(tmpdir(), "worktree-list-daemon-cwd-")),
