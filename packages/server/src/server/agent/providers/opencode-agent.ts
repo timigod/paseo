@@ -11,7 +11,6 @@ import {
   type Session as OpenCodeSession,
   type TextPartInput as OpenCodeTextPartInput,
 } from "@opencode-ai/sdk/v2/client";
-import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import { createPathEquivalenceMatcher } from "../../../utils/path.js";
 import pLimit from "p-limit";
@@ -1924,6 +1923,13 @@ export interface OpenCodeEventTranslationState {
   messageRoles: Map<string, OpenCodeMessageRole>;
   pendingUserMessageText?: string | null;
   pendingClientMessageId?: string | null;
+  /**
+   * When a foreground submission is active, emit only the provider-owned user
+   * message that Paseo bound to that turn. Undefined keeps history/autonomous
+   * translation behavior unchanged; null means the provider echo has not been
+   * observed yet.
+   */
+  foregroundUserMessageId?: string | null;
   emittedUserMessageIds?: Set<string>;
   accumulatedUsage: AgentUsage;
   sessionTotalCostUsd?: number;
@@ -2579,6 +2585,9 @@ function appendOpenCodeUserMessageUpdated(
   state: OpenCodeEventTranslationState,
   events: AgentStreamEvent[],
 ): void {
+  if (state.foregroundUserMessageId !== undefined && info.id !== state.foregroundUserMessageId) {
+    return;
+  }
   const text = state.pendingUserMessageText;
   if (!text || text.trim().length === 0 || state.emittedUserMessageIds?.has(info.id)) {
     return;
@@ -3391,11 +3400,10 @@ class OpenCodeAgentSession implements AgentSession {
     }
 
     const turnId = this.createTurnId();
-    const userMessageId = `msg_${randomUUID().replaceAll("-", "")}`;
     this.turnState = {
       status: "running",
       turnId,
-      userMessageId,
+      userMessageId: null,
       submission: "pending",
       acceptance: "activity",
       hasAssistantOutput: false,
@@ -3458,7 +3466,6 @@ class OpenCodeAgentSession implements AgentSession {
         .command({
           sessionID: this.sessionId,
           directory: this.config.cwd,
-          messageID: userMessageId,
           command: slashCommand.commandName,
           arguments: slashCommand.args ?? "",
           ...(this.config.model ? { model: this.config.model } : {}),
@@ -3519,7 +3526,6 @@ class OpenCodeAgentSession implements AgentSession {
           const promptResponse = await this.client.session.promptAsync({
             sessionID: this.sessionId,
             directory: this.config.cwd,
-            messageID: userMessageId,
             parts,
             ...(options?.outputSchema
               ? {
@@ -3880,6 +3886,9 @@ class OpenCodeAgentSession implements AgentSession {
     ) {
       return;
     }
+    if (turnId) {
+      this.bindForegroundUserMessageFromEvent(event, streamEventRevision, turnId);
+    }
     const translated = await this.translateEvent(event);
     const foregroundEvents = this.emitProviderInternalEvents(translated);
     if (!turnId && this.shouldStartAutonomousTurn(event, foregroundEvents)) {
@@ -4065,10 +4074,38 @@ class OpenCodeAgentSession implements AgentSession {
     );
   }
 
+  /** Bind a foreground turn to OpenCode's first post-dispatch user message. */
+  private bindForegroundUserMessageFromEvent(
+    event: OpenCodeEvent,
+    streamEventRevision: number,
+    turnId: string,
+  ): void {
+    const running = this.turnState;
+    if (
+      running.status !== "running" ||
+      running.turnId !== turnId ||
+      running.submission === "pending" ||
+      running.userMessageId !== null ||
+      running.dispatchStreamEventRevision === null ||
+      streamEventRevision <= running.dispatchStreamEventRevision ||
+      event.type !== "message.updated"
+    ) {
+      return;
+    }
+    const info = event.properties.info;
+    if (
+      info.sessionID !== this.sessionId ||
+      info.role !== "user" ||
+      this.emittedUserMessageIds.has(info.id)
+    ) {
+      return;
+    }
+    this.turnState = { ...running, userMessageId: info.id };
+  }
+
   /**
-   * Only activity attributable to the dispatched submission accepts it: the
-   * user message persisted under the messageID Paseo generated for this turn,
-   * or an assistant message parented on it. Prior-history echoes never match.
+   * Only activity attributable to the provider-owned user message bound to the
+   * dispatched submission accepts it. Prior-history echoes never match.
    */
   private acceptForegroundSubmissionFromEvent(event: OpenCodeEvent, turnId: string): void {
     const running = this.turnState;
@@ -4748,6 +4785,8 @@ class OpenCodeAgentSession implements AgentSession {
       messageRoles: this.messageRoles,
       pendingUserMessageText: this.pendingUserMessageText,
       pendingClientMessageId: this.pendingClientMessageId,
+      foregroundUserMessageId:
+        this.turnState.status === "running" ? this.turnState.userMessageId : undefined,
       emittedUserMessageIds: this.emittedUserMessageIds,
       accumulatedUsage: this.accumulatedUsage,
       sessionTotalCostUsd: this.sessionTotalCostUsd,

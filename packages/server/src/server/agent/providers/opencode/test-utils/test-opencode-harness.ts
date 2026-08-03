@@ -138,6 +138,11 @@ export class TestOpenCodeClient {
   commandListImplementation: ((parameters: unknown) => Promise<OpenCodeResponse>) | null = null;
   /** Mirrors real OpenCode: promptAsync publishes the persisted user message. */
   echoPromptUserMessage = true;
+  /** Opt in when a focused command test needs the provider-owned user echo. */
+  echoCommandUserMessage = false;
+  /** Optional exact provider-owned IDs for focused ordering/attribution tests. */
+  promptUserMessageIds: string[] = [];
+  commandUserMessageIds: string[] = [];
   eventStream: AsyncIterable<unknown>;
   experimentalSessionListResponse: OpenCodeResponse = { data: [] };
   mcpAddResponse: OpenCodeResponse = {};
@@ -170,6 +175,7 @@ export class TestOpenCodeClient {
   sessionSummarizeResponse: OpenCodeResponse = { data: {} };
   sessionUpdateResponse: OpenCodeResponse = {};
   private readonly queuedEventStream = createQueuedEventStream();
+  private providerUserMessageSequence = 0;
 
   constructor() {
     this.eventStream = this.queuedEventStream.stream;
@@ -270,6 +276,20 @@ export class TestOpenCodeClient {
           if (this.sessionCommandError) {
             throw this.sessionCommandError;
           }
+          const { sessionID, messageID: suppliedMessageId } = parameters as {
+            sessionID?: string;
+            messageID?: string;
+          };
+          const providerMessageId =
+            suppliedMessageId ??
+            this.commandUserMessageIds.shift() ??
+            `msg_test_user_${String(++this.providerUserMessageSequence).padStart(4, "0")}`;
+          if (this.echoCommandUserMessage && sessionID) {
+            this.emitEvent({
+              type: "message.updated",
+              properties: { info: { id: providerMessageId, sessionID, role: "user" } },
+            });
+          }
           for (const event of this.sessionCommandEvents) {
             this.emitEvent(event);
           }
@@ -300,18 +320,21 @@ export class TestOpenCodeClient {
         },
         promptAsync: async (parameters: unknown) => {
           this.calls.sessionPromptAsync.push(parameters);
-          // Real OpenCode persists the prompt's user message under the
-          // messageID the daemon supplied and publishes it before any other
-          // turn activity. The adapter relies on that echo to attribute the
-          // turn's submission, so the harness models it.
-          const { sessionID, messageID } = parameters as {
+          // Real OpenCode owns the persisted user-message ID when callers omit
+          // messageID. Model that boundary while still honoring an explicitly
+          // supplied ID so lower-level tests can exercise legacy inputs.
+          const { sessionID, messageID: suppliedMessageId } = parameters as {
             sessionID?: string;
             messageID?: string;
           };
-          if (this.echoPromptUserMessage && sessionID && messageID) {
+          const providerMessageId =
+            suppliedMessageId ??
+            this.promptUserMessageIds.shift() ??
+            `msg_test_user_${String(++this.providerUserMessageSequence).padStart(4, "0")}`;
+          if (this.echoPromptUserMessage && sessionID) {
             this.emitEvent({
               type: "message.updated",
-              properties: { info: { id: messageID, sessionID, role: "user" } },
+              properties: { info: { id: providerMessageId, sessionID, role: "user" } },
             });
           }
           for (const event of this.sessionPromptAsyncEvents) {

@@ -482,9 +482,12 @@ describe("OpenCodeAgentClient adapter smoke tests", () => {
     rmSync(cwd, { recursive: true, force: true });
   }, 120_000);
 
-  test("keeps a continuation open after its persisted user echo until assistant output", async () => {
+  test("uses provider-owned ordered IDs when a continuation caller ID sorts before history", async () => {
     const sessionId = "ses_continuation_output_gate";
+    const continuationClientMessageId = "msg_00000000000000000000000000000000";
+    const continuationUserMessageId = "msg_provider_user_0002";
     const { parent, openCode } = await createParentSession(sessionId, (client) => {
+      client.promptUserMessageIds = ["msg_provider_user_0001", continuationUserMessageId];
       client.sessionPromptAsyncEvents = assistantTurnEvents({ sessionId, text: "FIRST_OK" });
     });
     const events: AgentStreamEvent[] = [];
@@ -509,7 +512,7 @@ describe("OpenCodeAgentClient adapter smoke tests", () => {
           },
         },
       ];
-      await parent.startTurn("CONTINUED");
+      await parent.startTurn("CONTINUED", { clientMessageId: continuationClientMessageId });
       await vi.waitFor(() => {
         expect(events).toContainEqual({
           type: "timeline",
@@ -527,7 +530,19 @@ describe("OpenCodeAgentClient adapter smoke tests", () => {
         "A foreground turn is already active",
       );
 
-      const continuationCall = openCode.calls.sessionPromptAsync[1] as { messageID: string };
+      const continuationCall = openCode.calls.sessionPromptAsync[1] as { messageID?: string };
+      expect(continuationCall).not.toHaveProperty("messageID");
+      expect(events).toContainEqual({
+        type: "timeline",
+        provider: "opencode",
+        turnId: "opencode-turn-1",
+        item: {
+          type: "user_message",
+          text: "CONTINUED",
+          messageId: continuationUserMessageId,
+          clientMessageId: continuationClientMessageId,
+        },
+      });
       openCode.emitEvent({
         type: "message.updated",
         properties: {
@@ -535,7 +550,7 @@ describe("OpenCodeAgentClient adapter smoke tests", () => {
             id: "msg_continuation_assistant",
             sessionID: sessionId,
             role: "assistant",
-            parentID: continuationCall.messageID,
+            parentID: continuationUserMessageId,
           },
         },
       });
@@ -679,6 +694,51 @@ describe("OpenCodeAgentClient adapter smoke tests", () => {
     await session.close();
     rmSync(cwd, { recursive: true, force: true });
   }, 120_000);
+
+  test("keeps a low-sorting slash-command caller ID out of the OpenCode request", async () => {
+    const sessionId = "ses_provider_owned_slash_id";
+    const clientMessageId = "msg_00000000000000000000000000000000";
+    const providerUserMessageId = "msg_provider_user_0002";
+    const { parent, openCode } = await createParentSession(sessionId, (client) => {
+      client.commandListResponse = {
+        data: [{ name: "review", description: "Review", source: "command" }],
+      };
+      client.echoCommandUserMessage = true;
+      client.commandUserMessageIds = [providerUserMessageId];
+      client.sessionCommandEvents = [
+        busyEvent(sessionId),
+        { type: "session.idle", properties: { sessionID: sessionId } },
+      ];
+    });
+    const events: AgentStreamEvent[] = [];
+    const unsubscribe = parent.subscribe((event) => events.push(event));
+
+    try {
+      await parent.startTurn("/review", { clientMessageId });
+      await vi.waitFor(() => {
+        expect(events).toContainEqual(
+          expect.objectContaining({ type: "turn_completed", turnId: "opencode-turn-0" }),
+        );
+      });
+
+      expect(openCode.calls.sessionCommand).toHaveLength(1);
+      expect(openCode.calls.sessionCommand[0]).not.toHaveProperty("messageID");
+      expect(events).toContainEqual({
+        type: "timeline",
+        provider: "opencode",
+        turnId: "opencode-turn-0",
+        item: {
+          type: "user_message",
+          text: "/review",
+          messageId: providerUserMessageId,
+          clientMessageId,
+        },
+      });
+    } finally {
+      unsubscribe();
+      await parent.close();
+    }
+  });
 
   test("fetchCatalog returns models with required fields", async () => {
     const runtime = new TestOpenCodeHarness();
@@ -2164,6 +2224,8 @@ describe("OpenCode adapter startTurn error handling", () => {
 
   test("streamHistory attributes replay only to the exact generated user message", async () => {
     const openCode = new TestOpenCodeClient();
+    const userMessageId = "msg_provider_user_0001";
+    openCode.promptUserMessageIds = [userMessageId];
     openCode.sessionPromptAsyncEvents = [];
     openCode.sessionGetResponse = {
       data: { id: "ses_unit_test", directory: "/tmp/test", revert: undefined },
@@ -2174,11 +2236,20 @@ describe("OpenCode adapter startTurn error handling", () => {
       "ses_unit_test",
       createTestLogger(),
     );
+    const observedEvents: AgentStreamEvent[] = [];
+    const unsubscribe = session.subscribe((event) => observedEvents.push(event));
     try {
       const { turnId } = await session.startTurn("make the change");
       const promptCall = openCode.calls.sessionPromptAsync[0] as { messageID?: unknown };
-      expect(promptCall.messageID).toEqual(expect.any(String));
-      const userMessageId = promptCall.messageID as string;
+      expect(promptCall).not.toHaveProperty("messageID");
+      await vi.waitFor(() => {
+        expect(observedEvents).toContainEqual(
+          expect.objectContaining({
+            type: "timeline",
+            item: expect.objectContaining({ type: "user_message", messageId: userMessageId }),
+          }),
+        );
+      });
       openCode.sessionMessagesResponse = {
         data: [
           {
@@ -2226,12 +2297,15 @@ describe("OpenCode adapter startTurn error handling", () => {
         undefined,
       ]);
     } finally {
+      unsubscribe();
       await session.close();
     }
   });
 
   test("streamHistory rejects ambiguous latest correlated assistants", async () => {
     const openCode = new TestOpenCodeClient();
+    const userMessageId = "msg_provider_user_0001";
+    openCode.promptUserMessageIds = [userMessageId];
     openCode.sessionPromptAsyncEvents = [];
     openCode.sessionGetResponse = {
       data: { id: "ses_unit_test", directory: "/tmp/test", revert: undefined },
@@ -2244,8 +2318,7 @@ describe("OpenCode adapter startTurn error handling", () => {
     );
     try {
       await session.startTurn("make the change");
-      const userMessageId = (openCode.calls.sessionPromptAsync[0] as { messageID: string })
-        .messageID;
+      expect(openCode.calls.sessionPromptAsync[0]).not.toHaveProperty("messageID");
       openCode.sessionMessagesResponse = {
         data: ["a", "b"].map((suffix) => ({
           info: {
