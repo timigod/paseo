@@ -618,6 +618,9 @@ class ProviderImportHarness {
         this.activeAgent = this.snapshot;
         return this.snapshot;
       },
+      loadAgentHistoryFromPersistence: async () => {
+        throw new Error("Provider imports do not load archived history");
+      },
       hydrateTimelineFromProvider: async () => {},
       getTimeline: () => this.timeline,
       closeAgent: async (agentId: string) => {

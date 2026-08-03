@@ -7,6 +7,7 @@ import type {
   AgentCapabilityFlags,
   AgentClient,
   AgentFeature,
+  AgentHistoryLoader,
   AgentLaunchContext,
   AgentMode,
   AgentModelDefinition,
@@ -1224,6 +1225,13 @@ class FakeAgentClient implements AgentClient {
     });
     this.options.onSessionCreated?.(session);
     return session;
+  }
+
+  async loadHistorySession(
+    handle: AgentPersistenceHandle,
+    overrides?: Partial<AgentSessionConfig>,
+  ): Promise<AgentHistoryLoader> {
+    return await this.resumeSession(handle, overrides);
   }
 
   async fetchCatalog(

@@ -3,6 +3,7 @@ import type { Logger } from "pino";
 import type {
   AgentClient,
   AgentCreateConfigUnattendedInput,
+  AgentHistoryLoader,
   AgentMode,
   AgentModelDefinition,
   AgentPersistenceHandle,
@@ -383,6 +384,27 @@ export function wrapSessionProvider(provider: AgentProvider, inner: AgentSession
   };
 }
 
+function wrapHistoryLoaderProvider(
+  provider: AgentProvider,
+  inner: AgentHistoryLoader,
+): AgentHistoryLoader {
+  return {
+    provider,
+    id: inner.id,
+    capabilities: inner.capabilities,
+    get features() {
+      return inner.features;
+    },
+    async *streamHistory() {
+      for await (const event of inner.streamHistory()) {
+        yield mapStreamEvent(provider, event);
+      }
+    },
+    describePersistence: () => mapPersistenceHandle(provider, inner.describePersistence()),
+    close: () => inner.close(),
+  };
+}
+
 function wrapClientProvider(
   provider: AgentProvider,
   inner: AgentClient,
@@ -394,6 +416,7 @@ function wrapClientProvider(
   const importSession = inner.importSession?.bind(inner);
   const listCommands = inner.listCommands?.bind(inner);
   const listFeatures = inner.listFeatures?.bind(inner);
+  const loadHistorySession = inner.loadHistorySession?.bind(inner);
 
   return {
     provider,
@@ -429,6 +452,24 @@ function wrapClientProvider(
           options,
         ),
       ),
+    loadHistorySession: loadHistorySession
+      ? async (handle, overrides) =>
+          wrapHistoryLoaderProvider(
+            provider,
+            await loadHistorySession(
+              {
+                ...handle,
+                provider: inner.provider,
+              },
+              overrides
+                ? {
+                    ...overrides,
+                    provider: inner.provider,
+                  }
+                : undefined,
+            ),
+          )
+      : undefined,
     fetchCatalog: async (options) => {
       const catalog = await inner.fetchCatalog(options);
       return {

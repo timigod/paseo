@@ -5,6 +5,7 @@ import {
   type AgentClient,
   type AgentCreateSessionOptions,
   type AgentFeature,
+  type AgentHistoryLoader,
   type AgentLaunchContext,
   type AgentResumeSessionOptions,
   type AgentMode,
@@ -109,14 +110,6 @@ function assertChildWithPipes(
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value != null && typeof value === "object" && !Array.isArray(value);
-}
-
-function isArchivedCodexThreadResumeError(error: unknown, threadId: string): boolean {
-  if (!(error instanceof Error)) return false;
-  const expectedMessage =
-    `session ${threadId} is archived. ` +
-    `Run \`codex unarchive ${threadId}\` to unarchive it first.`;
-  return error.message === expectedMessage;
 }
 
 function isCodexAlreadyUnarchivedError(error: unknown, threadId: string): boolean {
@@ -3233,13 +3226,16 @@ export class CodexAppServerAgentSession implements AgentSession {
       await this.client.request("initialize", buildCodexAppServerInitializeParams());
       this.client.notify("initialized", {});
 
-      await this.loadCollaborationModes();
-      await this.loadSkills();
+      const historyOnly = this.initialResumePurpose === "history";
+      if (!historyOnly) {
+        await this.loadCollaborationModes();
+        await this.loadSkills();
+      }
 
       if (this.currentThreadId) {
-        await this.ensureThreadLoaded({
-          allowArchivedHistory: this.initialResumePurpose === "history",
-        });
+        if (!historyOnly) {
+          await this.ensureThreadLoaded();
+        }
         await this.loadPersistedHistory();
       }
 
@@ -3562,9 +3558,7 @@ export class CodexAppServerAgentSession implements AgentSession {
     }
   }
 
-  private async ensureThreadLoaded(
-    options: { allowArchivedHistory?: boolean } = {},
-  ): Promise<void> {
+  private async ensureThreadLoaded(): Promise<void> {
     if (!this.client || !this.currentThreadId) return;
     try {
       const loaded = toObjectRecord(await this.client.request("thread/loaded/list", {}));
@@ -3588,16 +3582,6 @@ export class CodexAppServerAgentSession implements AgentSession {
     } catch (error) {
       const threadId = this.currentThreadId;
       const message = error instanceof Error ? error.message : String(error);
-      if (
-        options.allowArchivedHistory === true &&
-        isArchivedCodexThreadResumeError(error, threadId)
-      ) {
-        this.logger.info(
-          { threadId },
-          "Loading archived Codex thread history without resuming the native session",
-        );
-        return;
-      }
       this.logger.warn({ error, threadId }, "Failed to resume persisted Codex thread");
       throw new Error(`Failed to resume Codex thread ${threadId}: ${message}`, { cause: error });
     }
@@ -6375,6 +6359,24 @@ export class CodexAppServerAgentClient implements AgentClient {
     );
     await session.connect();
     return session;
+  }
+
+  async loadHistorySession(
+    handle: AgentPersistenceHandle,
+    overrides?: Partial<AgentSessionConfig>,
+  ): Promise<AgentHistoryLoader> {
+    const session = await this.resumeSession(handle, overrides, undefined, { purpose: "history" });
+    return {
+      provider: session.provider,
+      id: session.id,
+      capabilities: session.capabilities,
+      get features() {
+        return session.features;
+      },
+      streamHistory: () => session.streamHistory(),
+      describePersistence: () => session.describePersistence(),
+      close: () => session.close(),
+    };
   }
 
   async listImportableSessions(

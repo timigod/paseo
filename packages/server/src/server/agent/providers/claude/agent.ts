@@ -70,6 +70,7 @@ import {
   type AgentClient,
   type AgentCreateSessionOptions,
   type AgentFeature,
+  type AgentHistoryLoader,
   type AgentLaunchContext,
   type AgentMetadata,
   type AgentMode,
@@ -1499,6 +1500,24 @@ export class ClaudeAgentClient implements AgentClient {
       queryFactory: this.queryFactory,
       resolveBinary: this.resolveBinary,
     });
+  }
+
+  async loadHistorySession(
+    handle: AgentPersistenceHandle,
+    overrides?: Partial<AgentSessionConfig>,
+  ): Promise<AgentHistoryLoader> {
+    const session = await this.resumeSession(handle, overrides);
+    return {
+      provider: session.provider,
+      id: session.id,
+      capabilities: session.capabilities,
+      get features() {
+        return session.features;
+      },
+      streamHistory: () => session.streamHistory(),
+      describePersistence: () => session.describePersistence(),
+      close: () => session.close(),
+    };
   }
 
   async fetchCatalog(_options: FetchCatalogOptions): Promise<ProviderCatalog> {

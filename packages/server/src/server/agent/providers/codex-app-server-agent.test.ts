@@ -925,11 +925,9 @@ describe("Codex app-server provider", () => {
     });
     const provider = createProviderWithFakeAppServer(appServer);
 
-    const session = await provider.resumeSession(archivedThreadHandle(), undefined, undefined, {
-      purpose: "history",
-    });
+    const session = await provider.loadHistorySession(archivedThreadHandle());
 
-    expect(threadRequests).toEqual(["thread/loaded/list", "thread/resume", "thread/read"]);
+    expect(threadRequests).toEqual(["thread/read"]);
     await session.close();
     appServer.assertNoErrors();
   });

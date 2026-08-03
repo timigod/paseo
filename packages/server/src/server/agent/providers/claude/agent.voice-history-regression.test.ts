@@ -254,7 +254,7 @@ describe("ClaudeAgentSession history replay regression", () => {
       },
     };
 
-    const session = await client.resumeSession(handle, { cwd });
+    const session = await client.loadHistorySession(handle, { cwd });
     const historyEvents: AgentStreamEvent[] = [];
 
     try {

@@ -1,6 +1,9 @@
-import { describe, expect, test } from "vitest";
+import { describe, expect, test, vi } from "vitest";
+import { createTestLogger } from "../test-utils/test-logger.js";
+import type { AgentManagerEvent, AgentSubscriber, ManagedAgent } from "./agent/agent-manager.js";
 import type { StoredAgentRecord } from "./agent/agent-storage.js";
 import {
+  attachAgentStoragePersistence,
   buildConfigOverrides,
   buildSessionConfig,
   toAgentPersistenceHandle,
@@ -27,6 +30,34 @@ function createRecord(overrides?: Partial<StoredAgentRecord>): StoredAgentRecord
 }
 
 describe("persistence hooks", () => {
+  test("does not persist read-only archived history views", () => {
+    let subscriber: AgentSubscriber | undefined;
+    const applySnapshot = vi.fn(async () => undefined);
+    const unsubscribe = attachAgentStoragePersistence(
+      createTestLogger(),
+      {
+        subscribe: (callback) => {
+          subscriber = callback;
+          return () => undefined;
+        },
+      },
+      { applySnapshot, list: async () => [] },
+    );
+    const event = {
+      type: "agent_state",
+      agent: {
+        id: "archived-agent",
+        lifecycle: "idle",
+        sessionExecutionMode: "history-only",
+      } as ManagedAgent,
+    } satisfies AgentManagerEvent;
+
+    subscriber?.(event);
+
+    expect(applySnapshot).not.toHaveBeenCalled();
+    unsubscribe();
+  });
+
   test("buildConfigOverrides carries systemPrompt and mcpServers", () => {
     const record = createRecord({
       title: "Voice agent (current)",

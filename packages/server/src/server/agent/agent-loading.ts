@@ -21,10 +21,12 @@ const pendingAgentInitializations = new Map<string, PendingAgentInitialization>(
 export type AgentLoaderManager = Pick<
   AgentManager,
   | "createAgent"
+  | "closeAgent"
   | "getAgent"
   | "getAgentInitializationState"
   | "getRegisteredProviderIds"
   | "hydrateTimelineFromProvider"
+  | "loadAgentHistoryFromPersistence"
   | "resumeAgentFromPersistence"
 > &
   Partial<Pick<AgentManager, "waitForAgentClose">>;
@@ -39,9 +41,7 @@ export interface EnsureAgentLoadedDeps {
 
 export async function ensureUnarchivedAgentLoaded(
   agentId: string,
-  deps: EnsureAgentLoadedDeps & {
-    agentManager: AgentLoaderManager & Pick<AgentManager, "closeAgent">;
-  },
+  deps: EnsureAgentLoadedDeps,
 ): Promise<ManagedAgent> {
   const record = await deps.agentStorage.get(agentId);
   if (record?.archivedAt) {
@@ -70,7 +70,15 @@ export async function ensureAgentLoaded(
     const inflight = pendingAgentInitializations.get(agentId);
     if (inflight) {
       inflight.options.broadcastTimeline ||= deps.broadcastTimeline === true;
-      return inflight.promise;
+      const initialized = await inflight.promise;
+      const reusable = await reuseLoadedAgent(initialized, agentId, deps);
+      if (reusable) {
+        return reusable;
+      }
+      if (pendingAgentInitializations.get(agentId) === inflight) {
+        pendingAgentInitializations.delete(agentId);
+      }
+      continue;
     }
 
     // The close barrier and the runtime lookup cannot be made atomic across an
@@ -81,7 +89,11 @@ export async function ensureAgentLoaded(
       continue;
     }
     if (initializationState.agent) {
-      return initializationState.agent;
+      const reusable = await reuseLoadedAgent(initializationState.agent, agentId, deps);
+      if (reusable) {
+        return reusable;
+      }
+      continue;
     }
     break;
   }
@@ -103,7 +115,21 @@ export async function ensureAgentLoaded(
     const handle = toAgentPersistenceHandle(validProviders, record.persistence);
 
     let snapshot: ManagedAgent;
-    if (handle) {
+    if (record.archivedAt) {
+      if (!handle) {
+        throw new Error(`Archived agent ${agentId} has no persisted session history`);
+      }
+      snapshot = await deps.agentManager.loadAgentHistoryFromPersistence(
+        handle,
+        buildConfigOverrides(record),
+        agentId,
+        extractTimestamps(record),
+      );
+      deps.logger.info(
+        { agentId, provider: record.provider },
+        "Agent history loaded from persistence",
+      );
+    } else if (handle) {
       snapshot = await deps.agentManager.resumeAgentFromPersistence(
         handle,
         buildConfigOverrides(record),
@@ -113,7 +139,6 @@ export async function ensureAgentLoaded(
           autoArchiveObligation: record.autoArchiveObligation,
           resumeRunning: record.lastStatus === "running",
         },
-        record.archivedAt ? { purpose: "history" } : undefined,
       );
       deps.logger.info({ agentId, provider: record.provider }, "Agent resumed from persistence");
     } else {
@@ -149,4 +174,23 @@ export async function ensureAgentLoaded(
       pendingAgentInitializations.delete(agentId);
     }
   }
+}
+
+async function reuseLoadedAgent(
+  agent: ManagedAgent,
+  agentId: string,
+  deps: EnsureAgentLoadedDeps,
+): Promise<ManagedAgent | null> {
+  if (agent.sessionExecutionMode !== "history-only") {
+    return agent;
+  }
+
+  const record = await deps.agentStorage.get(agentId);
+  if (record?.archivedAt) {
+    return agent;
+  }
+
+  await deps.agentManager.closeAgent(agentId);
+  await deps.agentManager.waitForAgentClose?.(agentId);
+  return null;
 }

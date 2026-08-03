@@ -51,7 +51,7 @@ export function attachAgentStoragePersistence(
     if (event.type !== "agent_state") {
       return;
     }
-    if (event.agent.lifecycle === "closed") {
+    if (event.agent.lifecycle === "closed" || event.agent.sessionExecutionMode === "history-only") {
       return;
     }
     void storage.applySnapshot(event.agent).catch((error) => {

@@ -198,11 +198,13 @@ function buildRunOutput(params: {
 type ScheduleAgentManager = Pick<
   AgentManager,
   | "createAgent"
+  | "closeAgent"
   | "getAgent"
   | "getAgentInitializationState"
   | "getRegisteredProviderIds"
   | "hasInFlightRun"
   | "hydrateTimelineFromProvider"
+  | "loadAgentHistoryFromPersistence"
   | "resumeAgentFromPersistence"
   | "runAgent"
   | "waitForAgentEvent"
