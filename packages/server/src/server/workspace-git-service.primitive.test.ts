@@ -2029,6 +2029,69 @@ describe("WorkspaceGitServiceImpl D2 read methods", () => {
     service.dispose();
   });
 
+  test("an external change from an unmapped sibling fences stale repository facts and diff loads", async () => {
+    const commonDir = join(REPO_CWD, ".git");
+    const siblingCwd = resolvePath("/tmp/repo-new-sibling");
+    const staleRepositoryFact = createDeferred<string>();
+    const staleSiblingDiff = createDeferred<CheckoutDiffResult>();
+    const loadDefaultBranch = vi
+      .fn<() => Promise<string>>()
+      .mockImplementationOnce(() => staleRepositoryFact.promise)
+      .mockResolvedValueOnce("develop");
+    let siblingReads = 0;
+    const getCheckoutDiff = vi.fn(
+      async (
+        cwd: string,
+        _compare: CheckoutDiffCompare,
+        context?: CheckoutContext,
+      ): Promise<CheckoutDiffResult> => {
+        if (cwd === siblingCwd && siblingReads++ === 0) {
+          return staleSiblingDiff.promise;
+        }
+        const defaultBranch = await context?.repositoryFacts?.read(
+          commonDir,
+          "default-branch",
+          loadDefaultBranch,
+        );
+        return { diff: `base:${defaultBranch ?? "missing"}` };
+      },
+    );
+    const service = createService({ getCheckoutDiff });
+
+    const originalDiff = service.getCheckoutDiff(REPO_CWD, { mode: "base" });
+    await vi.waitFor(() => expect(loadDefaultBranch).toHaveBeenCalledTimes(1));
+    const originalSiblingDiff = service.getCheckoutDiff(siblingCwd, { mode: "base" });
+    await vi.waitFor(() => expect(getCheckoutDiff).toHaveBeenCalledTimes(2));
+
+    try {
+      service.onWorkspaceStateMayHaveChanged(siblingCwd);
+      const forcedSiblingDiff = service.getCheckoutDiff(
+        siblingCwd,
+        { mode: "base" },
+        { force: true, reason: "external-state-change" },
+      );
+
+      await vi.waitFor(() => expect(getCheckoutDiff).toHaveBeenCalledTimes(3));
+      await vi.waitFor(() => expect(loadDefaultBranch).toHaveBeenCalledTimes(2));
+      await expect(forcedSiblingDiff).resolves.toEqual({ diff: "base:develop" });
+
+      staleSiblingDiff.resolve({ diff: "base:stale-outer" });
+      staleRepositoryFact.resolve("main");
+      await expect(originalSiblingDiff).resolves.toEqual({ diff: "base:stale-outer" });
+      await expect(originalDiff).resolves.toEqual({ diff: "base:main" });
+
+      await expect(service.getCheckoutDiff(siblingCwd, { mode: "base" })).resolves.toEqual({
+        diff: "base:develop",
+      });
+      expect(getCheckoutDiff).toHaveBeenCalledTimes(3);
+      expect(loadDefaultBranch).toHaveBeenCalledTimes(2);
+    } finally {
+      staleSiblingDiff.resolve({ diff: "base:stale-outer" });
+      staleRepositoryFact.resolve("main");
+      service.dispose();
+    }
+  });
+
   test("external state changes invalidate repository facts loaded by direct checkout reads", async () => {
     const commonDir = join(REPO_CWD, ".git");
     const loadDefaultBranch = vi
@@ -2349,7 +2412,7 @@ describe("WorkspaceGitServiceImpl D2 read methods", () => {
     service.dispose();
   });
 
-  test("onWorkspaceStateMayHaveChanged is a no-op for unknown cwds", () => {
+  test("onWorkspaceStateMayHaveChanged does not schedule workspace or forge work for unknown cwds", () => {
     const github = createGitHubServiceStub();
     const service = createService({ github });
 
