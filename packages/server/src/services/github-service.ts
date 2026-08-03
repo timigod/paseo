@@ -999,9 +999,10 @@ export function createGitHubService(options: CreateGitHubServiceOptions = {}): G
     headRepositoryOwner?: string;
     status: CurrentPullRequestStatus | null;
     notify: boolean;
+    expectedTarget: GitHubPollTarget | null;
   }): void {
     const target = pollTargets.get(getPollTargetKey(update));
-    if (!target) {
+    if (!target || target !== update.expectedTarget) {
       return;
     }
 
@@ -1066,6 +1067,12 @@ export function createGitHubService(options: CreateGitHubServiceOptions = {}): G
     target.retainCount = 0;
     target.callbacks.clear();
     target.errorCallbacks.clear();
+  }
+
+  function expireGitHubPollTargetRead(target: GitHubPollTarget): void {
+    const key = getPollTargetKey(target);
+    cache.delete(key);
+    inFlight.delete(key);
   }
 
   api = {
@@ -1204,6 +1211,7 @@ export function createGitHubService(options: CreateGitHubServiceOptions = {}): G
     },
 
     getCurrentPullRequestStatus(input) {
+      const expectedPollTarget = pollTargets.get(getPollTargetKey(input)) ?? null;
       return cached({
         cwd: input.cwd,
         method: "getCurrentPullRequestStatus",
@@ -1231,6 +1239,7 @@ export function createGitHubService(options: CreateGitHubServiceOptions = {}): G
           headRepositoryOwner: input.headRepositoryOwner,
           status,
           notify: input.reason === "self-heal-github",
+          expectedTarget: expectedPollTarget,
         });
         return status;
       });
@@ -1675,6 +1684,10 @@ export function createGitHubService(options: CreateGitHubServiceOptions = {}): G
           if (target.retainCount > 0) {
             return;
           }
+          // A replacement retained lifecycle with the same textual target must
+          // start its own read. The old request may still resolve, but its
+          // captured target identity prevents it from notifying the replacement.
+          expireGitHubPollTargetRead(target);
           closeGitHubPollTarget(target);
           pollTargets.delete(key);
         },
