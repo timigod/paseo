@@ -14,6 +14,7 @@ import {
   type ManagedAgent,
 } from "./agent-manager.js";
 import { AgentStorage } from "./agent-storage.js";
+import { InMemoryAgentTimelineStore } from "./agent-timeline-store.js";
 import { toAgentPayload } from "./agent-projections.js";
 import { PARENT_AGENT_ID_LABEL } from "@getpaseo/protocol/agent-labels";
 import { formatSystemNotificationPrompt } from "./agent-prompt.js";
@@ -40,6 +41,12 @@ import type {
 } from "./agent-sdk-types.js";
 import type { PaseoToolCatalog } from "./tools/types.js";
 import type { ProviderDefinition } from "./provider-registry.js";
+import type {
+  AgentTimelineFetchOptions,
+  AgentTimelineFetchResult,
+  AgentTimelineRow,
+  AgentTimelineStore,
+} from "./agent-timeline-store-types.js";
 
 interface Deferred<T> {
   promise: Promise<T>;
@@ -55,6 +62,70 @@ function deferred<T>(): Deferred<T> {
     reject = rej;
   });
   return { promise, resolve, reject };
+}
+
+class TestDurableTimelineStore implements AgentTimelineStore {
+  private readonly store = new InMemoryAgentTimelineStore();
+  beforeNextBulkInsert: (() => Promise<void>) | null = null;
+
+  async appendCommitted(
+    agentId: string,
+    item: AgentTimelineItem,
+    options?: { timestamp?: string },
+  ): Promise<AgentTimelineRow> {
+    this.ensure(agentId);
+    return this.store.append(agentId, item, options);
+  }
+
+  async fetchCommitted(
+    agentId: string,
+    options?: AgentTimelineFetchOptions,
+  ): Promise<AgentTimelineFetchResult> {
+    this.ensure(agentId);
+    return this.store.fetch(agentId, options);
+  }
+
+  async getLatestCommittedSeq(agentId: string): Promise<number> {
+    this.ensure(agentId);
+    return this.store.getRows(agentId).at(-1)?.seq ?? 0;
+  }
+
+  async getCommittedRows(agentId: string): Promise<AgentTimelineRow[]> {
+    this.ensure(agentId);
+    return this.store.getRows(agentId);
+  }
+
+  async getLastItem(agentId: string): Promise<AgentTimelineItem | null> {
+    this.ensure(agentId);
+    return this.store.getLastItem(agentId);
+  }
+
+  async getLastAssistantMessage(agentId: string): Promise<string | null> {
+    this.ensure(agentId);
+    return this.store.getLastAssistantMessage(agentId);
+  }
+
+  async deleteAgent(agentId: string): Promise<void> {
+    if (this.store.has(agentId)) this.store.delete(agentId);
+  }
+
+  async bulkInsert(agentId: string, rows: readonly AgentTimelineRow[]): Promise<void> {
+    const beforeInsert = this.beforeNextBulkInsert;
+    this.beforeNextBulkInsert = null;
+    await beforeInsert?.();
+    const existingRows = this.store.has(agentId) ? this.store.getRows(agentId) : [];
+    const bySeq = new Map(existingRows.map((row) => [row.seq, row]));
+    for (const row of rows) bySeq.set(row.seq, row);
+    const mergedRows = [...bySeq.values()].sort((left, right) => left.seq - right.seq);
+    this.store.initialize(agentId, {
+      rows: mergedRows,
+      nextSeq: (mergedRows.at(-1)?.seq ?? 0) + 1,
+    });
+  }
+
+  private ensure(agentId: string): void {
+    if (!this.store.has(agentId)) this.store.initialize(agentId);
+  }
 }
 
 function waitForAgentLifecycle(

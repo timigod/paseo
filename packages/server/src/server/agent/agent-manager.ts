@@ -563,8 +563,11 @@ export class AgentManager {
   private readonly providerSubagents = new ProviderSubagentStore();
   private readonly agentsAwaitingInitialSnapshotPersist = new Set<string>();
   private readonly sessionEventTails = new Map<string, Promise<void>>();
+  private readonly historyHydrationTails = new Map<string, Promise<void>>();
   private readonly activeHistoryHydrationAgentIds = new Set<string>();
   private readonly bufferedHistoryHydrationSessionEvents = new Map<string, AgentStreamEvent[]>();
+  private readonly durableTimelineMutationTails = new Map<string, Promise<void>>();
+  private readonly closingAgentIds = new Set<string>();
   private readonly runs = new AgentRunState();
   private readonly subscribers = new Set<SubscriptionRecord>();
   private readonly idFactory: () => string;
@@ -1346,12 +1349,14 @@ export class AgentManager {
       return existing;
     }
 
+    this.closingAgentIds.add(agentId);
     const close = this.closeAgentRuntime(agentId);
     this.inFlightAgentCloses.set(agentId, close);
     const clearClose = () => {
       if (this.inFlightAgentCloses.get(agentId) === close) {
         this.inFlightAgentCloses.delete(agentId);
       }
+      this.closingAgentIds.delete(agentId);
     };
     void close.then(clearClose, clearClose);
     return close;
@@ -1371,6 +1376,7 @@ export class AgentManager {
       },
       "agent.manager.close.start",
     );
+    await this.historyHydrationTails.get(agentId)?.catch(() => undefined);
     await this.drainSessionEvents(agentId);
     this.cancelRunningProviderSubagents(agentId);
     const closedAgent = this.prepareAgentForClosure(agent, "agent closed");
@@ -2369,6 +2375,9 @@ export class AgentManager {
     agentId: string,
     options?: HydrateTimelineOptions,
   ): Promise<void> {
+    if (this.closingAgentIds.has(agentId)) {
+      throw new Error(`Cannot hydrate agent '${agentId}' while it is closing`);
+    }
     const agent = this.requireSessionAgent(agentId);
     await this.hydrateTimelineFromLegacyProviderHistory(agent, options);
   }
@@ -2410,7 +2419,9 @@ export class AgentManager {
     if (!this.durableTimelineStore) {
       return;
     }
-    await this.durableTimelineStore.deleteAgent(agentId);
+    await this.queueDurableTimelineMutation(agentId, () =>
+      this.durableTimelineStore!.deleteAgent(agentId),
+    );
   }
 
   async deleteAgentState(agentId: string): Promise<void> {
@@ -3164,63 +3175,99 @@ export class AgentManager {
     agent: ActiveManagedAgent,
     broadcast: boolean,
   ): Promise<void> {
-    const historyEvents: Extract<AgentStreamEvent, { type: "timeline" }>[] = [];
-    const providerSubagentEvents: Extract<AgentStreamEvent, { type: "provider_subagent" }>[] = [];
-    for await (const event of agent.session.streamHistory()) {
-      if (event.type === "timeline") {
-        if (event.item.type === "user_message" && isSystemInjectedEnvelope(event.item.text)) {
-          continue;
+    await this.withHistoryHydrationBarrier(agent.id, async () => {
+      const historyEvents: Extract<AgentStreamEvent, { type: "timeline" }>[] = [];
+      const providerSubagentEvents: Extract<AgentStreamEvent, { type: "provider_subagent" }>[] = [];
+      for await (const event of agent.session.streamHistory()) {
+        if (event.type === "timeline") {
+          if (event.item.type === "user_message" && isSystemInjectedEnvelope(event.item.text)) {
+            continue;
+          }
+          historyEvents.push(event);
+        } else if (event.type === "provider_subagent") {
+          providerSubagentEvents.push(event);
         }
-        historyEvents.push(event);
-      } else if (event.type === "provider_subagent") {
-        providerSubagentEvents.push(event);
       }
-    }
 
-    this.agentStreamCoalescer.flushAndDiscard(agent.id);
-    await this.deleteCommittedTimeline(agent.id);
-    this.timelineStore.delete(agent.id);
-    this.timelineStore.initialize(agent.id, { timestamp: new Date().toISOString() });
-    agent.historyPrimed = true;
+      this.agentStreamCoalescer.flushAndDiscard(agent.id);
+      await this.deleteCommittedTimeline(agent.id);
+      this.timelineStore.delete(agent.id);
+      this.timelineStore.initialize(agent.id, { timestamp: new Date().toISOString() });
+      agent.historyPrimed = true;
 
-    for (const event of this.providerSubagents.deleteParent(agent.id)) {
-      if (broadcast) {
-        this.dispatch({ type: "provider_subagent", event });
+      for (const event of this.providerSubagents.deleteParent(agent.id)) {
+        if (broadcast) {
+          this.dispatch({ type: "provider_subagent", event });
+        }
+      }
+      for (const event of providerSubagentEvents) {
+        const update = this.providerSubagents.apply(agent.id, event.provider, event.event);
+        if (broadcast) {
+          this.dispatch({ type: "provider_subagent", event: update });
+        }
+      }
+      for (const event of historyEvents) {
+        const row = this.recordTimeline(
+          agent.id,
+          event.item,
+          event.timestamp ? { timestamp: event.timestamp } : undefined,
+        );
+        if (broadcast) {
+          this.dispatchStream(agent.id, event, {
+            seq: row.seq,
+            epoch: this.timelineStore.getEpoch(agent.id),
+            timestamp: row.timestamp,
+          });
+        }
+      }
+      this.touchUpdatedAt(agent);
+      this.emitState(agent);
+    });
+  }
+
+  private async withHistoryHydrationBarrier(
+    agentId: string,
+    hydrate: () => Promise<void>,
+  ): Promise<void> {
+    const previous = this.historyHydrationTails.get(agentId);
+    const current = (async () => {
+      if (previous) {
+        await previous.catch(() => undefined);
+      }
+      this.activeHistoryHydrationAgentIds.add(agentId);
+      try {
+        await this.drainSessionEvents(agentId);
+        await hydrate();
+      } finally {
+        this.activeHistoryHydrationAgentIds.delete(agentId);
+        const buffered = this.bufferedHistoryHydrationSessionEvents.get(agentId) ?? [];
+        this.bufferedHistoryHydrationSessionEvents.delete(agentId);
+        for (const event of buffered) {
+          this.enqueueSessionEvent(agentId, event);
+        }
+        await this.drainSessionEvents(agentId);
+      }
+    })();
+    this.historyHydrationTails.set(agentId, current);
+    try {
+      await current;
+    } finally {
+      if (this.historyHydrationTails.get(agentId) === current) {
+        this.historyHydrationTails.delete(agentId);
       }
     }
-    for (const event of providerSubagentEvents) {
-      const update = this.providerSubagents.apply(agent.id, event.provider, event.event);
-      if (broadcast) {
-        this.dispatch({ type: "provider_subagent", event: update });
-      }
-    }
-    for (const event of historyEvents) {
-      const row = this.recordTimeline(
-        agent.id,
-        event.item,
-        event.timestamp ? { timestamp: event.timestamp } : undefined,
-      );
-      if (broadcast) {
-        this.dispatchStream(agent.id, event, {
-          seq: row.seq,
-          epoch: this.timelineStore.getEpoch(agent.id),
-          timestamp: row.timestamp,
-        });
-      }
-    }
-    this.touchUpdatedAt(agent);
-    this.emitState(agent);
   }
 
   private async primeTimelineFromLegacyProviderHistory(
     agent: ActiveManagedAgent,
     broadcast: boolean | (() => boolean),
   ): Promise<void> {
-    await this.drainSessionEvents(agent.id);
-    this.activeHistoryHydrationAgentIds.add(agent.id);
-    const timelineEvents: Extract<AgentStreamEvent, { type: "timeline" }>[] = [];
-    const providerSubagentEvents: Extract<AgentStreamEvent, { type: "provider_subagent" }>[] = [];
-    try {
+    await this.withHistoryHydrationBarrier(agent.id, async () => {
+      if (agent.historyPrimed) {
+        return;
+      }
+      const timelineEvents: Extract<AgentStreamEvent, { type: "timeline" }>[] = [];
+      const providerSubagentEvents: Extract<AgentStreamEvent, { type: "provider_subagent" }>[] = [];
       agent.historyPrimed = true;
       try {
         for await (const event of agent.session.streamHistory()) {
@@ -3263,14 +3310,7 @@ export class AgentManager {
           });
         }
       }
-    } finally {
-      this.activeHistoryHydrationAgentIds.delete(agent.id);
-      const buffered = this.bufferedHistoryHydrationSessionEvents.get(agent.id) ?? [];
-      this.bufferedHistoryHydrationSessionEvents.delete(agent.id);
-      for (const event of buffered) {
-        this.enqueueSessionEvent(agent.id, event);
-      }
-    }
+    });
   }
 
   private notifyForegroundTurnWaiters(agentId: string, event: AgentStreamEvent): void {
@@ -3906,8 +3946,9 @@ export class AgentManager {
     if (!this.durableTimelineStore) {
       return;
     }
-    const task = this.durableTimelineStore
-      .bulkInsert(agentId, [row])
+    const task = this.queueDurableTimelineMutation(agentId, () =>
+      this.durableTimelineStore!.bulkInsert(agentId, [row]),
+    )
       .then(() => undefined)
       .catch((err) => {
         this.logger.error(
@@ -3925,13 +3966,36 @@ export class AgentManager {
     if (!this.durableTimelineStore || rows.length === 0) {
       return;
     }
-    const task = this.durableTimelineStore.bulkInsert(agentId, rows).catch((err) => {
+    const task = this.queueDurableTimelineMutation(agentId, () =>
+      this.durableTimelineStore!.bulkInsert(agentId, rows),
+    ).catch((err) => {
       this.logger.error(
         { err, agentId, rowCount: rows.length },
         "Failed to seed durable timeline store",
       );
     });
     this.trackBackgroundTask(task);
+  }
+
+  private queueDurableTimelineMutation(
+    agentId: string,
+    mutate: () => Promise<void>,
+  ): Promise<void> {
+    const previous = this.durableTimelineMutationTails.get(agentId);
+    const current = (async () => {
+      if (previous) {
+        await previous.catch(() => undefined);
+      }
+      await mutate();
+    })();
+    this.durableTimelineMutationTails.set(agentId, current);
+    const clear = () => {
+      if (this.durableTimelineMutationTails.get(agentId) === current) {
+        this.durableTimelineMutationTails.delete(agentId);
+      }
+    };
+    void current.then(clear, clear);
+    return current;
   }
 
   private trackBackgroundTask(task: Promise<void>): void {
