@@ -745,6 +745,11 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
       this.deps.getCheckoutDiff(normalizedCwd, normalizedOptions, {
         paseoHome: this.paseoHome,
         worktreesRoot: this.worktreesRoot,
+        repositoryFacts: this.createRepositoryFactReader(normalizedCwd),
+        repositoryCommonDir:
+          this.repositoryKeyByCwd.peek(normalizedCwd) ??
+          this.workspaceTargets.get(normalizedCwd)?.repoGitRoot ??
+          null,
       }),
     );
   }
@@ -943,6 +948,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
 
   onWorkspaceStateMayHaveChanged(cwd: string): void {
     const normalizedCwd = resolve(cwd);
+    this.invalidateCheckoutDiff(normalizedCwd);
     this.invalidateRepositoryFacts(normalizedCwd);
     const target = this.workspaceTargets.get(normalizedCwd);
     if (!target || target.closed) {
@@ -1099,8 +1105,13 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
   }
 
   private invalidateAllRepositoryFacts(): void {
+    this.checkoutDiffCache.clear();
     for (const target of this.workspaceTargets.values()) {
       target.repositoryFactsGeneration += 1;
+      if (target.latestSnapshot) {
+        target.snapshotStale = true;
+      }
+      this.invalidateCheckoutDiff(target.cwd);
     }
     if (this.repositoryFactCache.size === 0 && this.repositoryFactLoads.size === 0) {
       return;
@@ -1111,12 +1122,21 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
   }
 
   private markWorkspaceRepositoryFactsInvalidated(repositoryKey: string): void {
+    for (const [cwd, knownRepositoryKey] of this.repositoryKeyByCwd.entries()) {
+      if (knownRepositoryKey === repositoryKey) {
+        this.invalidateCheckoutDiff(cwd);
+      }
+    }
     for (const target of this.workspaceTargets.values()) {
       const targetRepositoryKey = target.repoGitRoot
         ? this.normalizeRepositoryKey(target.repoGitRoot)
         : this.repositoryKeyByCwd.peek(target.cwd);
       if (targetRepositoryKey === repositoryKey) {
         target.repositoryFactsGeneration += 1;
+        if (target.latestSnapshot) {
+          target.snapshotStale = true;
+        }
+        this.invalidateCheckoutDiff(target.cwd);
       }
     }
   }

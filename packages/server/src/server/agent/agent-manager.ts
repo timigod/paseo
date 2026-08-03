@@ -900,6 +900,7 @@ export class AgentManager {
   private readonly workspaceAgentRegistrations = new Map<string, WorkspaceAgentRegistrationState>();
   private readonly workspaceAgentRegistrationContext = new AsyncLocalStorage<Set<string>>();
   private readonly releasingWorkspaces = new Set<string>();
+  private readonly releasedWorkspaces = new Set<string>();
   private readonly agentStreamCoalescer: AgentStreamCoalescer;
   private mcpBaseUrl: string | null;
   private readonly issueAgentAuthToken: ((identity: AgentCallerIdentity) => string) | null;
@@ -2395,6 +2396,7 @@ export class AgentManager {
       }
 
       await options.release();
+      this.releasedWorkspaces.add(workspaceId);
       return true;
     } finally {
       this.releasingWorkspaces.delete(workspaceId);
@@ -2827,9 +2829,7 @@ export class AgentManager {
     agentId: string,
     updates?: { workspaceId?: string; labels?: AgentLabelPatch },
   ): Promise<boolean> {
-    return runAgentInteractiveTransition(agentId, () =>
-      this.unarchiveSnapshotWithWorkspaceRegistration(agentId, updates),
-    );
+    return this.unarchiveSnapshotWithWorkspaceRegistration(agentId, updates);
   }
 
   private async unarchiveSnapshotWithWorkspaceRegistration(
@@ -2844,7 +2844,9 @@ export class AgentManager {
     await validateWorkingDirectory(resolve(record.cwd));
     return this.runWorkspaceAgentRegistration(record.workspaceId, () =>
       this.runWorkspaceAgentRegistration(updates?.workspaceId, () =>
-        this.unarchiveSnapshotInternal(agentId, updates),
+        runAgentInteractiveTransition(agentId, () =>
+          this.unarchiveSnapshotInternal(agentId, updates),
+        ),
       ),
     );
   }
@@ -6453,7 +6455,7 @@ export class AgentManager {
     if (activeWorkspaces?.has(workspaceId)) {
       return register();
     }
-    if (this.releasingWorkspaces.has(workspaceId)) {
+    if (this.releasingWorkspaces.has(workspaceId) || this.releasedWorkspaces.has(workspaceId)) {
       return Promise.reject(new Error(`Workspace ${workspaceId} is being released`));
     }
 

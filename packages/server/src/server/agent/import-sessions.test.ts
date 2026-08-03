@@ -600,6 +600,10 @@ class ProviderImportHarness {
       },
       notifyAgentState: () => {},
       getAgent: () => this.activeAgent,
+      getAgentInitializationState: () => ({
+        agent: this.activeAgent,
+        closeInFlight: false,
+      }),
       getRegisteredProviderIds: () => ["codex"],
       createAgent: async () => {
         throw new Error("Stored provider imports must resume their persisted session");

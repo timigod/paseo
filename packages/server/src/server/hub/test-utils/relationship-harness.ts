@@ -274,7 +274,6 @@ class ControlledAgentClient implements AgentClient {
   readonly provider;
   readonly capabilities;
   private gate: Deferred<void> | null = null;
-  private heldCreationCwd: string | null = null;
   private creationChanged = deferred<void>();
   private creationFailure: Error | null = null;
   creations = 0;
@@ -286,9 +285,8 @@ class ControlledAgentClient implements AgentClient {
     this.capabilities = client.capabilities;
   }
 
-  holdCreation(cwd?: string): void {
+  holdCreation(): void {
     this.gate = deferred<void>();
-    this.heldCreationCwd = cwd ?? null;
   }
 
   async creationAt(count: number): Promise<void> {
@@ -298,18 +296,10 @@ class ControlledAgentClient implements AgentClient {
     );
   }
 
-  async creationAtCwd(cwd: string, after: number): Promise<void> {
-    await this.waitForCreationCondition(
-      () => this.createdConfigs.slice(after).some((config) => config.cwd === cwd),
-      `provider creation at ${cwd}`,
-    );
-  }
-
   finishCreation(): void {
     if (!this.gate) throw new Error("Agent creation is not held");
     this.gate.resolve();
     this.gate = null;
-    this.heldCreationCwd = null;
   }
 
   failNextCreation(error: Error): void {
@@ -321,18 +311,23 @@ class ControlledAgentClient implements AgentClient {
     launchContext?: AgentLaunchContext,
     options?: AgentCreateSessionOptions,
   ): Promise<AgentSession> {
-    this.creations++;
-    this.createdConfigs.push({ ...config });
-    const creationChanged = this.creationChanged;
-    this.creationChanged = deferred<void>();
-    creationChanged.resolve();
-    if (this.gate && (!this.heldCreationCwd || this.heldCreationCwd === config.cwd)) {
-      await this.gate.promise;
-    }
-    if (this.creationFailure) {
-      const error = this.creationFailure;
-      this.creationFailure = null;
-      throw error;
+    // Workspace auto-naming uses ephemeral internal provider sessions after a
+    // Hub response. They are not Hub agent creations and must not consume the
+    // lifecycle barriers or injected failure intended for the owned agent.
+    if (!config.internal) {
+      this.creations++;
+      this.createdConfigs.push({ ...config });
+      const creationChanged = this.creationChanged;
+      this.creationChanged = deferred<void>();
+      creationChanged.resolve();
+      if (this.gate) {
+        await this.gate.promise;
+      }
+      if (this.creationFailure) {
+        const error = this.creationFailure;
+        this.creationFailure = null;
+        throw error;
+      }
     }
     return this.client.createSession(config, launchContext, options);
   }
@@ -521,6 +516,7 @@ export class HubRelationshipHarness {
   private root = "";
   private paseoHome = "";
   private host = "";
+  private hubWorkspaceId = "";
   private readonly logs: string[] = [];
   private readonly providerPrompts: AgentPromptInput[] = [];
   private readonly cliProcesses = new Set<Promise<unknown>>();
@@ -554,6 +550,7 @@ export class HubRelationshipHarness {
     const harness = new HubRelationshipHarness(archiveWatchFiles);
     await harness.createHome();
     await harness.startDaemon();
+    await harness.createHubWorkspace();
     return harness;
   }
 
@@ -738,10 +735,6 @@ export class HubRelationshipHarness {
     this.codex.holdCreation();
   }
 
-  holdAgentCreationAtCwd(cwd: string): void {
-    this.codex.holdCreation(cwd);
-  }
-
   beginOwnedCreate(
     requestId: string,
     executionId = "execution-race",
@@ -749,7 +742,6 @@ export class HubRelationshipHarness {
       worktree?: CreateAgentWorktreeTarget;
       prompt?: string;
       modeId?: string;
-      mcpServers?: AgentSessionConfig["mcpServers"];
       cwd?: string;
       workspaceId?: string;
     } = {},
@@ -761,7 +753,7 @@ export class HubRelationshipHarness {
       executionId,
       provider: "codex",
       cwd: this.root,
-      workspaceId: "hub-workspace",
+      workspaceId: this.hubWorkspaceId,
       prompt,
       ...requestOptions,
     });
@@ -769,10 +761,6 @@ export class HubRelationshipHarness {
 
   async agentCreationAttempts(count: number): Promise<void> {
     await this.codex.creationAt(count);
-  }
-
-  async agentCreationAtCwd(cwd: string, after: number): Promise<void> {
-    await this.codex.creationAtCwd(cwd, after);
   }
 
   finishAgentCreation(): void {
@@ -1399,6 +1387,22 @@ export class HubRelationshipHarness {
     this.host = `127.0.0.1:${target.port}`;
   }
 
+  private async createHubWorkspace(): Promise<void> {
+    const client = await this.trustedClient();
+    try {
+      const result = await client.createWorkspace({
+        source: { kind: "directory", path: this.root },
+        title: "Hub test workspace",
+      });
+      if (!result.workspace) {
+        throw new Error(result.error ?? "Failed to create Hub test workspace");
+      }
+      this.hubWorkspaceId = result.workspace.id;
+    } finally {
+      await client.close();
+    }
+  }
+
   private async stopDaemon(): Promise<void> {
     const daemon = this.daemon;
     if (!daemon) return;
@@ -1545,7 +1549,7 @@ export class HubRelationshipHarness {
       executionId,
       provider: "codex",
       cwd: this.root,
-      workspaceId: "hub-workspace",
+      workspaceId: this.hubWorkspaceId,
       prompt: "Create through the Hub",
     };
   }

@@ -1270,10 +1270,15 @@ describe("WorkspaceGitServiceImpl primitive refresh entrypoint", () => {
       await service.getSnapshot(REPO_CWD);
       const subscription = service.registerWorkspace({ cwd: REPO_CWD }, vi.fn());
       await flushPromises();
+      await vi.advanceTimersByTimeAsync(0);
+      await flushPromises();
+      const forgeReadsAfterInitialPoll = forge.getCurrentPullRequestStatus.mock.calls.length;
       await vi.advanceTimersByTimeAsync(20_000);
       await flushPromises();
 
-      expect(forge.getCurrentPullRequestStatus).toHaveBeenCalledTimes(1);
+      expect(forge.getCurrentPullRequestStatus).toHaveBeenCalledTimes(
+        forgeReadsAfterInitialPoll + 1,
+      );
       subscription.unsubscribe();
     } finally {
       service.dispose();
@@ -1370,15 +1375,28 @@ describe("WorkspaceGitServiceImpl primitive refresh entrypoint", () => {
 
     try {
       await service.getSnapshot(REPO_CWD);
+      const forgeReadsAfterSnapshot = forge.getCurrentPullRequestStatus.mock.calls.length;
       const subscription = service.registerWorkspace({ cwd: REPO_CWD }, vi.fn());
 
-      await vi.advanceTimersByTimeAsync(120_000);
-      await vi.waitFor(() => expect(forge.getCurrentPullRequestStatus).toHaveBeenCalledTimes(1));
+      await vi.advanceTimersByTimeAsync(0);
+      await vi.waitFor(() =>
+        expect(forge.getCurrentPullRequestStatus).toHaveBeenCalledTimes(
+          forgeReadsAfterSnapshot + 1,
+        ),
+      );
 
       service.onWorkspaceStateMayHaveChanged("/tmp/unmapped-poll-sibling");
-      await service.getSnapshot(REPO_CWD, { includeForge: false });
+      await service.getSnapshot(REPO_CWD, {
+        includeForge: false,
+        force: true,
+        reason: "external-state-change",
+      });
       await vi.advanceTimersByTimeAsync(0);
-      await vi.waitFor(() => expect(forge.getCurrentPullRequestStatus).toHaveBeenCalledTimes(2));
+      await vi.waitFor(() =>
+        expect(forge.getCurrentPullRequestStatus).toHaveBeenCalledTimes(
+          forgeReadsAfterSnapshot + 2,
+        ),
+      );
 
       freshPoll.resolve(createCurrentPullRequestStatus({ title: "Fresh generation PR" }));
       await flushPromises();
@@ -2235,10 +2253,15 @@ describe("WorkspaceGitServiceImpl D2 read methods", () => {
 
       service.onWorkspaceStateMayHaveChanged("/tmp/unmapped-cached-snapshot-sibling");
 
-      expect(service.peekSnapshot(REPO_CWD)).toBeNull();
-      await expect(service.getSnapshot(REPO_CWD, { includeForge: false })).resolves.toMatchObject({
-        git: { baseRef: "develop" },
-      });
+      expect(service.peekSnapshot(REPO_CWD)).toMatchObject({ git: { baseRef: "main" } });
+      expect(service.isSnapshotStale(REPO_CWD)).toBe(true);
+      await expect(
+        service.getSnapshot(REPO_CWD, {
+          includeForge: false,
+          force: true,
+          reason: "external-state-change",
+        }),
+      ).resolves.toMatchObject({ git: { baseRef: "develop" } });
       expect(loadDefaultBranch).toHaveBeenCalledTimes(2);
     } finally {
       service.dispose();

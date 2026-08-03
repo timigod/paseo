@@ -77,6 +77,7 @@ describe("run create idempotency", () => {
     mocks.connectToDaemon.mockResolvedValue({
       createAgent,
       createWorkspace,
+      getLastServerInfoMessage: () => ({ status: "server_info", serverId: "daemon-1" }),
       close: vi.fn().mockResolvedValue(undefined),
     });
 

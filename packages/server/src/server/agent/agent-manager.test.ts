@@ -9223,11 +9223,14 @@ test("waits for an earlier workspace registration before checking ownership", as
     "00000000-0000-4000-8000-000000000144",
     { workspaceId },
   );
+  const laterCreationRejected = expect(laterCreation).rejects.toThrow(
+    `Workspace ${workspaceId} is being released`,
+  );
 
   heldClient.finishCreating();
 
   const rival = await rivalCreation;
-  await expect(laterCreation).rejects.toThrow(`Workspace ${workspaceId} is being released`);
+  await laterCreationRejected;
   await expect(release).resolves.toBe(false);
   expect({ released, rivalWorkspaceId: rival.workspaceId }).toEqual({
     released: false,
