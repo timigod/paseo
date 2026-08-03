@@ -20,6 +20,7 @@ import {
 import path from "node:path";
 import { WebSocket } from "ws";
 import { getOrCreateCliClientId } from "./client-id.js";
+import { boundCloseHandshake } from "./websocket-close.js";
 import { resolveCliVersion } from "../version.js";
 
 export interface ConnectOptions {
@@ -336,8 +337,8 @@ function createNodeWebSocketFactory() {
     const socket = new WebSocket(url, options?.protocols, {
       headers: options?.headers,
       ...(options?.socketPath ? { socketPath: options.socketPath } : {}),
-    }) as unknown as TerminableWebSocket;
-    return installBoundedWebSocketClose(socket);
+    });
+    return boundCloseHandshake(socket) as unknown as WebSocketLike;
   };
 }
 
