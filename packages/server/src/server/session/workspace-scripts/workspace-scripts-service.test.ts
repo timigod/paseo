@@ -83,6 +83,7 @@ interface BuildOptions {
   spawnThrows?: string;
   gitService?: Pick<WorkspaceGitService, "peekSnapshot">;
   agentAuthority?: LiveAgentAuthority;
+  onServiceRuntimeChanged?: (workspaceId: string) => Promise<void>;
 }
 
 function buildService(options: BuildOptions = {}) {
@@ -130,6 +131,7 @@ function buildService(options: BuildOptions = {}) {
         terminalId: "terminal-1",
       };
     },
+    onServiceRuntimeChanged: options.onServiceRuntimeChanged,
   });
 
   return { service, emitted, spawnCalls };
@@ -331,6 +333,15 @@ describe("stop", () => {
 });
 
 describe("start", () => {
+  test("notifies the daemon-owned service-route observer after lifecycle changes", async () => {
+    const onServiceRuntimeChanged = vi.fn(async () => {});
+    const { service } = buildService({ onServiceRuntimeChanged });
+
+    await service.start(request);
+
+    expect(onServiceRuntimeChanged).toHaveBeenCalledWith("ws-1");
+  });
+
   test("reports an error when workspace scripts are unavailable", async () => {
     const { service, emitted, spawnCalls } = buildService({ terminalManager: null });
     await service.start(request);
