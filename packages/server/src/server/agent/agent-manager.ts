@@ -2829,26 +2829,39 @@ export class AgentManager {
     agentId: string,
     updates?: { workspaceId?: string; labels?: AgentLabelPatch },
   ): Promise<boolean> {
-    return this.unarchiveSnapshotWithWorkspaceRegistration(agentId, updates);
-  }
+    type Admission = { ok: true } | { ok: false; error: unknown };
+    let settleAdmission!: (admission: Admission) => void;
+    const admission = new Promise<Admission>((resolveAdmission) => {
+      settleAdmission = resolveAdmission;
+    });
+    const transition = runAgentInteractiveTransition(agentId, async () => {
+      const admitted = await admission;
+      if (!admitted.ok) {
+        throw admitted.error;
+      }
+      return this.unarchiveSnapshotInternal(agentId, updates);
+    });
 
-  private async unarchiveSnapshotWithWorkspaceRegistration(
-    agentId: string,
-    updates?: { workspaceId?: string; labels?: AgentLabelPatch },
-  ): Promise<boolean> {
-    const registry = this.requireRegistry();
-    const record = await registry.get(agentId);
-    if (!record || !record.archivedAt) {
-      return false;
-    }
-    await validateWorkingDirectory(resolve(record.cwd));
-    return this.runWorkspaceAgentRegistration(record.workspaceId, () =>
-      this.runWorkspaceAgentRegistration(updates?.workspaceId, () =>
-        runAgentInteractiveTransition(agentId, () =>
-          this.unarchiveSnapshotInternal(agentId, updates),
-        ),
-      ),
-    );
+    return (async () => {
+      try {
+        const registry = this.requireRegistry();
+        const record = await registry.get(agentId);
+        if (!record || !record.archivedAt) {
+          settleAdmission({ ok: true });
+          return await transition;
+        }
+        await validateWorkingDirectory(resolve(record.cwd));
+        return await this.runWorkspaceAgentRegistration(record.workspaceId, () =>
+          this.runWorkspaceAgentRegistration(updates?.workspaceId, () => {
+            settleAdmission({ ok: true });
+            return transition;
+          }),
+        );
+      } catch (error) {
+        settleAdmission({ ok: false, error });
+        return await transition;
+      }
+    })();
   }
 
   private async unarchiveSnapshotInternal(

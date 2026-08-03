@@ -9951,9 +9951,12 @@ test("an earlier archived restore prevents workspace release", async () => {
     },
   });
   const laterRestore = manager.unarchiveSnapshot(agent.id);
+  const laterRestoreRejected = expect(laterRestore).rejects.toThrow(
+    `Workspace ${workspaceId} is being released`,
+  );
   client.finishNativeUnarchive();
 
-  await expect(laterRestore).rejects.toThrow(`Workspace ${workspaceId} is being released`);
+  await laterRestoreRejected;
   await expect(restore).resolves.toBe(true);
   await expect(release).resolves.toBe(false);
   expect({ released, archivedAt: (await storage.get(agent.id))?.archivedAt }).toEqual({

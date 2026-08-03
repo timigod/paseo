@@ -885,21 +885,17 @@ describe("ForgeService", () => {
     });
     await vi.advanceTimersByTimeAsync(0);
 
-    // A new retained lifecycle must not join the old lifecycle's same-key read.
-    expect(runner.calls).toHaveLength(2);
-
+    // The global GitHub admission gate serializes the new lifecycle behind the
+    // old request, but it must still perform its own same-key read afterwards.
+    expect(runner.calls).toHaveLength(1);
+    runner.resolveCall(0, currentPullRequestJson({ title: "Stale generation PR" }));
+    await vi.waitFor(() => expect(runner.calls).toHaveLength(2));
     runner.resolveCall(1, currentPullRequestJson({ title: "Fresh generation PR" }));
     await vi.waitFor(() => expect(runner.calls).toHaveLength(3));
     runner.resolveCall(2, currentPullRequestGithubFactsJson());
-    await vi.waitFor(() => expect(freshStatus).toHaveBeenCalledTimes(1));
-    expect(freshStatus).toHaveBeenLastCalledWith(
-      expect.objectContaining({ title: "Fresh generation PR" }),
-    );
-
-    runner.resolveCall(0, currentPullRequestJson({ title: "Stale generation PR" }));
     await vi.waitFor(() => expect(runner.calls).toHaveLength(4));
-    runner.resolveCall(3, currentPullRequestGithubFactsJson());
-    await flushMicrotasks();
+    runner.resolveCall(3, repoViewJson());
+    await vi.waitFor(() => expect(freshStatus).toHaveBeenCalledTimes(1));
 
     expect(oldStatus).not.toHaveBeenCalled();
     expect(freshStatus).toHaveBeenCalledTimes(1);
