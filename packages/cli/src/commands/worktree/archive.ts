@@ -106,6 +106,15 @@ export async function runArchiveCommandWithDeps(
       throw error;
     }
 
+    if (!options.cwd && !options.repoRoot && !listResponse.inventoryComplete) {
+      const error: CommandError = {
+        code: "WORKTREE_LIST_INCOMPLETE",
+        message: "Cannot safely archive from an incomplete worktree inventory",
+        details: "Retry, or use --repo-root <path> or --cwd <path> to select one repository.",
+      };
+      throw error;
+    }
+
     // Find the worktree by name or branch
     const matches = listResponse.worktrees.filter((wt) => {
       const name = path.basename(wt.worktreePath);

@@ -456,6 +456,7 @@ export async function handlePaseoWorktreeListRequest(
       type: "paseo_worktree_list_response",
       payload: {
         worktrees: [],
+        inventoryComplete: false,
         error: { code: "UNKNOWN", message: "cwd or repoRoot is required" },
         requestId,
       },
@@ -464,6 +465,7 @@ export async function handlePaseoWorktreeListRequest(
   }
 
   try {
+    let inventoryComplete = true;
     let worktrees: WorkspaceGitWorktreeInfo[];
     if (cwd) {
       worktrees = await listPaseoWorktreesCommand(
@@ -479,6 +481,7 @@ export async function handlePaseoWorktreeListRequest(
           try {
             return await dependencies.workspaceGitService.resolveRepoRoot(project.rootPath);
           } catch (error) {
+            inventoryComplete = false;
             dependencies.sessionLogger.warn(
               { err: error, projectId: project.projectId, projectRoot: project.rootPath },
               "Skipping project while listing Paseo worktrees",
@@ -502,6 +505,7 @@ export async function handlePaseoWorktreeListRequest(
               { cwd: repoRoot },
             );
           } catch (error) {
+            inventoryComplete = false;
             dependencies.sessionLogger.warn(
               { err: error, repoRoot },
               "Skipping repository while listing Paseo worktrees",
@@ -526,6 +530,7 @@ export async function handlePaseoWorktreeListRequest(
           branchName: entry.branchName ?? null,
           head: entry.head ?? null,
         })),
+        inventoryComplete,
         error: null,
         requestId,
       },
@@ -535,6 +540,7 @@ export async function handlePaseoWorktreeListRequest(
       type: "paseo_worktree_list_response",
       payload: {
         worktrees: [],
+        inventoryComplete: false,
         error: toCheckoutError(error),
         requestId,
       },

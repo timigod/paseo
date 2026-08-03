@@ -4767,6 +4767,8 @@ export const PaseoWorktreeListResponseSchema = z.object({
   type: z.literal("paseo_worktree_list_response"),
   payload: z.object({
     worktrees: z.array(PaseoWorktreeSchema),
+    // COMPAT(worktreeInventoryComplete): added in v0.2.6, remove optional after 2027-02-03.
+    inventoryComplete: z.boolean().optional().default(false),
     error: CheckoutErrorSchema.nullable(),
     requestId: z.string(),
   }),

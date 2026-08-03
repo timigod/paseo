@@ -13,6 +13,7 @@ function createFakeDaemonClient(
   return {
     getPaseoWorktreeList: async () => ({
       worktrees: [],
+      inventoryComplete: true,
       error: null,
       requestId: "req-list",
     }),
@@ -80,6 +81,7 @@ describe("runArchiveCommand", () => {
             createdAt: "2026-04-12T00:00:00.000Z",
           },
         ],
+        inventoryComplete: true,
         error: null,
         requestId: "req-list",
       }),
@@ -219,6 +221,7 @@ describe("runArchiveCommand", () => {
             createdAt: "2026-04-12T00:00:00.000Z",
           },
         ],
+        inventoryComplete: true,
         error: null,
         requestId: "req-list",
       }),
@@ -262,6 +265,7 @@ describe("runArchiveCommand", () => {
             createdAt: "2026-04-12T00:00:00.000Z",
           },
         ],
+        inventoryComplete: true,
         error: null,
         requestId: "req-list",
       }),
@@ -287,6 +291,45 @@ describe("runArchiveCommand", () => {
     expect(archiveCalls).toEqual([]);
   });
 
+  it("refuses a sole visible match when another repository inventory failed", async () => {
+    const visiblePath = "/tmp/paseo-home/worktrees/repo-a/shared";
+    const archiveCalls: Array<Parameters<DaemonClient["archivePaseoWorktree"]>[0]> = [];
+    const fakeClient = createFakeDaemonClient({
+      getPaseoWorktreeList: async () => ({
+        worktrees: [
+          {
+            worktreePath: visiblePath,
+            branchName: "shared",
+            head: "abc123",
+            createdAt: "2026-04-12T00:00:00.000Z",
+          },
+        ],
+        inventoryComplete: false,
+        error: null,
+        requestId: "req-list",
+      }),
+      archivePaseoWorktree: async (input) => {
+        archiveCalls.push(input);
+        return {
+          success: true,
+          removedAgents: [],
+          error: null,
+          requestId: "req-archive",
+        };
+      },
+    });
+
+    await expect(
+      runArchiveCommandWithDeps("shared", testOptions, {
+        connectToDaemon: async () => fakeClient,
+      }),
+    ).rejects.toMatchObject({
+      code: "WORKTREE_LIST_INCOMPLETE",
+      details: expect.stringContaining("--repo-root"),
+    });
+    expect(archiveCalls).toEqual([]);
+  });
+
   it.each([
     ["cwd", { cwd: "/repos/repo-a" }],
     ["repoRoot", { repoRoot: "/repos/repo-a" }],
@@ -306,6 +349,7 @@ describe("runArchiveCommand", () => {
               createdAt: "2026-04-12T00:00:00.000Z",
             },
           ],
+          inventoryComplete: true,
           error: null,
           requestId: "req-list",
         };
@@ -343,6 +387,7 @@ describe("runArchiveCommand", () => {
     const fakeClient = createFakeDaemonClient({
       getPaseoWorktreeList: async () => ({
         worktrees: [],
+        inventoryComplete: true,
         error: null,
         requestId: "req-list",
       }),
