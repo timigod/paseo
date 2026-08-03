@@ -1,4 +1,4 @@
-import { describe, expect, test } from "vitest";
+import { describe, expect, test, vi } from "vitest";
 
 import { createTestLogger } from "../../../test-utils/test-logger.js";
 import { OpenCodeAgentClient } from "./opencode-agent.js";
@@ -98,9 +98,7 @@ describe("OpenCodeAgentSession slash command timeout handling", () => {
     const session = await client.createSession({ provider: "opencode", cwd: "/tmp" });
 
     const runPromise = session.run("/help");
-    await nextTick();
-    await nextTick();
-    expect(openCodeClient.calls.sessionCommand).toHaveLength(1);
+    await vi.waitFor(() => expect(openCodeClient.calls.sessionCommand).toHaveLength(1));
     idleEventGate.resolve();
 
     await expect(runPromise).resolves.toMatchObject({

@@ -955,6 +955,138 @@ describe("OpenCodeAgentClient adapter smoke tests", () => {
     await buildSession.close();
     rmSync(cwd, { recursive: true, force: true });
   }, 180_000);
+
+  test.each([
+    {
+      label: "idle",
+      staleTerminal: (sessionId: string) => ({
+        type: "session.idle",
+        properties: { sessionID: sessionId },
+      }),
+    },
+    {
+      label: "error",
+      staleTerminal: (sessionId: string) => ({
+        type: "session.error",
+        properties: {
+          sessionID: sessionId,
+          error: { name: "UnknownError", data: { message: "stale failure" } },
+        },
+      }),
+    },
+  ])(
+    "rejects a queued pre-dispatch $label processed after dispatch and preserves the next continuation",
+    async ({ label, staleTerminal }) => {
+      const sessionId = `ses_pre_dispatch_${label}`;
+      const blockerSessionId = `${sessionId}_blocker`;
+      const drainSessionId = `${sessionId}_drain`;
+      const commandListRequested = createTestDeferred<void>();
+      const releaseCommandList = createTestDeferred<void>();
+      const childHydrationStarted = createTestDeferred<void>();
+      const releaseChildHydration = createTestDeferred<void>();
+      const streamDrained = createTestDeferred<void>();
+      const { parent, openCode } = await createParentSession(sessionId, (client) => {
+        client.echoPromptUserMessage = false;
+        client.commandListImplementation = async () => {
+          commandListRequested.resolve();
+          await releaseCommandList.promise;
+          return { data: [{ name: "review", description: "Review", source: "command" }] };
+        };
+        client.sessionCommandEvents = [];
+        client.sessionChildrenImplementation = async () => {
+          childHydrationStarted.resolve();
+          await releaseChildHydration.promise;
+          return { data: [] };
+        };
+      });
+      const events: AgentStreamEvent[] = [];
+      const unsubscribe = parent.subscribe((event) => {
+        events.push(event);
+        if (
+          event.type === "provider_subagent" &&
+          event.event.type === "upsert" &&
+          event.event.id === drainSessionId
+        ) {
+          streamDrained.resolve();
+        }
+      });
+      const terminalEvents = () =>
+        events.filter(
+          (event) =>
+            event.type === "turn_completed" ||
+            event.type === "turn_failed" ||
+            event.type === "turn_canceled",
+        );
+
+      try {
+        // Block stream processing on child hydration. Raw events continue to
+        // receive monotonically increasing revisions while their processing is queued.
+        openCode.emitEvent({
+          type: "message.updated",
+          properties: {
+            info: { id: "msg_blocker", sessionID: blockerSessionId, role: "assistant" },
+          },
+        });
+        await childHydrationStarted.promise;
+
+        const firstTurn = parent.startTurn("/review");
+        await commandListRequested.promise;
+        openCode.emitEvent(staleTerminal(sessionId));
+        // Let the stream dequeue and stamp the stale terminal while command
+        // discovery still holds the foreground submission before dispatch.
+        await new Promise<void>((resolve) => setImmediate(resolve));
+
+        releaseCommandList.resolve();
+        await expect(firstTurn).resolves.toEqual({ turnId: "opencode-turn-0" });
+        await vi.waitFor(() => expect(openCode.calls.sessionCommand).toHaveLength(1));
+
+        releaseChildHydration.resolve();
+        openCode.emitEvent({
+          type: "session.created",
+          properties: {
+            info: {
+              id: drainSessionId,
+              parentID: sessionId,
+              title: "Stale terminal drain marker",
+              directory: "/workspace/repo",
+            },
+          },
+        });
+        await streamDrained.promise;
+
+        expect(terminalEvents()).toEqual([]);
+        await expect(parent.startTurn("must still be busy")).rejects.toThrow(
+          "A foreground turn is already active",
+        );
+
+        openCode.emitEvent({ type: "session.idle", properties: { sessionID: sessionId } });
+        await vi.waitFor(() => {
+          expect(terminalEvents()).toEqual([
+            expect.objectContaining({ type: "turn_completed", turnId: "opencode-turn-0" }),
+          ]);
+        });
+
+        openCode.echoPromptUserMessage = true;
+        openCode.sessionPromptAsyncEvents = [
+          { type: "session.idle", properties: { sessionID: sessionId } },
+        ];
+        await expect(parent.startTurn("replacement continuation")).resolves.toEqual({
+          turnId: "opencode-turn-1",
+        });
+        await vi.waitFor(() => {
+          expect(terminalEvents()).toEqual([
+            expect.objectContaining({ type: "turn_completed", turnId: "opencode-turn-0" }),
+            expect.objectContaining({ type: "turn_completed", turnId: "opencode-turn-1" }),
+          ]);
+        });
+      } finally {
+        releaseCommandList.resolve();
+        releaseChildHydration.resolve();
+        unsubscribe();
+        await parent.close();
+      }
+    },
+  );
 });
 
 describe("OpenCode adapter context-window normalization", () => {
@@ -1372,7 +1504,20 @@ describe("OpenCode adapter startTurn error handling", () => {
         }),
       },
       session: {
-        promptAsync: vi.fn().mockImplementation(async () => {
+        promptAsync: vi.fn().mockImplementation(async (parameters: { messageID: string }) => {
+          globalEvents.splice(1, 0, {
+            directory: "/tmp/test",
+            payload: {
+              type: "message.updated",
+              properties: {
+                info: {
+                  id: parameters.messageID,
+                  sessionID: "ses_unit_test",
+                  role: "user",
+                },
+              },
+            },
+          });
           eventsGate.resolve();
           return { data: {}, error: undefined };
         }),
@@ -1391,9 +1536,11 @@ describe("OpenCode adapter startTurn error handling", () => {
     expect(turn.events.map((event) => event.type)).toEqual([
       "turn_started",
       "timeline",
+      "timeline",
       "turn_completed",
     ]);
     expect(turn.events.map((event) => ("turnId" in event ? event.turnId : undefined))).toEqual([
+      "opencode-turn-0",
       "opencode-turn-0",
       "opencode-turn-0",
       "opencode-turn-0",
@@ -1482,7 +1629,20 @@ describe("OpenCode adapter startTurn error handling", () => {
         }),
       },
       session: {
-        promptAsync: vi.fn().mockImplementation(async () => {
+        promptAsync: vi.fn().mockImplementation(async (parameters: { messageID: string }) => {
+          globalEvents.splice(2, 0, {
+            directory: "/tmp/test",
+            payload: {
+              type: "message.updated",
+              properties: {
+                info: {
+                  id: parameters.messageID,
+                  sessionID: "ses_unit_test",
+                  role: "user",
+                },
+              },
+            },
+          });
           eventsGate.resolve();
           return { data: {}, error: undefined };
         }),
@@ -2848,6 +3008,8 @@ describe("OpenCode provider subagent contract", () => {
       { provider: "opencode", cwd: "/workspace/repo" },
       { env: { PASEO_AGENT_ID: "parent-agent" } },
     );
+    const parentEvents: AgentStreamEvent[] = [];
+    parent.subscribe((event) => parentEvents.push(event));
 
     parentClient.emitEvent({
       type: "session.created",
@@ -2859,8 +3021,18 @@ describe("OpenCode provider subagent contract", () => {
         },
       },
     });
-    await Promise.resolve();
-    await Promise.resolve();
+    await vi.waitFor(() => {
+      expect(parentEvents).toContainEqual({
+        type: "provider_subagent",
+        provider: "opencode",
+        event: {
+          type: "upsert",
+          id: "ses_child_external",
+          title: "Externally driven child",
+          status: "running",
+        },
+      });
+    });
 
     const child = await client.resumeSession(
       {
@@ -2930,8 +3102,18 @@ describe("OpenCode provider subagent contract", () => {
         },
       },
     });
-    await Promise.resolve();
-    await Promise.resolve();
+    await vi.waitFor(() => {
+      expect(events).toContainEqual({
+        type: "provider_subagent",
+        provider: "opencode",
+        event: {
+          type: "upsert",
+          id: "ses_child_registry",
+          title: "Live child",
+          status: "running",
+        },
+      });
+    });
 
     const child = await client.resumeSession(
       {
@@ -3580,6 +3762,13 @@ describe("OpenCode provider subagent contract", () => {
 
     releaseChildEvent.resolve();
     await childConsumed.promise;
+    await vi.waitFor(() => {
+      expect(events.at(-1)).toEqual({
+        type: "provider_subagent",
+        provider: "opencode",
+        event: { type: "upsert", id: "ses_child_background", status: "completed" },
+      });
+    });
     await session.close();
 
     expect(events).toContainEqual({

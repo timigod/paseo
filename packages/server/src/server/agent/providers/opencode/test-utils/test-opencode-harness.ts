@@ -136,6 +136,8 @@ export class TestOpenCodeClient {
     | null = null;
   commandListResponse: OpenCodeResponse = { data: [] };
   commandListImplementation: ((parameters: unknown) => Promise<OpenCodeResponse>) | null = null;
+  /** Mirrors real OpenCode: promptAsync publishes the persisted user message. */
+  echoPromptUserMessage = true;
   eventStream: AsyncIterable<unknown>;
   experimentalSessionListResponse: OpenCodeResponse = { data: [] };
   mcpAddResponse: OpenCodeResponse = {};
@@ -298,6 +300,20 @@ export class TestOpenCodeClient {
         },
         promptAsync: async (parameters: unknown) => {
           this.calls.sessionPromptAsync.push(parameters);
+          // Real OpenCode persists the prompt's user message under the
+          // messageID the daemon supplied and publishes it before any other
+          // turn activity. The adapter relies on that echo to attribute the
+          // turn's submission, so the harness models it.
+          const { sessionID, messageID } = parameters as {
+            sessionID?: string;
+            messageID?: string;
+          };
+          if (this.echoPromptUserMessage && sessionID && messageID) {
+            this.emitEvent({
+              type: "message.updated",
+              properties: { info: { id: messageID, sessionID, role: "user" } },
+            });
+          }
           for (const event of this.sessionPromptAsyncEvents) {
             this.emitEvent(event);
           }
