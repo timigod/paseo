@@ -127,6 +127,46 @@ describe("ProviderSnapshotManager public surface", () => {
     }
   });
 
+  test("observational and provider-scoped reads leave unrelated providers cold", async () => {
+    const cwd = "/tmp/project";
+    const fetchClaudeCatalog = vi.fn(async () => ({
+      models: [] as AgentModelDefinition[],
+      modes: [] as AgentMode[],
+    }));
+    const isOpenCodeAvailable = vi.fn(async () => true);
+    const fetchOpenCodeCatalog = vi.fn(async () => ({
+      models: [] as AgentModelDefinition[],
+      modes: [] as AgentMode[],
+    }));
+    const manager = new ProviderSnapshotManager({
+      logger: createTestLogger(),
+      extraClients: {
+        claude: createExtraClient("claude", {
+          isAvailable: async () => true,
+          fetchCatalog: fetchClaudeCatalog,
+        }),
+        opencode: createExtraClient("opencode", {
+          isAvailable: isOpenCodeAvailable,
+          fetchCatalog: fetchOpenCodeCatalog,
+        }),
+      },
+    });
+
+    try {
+      expect(manager.getSnapshot(cwd).find((entry) => entry.provider === "opencode")?.status).toBe(
+        "loading",
+      );
+      await manager.listProviders({ cwd, wait: false });
+      await manager.listProviders({ cwd, providers: ["claude"], wait: true });
+
+      expect(fetchClaudeCatalog).toHaveBeenCalledTimes(1);
+      expect(isOpenCodeAvailable).not.toHaveBeenCalled();
+      expect(fetchOpenCodeCatalog).not.toHaveBeenCalled();
+    } finally {
+      manager.destroy();
+    }
+  });
+
   test("providerOverrides with enabled:false marks the provider as unavailable without probing", async () => {
     const isAvailable = vi.fn(async () => true);
     const fetchCatalog = vi.fn(async () => ({
@@ -843,6 +883,78 @@ describe("ProviderSnapshotManager public surface", () => {
           availableModes: childModes,
         },
       ]);
+    } finally {
+      manager.destroy();
+    }
+  });
+
+  test("explicit create does not wait for provider mode discovery", async () => {
+    let releaseCatalog!: (catalog: { models: AgentModelDefinition[]; modes: AgentMode[] }) => void;
+    const fetchCatalog = vi.fn(
+      () =>
+        new Promise<{ models: AgentModelDefinition[]; modes: AgentMode[] }>((resolveCatalog) => {
+          releaseCatalog = resolveCatalog;
+        }),
+    );
+    const manager = new ProviderSnapshotManager({
+      logger: createTestLogger(),
+      extraClients: {
+        opencode: createExtraClient("opencode", {
+          isAvailable: async () => true,
+          fetchCatalog,
+        }),
+      },
+    });
+
+    try {
+      await expect(
+        manager.resolveCreateConfig({
+          cwd: "/tmp/project",
+          provider: "opencode",
+          requestedMode: "base",
+          featureValues: undefined,
+          parent: null,
+          unattended: false,
+        }),
+      ).resolves.toMatchObject({ modeId: "base" });
+      expect(fetchCatalog).toHaveBeenCalledTimes(1);
+      releaseCatalog({ models: [], modes: [{ id: "base", label: "Base" }] });
+      await manager.listProviders({ cwd: "/tmp/project", providers: ["opencode"], wait: true });
+    } finally {
+      manager.destroy();
+    }
+  });
+
+  test("explicit create still validates against a ready mode catalog", async () => {
+    const manager = new ProviderSnapshotManager({
+      logger: createTestLogger(),
+      extraClients: {
+        opencode: createExtraClient("opencode", {
+          isAvailable: async () => true,
+          fetchCatalog: async () => ({
+            models: [] as AgentModelDefinition[],
+            modes: [{ id: "base", label: "Base" }],
+          }),
+        }),
+      },
+    });
+
+    try {
+      await manager.listProviders({
+        cwd: "/tmp/project",
+        providers: ["opencode"],
+        wait: true,
+      });
+      await expect(
+        manager.resolveCreateConfig({
+          cwd: "/tmp/project",
+          provider: "opencode",
+          requestedMode: "not-a-mode",
+          featureValues: undefined,
+          parent: null,
+          unattended: false,
+        }),
+      ).rejects.toThrow("Invalid mode 'not-a-mode'");
     } finally {
       manager.destroy();
     }

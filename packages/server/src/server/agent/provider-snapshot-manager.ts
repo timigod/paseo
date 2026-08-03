@@ -347,21 +347,53 @@ export class ProviderSnapshotManager {
   async resolveCreateConfig(
     input: ResolveProviderCreateConfigOptions,
   ): Promise<ResolvedProviderCreateConfig> {
-    const entry = await this.getReadyProvider({
-      cwd: input.cwd,
-      provider: input.provider,
-      wait: true,
-    });
     const definition = this.requireProvider(input.provider);
     const parent = input.parent ? this.resolveParent(input.parent) : null;
+    const availableModes = await this.resolveCreateAvailableModes(input, parent);
     return definition.resolveCreateConfig({
       provider: input.provider,
       requestedMode: input.requestedMode,
       featureValues: input.featureValues,
       parent,
       unattended: input.unattended || parent?.isUnattended === true,
-      availableModes: entry.modes ?? [],
+      availableModes,
     });
+  }
+
+  private async resolveCreateAvailableModes(
+    input: ResolveProviderCreateConfigOptions,
+    parent: AgentCreateConfigParent | null,
+  ): Promise<AgentMode[] | undefined> {
+    const needsModeCatalog =
+      input.requestedMode === undefined && (parent !== null || input.unattended);
+    if (needsModeCatalog) {
+      const entry = await this.getReadyProvider({
+        cwd: input.cwd,
+        provider: input.provider,
+        wait: true,
+      });
+      return entry.modes ?? [];
+    }
+
+    const definition = this.requireProvider(input.provider);
+    if (!definition.enabled) {
+      throw new Error(`Provider '${input.provider}' is disabled`);
+    }
+
+    const target = resolveProviderSnapshotTarget(input.cwd);
+    const entry = this.snapshots.get(target.snapshotCwd)?.get(input.provider);
+    if (entry?.status === "ready") {
+      return entry.modes ?? [];
+    }
+    if (entry?.status === "unavailable") {
+      throw new Error(`Provider '${entry.provider}' is not available`);
+    }
+
+    const providersToWarm = this.resolveProvidersToWarm(target.snapshotCwd, [input.provider]);
+    if (providersToWarm.length > 0) {
+      void this.warmUp(target, providersToWarm);
+    }
+    return undefined;
   }
 
   async getProviderDiagnostic(provider: AgentProvider): Promise<ProviderDiagnosticResult> {
@@ -483,10 +515,6 @@ export class ProviderSnapshotManager {
   }
 
   private getSnapshotForTarget(target: ProviderSnapshotTarget): ProviderSnapshotEntry[] {
-    const providersToWarm = this.resolveProvidersToWarm(target.snapshotCwd);
-    if (providersToWarm.length > 0) {
-      void this.warmUp(target, providersToWarm);
-    }
     return entriesToArray(this.getOrCreateSnapshot(target.snapshotCwd));
   }
 
@@ -574,7 +602,7 @@ export class ProviderSnapshotManager {
       const definition = this.providerRegistry[provider];
       entries.set(provider, {
         provider,
-        status: "loading",
+        status: definition?.enabled === false ? "unavailable" : "loading",
         enabled: definition?.enabled ?? true,
         source: this.getProviderSource(provider),
         label: definition?.label,

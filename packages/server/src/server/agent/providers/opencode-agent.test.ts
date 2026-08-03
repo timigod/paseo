@@ -1079,6 +1079,13 @@ describe("OpenCode adapter startTurn error handling", () => {
   test("dynamically adds injected MCP servers without config-backed connect", async () => {
     const runtime = new TestOpenCodeHarness();
     const openCodeClient = new TestOpenCodeClient();
+    openCodeClient.sessionPromptAsyncEvents = [
+      {
+        type: "session.status",
+        properties: { sessionID: "session-1", status: { type: "busy" } },
+      },
+      { type: "session.idle", properties: { sessionID: "session-1" } },
+    ];
     runtime.enqueueClient(openCodeClient);
     const cwd = tmpCwd();
     const client = new OpenCodeAgentClient(createTestLogger(), undefined, {
@@ -1898,6 +1905,38 @@ describe("OpenCode adapter startTurn error handling", () => {
     expect(failed?.type).toBe("turn_failed");
     if (failed?.type === "turn_failed") {
       expect(failed.error).toContain("boom: synchronous throw");
+    }
+  });
+
+  test("ignores a stale idle event before a continuation starts running", async () => {
+    const { parent: session, openCode } = await createParentSession("ses_continuation");
+    openCode.sessionPromptAsyncEvents = [];
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+    const emitStatus = (type: "busy" | "idle") => {
+      openCode.emitEvent({
+        type: "session.status",
+        properties: { sessionID: "ses_continuation", status: { type } },
+      });
+    };
+    const completedCount = () => events.filter((event) => event.type === "turn_completed").length;
+
+    try {
+      await session.startTurn("first");
+      emitStatus("busy");
+      emitStatus("idle");
+      await vi.waitFor(() => expect(completedCount()).toBe(1));
+
+      await session.startTurn("second");
+      emitStatus("idle");
+      await new Promise<void>((resolveImmediate) => setImmediate(resolveImmediate));
+      expect(completedCount()).toBe(1);
+
+      emitStatus("busy");
+      emitStatus("idle");
+      await vi.waitFor(() => expect(completedCount()).toBe(2));
+    } finally {
+      await session.close();
     }
   });
 
