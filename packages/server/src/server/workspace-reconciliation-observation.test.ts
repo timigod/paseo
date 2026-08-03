@@ -2,7 +2,20 @@ import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type { ProjectCheckoutLitePayload } from "@getpaseo/protocol/messages";
-import { afterEach, describe, expect, test } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
+
+const nodeFsMocks = vi.hoisted(() => ({
+  watch: vi.fn(() => {
+    const watcher = { close: vi.fn(), on: vi.fn() };
+    watcher.on.mockReturnValue(watcher);
+    return watcher;
+  }),
+}));
+
+vi.mock("node:fs", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs")>();
+  return { ...actual, watch: nodeFsMocks.watch };
+});
 
 import { createTestLogger } from "../test-utils/test-logger.js";
 import { areEquivalentPaths } from "../utils/path.js";
@@ -29,6 +42,7 @@ const cleanupPaths: string[] = [];
 
 afterEach(() => {
   for (const target of cleanupPaths.splice(0)) rmSync(target, { recursive: true, force: true });
+  nodeFsMocks.watch.mockClear();
 });
 
 interface ProjectSpec {
@@ -37,6 +51,11 @@ interface ProjectSpec {
   kind?: PersistedProjectRecord["kind"];
   workspaces?: Array<{ id: string; cwd: string }>;
   archived?: boolean;
+}
+
+interface ObservationOptions {
+  platform?: NodeJS.Platform;
+  injectWatchProjectRoot?: boolean;
 }
 
 interface Gate {
@@ -178,7 +197,10 @@ class ObservedPlacements {
   private started = false;
   private checkoutReadCount = 0;
 
-  constructor(private readonly specs: ProjectSpec[]) {
+  constructor(
+    private readonly specs: ProjectSpec[],
+    options: ObservationOptions = {},
+  ) {
     cleanupPaths.push(this.home);
     const logger = createTestLogger();
     this.projects = new ObservedProjectRegistry(path.join(this.home, "projects.json"), logger);
@@ -199,7 +221,8 @@ class ObservedPlacements {
       workspaceRegistry: this.workspaces,
       workspaceGitService: { getCheckout: async (cwd) => this.readCheckout(cwd) },
       logger,
-      watchProjectRoot,
+      platform: options.platform ?? "darwin",
+      ...(options.injectWatchProjectRoot === false ? {} : { watchProjectRoot }),
       clock: this.clock,
       debounceMs: DEBOUNCE_MS,
       rescanIntervalMs: RESCAN_INTERVAL_MS,
@@ -400,6 +423,71 @@ class ObservedPlacements {
 }
 
 describe("observed workspace placement", () => {
+  test("skips default root watches on darwin while registry and periodic reconciliation remain active", async () => {
+    const observed = new ObservedPlacements(
+      [
+        {
+          id: "project-one",
+          root: "repo",
+          kind: "git",
+          workspaces: [{ id: "workspace-one", cwd: "repo" }],
+        },
+      ],
+      { platform: "darwin", injectWatchProjectRoot: false },
+    );
+
+    await observed.start();
+
+    expect(nodeFsMocks.watch).not.toHaveBeenCalled();
+    expect(observed.pendingTimers).toBe(1);
+
+    await observed.add({ id: "project-added", root: "added" });
+    expect(observed.projectUpdates).toContainEqual({
+      kind: "upsert",
+      project: expect.objectContaining({ projectId: "project-added" }),
+    });
+
+    await observed.advanceBy(RESCAN_INTERVAL_MS);
+
+    expect(nodeFsMocks.watch).not.toHaveBeenCalled();
+    expect(await observed.placement("workspace-one")).toMatchObject({
+      kind: "local_checkout",
+      branch: "main",
+    });
+    observed.dispose();
+  });
+
+  test("enables an explicitly injected root watcher on darwin", async () => {
+    const observed = new ObservedPlacements([{ id: "project-one", root: "repo", kind: "git" }]);
+
+    await observed.start();
+
+    expect(nodeFsMocks.watch).not.toHaveBeenCalled();
+    expect(observed.watchedRoots()).toEqual(["repo"]);
+
+    observed.change("repo", ".git");
+    await observed.advanceBy(DEBOUNCE_MS);
+    expect(observed.gitReads).toBe(1);
+    observed.dispose();
+  });
+
+  test("keeps the default root watcher enabled off darwin", async () => {
+    const observed = new ObservedPlacements([{ id: "project-one", root: "repo", kind: "git" }], {
+      platform: "linux",
+      injectWatchProjectRoot: false,
+    });
+
+    await observed.start();
+
+    expect(nodeFsMocks.watch).toHaveBeenCalledTimes(1);
+    expect(nodeFsMocks.watch).toHaveBeenCalledWith(
+      expect.stringContaining("repo"),
+      { recursive: false },
+      expect.any(Function),
+    );
+    observed.dispose();
+  });
+
   test("publishes a new non-Git project without attempting an optional root watch", async () => {
     const observed = new ObservedPlacements([]);
     await observed.start();

@@ -94,6 +94,7 @@ export interface WorkspaceReconciliationServiceOptions {
   onWorkspaceArchived?: (workspaceId: string) => void | Promise<void>;
   onWorkspacesChanged?: (workspaceIds: string[]) => Promise<void>;
   watchProjectRoot?: ProjectRootWatch;
+  platform?: NodeJS.Platform;
   clock?: ReconciliationClock;
   rescanIntervalMs?: number;
   debounceMs?: number;
@@ -124,7 +125,7 @@ export class WorkspaceReconciliationService {
   private readonly onProjectUpdate: ((update: ProjectUpdate) => void) | null;
   private readonly onWorkspaceArchived: ((workspaceId: string) => void | Promise<void>) | null;
   private readonly onWorkspacesChanged: ((workspaceIds: string[]) => Promise<void>) | null;
-  private readonly watchProjectRoot: ProjectRootWatch;
+  private readonly watchProjectRoot: ProjectRootWatch | null;
   private readonly clock: ReconciliationClock;
   private readonly rescanIntervalMs: number;
   private readonly debounceMs: number;
@@ -147,7 +148,9 @@ export class WorkspaceReconciliationService {
     this.onProjectUpdate = options.onProjectUpdate ?? null;
     this.onWorkspaceArchived = options.onWorkspaceArchived ?? null;
     this.onWorkspacesChanged = options.onWorkspacesChanged ?? null;
-    this.watchProjectRoot = options.watchProjectRoot ?? watchProjectRoot;
+    this.watchProjectRoot =
+      options.watchProjectRoot ??
+      ((options.platform ?? process.platform) === "darwin" ? null : watchProjectRoot);
     this.clock = options.clock ?? systemClock;
     this.rescanIntervalMs = options.rescanIntervalMs ?? DEFAULT_RESCAN_INTERVAL_MS;
     this.debounceMs = options.debounceMs ?? DEFAULT_DEBOUNCE_MS;
@@ -418,7 +421,7 @@ export class WorkspaceReconciliationService {
   }
 
   private async syncProjectRootWatches(): Promise<void> {
-    if (this.disposed) return;
+    if (this.disposed || !this.watchProjectRoot) return;
     const projects = await this.projectRegistry.list();
     if (this.disposed) return;
     const observedProjects = projects.filter(
