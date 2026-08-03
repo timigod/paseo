@@ -1353,7 +1353,13 @@ describe("archiveByScope", () => {
     const workspaceA = "ws-worktree-a";
     const workspaceB = "ws-worktree-b";
     const workspaceC = "ws-worktree-subdirectory";
+    const unrelatedWorkspace = "ws-unrelated-legacy-worktree";
     const subdirectory = path.join(worktree.worktreePath, nestedRelative);
+    const unrelatedWorktree = await createPaseoOwnedWorktree(
+      repoDir,
+      paseoHome,
+      "unrelated-legacy-worktree",
+    );
 
     const result = await archiveAsCoordinator(
       createArchiveDeps({
@@ -1380,6 +1386,11 @@ describe("archiveByScope", () => {
             worktreeRoot: worktree.worktreePath,
             isPaseoOwnedWorktree: true,
           },
+          {
+            workspaceId: unrelatedWorkspace,
+            cwd: unrelatedWorktree.worktreePath,
+            kind: "worktree",
+          },
         ],
       }),
       {
@@ -1393,8 +1404,10 @@ describe("archiveByScope", () => {
       expect.arrayContaining([workspaceA, workspaceB, workspaceC]),
     );
     expect(result.archivedWorkspaceIds).toHaveLength(3);
+    expect(result.archivedWorkspaceIds).not.toContain(unrelatedWorkspace);
     expect(result.removedDirectory).toBe(true);
     expect(existsSync(worktree.worktreePath)).toBe(false);
+    expect(existsSync(unrelatedWorktree.worktreePath)).toBe(true);
     expect(readFileSync(path.join(repoDir, "root-scope-teardown.log"), "utf8")).toBe("ok");
     expect(readFileSync(path.join(repoDir, "nested-scope-teardown.log"), "utf8")).toBe("ok");
   });

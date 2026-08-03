@@ -41,7 +41,7 @@ import type {
   PersistedWorkspaceRecord,
   WorkspaceRegistry,
 } from "./workspace-registry.js";
-import { createRealpathAwarePathMatcher } from "../utils/path.js";
+import { createRealpathAwarePathMatcher, isRealpathInsideRoot } from "../utils/path.js";
 import {
   defaultWorkspaceLifecycleCoordinator,
   type WorkspaceLifecycleCoordinator,
@@ -772,14 +772,19 @@ async function resolveWorktreeArchiveTarget(
 ): Promise<ArchiveTarget> {
   const backing = await resolveBackingDirectory(targetPath, dependencies);
   const matchesBackingDirectory = createRealpathAwarePathMatcher(backing.path);
-  const targetWorkspaces = (
-    await Promise.all(
-      activeWorkspaces.map(async (workspace) => {
-        const backingDirectory = await resolveWorkspaceBackingDirectory(workspace, dependencies);
-        return matchesBackingDirectory(backingDirectory.path) ? workspace : null;
-      }),
-    )
-  ).filter((workspace): workspace is ActiveWorkspaceRef => workspace !== null);
+  // A worktree archive owns only workspaces rooted at (or nested beneath) the
+  // resolved backing directory. Filter by that durable path relationship
+  // before doing any legacy ownership discovery. Historical workspace records
+  // may lack worktreeRoot/mainRepoRoot; resolving every unrelated record runs
+  // a Git common-dir probe per record and can turn one archive into hundreds of
+  // commands before the already-known target is touched.
+  const targetWorkspaces = activeWorkspaces.filter(
+    (workspace) =>
+      (workspace.worktreeRoot !== null &&
+        workspace.worktreeRoot !== undefined &&
+        matchesBackingDirectory(workspace.worktreeRoot)) ||
+      isRealpathInsideRoot(backing.path, workspace.cwd),
+  );
   const pendingRecords = (await dependencies.workspaceRegistry?.list())?.filter(
     (workspace) =>
       workspace.cleanupPending !== null &&
