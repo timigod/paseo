@@ -3018,13 +3018,24 @@ export class Session {
     handle: AgentPersistenceHandle,
   ): Promise<StoredAgentRecord | null> {
     const records = await this.agentStorage.list();
-    return (
-      records.find(
+    return records
+      .filter(
         (record) =>
           record.persistence?.provider === handle.provider &&
           record.persistence?.sessionId === handle.sessionId,
-      ) ?? null
-    );
+      )
+      .reduce<StoredAgentRecord | null>((latest, candidate) => {
+        if (!latest) {
+          return candidate;
+        }
+        const updatedDelta =
+          Date.parse(resolveStoredAgentPayloadUpdatedAt(candidate)) -
+          Date.parse(resolveStoredAgentPayloadUpdatedAt(latest));
+        if (updatedDelta !== 0) {
+          return updatedDelta > 0 ? candidate : latest;
+        }
+        return Date.parse(candidate.createdAt) > Date.parse(latest.createdAt) ? candidate : latest;
+      }, null);
   }
 
   private async restoreArchivedAgentAfterResumeFailure(record: StoredAgentRecord): Promise<void> {
@@ -4304,23 +4315,29 @@ export class Session {
     let archivedRecordToRestore: StoredAgentRecord | null = null;
     try {
       const storedRecord = await this.findAgentRecordByHandle(handle);
-      if (storedRecord?.archivedAt) {
-        const unarchived = await unarchiveAgentState(
-          this.agentStorage,
-          this.agentManager,
-          storedRecord.id,
-        );
-        if (unarchived) {
-          archivedRecordToRestore = storedRecord;
-        }
-      }
-      const snapshot = await this.agentManager.resumeAgentFromPersistence(
-        handle,
-        storedRecord ? { ...buildConfigOverrides(storedRecord), ...overrides } : overrides,
-        storedRecord?.id,
-        storedRecord ? extractTimestamps(storedRecord) : undefined,
+      const snapshot = await this.agentManager.runWorkspaceAgentRegistration(
+        storedRecord?.workspaceId,
+        async () => {
+          if (storedRecord?.archivedAt) {
+            const unarchived = await unarchiveAgentState(
+              this.agentStorage,
+              this.agentManager,
+              storedRecord.id,
+            );
+            if (unarchived) {
+              archivedRecordToRestore = storedRecord;
+            }
+          }
+          const resumed = await this.agentManager.resumeAgentFromPersistence(
+            handle,
+            storedRecord ? { ...buildConfigOverrides(storedRecord), ...overrides } : overrides,
+            storedRecord?.id,
+            storedRecord ? extractTimestamps(storedRecord) : undefined,
+          );
+          await unarchiveAgentState(this.agentStorage, this.agentManager, resumed.id);
+          return resumed;
+        },
       );
-      await unarchiveAgentState(this.agentStorage, this.agentManager, snapshot.id);
       await this.agentManager.hydrateTimelineFromProvider(snapshot.id);
       await this.agentUpdates.forwardLiveAgent(snapshot);
       const timelineSize = this.agentManager.getTimeline(snapshot.id).length;
