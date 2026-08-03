@@ -7045,6 +7045,187 @@ test("emitWorkspaceUpdatesForWorkspaceIds includes archiving state and dedupes u
   ]);
 });
 
+test("archive lifecycle uses cached fast paths and an authoritative non-Git restore", async () => {
+  const emitted: SessionOutboundMessage[] = [];
+  const session = createSessionForWorkspaceTests();
+  const archivingAt = "2026-04-30T20:46:00.000Z";
+  const project = createPersistedProjectRecord({
+    projectId: "proj-archive-lifecycle-fast-path",
+    rootPath: REPO_CWD,
+    kind: "git",
+    displayName: "repo",
+    createdAt: "2026-03-01T12:00:00.000Z",
+    updatedAt: "2026-03-01T12:00:00.000Z",
+  });
+  const workspace = createPersistedWorkspaceRecord({
+    workspaceId: "ws-archive-lifecycle-fast-path",
+    projectId: project.projectId,
+    cwd: "/tmp/repo/worktree",
+    kind: "worktree",
+    displayName: "feature",
+    createdAt: "2026-03-01T12:00:00.000Z",
+    updatedAt: "2026-03-01T12:00:00.000Z",
+  });
+  const cachedWorkspace = {
+    id: workspace.workspaceId,
+    projectId: project.projectId,
+    projectDisplayName: project.displayName,
+    projectRootPath: project.rootPath,
+    workspaceDirectory: workspace.cwd,
+    projectKind: project.kind,
+    workspaceKind: workspace.kind,
+    name: workspace.displayName,
+    status: "attention" as const,
+    activityAt: null,
+    diffStat: null,
+    archivingAt: null,
+  };
+
+  session.emit = (message) => {
+    if (isSessionOutboundMessage(message)) emitted.push(message);
+  };
+  session.workspaceUpdatesSubscription = {
+    subscriptionId: "sub-archive-lifecycle-fast-path",
+    filter: undefined,
+    isBootstrapping: false,
+    pendingUpdatesByWorkspaceId: new Map(),
+    lastEmittedByWorkspaceId: new Map([
+      [workspace.workspaceId, { kind: "upsert", workspace: cachedWorkspace }],
+    ]),
+  };
+  session.projectRegistry.list = async () => [project];
+  session.workspaceRegistry.list = async () => [workspace];
+  session.workspaceRegistry.get = async (workspaceId: string) =>
+    workspaceId === workspace.workspaceId ? workspace : null;
+  const authoritativeWorkspace = { ...cachedWorkspace, status: "done" as const };
+  const buildDescriptorMap = vi.fn(
+    async () => new Map([[workspace.workspaceId, authoritativeWorkspace]]),
+  );
+  session.buildWorkspaceDescriptorMap = buildDescriptorMap;
+
+  await session.emitWorkspaceUpdatesForWorkspaceIds([workspace.workspaceId], {
+    archiveLifecycle: { phase: "archiving", archivingAt },
+  });
+  await session.emitWorkspaceUpdatesForWorkspaceIds([workspace.workspaceId], {
+    archiveLifecycle: { phase: "restored" },
+  });
+  workspace.archivedAt = "2026-04-30T20:46:01.000Z";
+  await session.emitWorkspaceUpdatesForWorkspaceIds([workspace.workspaceId], {
+    archiveLifecycle: { phase: "removed" },
+  });
+
+  expect(buildDescriptorMap).toHaveBeenCalledOnce();
+  expect(buildDescriptorMap).toHaveBeenCalledWith({
+    workspaceIds: new Set([workspace.workspaceId]),
+    includeGitData: false,
+  });
+  expect(filterByType(emitted, "workspace_update")).toEqual([
+    {
+      type: "workspace_update",
+      payload: {
+        kind: "upsert",
+        workspace: { ...cachedWorkspace, archivingAt },
+      },
+    },
+    {
+      type: "workspace_update",
+      payload: {
+        kind: "upsert",
+        workspace: { ...cachedWorkspace, archivingAt: null },
+      },
+    },
+    {
+      type: "workspace_update",
+      payload: {
+        kind: "upsert",
+        workspace: authoritativeWorkspace,
+      },
+    },
+    {
+      type: "workspace_update",
+      payload: {
+        kind: "remove",
+        id: workspace.workspaceId,
+        emptyProject: {
+          projectId: project.projectId,
+          projectDisplayName: project.displayName,
+          projectCustomName: null,
+          projectRootPath: project.rootPath,
+          projectKind: project.kind,
+        },
+      },
+    },
+  ]);
+});
+
+test("archive lifecycle buffers bootstrap transitions without Git hydration", async () => {
+  const emitted: SessionOutboundMessage[] = [];
+  const session = createSessionForWorkspaceTests();
+  const workspaceId = "ws-archive-lifecycle-bootstrap";
+  const archivingAt = "2026-04-30T20:47:00.000Z";
+  const cachedWorkspace = {
+    id: workspaceId,
+    projectId: "proj-archive-lifecycle-bootstrap",
+    projectDisplayName: "repo",
+    projectRootPath: REPO_CWD,
+    workspaceDirectory: "/tmp/repo/worktree",
+    projectKind: "git" as const,
+    workspaceKind: "worktree" as const,
+    name: "feature",
+    status: "done" as const,
+    activityAt: null,
+    diffStat: null,
+    archivingAt: null,
+  };
+  const pendingUpdatesByWorkspaceId = new Map([
+    [workspaceId, { kind: "upsert" as const, workspace: cachedWorkspace }],
+  ]);
+
+  session.emit = (message) => {
+    if (isSessionOutboundMessage(message)) emitted.push(message);
+  };
+  session.workspaceUpdatesSubscription = {
+    subscriptionId: "sub-archive-lifecycle-bootstrap",
+    filter: undefined,
+    isBootstrapping: true,
+    pendingUpdatesByWorkspaceId,
+    lastEmittedByWorkspaceId: new Map(),
+  };
+  session.workspaceRegistry.get = async () => null;
+  const buildDescriptorMap = vi.fn(async () => new Map([[workspaceId, cachedWorkspace]]));
+  session.buildWorkspaceDescriptorMap = buildDescriptorMap;
+
+  await session.emitWorkspaceUpdatesForWorkspaceIds([workspaceId], {
+    archiveLifecycle: { phase: "archiving", archivingAt },
+  });
+  expect(pendingUpdatesByWorkspaceId.get(workspaceId)).toEqual({
+    kind: "upsert",
+    workspace: { ...cachedWorkspace, archivingAt },
+  });
+
+  await session.emitWorkspaceUpdatesForWorkspaceIds([workspaceId], {
+    archiveLifecycle: { phase: "restored" },
+  });
+  expect(pendingUpdatesByWorkspaceId.get(workspaceId)).toEqual({
+    kind: "upsert",
+    workspace: { ...cachedWorkspace, archivingAt: null },
+  });
+
+  await session.emitWorkspaceUpdatesForWorkspaceIds([workspaceId], {
+    archiveLifecycle: { phase: "removed" },
+  });
+  expect(pendingUpdatesByWorkspaceId.get(workspaceId)).toEqual({
+    kind: "remove",
+    id: workspaceId,
+  });
+  expect(buildDescriptorMap).toHaveBeenCalledOnce();
+  expect(buildDescriptorMap).toHaveBeenCalledWith({
+    workspaceIds: new Set([workspaceId]),
+    includeGitData: false,
+  });
+  expect(emitted).toEqual([]);
+});
+
 test("external workspace updates emit one deduplicated batch", async () => {
   const emitted: SessionOutboundMessage[] = [];
   const session = createSessionForWorkspaceTests();

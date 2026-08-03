@@ -36,7 +36,7 @@ export interface AutoArchiveArchiveOptions {
   archiveWorkspaceRecord: ArchiveDependencies["archiveWorkspaceRecord"];
   markWorkspaceArchiving: (workspaceIds: Iterable<string>, archivingAt: string) => void;
   clearWorkspaceArchiving: (workspaceIds: Iterable<string>) => void;
-  emitWorkspaceUpdatesForWorkspaceIds: (workspaceIds: Iterable<string>) => Promise<void>;
+  emitWorkspaceUpdatesForWorkspaceIds: ArchiveDependencies["emitWorkspaceUpdatesForWorkspaceIds"];
 }
 
 export interface ArchiveIfSafeDependencies {

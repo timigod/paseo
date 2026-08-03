@@ -203,6 +203,7 @@ import {
   archivePersistedWorkspaceRecord,
   requireArchiveCleanupComplete,
   requireActiveWorkspaceForArchive,
+  type WorkspaceUpdateEmissionOptions,
 } from "./workspace-archive-service.js";
 import type { ServiceProxySubsystem } from "./service-proxy.js";
 import { renameCurrentBranch as renameCurrentBranchDefault } from "../utils/checkout-git.js";
@@ -1391,8 +1392,11 @@ export class Session {
     this.clearWorkspaceArchiving(workspaceIds);
   }
 
-  async emitWorkspaceUpdatesForExternalWorkspaceIds(workspaceIds: Iterable<string>): Promise<void> {
-    await this.emitWorkspaceUpdatesForWorkspaceIds(workspaceIds);
+  async emitWorkspaceUpdatesForExternalWorkspaceIds(
+    workspaceIds: Iterable<string>,
+    options?: WorkspaceUpdateEmissionOptions,
+  ): Promise<void> {
+    await this.emitWorkspaceUpdatesForWorkspaceIds(workspaceIds, options);
   }
 
   async syncWorkspaceGitObserversForExternalWorkspaceIds(
@@ -2818,8 +2822,8 @@ export class Session {
                 archiveWorkspaceRecord: (workspaceId, recheck) =>
                   this.archiveWorkspaceRecord(workspaceId, undefined, recheck),
                 workspaceRegistry: this.workspaceRegistry,
-                emitWorkspaceUpdatesForWorkspaceIds: (workspaceIds) =>
-                  this.emitWorkspaceUpdatesForWorkspaceIds(workspaceIds),
+                emitWorkspaceUpdatesForWorkspaceIds: (workspaceIds, options) =>
+                  this.emitWorkspaceUpdatesForWorkspaceIds(workspaceIds, options),
                 markWorkspaceArchiving: (workspaceIds, archivingAt) =>
                   this.markWorkspaceArchiving(workspaceIds, archivingAt),
                 clearWorkspaceArchiving: (workspaceIds) =>
@@ -3361,8 +3365,8 @@ export class Session {
                 this.archiveWorkspaceRecord(id, undefined, archiveRecheck),
               workspaceRegistry: this.workspaceRegistry,
               destructiveMembershipLease: destructiveLease,
-              emitWorkspaceUpdatesForWorkspaceIds: (workspaceIds) =>
-                this.emitWorkspaceUpdatesForWorkspaceIds(workspaceIds),
+              emitWorkspaceUpdatesForWorkspaceIds: (workspaceIds, options) =>
+                this.emitWorkspaceUpdatesForWorkspaceIds(workspaceIds, options),
               markWorkspaceArchiving: (workspaceIds, archivingAt) =>
                 this.markWorkspaceArchiving(workspaceIds, archivingAt),
               clearWorkspaceArchiving: (workspaceIds) => this.clearWorkspaceArchiving(workspaceIds),
@@ -4954,8 +4958,8 @@ export class Session {
           this.archiveWorkspaceRecord(workspaceId, undefined, recheck),
         workspaceRegistry: this.workspaceRegistry,
         emit: (message) => this.emit(message),
-        emitWorkspaceUpdatesForWorkspaceIds: (workspaceIds) =>
-          this.emitWorkspaceUpdatesForWorkspaceIds(workspaceIds),
+        emitWorkspaceUpdatesForWorkspaceIds: (workspaceIds, options) =>
+          this.emitWorkspaceUpdatesForWorkspaceIds(workspaceIds, options),
         markWorkspaceArchiving: (workspaceIds, archivingAt) =>
           this.markWorkspaceArchiving(workspaceIds, archivingAt),
         clearWorkspaceArchiving: (workspaceIds) => this.clearWorkspaceArchiving(workspaceIds),
@@ -5755,7 +5759,9 @@ export class Session {
       dedupeGitState?: boolean;
       removedProjectId?: string;
       optimisticStatus?: WorkspaceDescriptorPayload["status"];
+      archiveLifecycle?: WorkspaceUpdateEmissionOptions["archiveLifecycle"];
     },
+    includeGitData = true,
   ): Promise<void> {
     const subscription = this.workspaceUpdatesSubscription;
     if (!subscription) {
@@ -5767,9 +5773,18 @@ export class Session {
       return;
     }
 
+    if (options?.archiveLifecycle) {
+      await this.emitWorkspaceArchiveLifecycleUpdates(
+        subscription,
+        uniqueWorkspaceIds,
+        options.archiveLifecycle,
+      );
+      return;
+    }
+
     const descriptorsByWorkspaceId = await this.buildWorkspaceDescriptorMap({
       workspaceIds: uniqueWorkspaceIds,
-      includeGitData: true,
+      includeGitData,
     });
 
     for (const workspaceId of uniqueWorkspaceIds) {
@@ -5817,6 +5832,53 @@ export class Session {
       }
 
       this.bufferOrEmitWorkspaceUpdate(subscription, nextPayload);
+    }
+  }
+
+  private async emitWorkspaceArchiveLifecycleUpdates(
+    subscription: WorkspaceUpdatesSubscriptionState,
+    workspaceIds: Iterable<string>,
+    lifecycle: NonNullable<WorkspaceUpdateEmissionOptions["archiveLifecycle"]>,
+  ): Promise<void> {
+    const uniqueWorkspaceIds = Array.from(new Set(workspaceIds));
+    for (const workspaceId of uniqueWorkspaceIds) {
+      const lastEmitted =
+        subscription.pendingUpdatesByWorkspaceId.get(workspaceId) ??
+        subscription.lastEmittedByWorkspaceId.get(workspaceId);
+      if (lifecycle.phase !== "removed") {
+        if (lastEmitted?.kind !== "upsert") {
+          continue;
+        }
+        const nextPayload: WorkspaceUpdatePayload = {
+          kind: "upsert",
+          workspace: {
+            ...lastEmitted.workspace,
+            archivingAt: lifecycle.phase === "archiving" ? lifecycle.archivingAt : null,
+          },
+        };
+        if (equal(lastEmitted.workspace, nextPayload.workspace)) {
+          continue;
+        }
+        this.workspaceGitObserver.recordDescriptorState(workspaceId, nextPayload.workspace);
+        this.bufferOrEmitWorkspaceUpdate(subscription, nextPayload);
+        continue;
+      }
+
+      if (lastEmitted?.kind === "remove" || (!lastEmitted && !subscription.isBootstrapping)) {
+        continue;
+      }
+      this.workspaceGitObserver.recordDescriptorState(workspaceId, null);
+      this.bufferOrEmitWorkspaceUpdate(
+        subscription,
+        await this.buildWorkspaceRemoveUpdatePayload(workspaceId),
+      );
+    }
+
+    if (lifecycle.phase === "restored") {
+      // A failed archive can still retire one agent or terminal before another
+      // teardown fails. Correct the optimistic cached card from current
+      // contributions, but keep Git hydration outside this rare recovery path.
+      await this.emitWorkspaceUpdatesForWorkspaceIds(uniqueWorkspaceIds, undefined, false);
     }
   }
 
@@ -7051,8 +7113,8 @@ export class Session {
           getTerminalMembershipVersion: () => this.terminalController.getMembershipVersion(),
           archiveWorkspaceRecord: (workspaceId, recheck) =>
             this.archiveWorkspaceRecord(workspaceId, undefined, recheck),
-          emitWorkspaceUpdatesForWorkspaceIds: (workspaceIds) =>
-            this.emitWorkspaceUpdatesForWorkspaceIds(workspaceIds),
+          emitWorkspaceUpdatesForWorkspaceIds: (workspaceIds, options) =>
+            this.emitWorkspaceUpdatesForWorkspaceIds(workspaceIds, options),
           markWorkspaceArchiving: (workspaceIds, archivingAt) =>
             this.markWorkspaceArchiving(workspaceIds, archivingAt),
           clearWorkspaceArchiving: (workspaceIds) => this.clearWorkspaceArchiving(workspaceIds),

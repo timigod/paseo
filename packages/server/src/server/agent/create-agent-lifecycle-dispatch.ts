@@ -44,7 +44,7 @@ interface CreateAgentLifecycleDispatchDependencies {
   workspaceRegistry: Pick<WorkspaceRegistry, "get" | "list" | "update" | "subscribeToMutations">;
   emit: (message: SessionOutboundMessage) => void;
   emitAgentRemove: (agentId: string) => void;
-  emitWorkspaceUpdatesForWorkspaceIds: (workspaceIds: Iterable<string>) => Promise<void>;
+  emitWorkspaceUpdatesForWorkspaceIds: ArchiveDependencies["emitWorkspaceUpdatesForWorkspaceIds"];
   markWorkspaceArchiving: (workspaceIds: Iterable<string>, archivingAt: string) => void;
   clearWorkspaceArchiving: (workspaceIds: Iterable<string>) => void;
   killTerminalsForWorkspace: ArchiveDependencies["killTerminalsForWorkspace"];

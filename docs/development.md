@@ -421,6 +421,8 @@ Canonical automation uses `paseo workspace create/ls/archive`, `paseo heartbeat 
 
 Worktree-scope archive resolves the requested backing directory once, then uses realpath-aware containment to select only workspace records rooted inside it. Keep that candidate filter ahead of legacy ownership discovery: installations can retain many old workspace records without durable placement fields, and probing every unrelated record turns one archive into hundreds of Git commands.
 
+Archive lifecycle presentation is also part of the destructive request's latency boundary. Emit the temporary `archivingAt` state from the session's cached workspace payload and emit the final removal directly; do not rebuild workspace descriptors or hydrate Git state merely to acknowledge an archive that has already passed its destructive safety checks.
+
 ```bash
 npm run cli -- ls -a -g              # List all agents globally
 npm run cli -- ls -a -g --json       # Same, as JSON

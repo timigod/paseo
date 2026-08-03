@@ -157,6 +157,7 @@ import {
   requireArchiveCleanupComplete,
   retryPendingWorkspaceCleanup,
   type ActiveWorkspaceRef,
+  type WorkspaceUpdateEmissionOptions,
 } from "./workspace-archive-service.js";
 import { WorkspaceCleanupRetryService } from "./workspace-cleanup-retry-service.js";
 import { defaultWorkspaceLifecycleCoordinator } from "./workspace-lifecycle-coordinator.js";
@@ -1208,11 +1209,14 @@ export async function createPaseoDaemon(
       session.clearWorkspaceArchivingForExternalMutation(workspaceIdList);
     }
   };
-  const emitWorkspaceUpdatesExternal = async (workspaceIds: Iterable<string>) => {
+  const emitWorkspaceUpdatesExternal = async (
+    workspaceIds: Iterable<string>,
+    options?: WorkspaceUpdateEmissionOptions,
+  ) => {
     const workspaceIdList = Array.from(workspaceIds);
     await Promise.all(
       (wsServer?.listTrustedSessions() ?? []).map((session) =>
-        session.emitWorkspaceUpdatesForExternalWorkspaceIds(workspaceIdList),
+        session.emitWorkspaceUpdatesForExternalWorkspaceIds(workspaceIdList, options),
       ),
     );
   };

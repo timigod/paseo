@@ -61,6 +61,15 @@ export type ActiveWorkspaceRef = Pick<
   "workspaceId" | "cwd" | "kind" | "worktreeRoot" | "isPaseoOwnedWorktree" | "mainRepoRoot"
 >;
 
+export type WorkspaceArchiveLifecycleEmission =
+  | { phase: "archiving"; archivingAt: string }
+  | { phase: "restored" }
+  | { phase: "removed" };
+
+export interface WorkspaceUpdateEmissionOptions {
+  archiveLifecycle?: WorkspaceArchiveLifecycleEmission;
+}
+
 export interface ArchiveDependencies {
   paseoHome?: string;
   // Base directory that may hold worktrees across repositories.
@@ -84,7 +93,10 @@ export interface ArchiveDependencies {
   getWorkspaceMembershipVersion?: () => number;
   getTerminalMembershipVersion?: () => number;
   archiveWorkspaceRecord: (workspaceId: string, recheck: DestructiveActionRecheck) => Promise<void>;
-  emitWorkspaceUpdatesForWorkspaceIds: (workspaceIds: Iterable<string>) => Promise<void>;
+  emitWorkspaceUpdatesForWorkspaceIds: (
+    workspaceIds: Iterable<string>,
+    options?: WorkspaceUpdateEmissionOptions,
+  ) => Promise<void>;
   markWorkspaceArchiving: (workspaceIds: Iterable<string>, archivingAt: string) => void;
   clearWorkspaceArchiving: (workspaceIds: Iterable<string>) => void;
   killTerminalsForWorkspace: (
@@ -528,14 +540,17 @@ async function archiveResolvedTarget(
     assertDestructiveMembershipFence(membershipFence, membershipSources);
   }
 
+  const archivingAt = new Date().toISOString();
   if (targetWorkspaceIds.length > 0) {
-    dependencies.markWorkspaceArchiving(targetWorkspaceIds, new Date().toISOString());
+    dependencies.markWorkspaceArchiving(targetWorkspaceIds, archivingAt);
   }
 
   let removedDirectory = false;
   try {
     if (targetWorkspaceIds.length > 0) {
-      await dependencies.emitWorkspaceUpdatesForWorkspaceIds(targetWorkspaceIds);
+      await dependencies.emitWorkspaceUpdatesForWorkspaceIds(targetWorkspaceIds, {
+        archiveLifecycle: { phase: "archiving", archivingAt },
+      });
     }
 
     await recheckCaller();
@@ -573,7 +588,34 @@ async function archiveResolvedTarget(
   } finally {
     if (targetWorkspaceIds.length > 0) {
       dependencies.clearWorkspaceArchiving(targetWorkspaceIds);
-      await dependencies.emitWorkspaceUpdatesForWorkspaceIds(targetWorkspaceIds);
+      let activeWorkspaceIds: Set<string>;
+      try {
+        activeWorkspaceIds = new Set(
+          (await dependencies.listActiveWorkspaces()).map((workspace) => workspace.workspaceId),
+        );
+      } catch (error) {
+        dependencies.sessionLogger?.warn(
+          { err: error, targetWorkspaceIds, requestId: request.requestId },
+          "Failed to classify workspace archive presentation; restoring targets",
+        );
+        activeWorkspaceIds = new Set(targetWorkspaceIds);
+      }
+      const restoredWorkspaceIds = targetWorkspaceIds.filter((workspaceId) =>
+        activeWorkspaceIds.has(workspaceId),
+      );
+      const removedWorkspaceIds = targetWorkspaceIds.filter(
+        (workspaceId) => !activeWorkspaceIds.has(workspaceId),
+      );
+      if (restoredWorkspaceIds.length > 0) {
+        await dependencies.emitWorkspaceUpdatesForWorkspaceIds(restoredWorkspaceIds, {
+          archiveLifecycle: { phase: "restored" },
+        });
+      }
+      if (removedWorkspaceIds.length > 0) {
+        await dependencies.emitWorkspaceUpdatesForWorkspaceIds(removedWorkspaceIds, {
+          archiveLifecycle: { phase: "removed" },
+        });
+      }
     }
   }
 }

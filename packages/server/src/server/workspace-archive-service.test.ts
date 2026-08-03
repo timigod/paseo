@@ -1451,6 +1451,10 @@ describe("archiveByScope", () => {
       ],
     });
     const originalArchiveWorkspaceRecord = deps.archiveWorkspaceRecord;
+    const emitWorkspaceUpdates = vi.fn<ArchiveDependencies["emitWorkspaceUpdatesForWorkspaceIds"]>(
+      async () => {},
+    );
+    deps.emitWorkspaceUpdatesForWorkspaceIds = emitWorkspaceUpdates;
     deps.archiveWorkspaceRecord = async (workspaceId: string) => {
       if (workspaceId === workspaceA) {
         throw new Error("intentional teardown failure");
@@ -1468,6 +1472,60 @@ describe("archiveByScope", () => {
 
     expect((await deps.listActiveWorkspaces()).map((workspace) => workspace.workspaceId)).toEqual([
       workspaceA,
+    ]);
+    expect(emitWorkspaceUpdates.mock.calls).toEqual([
+      [
+        [workspaceA, workspaceB],
+        { archiveLifecycle: { phase: "archiving", archivingAt: expect.any(String) } },
+      ],
+      [[workspaceA], { archiveLifecycle: { phase: "restored" } }],
+      [[workspaceB], { archiveLifecycle: { phase: "removed" } }],
+    ]);
+    expect(existsSync(worktree.worktreePath)).toBe(true);
+  });
+
+  test("classification failure restores every target instead of hiding an active workspace", async () => {
+    const { tempDir, repoDir } = createGitRepo();
+    const paseoHome = path.join(tempDir, ".paseo");
+    const worktree = await createPaseoOwnedWorktree(repoDir, paseoHome, "classification-failure");
+    const workspaceId = "ws-classification-failure";
+    const deps = createArchiveDeps({
+      paseoHome,
+      activeWorkspaces: [{ workspaceId, cwd: worktree.worktreePath, kind: "worktree" }],
+    });
+    const originalListActiveWorkspaces = deps.listActiveWorkspaces;
+    let failClassification = false;
+    deps.listActiveWorkspaces = async () => {
+      if (failClassification) {
+        throw new Error("workspace registry temporarily unavailable");
+      }
+      return originalListActiveWorkspaces();
+    };
+    const emitWorkspaceUpdates = vi.fn<ArchiveDependencies["emitWorkspaceUpdatesForWorkspaceIds"]>(
+      async (_workspaceIds, options) => {
+        if (options?.archiveLifecycle?.phase === "archiving") {
+          failClassification = true;
+        }
+      },
+    );
+    deps.emitWorkspaceUpdatesForWorkspaceIds = emitWorkspaceUpdates;
+    deps.killTerminalsForWorkspace = vi.fn(async () => {
+      throw new Error("terminal still owned");
+    });
+
+    await expect(
+      archiveAsCoordinator(deps, {
+        scope: { kind: "workspace", workspaceId },
+        requestId: "req-classification-failure",
+      }),
+    ).rejects.toBeInstanceOf(WorkspaceArchiveTeardownError);
+
+    expect(emitWorkspaceUpdates.mock.calls).toEqual([
+      [
+        [workspaceId],
+        { archiveLifecycle: { phase: "archiving", archivingAt: expect.any(String) } },
+      ],
+      [[workspaceId], { archiveLifecycle: { phase: "restored" } }],
     ]);
     expect(existsSync(worktree.worktreePath)).toBe(true);
   });

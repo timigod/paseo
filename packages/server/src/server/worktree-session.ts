@@ -498,7 +498,7 @@ export async function handlePaseoWorktreeArchiveRequest(
   > & {
     emit: EmitSessionMessage;
     workspaceGitService: Pick<WorkspaceGitService, "getCheckout" | "getSnapshot" | "listWorktrees">;
-    emitWorkspaceUpdatesForWorkspaceIds: (workspaceIds: Iterable<string>) => Promise<void>;
+    emitWorkspaceUpdatesForWorkspaceIds: ArchiveDependencies["emitWorkspaceUpdatesForWorkspaceIds"];
   },
   msg: Extract<SessionInboundMessage, { type: "paseo_worktree_archive_request" }>,
   caller: ArchiveCallerContext,
