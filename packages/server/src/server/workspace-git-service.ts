@@ -365,6 +365,7 @@ interface WorkspaceGitTarget {
   selfHealTimer: NodeJS.Timeout | null;
   forgePrStatusPollSubscription: { unsubscribe: () => void } | null;
   forgePrStatusPollKey: string | null;
+  forgePrStatusPollGeneration: number | null;
   refreshState: WorkspaceGitRefreshState;
   latestGit: WorkspaceGitRuntimeSnapshot["git"] | null;
   latestGitLoadedAtMs: number | null;
@@ -1242,6 +1243,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
       selfHealTimer: null,
       forgePrStatusPollSubscription: null,
       forgePrStatusPollKey: null,
+      forgePrStatusPollGeneration: null,
       refreshState: { status: "idle" },
       latestGit: null,
       latestGitLoadedAtMs: null,
@@ -1896,14 +1898,23 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
       remoteUrl,
       target: pollTarget,
     });
+    const pollGeneration = target.factsGeneration;
     const previousPollKey = target.forgePrStatusPollKey;
-    if (target.forgePrStatusPollKey === pollKey && target.forgePrStatusPollSubscription) {
+    const previousPollGeneration = target.forgePrStatusPollGeneration;
+    if (
+      target.forgePrStatusPollKey === pollKey &&
+      target.forgePrStatusPollGeneration === pollGeneration &&
+      target.forgePrStatusPollSubscription
+    ) {
       return;
     }
-    const pollImmediately = previousPollKey !== null && previousPollKey !== pollKey;
+    const pollImmediately =
+      previousPollKey !== null &&
+      (previousPollKey !== pollKey || previousPollGeneration !== pollGeneration);
 
     this.stopForgePrStatusPollForTarget(target);
     target.forgePrStatusPollKey = pollKey;
+    target.forgePrStatusPollGeneration = pollGeneration;
     if (resolution.service.retainCurrentPullRequestStatusPoll) {
       target.forgePrStatusPollSubscription = resolution.service.retainCurrentPullRequestStatusPoll({
         cwd: target.cwd,
@@ -1913,7 +1924,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
           ? { headRepositoryOwner: pollTarget.headRepositoryOwner }
           : {}),
         onStatus: (status) => {
-          if (!this.isActiveObservedWorkspaceTarget(target)) {
+          if (!this.isCurrentForgePrStatusPoll(target, pollKey, pollGeneration)) {
             return;
           }
           this.rememberForgePrStatusSnapshot(
@@ -1925,6 +1936,9 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
           );
         },
         onError: (error) => {
+          if (!this.isCurrentForgePrStatusPoll(target, pollKey, pollGeneration)) {
+            return;
+          }
           this.logger.warn(
             {
               err: error,
@@ -1946,6 +1960,8 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
       forge: resolution.forge,
       service: resolution.service,
       pollTarget,
+      pollKey,
+      pollGeneration,
       pollImmediately,
     });
   }
@@ -1955,12 +1971,16 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     forge,
     service,
     pollTarget,
+    pollKey,
+    pollGeneration,
     pollImmediately,
   }: {
     target: WorkspaceGitTarget;
     forge: string;
     service: ForgeService;
     pollTarget: WorkspaceForgePrStatusPollTarget;
+    pollKey: string;
+    pollGeneration: number;
     pollImmediately: boolean;
   }): { unsubscribe: () => void } {
     let closed = false;
@@ -1970,7 +1990,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     let consecutiveErrors = 0;
 
     const schedule = (delayMs: number) => {
-      if (closed) {
+      if (closed || !this.isCurrentForgePrStatusPoll(target, pollKey, pollGeneration)) {
         return;
       }
       timer = setTimeout(() => {
@@ -1980,7 +2000,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     };
 
     const poll = async () => {
-      if (closed || !this.isActiveObservedWorkspaceTarget(target)) {
+      if (closed || !this.isCurrentForgePrStatusPoll(target, pollKey, pollGeneration)) {
         return;
       }
       try {
@@ -1993,14 +2013,18 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
             : {}),
           reason: "self-heal-forge-pr-status",
         });
-        if (!closed && this.isActiveObservedWorkspaceTarget(target)) {
-          latestStatus = status;
-          consecutiveErrors = 0;
-          this.rememberForgePrStatusSnapshot(target, buildForgeSnapshotFromStatus(status, forge), {
-            notify: true,
-          });
+        if (closed || !this.isCurrentForgePrStatusPoll(target, pollKey, pollGeneration)) {
+          return;
         }
+        latestStatus = status;
+        consecutiveErrors = 0;
+        this.rememberForgePrStatusSnapshot(target, buildForgeSnapshotFromStatus(status, forge), {
+          notify: true,
+        });
       } catch (error) {
+        if (closed || !this.isCurrentForgePrStatusPoll(target, pollKey, pollGeneration)) {
+          return;
+        }
         consecutiveErrors += 1;
         this.logger.warn(
           {
@@ -2035,6 +2059,18 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     };
   }
 
+  private isCurrentForgePrStatusPoll(
+    target: WorkspaceGitTarget,
+    pollKey: string,
+    pollGeneration: number,
+  ): boolean {
+    return (
+      this.isActiveObservedWorkspaceTarget(target) &&
+      target.forgePrStatusPollKey === pollKey &&
+      target.forgePrStatusPollGeneration === pollGeneration
+    );
+  }
+
   private resolveForgePrStatusPollTarget(
     target: WorkspaceGitTarget,
   ): WorkspaceForgePrStatusPollTarget | null {
@@ -2060,6 +2096,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     target.forgePrStatusPollSubscription?.unsubscribe();
     target.forgePrStatusPollSubscription = null;
     target.forgePrStatusPollKey = null;
+    target.forgePrStatusPollGeneration = null;
   }
 
   private addWorkingTreeWatcher(

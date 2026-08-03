@@ -1335,6 +1335,68 @@ describe("WorkspaceGitServiceImpl primitive refresh entrypoint", () => {
     }
   });
 
+  test("global invalidation replaces an in-flight same-key forge poll after a git-only read", async () => {
+    const stalePoll = createDeferred<CurrentPullRequestStatus | null>();
+    const freshPoll = createDeferred<CurrentPullRequestStatus | null>();
+    const forge = {
+      ...createGitHubServiceStub(),
+      retainCurrentPullRequestStatusPoll: undefined,
+      getCurrentPullRequestStatus: vi
+        .fn<() => Promise<CurrentPullRequestStatus | null>>()
+        .mockImplementationOnce(() => stalePoll.promise)
+        .mockImplementationOnce(() => freshPoll.promise),
+    };
+    const unregister = defaultForgeRegistry.register("forge-generation-fence-test", {
+      createService: () => forge,
+      matchesHost: (host) => host === "forge-generation-fence.test",
+    });
+    const service = createService({
+      getWorkspaceGitSelfHealPhaseMs: () => 1_000_000,
+      getCheckoutSnapshotFacts: vi.fn(async (cwd: string) =>
+        createCheckoutFacts(cwd, {
+          currentBranch: "feature",
+          remoteUrl: "https://forge-generation-fence.test/acme/repo.git",
+          pullRequestLookupTarget: { headRef: "feature" },
+        }),
+      ),
+      getCheckoutStatus: vi.fn(async (cwd: string) =>
+        createCheckoutStatus(cwd, {
+          currentBranch: "feature",
+          remoteUrl: "https://forge-generation-fence.test/acme/repo.git",
+        }),
+      ),
+      getPullRequestStatus: vi.fn(async () => createPullRequestStatusResult("Initial PR")),
+    });
+
+    try {
+      await service.getSnapshot(REPO_CWD);
+      const subscription = service.registerWorkspace({ cwd: REPO_CWD }, vi.fn());
+
+      await vi.advanceTimersByTimeAsync(120_000);
+      await vi.waitFor(() => expect(forge.getCurrentPullRequestStatus).toHaveBeenCalledTimes(1));
+
+      service.onWorkspaceStateMayHaveChanged("/tmp/unmapped-poll-sibling");
+      await service.getSnapshot(REPO_CWD, { includeForge: false });
+      await vi.advanceTimersByTimeAsync(0);
+      await vi.waitFor(() => expect(forge.getCurrentPullRequestStatus).toHaveBeenCalledTimes(2));
+
+      freshPoll.resolve(createCurrentPullRequestStatus({ title: "Fresh generation PR" }));
+      await flushPromises();
+      expect(service.peekSnapshot(REPO_CWD)?.forge.pullRequest?.title).toBe("Fresh generation PR");
+
+      stalePoll.resolve(createCurrentPullRequestStatus({ title: "Stale generation PR" }));
+      await flushPromises();
+      expect(service.peekSnapshot(REPO_CWD)?.forge.pullRequest?.title).toBe("Fresh generation PR");
+
+      subscription.unsubscribe();
+    } finally {
+      stalePoll.resolve(null);
+      freshPoll.resolve(null);
+      service.dispose();
+      unregister();
+    }
+  });
+
   test("subscription cancels generic forge PR status self-heal polling after unsubscribe", async () => {
     const forge = {
       ...createGitHubServiceStub(),
