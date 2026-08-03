@@ -6933,6 +6933,48 @@ test("archiveAgent closes before it persists archivedAt", async () => {
   expect(lifecycles).toEqual(["closed", "closed"]);
 });
 
+test("releases a workspace after an archived agent is loaded only for history", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-release-history-agent-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const manager = new AgentManager({
+    clients: { codex: new TestAgentClient() },
+    registry: storage,
+    logger,
+  });
+  const workspaceId = "wks_archived_history";
+  const finished = await manager.createAgent(
+    { provider: "codex", cwd: workdir },
+    "00000000-0000-4000-8000-000000000149",
+    { workspaceId },
+  );
+  await manager.archiveAgent(finished.id);
+
+  await ensureAgentLoaded(finished.id, {
+    agentManager: manager,
+    agentStorage: storage,
+    logger,
+  });
+  expect(manager.getAgent(finished.id)?.workspaceId).toBe(workspaceId);
+  expect((await storage.get(finished.id))?.archivedAt).toEqual(expect.any(String));
+
+  let released = false;
+  await expect(
+    manager.releaseWorkspaceIfUnowned({
+      workspaceId,
+      finishedAgentId: finished.id,
+      release: async () => {
+        released = true;
+      },
+    }),
+  ).resolves.toBe(true);
+
+  expect({ released, loadedAgent: manager.getAgent(finished.id) }).toEqual({
+    released: true,
+    loadedAgent: null,
+  });
+  rmSync(workdir, { recursive: true, force: true });
+});
+
 test("waits for an earlier workspace registration before checking ownership", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-release-pending-registration-"));
   const storage = new AgentStorage(join(workdir, "agents"), logger);
