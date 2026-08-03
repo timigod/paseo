@@ -4022,6 +4022,8 @@ export class DaemonClient {
       worktreePath?: string;
       repoRoot?: string;
       branchName?: string;
+      expectedWorktreeIdentity?: string;
+      expectedWorktreePath?: string;
       workspaceId?: string;
       scope?: "workspace" | "worktree";
     },
@@ -4034,6 +4036,8 @@ export class DaemonClient {
         worktreePath: input.worktreePath,
         repoRoot: input.repoRoot,
         branchName: input.branchName,
+        expectedWorktreeIdentity: input.expectedWorktreeIdentity,
+        expectedWorktreePath: input.expectedWorktreePath,
         ...(input.workspaceId !== undefined ? { workspaceId: input.workspaceId } : {}),
         ...(input.scope !== undefined ? { scope: input.scope } : {}),
       },

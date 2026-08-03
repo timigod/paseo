@@ -2661,6 +2661,121 @@ describe("handlePaseoWorktreeArchiveRequest worktree scope", () => {
     });
   });
 
+  test("rejects an identity from a primed cache after its branch moves to another path", async () => {
+    const { tempDir, repoDir } = createGitRepo();
+    cleanupPaths.push(tempDir);
+
+    const paseoHome = path.join(tempDir, ".paseo");
+    const created = await createLegacyWorktreeForTest({
+      branchName: "cached-archive-name",
+      cwd: repoDir,
+      baseBranch: "main",
+      worktreeSlug: "stable-archive-path",
+      runSetup: false,
+      paseoHome,
+    });
+    const workspaceGitService = new WorkspaceGitServiceImpl({
+      logger: createLogger(),
+      paseoHome,
+      deps: { forgeOverrides: { github: createGitHubServiceStub() } },
+    });
+    const archiveWorkspaceRecord = vi.fn(async () => {});
+    const archiveAgent = vi.fn(async () => ({ archivedAt: new Date().toISOString() }));
+    const emitted: SessionOutboundMessage[] = [];
+
+    try {
+      await expect(workspaceGitService.listWorktrees(repoDir)).resolves.toEqual([
+        expect.objectContaining({
+          path: created.worktreePath,
+          branchName: "cached-archive-name",
+        }),
+      ]);
+      execFileSync("git", ["branch", "-m", "renamed-before-archive"], {
+        cwd: created.worktreePath,
+        stdio: "pipe",
+      });
+      const replacement = await createLegacyWorktreeForTest({
+        branchName: "cached-archive-name",
+        cwd: repoDir,
+        baseBranch: "main",
+        worktreeSlug: "replacement-archive-path",
+        runSetup: false,
+        paseoHome,
+      });
+      await expect(workspaceGitService.listWorktrees(repoDir)).resolves.toEqual([
+        expect.objectContaining({
+          path: created.worktreePath,
+          branchName: "cached-archive-name",
+        }),
+      ]);
+
+      await handlePaseoWorktreeArchiveRequest(
+        {
+          paseoHome,
+          github: createGitHubServiceStub(),
+          workspaceGitService,
+          agentManager: {
+            listAgents: () => [],
+            archiveAgent,
+            archiveSnapshot: vi.fn(async () => {
+              throw new Error("not expected for empty agent list");
+            }),
+          },
+          agentStorage: createAgentStorageStub(),
+          findWorkspaceIdForCwd: vi.fn(async () => "ws-cached-archive"),
+          listActiveWorkspaces: vi.fn(async () => [
+            {
+              workspaceId: "ws-cached-archive",
+              cwd: created.worktreePath,
+              kind: "worktree" as const,
+            },
+          ]),
+          archiveWorkspaceRecord,
+          emit: (message) => emitted.push(message),
+          emitWorkspaceUpdatesForWorkspaceIds: vi.fn(async () => {}),
+          markWorkspaceArchiving: vi.fn(),
+          clearWorkspaceArchiving: vi.fn(),
+          killTerminalsForWorkspace: vi.fn(async () => {}),
+          sessionLogger: createLogger(),
+        },
+        {
+          type: "paseo_worktree_archive_request",
+          requestId: "req-stale-cached-identity",
+          repoRoot: repoDir,
+          expectedWorktreeIdentity: "cached-archive-name",
+          expectedWorktreePath: created.worktreePath,
+          scope: "worktree",
+        },
+      );
+
+      expect(archiveWorkspaceRecord).not.toHaveBeenCalled();
+      expect(archiveAgent).not.toHaveBeenCalled();
+      expect(existsSync(created.worktreePath)).toBe(true);
+      expect(existsSync(replacement.worktreePath)).toBe(true);
+      expect(
+        execFileSync("git", ["branch", "--show-current"], {
+          cwd: created.worktreePath,
+          stdio: "pipe",
+        })
+          .toString()
+          .trim(),
+      ).toBe("renamed-before-archive");
+      expect(
+        emitted.find((message) => message.type === "paseo_worktree_archive_response"),
+      ).toMatchObject({
+        payload: {
+          success: false,
+          removedAgents: [],
+          error: {
+            message: "Paseo worktree identity cached-archive-name now matches a different path",
+          },
+        },
+      });
+    } finally {
+      workspaceGitService.dispose();
+    }
+  });
+
   test("default scope archives a single workspace record and removes the directory on last reference", async () => {
     const { tempDir, repoDir } = createGitRepo();
     cleanupPaths.push(tempDir);

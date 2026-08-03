@@ -32,29 +32,6 @@ function createFakeDaemonClient(
 // worktree-session.test.ts prove real filesystem removal end-to-end.
 
 describe("runArchiveCommand", () => {
-  it("lists worktrees from the caller repository context", async () => {
-    const listCalls: Array<Parameters<DaemonClient["getPaseoWorktreeList"]>[0]> = [];
-    const fakeClient = createFakeDaemonClient({
-      getPaseoWorktreeList: async (input) => {
-        listCalls.push(input);
-        return { worktrees: [], error: null, requestId: "req-list" };
-      },
-    });
-
-    await expect(
-      runArchiveCommandWithDeps(
-        "missing",
-        {},
-        {
-          connectToDaemon: async () => fakeClient,
-          cwd: () => "/repo/project",
-        },
-      ),
-    ).rejects.toMatchObject({ code: "WORKTREE_NOT_FOUND" });
-
-    expect(listCalls).toEqual([{ cwd: "/repo/project", repoRoot: undefined }]);
-  });
-
   it("registers cwd and repoRoot selectors", () => {
     const archiveCommand = createWorktreeCommand().commands.find(
       (command) => command.name() === "archive",
@@ -82,7 +59,7 @@ describe("runArchiveCommand", () => {
     expect(connectCalls).toBe(0);
   });
 
-  it("sends scope worktree when archiving by worktree path", async () => {
+  it("sends scope and expected identity without authorizing the cached path", async () => {
     const worktreePath = "/tmp/paseo-home/worktrees/repo/feature";
     const archiveCalls: Array<{
       input: Parameters<DaemonClient["archivePaseoWorktree"]>[0];
@@ -120,9 +97,13 @@ describe("runArchiveCommand", () => {
     );
 
     expect(archiveCalls).toHaveLength(1);
-    expect(archiveCalls[0]?.input.scope).toBe("worktree");
-    expect(archiveCalls[0]?.input.worktreePath).toBe(worktreePath);
-    expect(archiveCalls[0]?.input.caller).toBeUndefined();
+    expect(archiveCalls[0]?.input).toEqual({
+      repoRoot: "/repos/repo",
+      expectedWorktreeIdentity: "feature",
+      expectedWorktreePath: worktreePath,
+      scope: "worktree",
+    });
+    expect(archiveCalls[0]?.input).not.toHaveProperty("worktreePath");
     expect(result).toEqual({
       type: "single",
       data: {
@@ -134,7 +115,7 @@ describe("runArchiveCommand", () => {
     });
   });
 
-  it("sends daemon-issued caller identity from a provider environment", async () => {
+  it("does not send a deprecated per-action caller identity", async () => {
     const worktreePath = "/tmp/paseo-home/worktrees/repo/feature";
     const archiveCalls: Array<Parameters<DaemonClient["archivePaseoWorktree"]>[0]> = [];
     const fakeClient = createFakeDaemonClient({
@@ -161,9 +142,19 @@ describe("runArchiveCommand", () => {
       },
     });
 
-    await runArchiveCommandWithDeps("feature", {}, { connectToDaemon: async () => fakeClient });
+    await runArchiveCommandWithDeps(
+      "feature",
+      { cwd: "/repos/repo" },
+      { connectToDaemon: async () => fakeClient },
+    );
 
-    expect(archiveCalls[0]).toEqual({ worktreePath, scope: "worktree" });
+    expect(archiveCalls[0]).toEqual({
+      repoRoot: "/repos/repo",
+      expectedWorktreeIdentity: "feature",
+      expectedWorktreePath: worktreePath,
+      scope: "worktree",
+    });
+    expect(archiveCalls[0]).not.toHaveProperty("callerAgentId");
   });
 
   it("preserves the typed self-archive rejection code", async () => {
@@ -191,7 +182,11 @@ describe("runArchiveCommand", () => {
     });
 
     await expect(
-      runArchiveCommandWithDeps("feature", {}, { connectToDaemon: async () => fakeClient }, {}),
+      runArchiveCommandWithDeps(
+        "feature",
+        { cwd: "/repos/repo" },
+        { connectToDaemon: async () => fakeClient },
+      ),
     ).rejects.toMatchObject({ code: "SELF_ARCHIVE_BLOCKED" });
   });
 
@@ -221,7 +216,11 @@ describe("runArchiveCommand", () => {
     });
 
     await expect(
-      runArchiveCommandWithDeps("feature", {}, { connectToDaemon: async () => fakeClient }),
+      runArchiveCommandWithDeps(
+        "feature",
+        { cwd: "/repos/repo" },
+        { connectToDaemon: async () => fakeClient },
+      ),
     ).rejects.toMatchObject({ code: "WORKTREE_NOT_REMOVED" });
   });
 
@@ -263,8 +262,12 @@ describe("runArchiveCommand", () => {
     );
 
     expect(archiveCalls).toHaveLength(1);
-    expect(archiveCalls[0]?.input.scope).toBe("worktree");
-    expect(archiveCalls[0]?.input.worktreePath).toBe(worktreePath);
+    expect(archiveCalls[0]?.input).toEqual({
+      repoRoot: "/repos/repo",
+      expectedWorktreeIdentity: "feature-x",
+      expectedWorktreePath: worktreePath,
+      scope: "worktree",
+    });
   });
 
   it("refuses to archive either of two same-named worktrees", async () => {
@@ -356,16 +359,17 @@ describe("runArchiveCommand", () => {
       {
         connectToDaemon: async () => fakeClient,
       },
-      {},
     );
 
-    expect(listCalls).toEqual([
+    expect(listCalls).toEqual([{ cwd: undefined, repoRoot: undefined, ...selector }]);
+    expect(archiveCalls).toEqual([
       {
-        cwd: "cwd" in selector ? selector.cwd : undefined,
-        repoRoot: "repoRoot" in selector ? selector.repoRoot : undefined,
+        repoRoot: "/repos/repo-a",
+        expectedWorktreeIdentity: "shared",
+        expectedWorktreePath: selectedPath,
+        scope: "worktree",
       },
     ]);
-    expect(archiveCalls).toEqual([{ worktreePath: selectedPath, scope: "worktree" }]);
   });
 
   it("throws a CommandError when the worktree is not found", async () => {

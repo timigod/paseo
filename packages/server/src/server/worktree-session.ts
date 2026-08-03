@@ -566,6 +566,8 @@ export async function handlePaseoWorktreeArchiveRequest(
       worktreePath: msg.worktreePath,
       repoRoot: msg.repoRoot,
       branchName: msg.branchName,
+      expectedWorktreeIdentity: msg.expectedWorktreeIdentity,
+      expectedWorktreePath: msg.expectedWorktreePath,
       workspaceId: msg.workspaceId,
       scope: msg.scope,
       caller,

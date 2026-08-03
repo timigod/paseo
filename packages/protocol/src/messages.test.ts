@@ -457,6 +457,11 @@ describe("file explorer request compatibility", () => {
 });
 
 describe("paseo worktree archive request compatibility", () => {
+  const legacyRequestSchema = PaseoWorktreeArchiveRequestSchema.omit({
+    expectedWorktreeIdentity: true,
+    expectedWorktreePath: true,
+  });
+
   test("omitted scope defaults to workspace", () => {
     const parsed = PaseoWorktreeArchiveRequestSchema.parse({
       type: "paseo_worktree_archive_request",
@@ -505,6 +510,42 @@ describe("paseo worktree archive request compatibility", () => {
         requestId: "req-new-caller",
       }),
     ).toMatchObject({ callerAgentId: "agent-1", callerAgentProof: "proof-1" });
+  });
+
+  test("old daemons strip expected identity fields and cannot receive a destructive path", () => {
+    const parsed = legacyRequestSchema.parse({
+      type: "paseo_worktree_archive_request",
+      repoRoot: "/repo",
+      expectedWorktreeIdentity: "feature",
+      expectedWorktreePath: "/paseo/worktrees/repo/feature",
+      scope: "worktree",
+      requestId: "req-new-cli-old-daemon",
+    });
+
+    expect(parsed).toEqual({
+      type: "paseo_worktree_archive_request",
+      repoRoot: "/repo",
+      scope: "worktree",
+      deleteWorktreeFromDisk: false,
+      requestId: "req-new-cli-old-daemon",
+    });
+    expect(parsed).not.toHaveProperty("worktreePath");
+  });
+
+  test("new daemons preserve the expected identity and path", () => {
+    const parsed = PaseoWorktreeArchiveRequestSchema.parse({
+      type: "paseo_worktree_archive_request",
+      repoRoot: "/repo",
+      expectedWorktreeIdentity: "feature",
+      expectedWorktreePath: "/paseo/worktrees/repo/feature",
+      scope: "worktree",
+      requestId: "req-new-cli-new-daemon",
+    });
+
+    expect(parsed).toMatchObject({
+      expectedWorktreeIdentity: "feature",
+      expectedWorktreePath: "/paseo/worktrees/repo/feature",
+    });
   });
 });
 

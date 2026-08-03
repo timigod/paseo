@@ -3587,6 +3587,64 @@ test("requests registered-project worktree inventory via RPC", async () => {
   });
 });
 
+test("archives a worktree by expected identity without sending a destructive path", async () => {
+  const logger = createMockLogger();
+  const mock = createMockTransport();
+
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "clsk_unit_test",
+    logger,
+    reconnect: { enabled: false },
+    transportFactory: () => mock.transport,
+  });
+  clients.push(client);
+
+  const connectPromise = client.connect();
+  mock.triggerOpen();
+  await connectPromise;
+
+  const promise = client.archivePaseoWorktree(
+    {
+      repoRoot: "/repo",
+      expectedWorktreeIdentity: "feature",
+      expectedWorktreePath: "/paseo/worktrees/repo/feature",
+      scope: "worktree",
+    },
+    "req-archive-worktree",
+  );
+
+  expect(mock.sent).toHaveLength(1);
+  expect(parseSentFrame(mock.sent[0])).toEqual({
+    type: "paseo_worktree_archive_request",
+    repoRoot: "/repo",
+    expectedWorktreeIdentity: "feature",
+    expectedWorktreePath: "/paseo/worktrees/repo/feature",
+    scope: "worktree",
+    deleteWorktreeFromDisk: false,
+    requestId: "req-archive-worktree",
+  });
+
+  mock.triggerMessage(
+    wrapSessionMessage({
+      type: "paseo_worktree_archive_response",
+      payload: {
+        success: true,
+        removedAgents: [],
+        error: null,
+        requestId: "req-archive-worktree",
+      },
+    }),
+  );
+
+  await expect(promise).resolves.toEqual({
+    success: true,
+    removedAgents: [],
+    error: null,
+    requestId: "req-archive-worktree",
+  });
+});
+
 test("requests checkout merge from base via RPC", async () => {
   const logger = createMockLogger();
   const mock = createMockTransport();

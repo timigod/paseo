@@ -2020,6 +2020,11 @@ export const PaseoWorktreeArchiveRequestSchema = z.object({
   worktreePath: z.string().optional(),
   repoRoot: z.string().optional(),
   branchName: z.string().optional(),
+  // COMPAT(worktreeArchiveExpectedIdentity): added in v0.2.6, remove optional after 2027-02-03.
+  // New destructive clients send both fields instead of worktreePath so an old
+  // daemon strips them and fails safely rather than trusting a stale cached path.
+  expectedWorktreeIdentity: z.string().optional(),
+  expectedWorktreePath: z.string().optional(),
   // COMPAT(worktreeArchiveWorkspaceId): added in v0.1.97, drop the optional gate when floor >= v0.1.97.
   // Explicit workspace record to archive. A directory can back multiple workspaces
   // (Model B), so resolving the target by cwd alone picks the wrong record. When
