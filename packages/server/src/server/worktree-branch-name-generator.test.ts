@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, test, vi } from "vitest";
@@ -111,7 +111,6 @@ describe("generateBranchNameFromFirstAgentContext", () => {
       throw new Error("expected structured generation call");
     }
     expect(firstCall).toMatchObject({
-      cwd: "/tmp/repo",
       schemaName: "BranchName",
       maxRetries: 2,
       agentConfigOverrides: {
@@ -122,6 +121,32 @@ describe("generateBranchNameFromFirstAgentContext", () => {
     expect(firstCall.prompt).toContain("Fix the login flow");
     expect(firstCall.prompt).toContain("<user-prompt>\nFix the login flow\n</user-prompt>");
     expect(firstCall.prompt).not.toContain("User context:");
+  });
+
+  test("runs same-workspace auto-name generation in an isolated directory", async () => {
+    const workspaceCwd = createTempDir("managed-auto-name-workspace-");
+    let generationCwd: string | null = null;
+
+    const result = await generateBranchNameFromFirstAgentContext({
+      agentManager: {} as AgentManager,
+      cwd: workspaceCwd,
+      firstAgentContext: { prompt: "Fix the login flow" },
+      logger: createLogger(),
+      deps: {
+        generateStructuredAgentResponseWithFallback: async (options) => {
+          generationCwd = options.cwd;
+          expect(generationCwd).not.toBe(workspaceCwd);
+          expect(path.dirname(generationCwd)).toBe(tmpdir());
+          expect(path.basename(generationCwd)).toMatch(/^paseo-branch-name-/);
+          expect(existsSync(generationCwd)).toBe(true);
+          return { title: "Fix login flow", branch: "fix-login-flow" };
+        },
+      },
+    });
+
+    expect(result).toEqual({ title: "Fix login flow", branch: "fix-login-flow" });
+    expect(generationCwd).not.toBeNull();
+    expect(existsSync(generationCwd ?? workspaceCwd)).toBe(false);
   });
 
   test("wraps a slash-only first-agent prompt as naming input", async () => {

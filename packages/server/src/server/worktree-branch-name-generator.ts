@@ -1,3 +1,6 @@
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { z } from "zod";
 import type { FirstAgentContext } from "@getpaseo/protocol/messages";
 import type { AgentManager } from "./agent/agent-manager.js";
@@ -101,6 +104,7 @@ export async function generateBranchNameFromFirstAgentContext(
   const generator =
     options.deps?.generateStructuredAgentResponseWithFallback ??
     generateStructuredAgentResponseWithFallback;
+  let generationCwd: string | null = null;
 
   try {
     const providers = options.providerSnapshotManager
@@ -111,13 +115,17 @@ export async function generateBranchNameFromFirstAgentContext(
           currentSelection: options.currentSelection,
         })
       : [];
+    const prompt = await buildPrompt(seed, {
+      cwd: options.cwd,
+      workspaceGitService: options.workspaceGitService,
+    });
+    // Naming only needs the prepared prompt. Keep its agent outside the managed
+    // worktree so it cannot contend with the first agent that owns that worktree.
+    generationCwd = await mkdtemp(join(tmpdir(), "paseo-branch-name-"));
     const result = await generator({
       manager: options.agentManager,
-      cwd: options.cwd,
-      prompt: await buildPrompt(seed, {
-        cwd: options.cwd,
-        workspaceGitService: options.workspaceGitService,
-      }),
+      cwd: generationCwd,
+      prompt,
       schema: BranchNameSchema,
       schemaName: "BranchName",
       maxRetries: 2,
@@ -142,5 +150,14 @@ export async function generateBranchNameFromFirstAgentContext(
         : "Branch name generation failed",
     );
     return null;
+  } finally {
+    if (generationCwd) {
+      await rm(generationCwd, { recursive: true, force: true }).catch((error: unknown) => {
+        options.logger.warn(
+          { err: error, cwd: generationCwd },
+          "Failed to remove branch name generation directory",
+        );
+      });
+    }
   }
 }

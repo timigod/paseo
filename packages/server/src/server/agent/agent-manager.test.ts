@@ -12516,6 +12516,35 @@ test("managed worktree writer fence keeps an idle agent as owner", async () => {
   }
 });
 
+test("managed worktree writer fence permits isolated auto-name generation but rejects a competing writer", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "managed-writer-auto-name-"));
+  const generationDir = mkdtempSync(join(tmpdir(), "managed-writer-auto-name-generation-"));
+  try {
+    const client = new ManagedWriterTestClient();
+    const manager = createManagedWriterManager({
+      cwd: workdir,
+      storage: new AgentStorage(join(workdir, "agents"), logger),
+      client,
+    });
+    await createManagedWriterAgent(manager, workdir);
+
+    const generator = await manager.createAgent(
+      { provider: "codex", cwd: generationDir, internal: true },
+      undefined,
+      { workspaceId: undefined },
+    );
+    await manager.closeAgent(generator.id);
+
+    await expect(createManagedWriterAgent(manager, workdir)).rejects.toBeInstanceOf(
+      ManagedWorktreeWriterConflictError,
+    );
+    expect(client.createCalls).toBe(2);
+  } finally {
+    rmSync(workdir, { recursive: true, force: true });
+    rmSync(generationDir, { recursive: true, force: true });
+  }
+});
+
 test("managed worktree writer fence permits same-agent same-session recovery", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "managed-writer-recovery-"));
   try {
