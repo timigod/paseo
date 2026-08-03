@@ -1,0 +1,44 @@
+{
+  "schemaVersion": 1,
+  "description": "Temporary Paseo runtime overlay for Timi's two-host fleet",
+  "stableBase": {
+    "tag": "v0.2.5",
+    "commit": "6fc491e6220fba6543bbbe4bf1b1f58cfe59228b"
+  },
+  "patchVector": {
+    "authority": "the Git commit containing this manifest",
+    "baseExclusive": "6fc491e6220fba6543bbbe4bf1b1f58cfe59228b",
+    "tipInclusive": "self",
+    "order": "git rev-list --reverse <baseExclusive>..<containingCommit>"
+  },
+  "destinations": [
+    {
+      "id": "generic-paseo-corrections",
+      "destination": "small independent getpaseo/paseo pull requests",
+      "dropCondition": "equivalent behavior is present in an official stable Paseo release"
+    },
+    {
+      "id": "fleet-topology-and-routing",
+      "destination": "external Plexer-owned Paseo fleet companion",
+      "dropCondition": "the companion consumes only released Paseo interfaces and the core copies are removed"
+    },
+    {
+      "id": "plexer-provider-behavior",
+      "destination": "Plexer",
+      "dropCondition": "no Plexer account, model, or quota policy remains in Paseo"
+    },
+    {
+      "id": "machine-convergence-and-packaging",
+      "destination": "machine-local rollout tooling plus generic upstream packaging fixes",
+      "dropCondition": "official stable packages expose equivalent provenance and both hosts run an unmodified release"
+    }
+  ],
+  "excludedRefs": [
+    "safety/20260803-early-provider-continuation",
+    "safety/20260803-hydration-serialization"
+  ],
+  "notes": [
+    "Safety refs preserve unfinished evidence only; they are not runtime patches or upstream proposals.",
+    "Machine-local credentials, provider profiles, agent records, and worktrees are never part of this manifest."
+  ]
+}
