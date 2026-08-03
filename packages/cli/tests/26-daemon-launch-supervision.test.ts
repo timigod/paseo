@@ -18,6 +18,8 @@ const serverConnectionOfferE2ePath = join(
 );
 const desktopRuntimePathsPath = join(repoRoot, "packages/desktop/src/daemon/runtime-paths.ts");
 const nixPackagePath = join(repoRoot, "nix/package.nix");
+const nixModulePath = join(repoRoot, "nix/module.nix");
+const dockerBasePath = join(repoRoot, "docker/base/Dockerfile");
 
 function assertNoDirectWorkerLaunch(label: string, command: string): void {
   assert(
@@ -101,5 +103,15 @@ assert(
 );
 assertNoDirectWorkerLaunch("Nix package wrapper", nixPackage);
 console.log("✓ desktop runtime and Nix wrapper enter supervisor\n");
+
+console.log("Test 5: service managers use their reserved stop signal");
+const [nixModule, dockerBase] = await Promise.all([
+  readFile(nixModulePath, "utf-8"),
+  readFile(dockerBasePath, "utf-8"),
+]);
+assert(/^STOPSIGNAL SIGQUIT$/m.test(dockerBase), "Docker must stop Paseo with SIGQUIT");
+assert(/\bKillMode\s*=\s*"mixed";/.test(nixModule), "NixOS must signal the supervisor first");
+assert(/\bKillSignal\s*=\s*"SIGQUIT";/.test(nixModule), "NixOS must stop with SIGQUIT");
+console.log("✓ service-manager stop ownership is explicit\n");
 
 console.log("=== Daemon launch supervision regression test passed ===");
