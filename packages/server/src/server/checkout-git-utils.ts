@@ -34,6 +34,8 @@ export function toCheckoutError(error: unknown): CheckoutErrorPayload {
   if (error instanceof NotGitRepoError) {
     return { code: "NOT_GIT_REPO", message: error.message };
   }
+  // A MergeCleanupError extends AggregateError but must not map to MERGE_CONFLICT:
+  // the checkout is not in a cleanly-recoverable conflict state.
   if (error instanceof MergeCleanupError) {
     return { code: "UNKNOWN", message: error.message };
   }

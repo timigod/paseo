@@ -3226,6 +3226,8 @@ async function verifyMergeCleanup(cwd: string): Promise<unknown[]> {
 async function cleanupFailedMerge(cwd: string, mode: "merge" | "squash"): Promise<unknown[]> {
   const errors: unknown[] = [];
   try {
+    // A failed squash merge leaves conflicted index entries without MERGE_HEAD,
+    // so `merge --abort` cannot clean it; `reset --merge` can.
     const cleanupArgs = mode === "squash" ? ["reset", "--merge", "HEAD"] : ["merge", "--abort"];
     await runGitCommand(cleanupArgs, { cwd, timeout: 120_000 });
   } catch (error) {
