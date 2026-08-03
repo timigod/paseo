@@ -12,13 +12,18 @@ import {
   getCheckoutSnapshotFacts as getCheckoutSnapshotFactsUncached,
   getCheckoutStatus as getCheckoutStatusUncached,
   resolveAbsoluteGitDir as resolveAbsoluteGitDirReal,
+  type CheckoutContext,
   type CheckoutDiffCompare,
   type CheckoutDiffResult,
   type CheckoutSnapshotFacts,
   type CheckoutStatusGit,
   type PullRequestStatusResult,
 } from "../utils/checkout-git.js";
-import { runGitCommand as runGitCommandReal } from "../utils/run-git-command.js";
+import {
+  runGitCommand as runGitCommandReal,
+  startGitCommandMetrics,
+  stopGitCommandMetrics,
+} from "../utils/run-git-command.js";
 import {
   WorkspaceGitServiceImpl,
   type WorkspaceGitRuntimeSnapshot,
@@ -1923,6 +1928,173 @@ describe("WorkspaceGitServiceImpl D2 read methods", () => {
     nowMs = 1_000;
     await service.getProjectSlug(join(REPO_CWD, "."));
     expect(getCheckoutStatus).toHaveBeenCalledTimes(1);
+
+    service.dispose();
+  });
+
+  test("shares repository-common Git reads across sibling worktrees while keeping checkout reads local", async () => {
+    vi.useRealTimers();
+    const tempDir = realpathSync(mkdtempSync(join(tmpdir(), "workspace-git-shared-facts-")));
+    const repoDir = join(tempDir, "repo");
+    const worktreeDir = join(tempDir, "feature-worktree");
+    mkdirSync(repoDir, { recursive: true });
+    execFileSync("git", ["init", "-b", "main"], { cwd: repoDir, stdio: "pipe" });
+    execFileSync("git", ["config", "user.email", "test@test.com"], {
+      cwd: repoDir,
+      stdio: "pipe",
+    });
+    execFileSync("git", ["config", "user.name", "Test"], { cwd: repoDir, stdio: "pipe" });
+    writeFileSync(join(repoDir, "tracked.txt"), "initial\n");
+    execFileSync("git", ["add", "tracked.txt"], { cwd: repoDir, stdio: "pipe" });
+    execFileSync("git", ["-c", "commit.gpgsign=false", "commit", "-m", "initial"], {
+      cwd: repoDir,
+      stdio: "pipe",
+    });
+    execFileSync("git", ["branch", "feature/shared-facts"], { cwd: repoDir, stdio: "pipe" });
+    execFileSync("git", ["worktree", "add", worktreeDir, "feature/shared-facts"], {
+      cwd: repoDir,
+      stdio: "pipe",
+    });
+
+    const service = createService({
+      getCheckoutSnapshotFacts: getCheckoutSnapshotFactsUncached as never,
+      getCheckoutStatus: getCheckoutStatusUncached as never,
+    });
+
+    startGitCommandMetrics();
+    try {
+      await Promise.all([
+        service.getSnapshot(repoDir, { includeForge: false }),
+        service.getSnapshot(worktreeDir, { includeForge: false }),
+      ]);
+      const commands = stopGitCommandMetrics().commands.map((command) => command.args.join(" "));
+
+      expect(
+        commands.filter((command) => command === "symbolic-ref --quiet refs/remotes/origin/HEAD"),
+      ).toHaveLength(1);
+      expect(
+        commands.filter((command) => command === "branch --format=%(refname:short)"),
+      ).toHaveLength(1);
+      expect(
+        commands.filter((command) => command === "config --get remote.origin.url"),
+      ).toHaveLength(2);
+      expect(commands.filter((command) => command === "status --porcelain")).toHaveLength(2);
+      expect(commands.filter((command) => command === "rev-parse --git-common-dir")).toHaveLength(
+        2,
+      );
+    } finally {
+      stopGitCommandMetrics();
+      service.dispose();
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  test("an invalidated in-flight repository fact cannot replace a newer value", async () => {
+    const commonDir = join(REPO_CWD, ".git");
+    const siblingCwd = resolvePath("/tmp/repo-sibling");
+    const laterCwd = resolvePath("/tmp/repo-later-sibling");
+    const staleLoad = createDeferred<string>();
+    const freshLoad = createDeferred<string>();
+    const loadDefaultBranch = vi
+      .fn<() => Promise<string>>()
+      .mockImplementationOnce(() => staleLoad.promise)
+      .mockImplementationOnce(() => freshLoad.promise);
+    const resolvedBranches = new Map<string, string>();
+    const getCheckoutSnapshotFacts = vi.fn(async (cwd: string, context?: CheckoutContext) => {
+      const branch = await context?.repositoryFacts?.read(
+        commonDir,
+        "default-branch",
+        loadDefaultBranch,
+      );
+      resolvedBranches.set(cwd, branch ?? "missing");
+      return createCheckoutFacts(cwd, { gitCommonDir: commonDir, resolvedBaseRef: branch ?? null });
+    });
+    const service = createService({ getCheckoutSnapshotFacts });
+
+    const staleSnapshot = service.getSnapshot(REPO_CWD, { includeForge: false });
+    await vi.waitFor(() => expect(loadDefaultBranch).toHaveBeenCalledTimes(1));
+    service.onWorkspaceStateMayHaveChanged(REPO_CWD);
+    const freshSnapshot = service.getSnapshot(siblingCwd, { includeForge: false });
+    await vi.waitFor(() => expect(loadDefaultBranch).toHaveBeenCalledTimes(2));
+
+    freshLoad.resolve("develop");
+    await freshSnapshot;
+    staleLoad.resolve("main");
+    await staleSnapshot;
+    await service.getSnapshot(laterCwd, { includeForge: false });
+
+    expect(loadDefaultBranch).toHaveBeenCalledTimes(2);
+    expect(resolvedBranches.get(laterCwd)).toBe("develop");
+
+    service.dispose();
+  });
+
+  test("external state changes invalidate repository facts loaded by direct checkout reads", async () => {
+    const commonDir = join(REPO_CWD, ".git");
+    const loadDefaultBranch = vi
+      .fn<() => Promise<string>>()
+      .mockResolvedValueOnce("main")
+      .mockResolvedValueOnce("develop");
+    const getCheckoutStatus = vi.fn(async (cwd: string, context?: CheckoutContext) => {
+      const resolvedBaseRef = await context?.repositoryFacts?.read(
+        commonDir,
+        "default-branch",
+        loadDefaultBranch,
+      );
+      return createCheckoutStatus(cwd, { resolvedBaseRef: resolvedBaseRef ?? null });
+    });
+    const service = createService({ getCheckoutStatus });
+
+    await service.getCheckout(REPO_CWD);
+    service.onWorkspaceStateMayHaveChanged(REPO_CWD);
+    await service.getCheckout(REPO_CWD);
+
+    expect(loadDefaultBranch).toHaveBeenCalledTimes(2);
+
+    service.dispose();
+  });
+
+  test("repository fact ready values are bounded by physical repository count", async () => {
+    const firstRepository = resolvePath("/tmp/repository-0/.git");
+    const loadFact = vi.fn(async () => "loaded");
+    const getCheckoutSnapshotFacts = vi.fn(async (cwd: string, context?: CheckoutContext) => {
+      const repository = cwd.endsWith("first-sibling") ? firstRepository : join(cwd, ".git");
+      await context?.repositoryFacts?.read(repository, "default-branch", loadFact);
+      return createCheckoutFacts(cwd, { gitCommonDir: repository });
+    });
+    const service = createService({ getCheckoutSnapshotFacts });
+
+    for (let index = 0; index < 129; index += 1) {
+      await service.getSnapshot(resolvePath(`/tmp/repository-${index}`), { includeForge: false });
+    }
+    await service.getSnapshot(resolvePath("/tmp/first-sibling"), { includeForge: false });
+
+    expect(loadFact).toHaveBeenCalledTimes(130);
+
+    service.dispose();
+  });
+
+  test("repository fact ready values are bounded by operation count", async () => {
+    const commonDir = resolvePath("/tmp/shared-repository/.git");
+    const loadFact = vi.fn(async () => "loaded");
+    const getCheckoutSnapshotFacts = vi.fn(async (cwd: string, context?: CheckoutContext) => {
+      const operation =
+        cwd.endsWith("operation-0") || cwd.endsWith("operation-0-sibling")
+          ? "ref-exists:0"
+          : `ref-exists:${cwd}`;
+      await context?.repositoryFacts?.read(commonDir, operation, loadFact);
+      return createCheckoutFacts(cwd, { gitCommonDir: commonDir });
+    });
+    const service = createService({ getCheckoutSnapshotFacts });
+
+    for (let index = 0; index < 65; index += 1) {
+      await service.getSnapshot(resolvePath(`/tmp/operation-${index}`), { includeForge: false });
+    }
+    await service.getSnapshot(resolvePath("/tmp/operation-0-sibling"), {
+      includeForge: false,
+    });
+
+    expect(loadFact).toHaveBeenCalledTimes(66);
 
     service.dispose();
   });
