@@ -2011,6 +2011,7 @@ export const PaseoWorktreeListRequestSchema = z.object({
   type: z.literal("paseo_worktree_list_request"),
   cwd: z.string().optional(),
   repoRoot: z.string().optional(),
+  allRegisteredProjects: z.literal(true).optional(),
   requestId: z.string(),
 });
 
@@ -4767,8 +4768,9 @@ export const PaseoWorktreeListResponseSchema = z.object({
   type: z.literal("paseo_worktree_list_response"),
   payload: z.object({
     worktrees: z.array(PaseoWorktreeSchema),
-    // COMPAT(worktreeInventoryComplete): added in v0.2.6, remove optional after 2027-02-03.
-    inventoryComplete: z.boolean().optional().default(false),
+    // Reports only failures observed while inspecting current registered projects.
+    // Absence does not assert that the inventory is complete.
+    repositoryErrors: z.number().int().positive().optional(),
     error: CheckoutErrorSchema.nullable(),
     requestId: z.string(),
   }),

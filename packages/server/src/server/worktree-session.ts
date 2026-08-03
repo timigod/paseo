@@ -451,12 +451,11 @@ export async function handlePaseoWorktreeListRequest(
 ): Promise<void> {
   const { requestId } = msg;
   const cwd = msg.repoRoot ?? msg.cwd;
-  if (!cwd && (msg.repoRoot !== undefined || msg.cwd !== undefined)) {
+  if (!cwd && msg.allRegisteredProjects !== true) {
     dependencies.emit({
       type: "paseo_worktree_list_response",
       payload: {
         worktrees: [],
-        inventoryComplete: false,
         error: { code: "UNKNOWN", message: "cwd or repoRoot is required" },
         requestId,
       },
@@ -465,7 +464,7 @@ export async function handlePaseoWorktreeListRequest(
   }
 
   try {
-    let inventoryComplete = true;
+    let repositoryErrors = 0;
     let worktrees: WorkspaceGitWorktreeInfo[];
     if (cwd) {
       worktrees = await listPaseoWorktreesCommand(
@@ -481,7 +480,7 @@ export async function handlePaseoWorktreeListRequest(
           try {
             return await dependencies.workspaceGitService.resolveRepoRoot(project.rootPath);
           } catch (error) {
-            inventoryComplete = false;
+            repositoryErrors += 1;
             dependencies.sessionLogger.warn(
               { err: error, projectId: project.projectId, projectRoot: project.rootPath },
               "Skipping project while listing Paseo worktrees",
@@ -505,7 +504,7 @@ export async function handlePaseoWorktreeListRequest(
               { cwd: repoRoot },
             );
           } catch (error) {
-            inventoryComplete = false;
+            repositoryErrors += 1;
             dependencies.sessionLogger.warn(
               { err: error, repoRoot },
               "Skipping repository while listing Paseo worktrees",
@@ -530,7 +529,7 @@ export async function handlePaseoWorktreeListRequest(
           branchName: entry.branchName ?? null,
           head: entry.head ?? null,
         })),
-        inventoryComplete,
+        ...(repositoryErrors > 0 ? { repositoryErrors } : {}),
         error: null,
         requestId,
       },
@@ -540,7 +539,6 @@ export async function handlePaseoWorktreeListRequest(
       type: "paseo_worktree_list_response",
       payload: {
         worktrees: [],
-        inventoryComplete: false,
         error: toCheckoutError(error),
         requestId,
       },

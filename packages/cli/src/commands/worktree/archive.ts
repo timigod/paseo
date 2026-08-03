@@ -37,6 +37,26 @@ export interface WorktreeArchiveOptions extends CommandOptions {
 
 export type WorktreeArchiveCommandResult = SingleResult<WorktreeArchiveResult>;
 
+function assertArchiveInput(nameArg: string, options: WorktreeArchiveOptions): void {
+  if (!nameArg || nameArg.trim().length === 0) {
+    const error: CommandError = {
+      code: "MISSING_WORKTREE_NAME",
+      message: "Worktree name is required",
+      details: "Usage: paseo worktree archive <name>",
+    };
+    throw error;
+  }
+
+  if (!options.cwd && !options.repoRoot) {
+    const error: CommandError = {
+      code: "MISSING_WORKTREE_SELECTOR",
+      message: "Archive requires --cwd or --repo-root",
+      details: "Use --repo-root <path> or --cwd <path> to select one repository.",
+    };
+    throw error;
+  }
+}
+
 function assertArchiveRemoved(
   response: Awaited<ReturnType<DaemonClient["archivePaseoWorktree"]>>,
   worktreePath: string,
@@ -68,15 +88,7 @@ export async function runArchiveCommandWithDeps(
 ): Promise<WorktreeArchiveCommandResult> {
   const host = getDaemonHost({ host: options.host });
 
-  // Validate arguments
-  if (!nameArg || nameArg.trim().length === 0) {
-    const error: CommandError = {
-      code: "MISSING_WORKTREE_NAME",
-      message: "Worktree name is required",
-      details: "Usage: paseo worktree archive <name>",
-    };
-    throw error;
-  }
+  assertArchiveInput(nameArg, options);
 
   let client: DaemonClient;
   try {
@@ -102,15 +114,6 @@ export async function runArchiveCommandWithDeps(
       const error: CommandError = {
         code: "WORKTREE_LIST_FAILED",
         message: `Failed to list worktrees: ${listResponse.error.message}`,
-      };
-      throw error;
-    }
-
-    if (!options.cwd && !options.repoRoot && !listResponse.inventoryComplete) {
-      const error: CommandError = {
-        code: "WORKTREE_LIST_INCOMPLETE",
-        message: "Cannot safely archive from an incomplete worktree inventory",
-        details: "Retry, or use --repo-root <path> or --cwd <path> to select one repository.",
       };
       throw error;
     }

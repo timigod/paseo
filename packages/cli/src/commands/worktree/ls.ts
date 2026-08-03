@@ -61,12 +61,12 @@ export async function runLsCommand(
   options: WorktreeLsOptions,
   _command: Command,
 ): Promise<WorktreeLsResult> {
-  return runLsCommandWithDeps(options, { connectToDaemon, cwd: process.cwd });
+  return runLsCommandWithDeps(options, { connectToDaemon });
 }
 
 export async function runLsCommandWithDeps(
   options: WorktreeLsOptions,
-  deps: { connectToDaemon: typeof connectToDaemon; cwd?: () => string },
+  deps: { connectToDaemon: typeof connectToDaemon },
 ): Promise<WorktreeLsResult> {
   const host = getDaemonHost({ host: options.host });
 
@@ -87,8 +87,7 @@ export async function runLsCommandWithDeps(
     const agentsPayload = await client.fetchAgents({ filter: { includeArchived: true } });
     const agents = agentsPayload.entries.map((entry) => entry.agent);
 
-    // Get worktree list from daemon
-    const response = await client.getPaseoWorktreeList({ cwd: (deps.cwd ?? process.cwd)() });
+    const response = await client.getPaseoWorktreeList({ allRegisteredProjects: true });
 
     await client.close();
 
@@ -96,6 +95,15 @@ export async function runLsCommandWithDeps(
       const error: CommandError = {
         code: "WORKTREE_LIST_FAILED",
         message: `Failed to list worktrees: ${response.error.message}`,
+      };
+      throw error;
+    }
+
+    if (response.repositoryErrors !== undefined) {
+      const error: CommandError = {
+        code: "WORKTREE_LIST_PARTIAL",
+        message: `Failed to list worktrees from ${response.repositoryErrors} registered ${response.repositoryErrors === 1 ? "repository" : "repositories"}`,
+        details: "Resolve the unavailable repositories and retry.",
       };
       throw error;
     }

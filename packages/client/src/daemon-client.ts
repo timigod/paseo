@@ -4002,7 +4002,7 @@ export class DaemonClient {
   }
 
   async getPaseoWorktreeList(
-    input: { cwd?: string; repoRoot?: string },
+    input: { cwd?: string; repoRoot?: string; allRegisteredProjects?: true },
     requestId?: string,
   ): Promise<PaseoWorktreeListPayload> {
     return this.sendCorrelatedSessionRequest({
@@ -4011,6 +4011,7 @@ export class DaemonClient {
         type: "paseo_worktree_list_request",
         cwd: input.cwd,
         repoRoot: input.repoRoot,
+        allRegisteredProjects: input.allRegisteredProjects,
       },
       responseType: "paseo_worktree_list_response",
     });

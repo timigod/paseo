@@ -7,6 +7,7 @@ import {
   MANAGED_WORKTREE_WRITER_CONFLICT_ERROR_CODE,
   PaseoWorktreeArchiveRequestSchema,
   PaseoWorktreeArchiveResponseSchema,
+  PaseoWorktreeListRequestSchema,
   parseServerInfoStatusPayload,
   SessionInboundMessageSchema,
   SessionOutboundMessageSchema,
@@ -689,6 +690,67 @@ describe("destructive caller hello compatibility", () => {
         callerAgent: { incarnation: oversized },
       }).success,
     ).toBe(false);
+  });
+});
+
+describe("paseo worktree list request compatibility", () => {
+  const legacyRequestSchema = PaseoWorktreeListRequestSchema.omit({
+    allRegisteredProjects: true,
+  });
+
+  test("old CLI and old daemon retain the unscoped legacy request shape", () => {
+    const parsed = legacyRequestSchema.parse({
+      type: "paseo_worktree_list_request",
+      requestId: "req-old-cli-old-daemon",
+    });
+
+    expect(parsed).toEqual({
+      type: "paseo_worktree_list_request",
+      requestId: "req-old-cli-old-daemon",
+    });
+  });
+
+  test("old daemon strips the new global inventory flag and returns its explicit error", () => {
+    const request = legacyRequestSchema.parse({
+      type: "paseo_worktree_list_request",
+      allRegisteredProjects: true,
+      requestId: "req-new-cli-old-daemon",
+    });
+    const response = SessionOutboundMessageSchema.parse({
+      type: "paseo_worktree_list_response",
+      payload: {
+        worktrees: [],
+        error: { code: "UNKNOWN", message: "cwd or repoRoot is required" },
+        requestId: "req-new-cli-old-daemon",
+      },
+    });
+
+    expect(request).toEqual({
+      type: "paseo_worktree_list_request",
+      requestId: "req-new-cli-old-daemon",
+    });
+    expect(response).toEqual({
+      type: "paseo_worktree_list_response",
+      payload: {
+        worktrees: [],
+        error: { code: "UNKNOWN", message: "cwd or repoRoot is required" },
+        requestId: "req-new-cli-old-daemon",
+      },
+    });
+  });
+
+  test("new daemon preserves the explicit global inventory flag", () => {
+    const parsed = PaseoWorktreeListRequestSchema.parse({
+      type: "paseo_worktree_list_request",
+      allRegisteredProjects: true,
+      requestId: "req-new-cli-new-daemon",
+    });
+
+    expect(parsed).toEqual({
+      type: "paseo_worktree_list_request",
+      allRegisteredProjects: true,
+      requestId: "req-new-cli-new-daemon",
+    });
   });
 });
 

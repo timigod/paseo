@@ -468,7 +468,6 @@ describe("handlePaseoWorktreeListRequest", () => {
             head: "abc123",
           },
         ],
-        inventoryComplete: true,
         error: null,
         requestId: "request-worktrees",
       },
@@ -493,6 +492,7 @@ describe("handlePaseoWorktreeListRequest", () => {
         type: "paseo_worktree_list_request",
         cwd: "/tmp/cwd-repository",
         repoRoot: "/tmp/selected-repository",
+        allRegisteredProjects: true,
         requestId: "request-selected-worktrees",
       },
     );
@@ -503,11 +503,46 @@ describe("handlePaseoWorktreeListRequest", () => {
       type: "paseo_worktree_list_response",
       payload: {
         worktrees: [],
-        inventoryComplete: true,
         error: null,
         requestId: "request-selected-worktrees",
       },
     });
+  });
+
+  test("rejects an unscoped request that omits explicit global inventory", async () => {
+    const emitted: SessionOutboundMessage[] = [];
+    const workspaceGitService = {
+      listWorktrees: vi.fn(async () => []),
+      resolveRepoRoot: vi.fn(async () => "/tmp/repo"),
+    };
+    const projectRegistry = { list: vi.fn(async () => []) };
+
+    await handlePaseoWorktreeListRequest(
+      {
+        emit: (message) => emitted.push(message),
+        workspaceGitService: workspaceGitService as unknown as WorkspaceGitService,
+        projectRegistry,
+        sessionLogger: createLogger(),
+      },
+      {
+        type: "paseo_worktree_list_request",
+        requestId: "request-legacy-unscoped",
+      },
+    );
+
+    expect(projectRegistry.list).not.toHaveBeenCalled();
+    expect(workspaceGitService.resolveRepoRoot).not.toHaveBeenCalled();
+    expect(workspaceGitService.listWorktrees).not.toHaveBeenCalled();
+    expect(emitted).toEqual([
+      {
+        type: "paseo_worktree_list_response",
+        payload: {
+          worktrees: [],
+          error: { code: "UNKNOWN", message: "cwd or repoRoot is required" },
+          requestId: "request-legacy-unscoped",
+        },
+      },
+    ]);
   });
 
   test("lists registered project worktrees when the process cwd is outside Git", async () => {
@@ -546,6 +581,7 @@ describe("handlePaseoWorktreeListRequest", () => {
         },
         {
           type: "paseo_worktree_list_request",
+          allRegisteredProjects: true,
           requestId: "request-all-worktrees",
         },
       );
@@ -563,7 +599,6 @@ describe("handlePaseoWorktreeListRequest", () => {
               head: "abc123",
             },
           ],
-          inventoryComplete: true,
           error: null,
           requestId: "request-all-worktrees",
         },
@@ -636,6 +671,7 @@ describe("handlePaseoWorktreeListRequest", () => {
       },
       {
         type: "paseo_worktree_list_request",
+        allRegisteredProjects: true,
         requestId: "request-available-worktrees",
       },
     );
@@ -662,7 +698,7 @@ describe("handlePaseoWorktreeListRequest", () => {
             head: "abc123",
           },
         ],
-        inventoryComplete: false,
+        repositoryErrors: 2,
         error: null,
         requestId: "request-available-worktrees",
       },

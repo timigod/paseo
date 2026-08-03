@@ -3543,6 +3543,50 @@ test("requests directory suggestions via RPC", async () => {
   });
 });
 
+test("requests registered-project worktree inventory via RPC", async () => {
+  const logger = createMockLogger();
+  const mock = createMockTransport();
+
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "clsk_unit_test",
+    logger,
+    reconnect: { enabled: false },
+    transportFactory: () => mock.transport,
+  });
+  clients.push(client);
+
+  const connectPromise = client.connect();
+  mock.triggerOpen();
+  await connectPromise;
+
+  const promise = client.getPaseoWorktreeList({ allRegisteredProjects: true }, "req-all-worktrees");
+
+  expect(mock.sent).toHaveLength(1);
+  expect(parseSentFrame(mock.sent[0])).toEqual({
+    type: "paseo_worktree_list_request",
+    allRegisteredProjects: true,
+    requestId: "req-all-worktrees",
+  });
+
+  mock.triggerMessage(
+    wrapSessionMessage({
+      type: "paseo_worktree_list_response",
+      payload: {
+        worktrees: [],
+        error: null,
+        requestId: "req-all-worktrees",
+      },
+    }),
+  );
+
+  await expect(promise).resolves.toEqual({
+    worktrees: [],
+    error: null,
+    requestId: "req-all-worktrees",
+  });
+});
+
 test("requests checkout merge from base via RPC", async () => {
   const logger = createMockLogger();
   const mock = createMockTransport();
