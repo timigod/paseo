@@ -1,3 +1,4 @@
+import type { AgentTimelineItem } from "@getpaseo/protocol/agent-types";
 import type { AgentStreamEventPayload } from "@getpaseo/protocol/messages";
 import { describe, expect, it, vi } from "vitest";
 import {
@@ -15,12 +16,24 @@ const OTHER_ID = "22222222-2222-4222-8222-222222222222";
 class FakeAttachClient implements AttachSessionClient {
   readonly streamListeners = new Set<(agentId: string, event: AgentStreamEventPayload) => void>();
   readonly updateListeners = new Set<(update: AttachAgentUpdate) => void>();
-  readonly startAgentUpdates = vi.fn(async () => undefined);
+  private readback: AttachAgentState | null | Promise<AttachAgentState | null>;
+  private startResult: Promise<void> = Promise.resolve();
+  readonly startAgentUpdates = vi.fn(() => this.startResult);
   readonly close = vi.fn(async () => undefined);
-  readonly fetchAgent: AttachSessionClient["fetchAgent"];
+  readonly fetchAgent = vi.fn(async () => this.readback);
 
-  constructor(readback: AttachAgentState | null = runningAgent(TARGET_ID)) {
-    this.fetchAgent = vi.fn(async () => readback);
+  constructor(
+    readback: AttachAgentState | null | Promise<AttachAgentState | null> = runningAgent(TARGET_ID),
+  ) {
+    this.readback = readback;
+  }
+
+  setReadback(readback: AttachAgentState | null | Promise<AttachAgentState | null>): void {
+    this.readback = readback;
+  }
+
+  setStartResult(startResult: Promise<void>): void {
+    this.startResult = startResult;
   }
 
   onAgentStream(listener: (agentId: string, event: AgentStreamEventPayload) => void): () => void {
@@ -77,9 +90,21 @@ function runningAgent(id: string): AttachAgentState {
   return { id, status: "running", archivedAt: null };
 }
 
-function createSession(client: FakeAttachClient, signalSource = new FakeSignalSource()) {
+function deferred<T>(): { promise: Promise<T>; resolve(value: T): void } {
+  let resolve: (value: T) => void = () => {};
+  const promise = new Promise<T>((promiseResolve) => {
+    resolve = promiseResolve;
+  });
+  return { promise, resolve };
+}
+
+function createSession(
+  client: FakeAttachClient,
+  signalSource = new FakeSignalSource(),
+  fetchTimelineItems = vi.fn(async () => [] as AgentTimelineItem[]),
+) {
   const effects = {
-    fetchTimelineItems: vi.fn(async () => []),
+    fetchTimelineItems,
     printTimelineItem: vi.fn(),
     printStreamEvent: vi.fn(),
     warnTimeline: vi.fn(),
@@ -95,15 +120,45 @@ function createSession(client: FakeAttachClient, signalSource = new FakeSignalSo
 }
 
 describe("runAttachSession", () => {
-  it("exits when the exact target emits a terminal turn", async () => {
+  it("exits when an exact-target terminal is confirmed by authoritative state", async () => {
     const client = new FakeAttachClient();
     const session = createSession(client);
+    await vi.waitFor(() => expect(client.fetchAgent).toHaveBeenCalledOnce());
+    client.setReadback({ id: TARGET_ID, status: "idle", archivedAt: null });
 
     client.emitStream(TARGET_ID, { type: "turn_completed", provider: "mock" });
 
     await session.promise;
+    expect(client.fetchAgent).toHaveBeenCalledTimes(2);
     expect(client.close).toHaveBeenCalledOnce();
   });
+
+  it.each([
+    ["stale", { type: "turn_completed", provider: "mock", turnId: "stale-turn" }],
+    [
+      "autonomous",
+      { type: "turn_failed", provider: "mock", turnId: "autonomous-turn", error: "failed" },
+    ],
+    [
+      "replacement",
+      { type: "turn_canceled", provider: "mock", turnId: "replaced-turn", reason: "replace" },
+    ],
+  ] satisfies Array<[string, AgentStreamEventPayload]>)(
+    "stays attached after a %s terminal while authoritative state is running",
+    async (_, event) => {
+      const client = new FakeAttachClient();
+      const session = createSession(client);
+      await vi.waitFor(() => expect(client.fetchAgent).toHaveBeenCalledOnce());
+
+      client.emitStream(TARGET_ID, event);
+      await vi.waitFor(() => expect(client.fetchAgent).toHaveBeenCalledTimes(2));
+      await Promise.resolve();
+
+      expect(client.close).not.toHaveBeenCalled();
+      client.emitUpsert({ id: TARGET_ID, status: "idle", archivedAt: null });
+      await session.promise;
+    },
+  );
 
   it("exits when the exact target is archived", async () => {
     const client = new FakeAttachClient();
@@ -142,7 +197,7 @@ describe("runAttachSession", () => {
     expect(settled).toBe(false);
     expect(client.close).not.toHaveBeenCalled();
 
-    client.emitStream(TARGET_ID, { type: "turn_completed", provider: "mock" });
+    client.emitUpsert({ id: TARGET_ID, status: "idle", archivedAt: null });
     await session.promise;
   });
 
@@ -165,12 +220,72 @@ describe("runAttachSession", () => {
   it("cleans up stream and update listeners after exit", async () => {
     const client = new FakeAttachClient();
     const session = createSession(client);
+    await vi.waitFor(() => expect(client.fetchAgent).toHaveBeenCalledOnce());
+    client.setReadback({ id: TARGET_ID, status: "error", archivedAt: null });
 
     client.emitStream(TARGET_ID, { type: "turn_failed", provider: "mock", error: "failed" });
 
     await session.promise;
     expect(client.streamListeners.size).toBe(0);
     expect(client.updateListeners.size).toBe(0);
+    expect(client.close).toHaveBeenCalledOnce();
+  });
+
+  it("does not wait for a pending subscription bootstrap after exact-target completion", async () => {
+    const start = deferred<void>();
+    const client = new FakeAttachClient({ id: TARGET_ID, status: "idle", archivedAt: null });
+    client.setStartResult(start.promise);
+    const session = createSession(client);
+
+    client.emitStream(TARGET_ID, { type: "turn_completed", provider: "mock" });
+
+    await session.promise;
+    expect(client.close).toHaveBeenCalledOnce();
+    expect(client.streamListeners.size).toBe(0);
+    expect(client.updateListeners.size).toBe(0);
+  });
+
+  it("does not wait for a pending exact readback after exact-target removal", async () => {
+    const readback = deferred<AttachAgentState | null>();
+    const client = new FakeAttachClient(readback.promise);
+    const session = createSession(client);
+    await vi.waitFor(() => expect(client.fetchAgent).toHaveBeenCalledOnce());
+
+    client.emitRemove(TARGET_ID);
+
+    await session.promise;
+    expect(client.close).toHaveBeenCalledOnce();
+    expect(session.signalSource.listenerCount("SIGINT")).toBe(0);
+    expect(session.signalSource.listenerCount("SIGTERM")).toBe(0);
+  });
+
+  it("does not wait for pending timeline catch-up after exact-target completion", async () => {
+    const timeline = deferred<AgentTimelineItem[]>();
+    const fetchTimelineItems = vi.fn(() => timeline.promise);
+    const client = new FakeAttachClient();
+    const session = createSession(client, new FakeSignalSource(), fetchTimelineItems);
+    await vi.waitFor(() => expect(fetchTimelineItems).toHaveBeenCalledOnce());
+    client.setReadback({ id: TARGET_ID, status: "idle", archivedAt: null });
+
+    client.emitStream(TARGET_ID, { type: "turn_completed", provider: "mock" });
+
+    await session.promise;
+    expect(session.warnTimeline).not.toHaveBeenCalled();
+    expect(client.close).toHaveBeenCalledOnce();
+  });
+
+  it("does not warn when SIGINT closes pending timeline catch-up", async () => {
+    const timeline = deferred<AgentTimelineItem[]>();
+    const fetchTimelineItems = vi.fn(() => timeline.promise);
+    const client = new FakeAttachClient();
+    const session = createSession(client, new FakeSignalSource(), fetchTimelineItems);
+    await vi.waitFor(() => expect(fetchTimelineItems).toHaveBeenCalledOnce());
+
+    session.signalSource.emit("SIGINT");
+
+    await session.promise;
+    expect(session.warnTimeline).not.toHaveBeenCalled();
+    expect(session.printDetach).toHaveBeenCalledOnce();
     expect(client.close).toHaveBeenCalledOnce();
   });
 

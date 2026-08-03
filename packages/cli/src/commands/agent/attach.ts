@@ -6,10 +6,7 @@ export function addAttachOptions(cmd: Command): Command {
     .argument("<id>", "Agent ID (or prefix)");
 }
 import { connectToDaemon, getDaemonHost } from "../../utils/client.js";
-import {
-  fetchProjectedTimelineItems,
-  LIVE_HISTORY_FETCH_TIMEOUT_MS,
-} from "../../utils/timeline.js";
+import { fetchProjectedTimelineItems } from "../../utils/timeline.js";
 import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
 import type { AgentTimelineItem } from "@getpaseo/protocol/agent-types";
 import type {
@@ -147,7 +144,6 @@ function isTerminalTurn(event: AgentStreamEventPayload): boolean {
 
 export async function runAttachSession(input: RunAttachSessionInput): Promise<void> {
   let completed = false;
-  let detached = false;
   let closePromise: Promise<void> | null = null;
   let resolveCompletion: () => void = () => {};
   const completion = new Promise<void>((resolve) => {
@@ -158,6 +154,7 @@ export async function runAttachSession(input: RunAttachSessionInput): Promise<vo
     if (completed) return;
     completed = true;
     resolveCompletion();
+    void closeClient().catch(() => {});
   }
 
   function closeClient(): Promise<void> {
@@ -167,14 +164,32 @@ export async function runAttachSession(input: RunAttachSessionInput): Promise<vo
 
   function detach(): void {
     if (completed) return;
-    detached = true;
     input.printDetach();
     complete();
-    void closeClient().catch(() => {});
+  }
+
+  async function verifyTerminalState(): Promise<void> {
+    try {
+      const agent = await Promise.race([input.client.fetchAgent(input.agentId), completion]);
+      if (!completed && (!agent || !isAttachable(agent))) complete();
+    } catch {
+      return;
+    }
+  }
+
+  async function catchUpTimeline(): Promise<void> {
+    try {
+      const timelineItems = await Promise.race([input.fetchTimelineItems(), completion]);
+      if (completed) return;
+      for (const item of timelineItems ?? []) input.printTimelineItem(item);
+    } catch (error) {
+      if (!completed) input.warnTimeline(error);
+    }
   }
 
   const unsubscribeLifecycle = input.client.onAgentStream((agentId, event) => {
-    if (agentId === input.agentId && isTerminalTurn(event)) complete();
+    if (agentId !== input.agentId || !isTerminalTurn(event)) return;
+    void verifyTerminalState();
   });
   const unsubscribeUpdates = input.client.onAgentUpdate((update) => {
     if (update.kind === "remove") {
@@ -189,21 +204,16 @@ export async function runAttachSession(input: RunAttachSessionInput): Promise<vo
 
   try {
     try {
-      await input.client.startAgentUpdates();
-      const readback = await input.client.fetchAgent(input.agentId);
-      if (!readback || !isAttachable(readback)) complete();
+      await Promise.race([input.client.startAgentUpdates(), completion]);
+      if (!completed) {
+        const readback = await Promise.race([input.client.fetchAgent(input.agentId), completion]);
+        if (!completed && (!readback || !isAttachable(readback))) complete();
+      }
     } catch (error) {
       if (!completed) throw error;
     }
 
-    if (!detached) {
-      try {
-        const timelineItems = await input.fetchTimelineItems();
-        for (const item of timelineItems) input.printTimelineItem(item);
-      } catch (error) {
-        input.warnTimeline(error);
-      }
-    }
+    if (!completed) await catchUpTimeline();
 
     if (!completed) {
       unsubscribeOutput = input.client.onAgentStream((agentId, event) => {
@@ -296,7 +306,6 @@ export async function runAttachCommand(
         return fetchProjectedTimelineItems({
           client,
           agentId: resolvedId,
-          timeoutMs: LIVE_HISTORY_FETCH_TIMEOUT_MS,
         });
       },
       printTimelineItem,

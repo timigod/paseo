@@ -1,10 +1,7 @@
 import { Command } from "commander";
 import { connectToDaemon, getDaemonHost } from "../../utils/client.js";
 import type { CommandOptions } from "../../output/index.js";
-import {
-  fetchProjectedTimelineItems,
-  LIVE_HISTORY_FETCH_TIMEOUT_MS,
-} from "../../utils/timeline.js";
+import { fetchProjectedTimelineItems } from "../../utils/timeline.js";
 import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
 import type { AgentTimelineItem } from "@getpaseo/protocol/agent-types";
 import type { AgentStreamMessage } from "@getpaseo/protocol/messages";
@@ -179,9 +176,7 @@ async function runFollowMode(
   // First, get existing timeline.
   let existingItems: AgentTimelineItem[] = [];
   try {
-    existingItems = await fetchAgentTimelineItems(client, agentId, {
-      timeoutMs: LIVE_HISTORY_FETCH_TIMEOUT_MS,
-    });
+    existingItems = await fetchAgentTimelineItems(client, agentId);
   } catch (error) {
     console.warn("Warning: failed to fetch existing timeline", error);
   }
