@@ -456,11 +456,13 @@ describe("CreateAgentRequestStore", () => {
     ).rejects.toThrow("cannot move backward");
   });
 
-  it("does not persist failure details and replays the failed state", async () => {
+  it("does not persist failure details and retries the same failed reservation", async () => {
     const home = createHome();
+    const agentId = "00000000-0000-4000-8000-000000000018";
     const firstStore = new CreateAgentRequestStore({
       paseoHome: home,
       hasAgent: async () => false,
+      idFactory: () => agentId,
     });
     await expect(
       firstStore.run(
@@ -481,17 +483,63 @@ describe("CreateAgentRequestStore", () => {
       paseoHome: home,
       hasAgent: async () => false,
     });
-    const duplicateCreate = vi.fn(async () => {});
+    const retryCreate = vi.fn(async (context: CreateAgentRequestContext) => {
+      expect(context.agentId).toBe(agentId);
+      expect(context.phase).toBe("reserved");
+    });
     await expect(
       restartedStore.run(
         scopedInput({
           key: "failed-create",
           fingerprint: REQUEST_A,
-          create: duplicateCreate,
+          create: retryCreate,
         }),
       ),
-    ).rejects.toThrow("previous create request failed");
-    expect(duplicateCreate).not.toHaveBeenCalled();
+    ).resolves.toBe(agentId);
+    expect(retryCreate).toHaveBeenCalledOnce();
+
+    const receipt = JSON.parse(readFileSync(path.join(home, "create-agent-requests.json"), "utf8"));
+    expect(receipt.receipts).toEqual([
+      expect.objectContaining({
+        key: "failed-create",
+        agentId,
+        state: "succeeded",
+        phase: "reserved",
+      }),
+    ]);
+  });
+
+  it("recovers a late registration before retrying a failed reservation", async () => {
+    const home = createHome();
+    const agentId = "00000000-0000-4000-8000-000000000019";
+    const existingAgents = new Set<string>();
+    const firstStore = new CreateAgentRequestStore({
+      paseoHome: home,
+      hasAgent: async (candidate) => existingAgents.has(candidate),
+      idFactory: () => agentId,
+    });
+    const input = scopedInput({
+      key: "late-registration",
+      fingerprint: REQUEST_A,
+      create: async () => {
+        throw new Error("workspace setup timed out");
+      },
+    });
+    await expect(firstStore.run(input)).rejects.toThrow("workspace setup timed out");
+
+    existingAgents.add(agentId);
+    const restartedStore = new CreateAgentRequestStore({
+      paseoHome: home,
+      hasAgent: async (candidate) => existingAgents.has(candidate),
+    });
+    const resumeCreate = vi.fn(async (context: CreateAgentRequestContext) => {
+      expect(context.agentId).toBe(agentId);
+      expect(context.phase).toBe("agent_registered");
+      await context.checkpoint("prompt_dispatched");
+    });
+
+    await expect(restartedStore.run({ ...input, create: resumeCreate })).resolves.toBe(agentId);
+    expect(resumeCreate).toHaveBeenCalledOnce();
   });
 
   it("refuses a delayed retry after pruning when the deterministic agent still exists", async () => {

@@ -313,9 +313,6 @@ export class CreateAgentRequestStore {
     if (existing && existing.fingerprint !== input.fingerprint) {
       throw new CreateAgentIdempotencyConflictError();
     }
-    if (existing?.state === "failed") {
-      throw new Error("The previous create request failed");
-    }
     if (isCompletedReceipt(existing)) {
       return this.replayCompletedReceipt(existing, scopedKey);
     }
@@ -333,14 +330,22 @@ export class CreateAgentRequestStore {
       throw new Error(`Create idempotency receipt limit of ${this.maxReceipts} was reached`);
     }
 
-    let pending: CreateAgentRequestReceipt = existing ?? {
-      ...identity,
-      fingerprint: input.fingerprint,
-      agentId,
-      state: "pending",
-      phase: "reserved",
-      updatedAt: this.now().toISOString(),
-    };
+    let pending: CreateAgentRequestReceipt = existing
+      ? {
+          ...existing,
+          // A failed receipt can only represent a pre-placement failure. Reopen
+          // that exact reservation so a same-key retry keeps the deterministic
+          // agent identity instead of forcing callers to invent a new key.
+          ...(existing.state === "failed" ? { state: "pending" as const } : {}),
+        }
+      : {
+          ...identity,
+          fingerprint: input.fingerprint,
+          agentId,
+          state: "pending",
+          phase: "reserved",
+          updatedAt: this.now().toISOString(),
+        };
     pending = await this.updateReceipt(scopedKey, pending);
 
     if (
