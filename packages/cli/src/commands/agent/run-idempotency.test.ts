@@ -10,6 +10,7 @@ vi.mock("../../utils/client.js", () => ({
 }));
 
 import { runAgentRunIntent, runRunCommand, type AgentRunIntent } from "./run.js";
+import { DaemonRpcError } from "@getpaseo/client/internal/daemon-client";
 
 const originalAgentId = process.env.PASEO_AGENT_ID;
 const originalWorkspaceId = process.env.PASEO_WORKSPACE_ID;
@@ -77,6 +78,7 @@ describe("run create idempotency", () => {
     mocks.connectToDaemon.mockResolvedValue({
       createAgent,
       createWorkspace,
+      getLastServerInfoMessage: () => ({ features: { createAgentIdempotency: true } }),
       close: vi.fn().mockResolvedValue(undefined),
     });
 
@@ -168,5 +170,93 @@ describe("run create idempotency", () => {
       }),
     ).rejects.toMatchObject({ code: "FLEET_DAEMON_IDENTITY_UNAVAILABLE" });
     expect(createAgent).not.toHaveBeenCalled();
+  });
+
+  it("retries a safe daemon rejection once with the identical key and intent", async () => {
+    const retryable = new DaemonRpcError({
+      requestId: "request-1",
+      requestType: "create_agent_request",
+      error: "Git command timed out after 30000ms: git worktree list --porcelain",
+      code: "agent_create_retryable",
+    });
+    const createAgent = vi.fn();
+    createAgent.mockRejectedValueOnce(retryable).mockResolvedValueOnce({
+      id: "agent-1",
+      status: "running",
+      provider: "claude",
+      cwd: "/tmp/project",
+      title: null,
+    });
+    mocks.connectToDaemon.mockResolvedValue({
+      createAgent,
+      getLastServerInfoMessage: () => ({ status: "server_info", serverId: "daemon-a" }),
+      close: vi.fn().mockResolvedValue(undefined),
+    });
+    const intent: AgentRunIntent = {
+      create: {
+        type: "create_agent_request",
+        config: { provider: "claude", cwd: "/tmp/project" },
+        initialPrompt: "repair the fleet",
+        idempotencyKey: "fleet-create-1",
+        workspaceSource: { kind: "directory", path: "/tmp/project" },
+        labels: {},
+      },
+      prompt: "repair the fleet",
+      waitTimeoutMs: 0,
+      background: true,
+    };
+
+    await expect(
+      runAgentRunIntent({
+        intent,
+        host: "builder-a.internal:7777",
+        expectedDaemonId: "daemon-a",
+        idempotencyKey: "fleet-create-1",
+      }),
+    ).resolves.toMatchObject({ data: { agentId: "agent-1" } });
+    expect(createAgent).toHaveBeenCalledTimes(2);
+    expect(createAgent.mock.calls[0]).toEqual(createAgent.mock.calls[1]);
+  });
+
+  it("retries an unknown transport outcome once with the identical key", async () => {
+    const createAgent = vi
+      .fn()
+      .mockRejectedValueOnce(new Error("Timeout waiting for message (60000ms)"))
+      .mockResolvedValueOnce({
+        id: "agent-1",
+        status: "running",
+        provider: "claude",
+        cwd: "/tmp/project",
+        title: null,
+      });
+    mocks.connectToDaemon.mockResolvedValue({
+      createAgent,
+      getLastServerInfoMessage: () => ({ status: "server_info", serverId: "daemon-a" }),
+      close: vi.fn().mockResolvedValue(undefined),
+    });
+    const intent: AgentRunIntent = {
+      create: {
+        type: "create_agent_request",
+        config: { provider: "claude", cwd: "/tmp/project" },
+        initialPrompt: "repair the fleet",
+        idempotencyKey: "fleet-create-2",
+        workspaceSource: { kind: "directory", path: "/tmp/project" },
+        labels: {},
+      },
+      prompt: "repair the fleet",
+      waitTimeoutMs: 0,
+      background: true,
+    };
+
+    await expect(
+      runAgentRunIntent({
+        intent,
+        host: "builder-a.internal:7777",
+        expectedDaemonId: "daemon-a",
+        idempotencyKey: "fleet-create-2",
+      }),
+    ).resolves.toMatchObject({ data: { agentId: "agent-1" } });
+    expect(createAgent).toHaveBeenCalledTimes(2);
+    expect(createAgent.mock.calls[0]).toEqual(createAgent.mock.calls[1]);
   });
 });

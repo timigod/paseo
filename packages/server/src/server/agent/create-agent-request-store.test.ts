@@ -509,6 +509,33 @@ describe("CreateAgentRequestStore", () => {
     ]);
   });
 
+  it("classifies a Git timeout before prompt dispatch as safe for a same-key retry", async () => {
+    const home = createHome();
+    const agentId = "00000000-0000-4000-8000-000000000020";
+    const store = new CreateAgentRequestStore({
+      paseoHome: home,
+      hasAgent: async () => false,
+      idFactory: () => agentId,
+    });
+    const input = scopedInput({
+      key: "timed-out-create",
+      fingerprint: REQUEST_A,
+      create: vi
+        .fn()
+        .mockRejectedValueOnce(
+          new Error("Git command timed out after 30000ms: git worktree list --porcelain"),
+        )
+        .mockResolvedValueOnce(undefined),
+    });
+
+    await expect(store.run(input)).rejects.toMatchObject({
+      code: "agent_create_retryable",
+      receipt: { agentId, idempotencyKey: "timed-out-create" },
+    });
+    await expect(store.run(input)).resolves.toBe(agentId);
+    expect(input.create).toHaveBeenCalledTimes(2);
+  });
+
   it("recovers a late registration before retrying a failed reservation", async () => {
     const home = createHome();
     const agentId = "00000000-0000-4000-8000-000000000019";

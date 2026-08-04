@@ -293,6 +293,13 @@ export class CreateAgentRequestStore {
       } catch (recoveryError) {
         throw this.retryableReceiptError(recoveryReceipt, recoveryError);
       }
+      if (
+        CREATE_AGENT_PHASE_ORDER[recoveryReceipt.phase] <
+          CREATE_AGENT_PHASE_ORDER.prompt_dispatching &&
+        isRetryableCreateAttemptError(error)
+      ) {
+        throw this.retryableAttemptError(recoveryReceipt, error);
+      }
       throw error;
     }
   }
@@ -552,6 +559,41 @@ export class CreateAgentRequestStore {
       { cause },
     );
   }
+
+  private retryableAttemptError(
+    receipt: CreateAgentRequestReceipt,
+    cause: unknown,
+  ): CreateAgentRetryableReceiptError {
+    const reason = cause instanceof Error ? cause.message : String(cause);
+    return new CreateAgentRetryableReceiptError(
+      `${reason}. The create stopped before prompt dispatch; retry with the same idempotency key '${receipt.key}' to resume the reserved agent identity.`,
+      {
+        agentId: receipt.agentId,
+        idempotencyKey: receipt.key,
+        ...(receipt.placement ? { placement: receipt.placement } : {}),
+      },
+      { cause },
+    );
+  }
+}
+
+function isRetryableCreateAttemptError(error: unknown): boolean {
+  if (error instanceof CreateAgentRetryableReceiptError) {
+    return true;
+  }
+  if (!(error instanceof Error)) {
+    return false;
+  }
+  const code = (error as Error & { code?: unknown }).code;
+  if (
+    code === "ETIMEDOUT" ||
+    code === "ECONNRESET" ||
+    code === "ECONNABORTED" ||
+    code === "EPIPE"
+  ) {
+    return true;
+  }
+  return error.message.startsWith("Git command timed out after ");
 }
 
 const CREATE_AGENT_PHASE_ORDER: Record<CreateAgentRequestPhase, number> = {

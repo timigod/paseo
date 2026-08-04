@@ -868,7 +868,7 @@ async function executeAgentRunIntent(
     let structuredAgent: AgentSnapshotPayload | null = null;
     const callStructuredTurn = async (structuredPrompt: string): Promise<string> => {
       if (!structuredAgent) {
-        structuredAgent = await client.createAgent({
+        structuredAgent = await createAgentWithSameKeyRetry(client, {
           ...createOptions,
           initialPrompt: structuredPrompt,
         });
@@ -918,7 +918,7 @@ async function executeAgentRunIntent(
     };
   }
 
-  const agent = await client.createAgent(createOptions);
+  const agent = await createAgentWithSameKeyRetry(client, createOptions);
   if (!intent.background) {
     const state = await client.waitForFinish(agent.id, intent.waitTimeoutMs);
     const finalAgent = state.final ?? agent;
@@ -926,6 +926,31 @@ async function executeAgentRunIntent(
     return { type: "single", data: toRunResult(finalAgent, status), schema: agentRunSchema };
   }
   return { type: "single", data: toRunResult(agent), schema: agentRunSchema };
+}
+
+async function createAgentWithSameKeyRetry(
+  client: Pick<ConnectedDaemonClient, "createAgent">,
+  options: Parameters<ConnectedDaemonClient["createAgent"]>[0],
+): Promise<AgentSnapshotPayload> {
+  try {
+    return await client.createAgent(options);
+  } catch (error) {
+    if (!options.idempotencyKey?.trim() || !isSafeSameKeyCreateRetry(error)) {
+      throw error;
+    }
+    return client.createAgent(options);
+  }
+}
+
+function isSafeSameKeyCreateRetry(error: unknown): boolean {
+  if (error instanceof DaemonRpcError) {
+    return error.requestType === "create_agent_request" && error.code === "agent_create_retryable";
+  }
+  // A transport/protocol failure does not prove whether the daemon accepted
+  // the first request. The keyed create state machine coalesces an in-flight
+  // request and replays or resumes a durable receipt, so one same-key retry is
+  // safer than forcing the operator to inspect and invent a replacement key.
+  return error instanceof Error;
 }
 
 function normalizeRunError(error: unknown): CommandError {
