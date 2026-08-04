@@ -148,13 +148,10 @@ function assertAgentConsumable(
       `Agent ${input.agentId} is still running. Wait for completion or finish with force.`,
     );
   }
-  const unconsumed = live
-    ? live.requiresAttention || live.pendingPermissionCount > 0
-    : stored?.requiresAttention === true;
-  if (unconsumed) {
+  if (live && live.pendingPermissionCount > 0) {
     throw new FinishAgentRefusedError(
       FINISH_AGENT_ERROR_CODES.unconsumedWork,
-      `Agent ${input.agentId} has unconsumed work (pending attention or permission requests). Consume it first or finish with force.`,
+      `Agent ${input.agentId} has pending permission requests. Resolve them before finishing.`,
     );
   }
 }

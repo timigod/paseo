@@ -124,8 +124,8 @@ describe("runFinishAgentCommand", () => {
     expect(forced.archiveAgent).toHaveBeenCalledTimes(1);
   });
 
-  it("refuses unconsumed work (attention or pending permissions) without force", async () => {
-    const unconsumed = createDependencies({
+  it("accepts finished attention but refuses pending permissions without force", async () => {
+    const finishedAttention = createDependencies({
       live: {
         cwd: path.join(WORKTREE, "src"),
         workspaceId: "workspace-1",
@@ -134,8 +134,10 @@ describe("runFinishAgentCommand", () => {
         pendingPermissionCount: 0,
       },
     });
-    await expect(runFinishAgentCommand(unconsumed.dependencies, input())).rejects.toMatchObject({
-      code: FINISH_AGENT_ERROR_CODES.unconsumedWork,
+    await expect(runFinishAgentCommand(finishedAttention.dependencies, input())).resolves.toEqual({
+      agentId: "agent-1",
+      archivedAt: "2026-08-03T00:00:00.000Z",
+      worktree: "released",
     });
 
     const blocked = createDependencies({
@@ -151,7 +153,7 @@ describe("runFinishAgentCommand", () => {
       code: FINISH_AGENT_ERROR_CODES.unconsumedWork,
     });
 
-    const storedUnconsumed = createDependencies({
+    const storedFinishedAttention = createDependencies({
       stored: {
         cwd: path.join(WORKTREE, "src"),
         workspaceId: "workspace-1",
@@ -161,8 +163,8 @@ describe("runFinishAgentCommand", () => {
       },
     });
     await expect(
-      runFinishAgentCommand(storedUnconsumed.dependencies, input()),
-    ).rejects.toMatchObject({ code: FINISH_AGENT_ERROR_CODES.unconsumedWork });
+      runFinishAgentCommand(storedFinishedAttention.dependencies, input()),
+    ).resolves.toMatchObject({ agentId: "agent-1", worktree: "released" });
   });
 
   it("refuses to release a dirty worktree", async () => {
