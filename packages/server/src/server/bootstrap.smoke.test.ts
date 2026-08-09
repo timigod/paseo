@@ -8,6 +8,7 @@ import { WebSocket } from "ws";
 
 import { createPaseoDaemon, parseListenString, type PaseoDaemonConfig } from "./bootstrap.js";
 import { AgentManagerShuttingDownError } from "./agent/agent-manager.js";
+import { AgentStorage } from "./agent/agent-storage.js";
 import { hashDaemonPassword } from "./auth.js";
 import { generateLocalPairingOffer } from "./pairing-offer.js";
 import { createTestPaseoDaemon } from "./test-utils/paseo-daemon.js";
@@ -410,8 +411,12 @@ describe("paseo daemon bootstrap", () => {
       await daemonHandle.close();
       stopped = true;
 
+      const reloadedStorage = new AgentStorage(
+        path.join(daemonHandle.paseoHome, "agents"),
+        pino({ level: "silent" }),
+      );
       const afterShutdown = await Promise.all(
-        retainedIds.map((agentId) => daemonHandle.daemon.agentStorage.get(agentId)),
+        retainedIds.map((agentId) => reloadedStorage.get(agentId)),
       );
       expect({
         afterShutdown,
@@ -424,6 +429,53 @@ describe("paseo daemon bootstrap", () => {
         closedSessions: 2,
         residentAgents: [],
       });
+      expect(
+        afterShutdown.map((record) => ({
+          id: record?.id,
+          cwd: record?.cwd,
+          workspaceId: record?.workspaceId,
+          persistence: record?.persistence,
+          owner: record?.owner,
+          lastStatus: record?.lastStatus,
+          archivedAt: record?.archivedAt ?? null,
+        })),
+      ).toEqual([
+        {
+          id: idleAgent.id,
+          cwd: paseoHomeRoot,
+          workspaceId: "workspace-idle",
+          persistence: beforeShutdown[0]?.persistence,
+          owner: { kind: "daemon", daemonId: "daemon-idle", executionId: "execution-idle" },
+          lastStatus: "idle",
+          archivedAt: null,
+        },
+        {
+          id: runningAgent.id,
+          cwd: paseoHomeRoot,
+          workspaceId: "workspace-running",
+          persistence: beforeShutdown[1]?.persistence,
+          owner: {
+            kind: "daemon",
+            daemonId: "daemon-running",
+            executionId: "execution-running",
+          },
+          lastStatus: "running",
+          archivedAt: null,
+        },
+        {
+          id: archivedAgent.id,
+          cwd: paseoHomeRoot,
+          workspaceId: "workspace-archived",
+          persistence: beforeShutdown[2]?.persistence,
+          owner: {
+            kind: "daemon",
+            daemonId: "daemon-archived",
+            executionId: "execution-archived",
+          },
+          lastStatus: "closed",
+          archivedAt: beforeShutdown[2]?.archivedAt,
+        },
+      ]);
     } finally {
       if (!stopped) {
         await daemonHandle.close();

@@ -278,6 +278,19 @@ export interface CloseAgentOptions {
   persistClosedState?: boolean;
 }
 
+interface CloseAgentRequirements {
+  persistClosedState: boolean;
+}
+
+interface InFlightAgentClose {
+  promise: Promise<void>;
+  requirements: CloseAgentRequirements;
+}
+
+type ArchiveAgentOutcome =
+  | { status: "archived"; archivedAt: string }
+  | { status: "failed"; error: unknown };
+
 export interface AgentManagerOptions {
   clients?: ProviderClientMap;
   providerDefinitions?: ProviderEnabledMap;
@@ -660,7 +673,8 @@ export class AgentManager {
   private readonly previousStatuses = new Map<string, AgentLifecycleStatus>();
   private readonly backgroundTasks = new Set<Promise<void>>();
   private readonly agentRegistrationTasks = new Set<Promise<void>>();
-  private readonly inFlightAgentCloses = new Map<string, Promise<void>>();
+  private readonly inFlightAgentCloses = new Map<string, InFlightAgentClose>();
+  private readonly inFlightAgentArchives = new Map<string, Promise<{ archivedAt: string }>>();
   private readonly retainedAgentRuntimeCleanups = new Set<AgentSession>();
   private retainedAgentRuntimeCleanupRetry: Promise<void> | null = null;
   private readonly agentStreamCoalescer: AgentStreamCoalescer;
@@ -1100,7 +1114,7 @@ export class AgentManager {
   }
 
   async waitForAgentClose(agentId: string): Promise<void> {
-    await this.inFlightAgentCloses?.get(agentId)?.catch(() => undefined);
+    await this.inFlightAgentCloses.get(agentId)?.promise.catch(() => undefined);
   }
 
   getTimeline(id: string): AgentTimelineItem[] {
@@ -1514,23 +1528,32 @@ export class AgentManager {
   }
 
   closeAgent(agentId: string, options: CloseAgentOptions = {}): Promise<void> {
+    const persistClosedState = options.persistClosedState !== false;
     const existing = this.inFlightAgentCloses.get(agentId);
     if (existing) {
-      return existing;
+      if (persistClosedState) {
+        existing.requirements.persistClosedState = true;
+      }
+      return existing.promise;
     }
 
-    const close = this.closeAgentRuntime(agentId, options);
+    const requirements = { persistClosedState };
+    const promise = this.closeAgentRuntime(agentId, requirements);
+    const close = { promise, requirements };
     this.inFlightAgentCloses.set(agentId, close);
     const clearClose = () => {
       if (this.inFlightAgentCloses.get(agentId) === close) {
         this.inFlightAgentCloses.delete(agentId);
       }
     };
-    void close.then(clearClose, clearClose);
-    return close;
+    void promise.then(clearClose, clearClose);
+    return promise;
   }
 
-  private async closeAgentRuntime(agentId: string, options: CloseAgentOptions): Promise<void> {
+  private async closeAgentRuntime(
+    agentId: string,
+    requirements: CloseAgentRequirements,
+  ): Promise<void> {
     const agent = this.requireAgent(agentId);
     this.logger.trace(
       {
@@ -1555,7 +1578,7 @@ export class AgentManager {
     }
 
     let persistError: unknown;
-    if (options.persistClosedState !== false) {
+    if (requirements.persistClosedState) {
       try {
         await this.persistSnapshot(closedAgent);
       } catch (error) {
@@ -1594,28 +1617,77 @@ export class AgentManager {
     }
   }
 
-  async archiveAgent(agentId: string): Promise<{ archivedAt: string }> {
-    const agent = this.requireAgent(agentId);
-    if (!this.registry) {
+  archiveAgent(agentId: string): Promise<{ archivedAt: string }> {
+    const existing = this.inFlightAgentArchives.get(agentId);
+    if (existing) {
+      return existing;
+    }
+
+    const archive = this.archiveAgentRuntime(agentId);
+    this.inFlightAgentArchives.set(agentId, archive);
+    const clearArchive = () => {
+      if (this.inFlightAgentArchives.get(agentId) === archive) {
+        this.inFlightAgentArchives.delete(agentId);
+      }
+    };
+    void archive.then(clearArchive, clearArchive);
+    return archive;
+  }
+
+  private async archiveAgentRuntime(agentId: string): Promise<{ archivedAt: string }> {
+    if (!this.agents.has(agentId) && !this.inFlightAgentCloses.has(agentId)) {
+      this.requireAgent(agentId);
+    }
+    const registry = this.registry;
+    if (!registry) {
       throw new Error("Agent storage is not configured");
     }
 
-    await this.registry.applySnapshot(agent, {
-      internal: agent.internal,
-    });
-    const stored = await this.registry.get(agentId);
-    if (!stored) {
-      throw new Error(`Agent ${agentId} not found in storage after snapshot`);
+    let closeFailed = false;
+    let closeError: unknown;
+    try {
+      await this.closeAgent(agentId);
+    } catch (error) {
+      closeFailed = true;
+      closeError = error;
     }
 
-    const { archivedAt } = await this.markRecordArchived(stored);
-    agent.updatedAt = new Date(archivedAt);
-    await this.closeAgent(agentId);
-    this.discardRetainedAgentState(agentId);
+    let archiveOutcome: ArchiveAgentOutcome;
+    try {
+      const stored = await registry.get(agentId);
+      if (!stored) {
+        throw new Error(`Agent ${agentId} not found in storage after close`);
+      }
+      if (stored.lastStatus !== "closed") {
+        throw new Error(
+          `Agent ${agentId} is not durably closed after close (lastStatus: ${stored.lastStatus})`,
+        );
+      }
 
-    await this.cascadeArchiveChildren(agentId);
+      const { archivedAt } = await this.markRecordArchived(stored);
+      this.discardRetainedAgentState(agentId);
 
-    return { archivedAt };
+      await this.cascadeArchiveChildren(agentId);
+      archiveOutcome = { status: "archived", archivedAt };
+    } catch (error) {
+      archiveOutcome = { status: "failed", error };
+    }
+
+    if (archiveOutcome.status === "failed") {
+      if (closeFailed) {
+        throw new AggregateError(
+          [closeError, archiveOutcome.error],
+          `Agent ${agentId} close and archive both failed`,
+          { cause: archiveOutcome.error },
+        );
+      }
+      throw archiveOutcome.error;
+    }
+
+    if (closeFailed) {
+      throw closeError;
+    }
+    return { archivedAt: archiveOutcome.archivedAt };
   }
 
   // Children created via the MCP `create_agent` tool carry the parent-agent-id
@@ -1629,17 +1701,21 @@ export class AgentManager {
     }
     const records = await registry.list();
     for (const record of records) {
-      if (record.archivedAt) {
-        continue;
-      }
       if (record.labels?.[PARENT_AGENT_ID_LABEL] !== parentAgentId) {
         continue;
       }
-      if (this.agents.has(record.id)) {
+      const shouldJoinLifecycle =
+        this.agents.has(record.id) ||
+        this.inFlightAgentCloses.has(record.id) ||
+        this.inFlightAgentArchives.has(record.id);
+      if (shouldJoinLifecycle) {
         await this.archiveAgent(record.id);
-      } else {
-        await this.archiveSnapshot(record.id, new Date().toISOString());
+        continue;
       }
+      if (record.archivedAt) {
+        continue;
+      }
+      await this.archiveSnapshot(record.id, new Date().toISOString());
     }
   }
 
@@ -4424,7 +4500,10 @@ export class AgentManager {
    * Flush any background persistence work (best-effort).
    */
   async flush(): Promise<void> {
-    await this.flushTasks({ includeAgentRegistrations: false });
+    await this.flushTasks({
+      includeAgentRegistrations: false,
+      includeAgentLifecycleOperations: false,
+    });
   }
 
   /**
@@ -4433,20 +4512,40 @@ export class AgentManager {
    * either install them or close them.
    */
   async flushForShutdown(): Promise<void> {
-    await this.flushTasks({ includeAgentRegistrations: true });
-    await this.retryRetainedAgentRuntimeCleanups();
+    do {
+      await this.flushTasks({
+        includeAgentRegistrations: true,
+        includeAgentLifecycleOperations: true,
+      });
+      await this.retryRetainedAgentRuntimeCleanups();
+    } while (
+      this.backgroundTasks.size > 0 ||
+      this.agentRegistrationTasks.size > 0 ||
+      this.inFlightAgentCloses.size > 0 ||
+      this.inFlightAgentArchives.size > 0
+    );
   }
 
-  private async flushTasks(options: { includeAgentRegistrations: boolean }): Promise<void> {
+  private async flushTasks(options: {
+    includeAgentRegistrations: boolean;
+    includeAgentLifecycleOperations: boolean;
+  }): Promise<void> {
     this.agentStreamCoalescer.flushAll();
     // Drain tasks, including tasks spawned while awaiting.
-    while (
-      this.backgroundTasks.size > 0 ||
-      (options.includeAgentRegistrations && this.agentRegistrationTasks.size > 0)
-    ) {
-      const pending = options.includeAgentRegistrations
-        ? [...this.backgroundTasks, ...this.agentRegistrationTasks]
-        : [...this.backgroundTasks];
+    while (true) {
+      const pending: Promise<unknown>[] = [...this.backgroundTasks];
+      if (options.includeAgentRegistrations) {
+        pending.push(...this.agentRegistrationTasks);
+      }
+      if (options.includeAgentLifecycleOperations) {
+        pending.push(
+          ...Array.from(this.inFlightAgentCloses.values(), (close) => close.promise),
+          ...this.inFlightAgentArchives.values(),
+        );
+      }
+      if (pending.length === 0) {
+        return;
+      }
       await Promise.allSettled(pending);
     }
   }

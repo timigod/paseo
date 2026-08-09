@@ -74,10 +74,10 @@ children.
 
 Archiving runs through `AgentManager.archiveAgent` (`packages/server/src/server/agent/agent-manager.ts`):
 
-1. Snapshot the current session into the registry
-2. Set `archivedAt` and normalize `lastStatus` away from `running`/`initializing`
-3. Notify subscribers
-4. Close the runtime (kills the process if still running)
+1. Start or join one persisting close operation for the agent
+2. Close the runtime and persist the durable `closed` record
+3. Set `archivedAt` on that durable record and notify subscribers
+4. Discard retained runtime state
 5. **Cascade-archive children** — any agent whose `paseo.parent-agent-id` label matches the archived agent gets archived too, recursively
 
 Cascade is what keeps subagent fleets from outliving their orchestrator.

@@ -6852,7 +6852,7 @@ test("streamAgent clears pending run when startTurn fails before a turn id exist
   );
 });
 
-test("archiveAgent persists archivedAt and updatedAt before emitting closed state", async () => {
+test("archiveAgent closes before it persists archivedAt", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-archive-"));
   const storagePath = join(workdir, "agents");
   const storage = new AgentStorage(storagePath, logger);
@@ -6899,7 +6899,7 @@ test("archiveAgent persists archivedAt and updatedAt before emitting closed stat
   expect(
     Math.abs(new Date(stored!.updatedAt).getTime() - new Date(archivedAt).getTime()),
   ).toBeLessThanOrEqual(5);
-  expect(lifecycles.slice(-2)).toEqual(["idle", "closed"]);
+  expect(lifecycles).toEqual(["closed", "closed"]);
 });
 
 test("fires onAgentArchived for archived parent and cascaded children", async () => {
@@ -8592,8 +8592,44 @@ test("load waits for an in-flight explicit close and creates one resumed runtime
   }
 });
 
-test("concurrent explicit closes tear down the runtime once", async () => {
+interface BlockedCloseHarness {
+  agentId: string;
+  closeAllowed: Deferred<void>;
+  closeStarted: Deferred<void>;
+  getCloseCount(): number;
+  manager: AgentManager;
+  storage: ArchiveRecordingStorage;
+  storagePath: string;
+  workdir: string;
+}
+
+class ArchiveRecordingStorage extends AgentStorage {
+  readonly archiveWriteAllowed = deferred<void>();
+  readonly archiveWriteStarted = deferred<void>();
+  archiveWriteCount = 0;
+  private blockArchiveWrite = false;
+
+  blockNextArchiveWrite(): void {
+    this.blockArchiveWrite = true;
+  }
+
+  override async upsert(record: StoredAgentRecord): Promise<void> {
+    if (record.archivedAt) {
+      this.archiveWriteCount += 1;
+      if (this.blockArchiveWrite) {
+        this.blockArchiveWrite = false;
+        this.archiveWriteStarted.resolve();
+        await this.archiveWriteAllowed.promise;
+      }
+    }
+    await super.upsert(record);
+  }
+}
+
+async function createBlockedCloseHarness(): Promise<BlockedCloseHarness> {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-concurrent-close-"));
+  const storagePath = join(workdir, "agents");
+  const storage = new ArchiveRecordingStorage(storagePath, logger);
   const closeStarted = deferred<void>();
   const closeAllowed = deferred<void>();
   let closeCount = 0;
@@ -8611,22 +8647,574 @@ test("concurrent explicit closes tear down the runtime once", async () => {
       })(config);
     }
   })();
-  const manager = new AgentManager({ clients: { codex: client }, logger });
+  const manager = new AgentManager({ clients: { codex: client }, registry: storage, logger });
+  const agent = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+    workspaceId: undefined,
+  });
+
+  return {
+    agentId: agent.id,
+    closeAllowed,
+    closeStarted,
+    getCloseCount: () => closeCount,
+    manager,
+    storage,
+    storagePath,
+    workdir,
+  };
+}
+
+async function cleanUpBlockedCloseHarness(harness: BlockedCloseHarness): Promise<void> {
+  harness.closeAllowed.resolve();
+  harness.storage.archiveWriteAllowed.resolve();
+  await harness.manager.closeAgent(harness.agentId).catch(() => undefined);
+  await harness.storage.flush().catch(() => undefined);
+  rmSync(harness.workdir, { recursive: true, force: true });
+}
+
+test("an explicit close upgrades an in-flight non-persisting shutdown close", async () => {
+  const harness = await createBlockedCloseHarness();
+
+  try {
+    const shutdownClose = harness.manager.closeAgent(harness.agentId, {
+      persistClosedState: false,
+    });
+    await harness.closeStarted.promise;
+    const explicitClose = harness.manager.closeAgent(harness.agentId);
+
+    harness.closeAllowed.resolve();
+    await Promise.all([shutdownClose, explicitClose]);
+
+    const reloadedStorage = new AgentStorage(harness.storagePath, logger);
+    const stored = await reloadedStorage.get(harness.agentId);
+    expect(harness.getCloseCount()).toBe(1);
+    expect(stored).toMatchObject({
+      id: harness.agentId,
+      lastStatus: "closed",
+    });
+    expect(stored?.archivedAt).toBeUndefined();
+  } finally {
+    await cleanUpBlockedCloseHarness(harness);
+  }
+});
+
+test("a non-persisting shutdown close cannot downgrade an in-flight explicit close", async () => {
+  const harness = await createBlockedCloseHarness();
+
+  try {
+    const explicitClose = harness.manager.closeAgent(harness.agentId);
+    await harness.closeStarted.promise;
+    const shutdownClose = harness.manager.closeAgent(harness.agentId, {
+      persistClosedState: false,
+    });
+
+    harness.closeAllowed.resolve();
+    await Promise.all([explicitClose, shutdownClose]);
+
+    const reloadedStorage = new AgentStorage(harness.storagePath, logger);
+    const stored = await reloadedStorage.get(harness.agentId);
+    expect(harness.getCloseCount()).toBe(1);
+    expect(stored).toMatchObject({
+      id: harness.agentId,
+      lastStatus: "closed",
+    });
+    expect(stored?.archivedAt).toBeUndefined();
+  } finally {
+    await cleanUpBlockedCloseHarness(harness);
+  }
+});
+
+test("an archive upgrades an in-flight non-persisting shutdown close", async () => {
+  const harness = await createBlockedCloseHarness();
+
+  try {
+    const shutdownClose = harness.manager.closeAgent(harness.agentId, {
+      persistClosedState: false,
+    });
+    await harness.closeStarted.promise;
+    const archive = harness.manager.archiveAgent(harness.agentId);
+
+    harness.closeAllowed.resolve();
+    const [, { archivedAt }] = await Promise.all([shutdownClose, archive]);
+
+    const reloadedStorage = new AgentStorage(harness.storagePath, logger);
+    expect(harness.getCloseCount()).toBe(1);
+    expect(harness.storage.archiveWriteCount).toBe(1);
+    expect(await reloadedStorage.get(harness.agentId)).toMatchObject({
+      id: harness.agentId,
+      lastStatus: "closed",
+      archivedAt,
+    });
+  } finally {
+    await cleanUpBlockedCloseHarness(harness);
+  }
+});
+
+test("an archive-first shutdown close finishes before the archive storage write", async () => {
+  const harness = await createBlockedCloseHarness();
+
+  try {
+    harness.storage.blockNextArchiveWrite();
+    const archive = harness.manager.archiveAgent(harness.agentId);
+    await harness.closeStarted.promise;
+    const shutdownClose = harness.manager.closeAgent(harness.agentId, {
+      persistClosedState: false,
+    });
+
+    harness.closeAllowed.resolve();
+    await harness.storage.archiveWriteStarted.promise;
+    await shutdownClose;
+
+    const closedStorage = new AgentStorage(harness.storagePath, logger);
+    const closedRecord = await closedStorage.get(harness.agentId);
+    expect(closedRecord).toMatchObject({
+      id: harness.agentId,
+      lastStatus: "closed",
+    });
+    expect(closedRecord?.archivedAt).toBeUndefined();
+
+    harness.storage.archiveWriteAllowed.resolve();
+    const { archivedAt } = await archive;
+
+    const reloadedStorage = new AgentStorage(harness.storagePath, logger);
+    expect(harness.getCloseCount()).toBe(1);
+    expect(harness.storage.archiveWriteCount).toBe(1);
+    expect(await reloadedStorage.get(harness.agentId)).toMatchObject({
+      id: harness.agentId,
+      lastStatus: "closed",
+      archivedAt,
+    });
+  } finally {
+    await cleanUpBlockedCloseHarness(harness);
+  }
+});
+
+test("shutdown flush waits for an archive-first close and durable archive", async () => {
+  const harness = await createBlockedCloseHarness();
+
+  try {
+    const archive = harness.manager.archiveAgent(harness.agentId);
+    await harness.closeStarted.promise;
+    let flushFinished = false;
+    const flush = harness.manager.flushForShutdown().then(() => {
+      flushFinished = true;
+      return undefined;
+    });
+
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(flushFinished).toBe(false);
+
+    harness.closeAllowed.resolve();
+    const [{ archivedAt }] = await Promise.all([archive, flush]);
+
+    const reloadedStorage = new AgentStorage(harness.storagePath, logger);
+    expect(harness.getCloseCount()).toBe(1);
+    expect(await reloadedStorage.get(harness.agentId)).toMatchObject({
+      id: harness.agentId,
+      lastStatus: "closed",
+      archivedAt,
+    });
+  } finally {
+    await cleanUpBlockedCloseHarness(harness);
+  }
+});
+
+test("parent archive joins and upgrades a child close removed from live agents", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-child-close-cascade-"));
+  const storagePath = join(workdir, "agents");
+  const cascadeListCompleted = deferred<void>();
+  let parentId: string | null = null;
+
+  class CascadeRecordingStorage extends AgentStorage {
+    override async list(): Promise<StoredAgentRecord[]> {
+      const records = await super.list();
+      if (parentId && records.some((record) => record.id === parentId && record.archivedAt)) {
+        cascadeListCompleted.resolve();
+      }
+      return records;
+    }
+  }
+
+  const storage = new CascadeRecordingStorage(storagePath, logger);
+  const childCloseStarted = deferred<void>();
+  const childCloseAllowed = deferred<void>();
+  let parentCloseCount = 0;
+  let childCloseCount = 0;
+  const client = new (class extends TestAgentClient {
+    override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+      const isChild = config.title === "Child";
+      return new (class extends TestAgentSession {
+        override async close(): Promise<void> {
+          if (!isChild) {
+            parentCloseCount += 1;
+            return;
+          }
+          childCloseCount += 1;
+          childCloseStarted.resolve();
+          await childCloseAllowed.promise;
+        }
+      })(config);
+    }
+  })();
+  const manager = new AgentManager({ clients: { codex: client }, registry: storage, logger });
+
+  try {
+    const parent = await manager.createAgent(
+      { provider: "codex", cwd: workdir, title: "Parent" },
+      undefined,
+      { workspaceId: undefined },
+    );
+    parentId = parent.id;
+    const child = await manager.createAgent(
+      { provider: "codex", cwd: workdir, title: "Child" },
+      undefined,
+      {
+        labels: { [PARENT_AGENT_ID_LABEL]: parent.id },
+        workspaceId: undefined,
+      },
+    );
+
+    const childClose = manager.closeAgent(child.id, { persistClosedState: false });
+    await childCloseStarted.promise;
+    expect(manager.listAgents().map((agent) => agent.id)).toEqual([parent.id]);
+
+    const parentArchive = manager.archiveAgent(parent.id);
+    await cascadeListCompleted.promise;
+    await Promise.resolve();
+
+    childCloseAllowed.resolve();
+    await Promise.all([childClose, parentArchive]);
+
+    const reloadedStorage = new AgentStorage(storagePath, logger);
+    expect({ parentCloseCount, childCloseCount }).toEqual({
+      parentCloseCount: 1,
+      childCloseCount: 1,
+    });
+    expect(await reloadedStorage.get(child.id)).toMatchObject({
+      id: child.id,
+      lastStatus: "closed",
+      archivedAt: expect.any(String),
+    });
+  } finally {
+    childCloseAllowed.resolve();
+    await manager.flushForShutdown().catch(() => undefined);
+    await storage.flush().catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("shutdown flush catches a child archive spawned while it is waiting", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-shutdown-child-archive-"));
+  const storagePath = join(workdir, "agents");
+  const storage = new AgentStorage(storagePath, logger);
+  const blockerCloseStarted = deferred<void>();
+  const blockerCloseAllowed = deferred<void>();
+  const childCloseStarted = deferred<void>();
+  const childCloseAllowed = deferred<void>();
+  const closeCounts = { blocker: 0, child: 0, parent: 0 };
+  const client = new (class extends TestAgentClient {
+    override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+      return new (class extends TestAgentSession {
+        override async close(): Promise<void> {
+          if (config.title === "Blocker") {
+            closeCounts.blocker += 1;
+            blockerCloseStarted.resolve();
+            await blockerCloseAllowed.promise;
+            return;
+          }
+          if (config.title === "Child") {
+            closeCounts.child += 1;
+            childCloseStarted.resolve();
+            await childCloseAllowed.promise;
+            return;
+          }
+          closeCounts.parent += 1;
+        }
+      })(config);
+    }
+  })();
+  const manager = new AgentManager({ clients: { codex: client }, registry: storage, logger });
+
+  try {
+    const blocker = await manager.createAgent(
+      { provider: "codex", cwd: workdir, title: "Blocker" },
+      undefined,
+      { workspaceId: undefined },
+    );
+    const parent = await manager.createAgent(
+      { provider: "codex", cwd: workdir, title: "Parent" },
+      undefined,
+      { workspaceId: undefined },
+    );
+    const child = await manager.createAgent(
+      { provider: "codex", cwd: workdir, title: "Child" },
+      undefined,
+      {
+        labels: { [PARENT_AGENT_ID_LABEL]: parent.id },
+        workspaceId: undefined,
+      },
+    );
+
+    const blockerClose = manager.closeAgent(blocker.id, { persistClosedState: false });
+    await blockerCloseStarted.promise;
+    let flushFinished = false;
+    const flush = manager.flushForShutdown().then(() => {
+      flushFinished = true;
+      return undefined;
+    });
+
+    const parentArchive = manager.archiveAgent(parent.id);
+    await childCloseStarted.promise;
+    blockerCloseAllowed.resolve();
+    await blockerClose;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(flushFinished).toBe(false);
+
+    childCloseAllowed.resolve();
+    const [{ archivedAt }] = await Promise.all([parentArchive, flush]);
+
+    const reloadedStorage = new AgentStorage(storagePath, logger);
+    expect(closeCounts).toEqual({ blocker: 1, child: 1, parent: 1 });
+    expect(await reloadedStorage.get(parent.id)).toMatchObject({
+      id: parent.id,
+      lastStatus: "closed",
+      archivedAt,
+    });
+    expect(await reloadedStorage.get(child.id)).toMatchObject({
+      id: child.id,
+      lastStatus: "closed",
+      archivedAt: expect.any(String),
+    });
+  } finally {
+    blockerCloseAllowed.resolve();
+    childCloseAllowed.resolve();
+    await manager.flushForShutdown().catch(() => undefined);
+    await storage.flush().catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("two concurrent archives share one close and one durable archived result", async () => {
+  const harness = await createBlockedCloseHarness();
+  const archivedIds: string[] = [];
+  harness.manager.setAgentArchivedCallback((agentId) => {
+    archivedIds.push(agentId);
+  });
+
+  try {
+    const firstArchive = harness.manager.archiveAgent(harness.agentId);
+    const secondArchive = harness.manager.archiveAgent(harness.agentId);
+    expect(secondArchive).toBe(firstArchive);
+
+    await harness.closeStarted.promise;
+    harness.closeAllowed.resolve();
+    const [firstResult, secondResult] = await Promise.all([firstArchive, secondArchive]);
+
+    const reloadedStorage = new AgentStorage(harness.storagePath, logger);
+    expect(secondResult).toBe(firstResult);
+    expect(harness.getCloseCount()).toBe(1);
+    expect(harness.storage.archiveWriteCount).toBe(1);
+    expect(archivedIds).toEqual([harness.agentId]);
+    expect(await reloadedStorage.get(harness.agentId)).toMatchObject({
+      id: harness.agentId,
+      lastStatus: "closed",
+      archivedAt: firstResult.archivedAt,
+    });
+  } finally {
+    await cleanUpBlockedCloseHarness(harness);
+  }
+});
+
+test("provider close failure archives the durable closed parent and managed child", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-archive-close-failure-"));
+  const storagePath = join(workdir, "agents");
+  const storage = new AgentStorage(storagePath, logger);
+  const providerCloseError = new Error("parent provider cleanup failed");
+  let sessionCount = 0;
+  const client = new (class extends TestAgentClient {
+    override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+      sessionCount += 1;
+      const closeError = sessionCount === 1 ? providerCloseError : null;
+      return new (class extends TestAgentSession {
+        override async close(): Promise<void> {
+          if (closeError) {
+            throw closeError;
+          }
+        }
+      })(config);
+    }
+  })();
+  const manager = new AgentManager({ clients: { codex: client }, registry: storage, logger });
+
+  try {
+    const parent = await manager.createAgent(
+      { provider: "codex", cwd: workdir, title: "Parent" },
+      undefined,
+      { workspaceId: undefined },
+    );
+    const child = await manager.createAgent(
+      { provider: "codex", cwd: workdir, title: "Managed child" },
+      undefined,
+      {
+        labels: { [PARENT_AGENT_ID_LABEL]: parent.id },
+        workspaceId: undefined,
+      },
+    );
+
+    const archiveError = await manager.archiveAgent(parent.id).catch((error: unknown) => error);
+    expect(archiveError).toBe(providerCloseError);
+    await storage.flush();
+
+    const reloadedStorage = new AgentStorage(storagePath, logger);
+    expect(await reloadedStorage.get(parent.id)).toMatchObject({
+      id: parent.id,
+      lastStatus: "closed",
+      archivedAt: expect.any(String),
+    });
+    expect(await reloadedStorage.get(child.id)).toMatchObject({
+      id: child.id,
+      lastStatus: "closed",
+      archivedAt: expect.any(String),
+    });
+  } finally {
+    await manager.flush().catch(() => undefined);
+    await storage.flush().catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("archive does not proceed without a durable closed snapshot", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-archive-persist-failure-"));
+  const storagePath = join(workdir, "agents");
+  const closedSnapshotError = new Error("closed snapshot persistence failed");
+
+  class FailingClosedSnapshotStorage extends AgentStorage {
+    archiveWriteCount = 0;
+    failClosedSnapshot = false;
+
+    override async applySnapshot(
+      agent: ManagedAgent,
+      options?: { title?: string | null; internal?: boolean },
+    ): Promise<void> {
+      if (this.failClosedSnapshot && agent.lifecycle === "closed") {
+        throw closedSnapshotError;
+      }
+      await super.applySnapshot(agent, options);
+    }
+
+    override async upsert(record: StoredAgentRecord): Promise<void> {
+      if (record.archivedAt) {
+        this.archiveWriteCount += 1;
+      }
+      await super.upsert(record);
+    }
+  }
+
+  const storage = new FailingClosedSnapshotStorage(storagePath, logger);
+  const manager = new AgentManager({
+    clients: { codex: new TestAgentClient() },
+    registry: storage,
+    logger,
+  });
 
   try {
     const agent = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
       workspaceId: undefined,
     });
-    const firstClose = manager.closeAgent(agent.id);
-    await closeStarted.promise;
-    const secondClose = manager.closeAgent(agent.id);
+    storage.failClosedSnapshot = true;
 
-    closeAllowed.resolve();
-    await Promise.all([firstClose, secondClose]);
+    const archiveError = await manager.archiveAgent(agent.id).catch((error: unknown) => error);
+    expect(archiveError).toBeInstanceOf(AggregateError);
+    if (!(archiveError instanceof AggregateError)) {
+      throw archiveError;
+    }
+    expect(archiveError.message).toBe(`Agent ${agent.id} close and archive both failed`);
+    expect(archiveError.errors).toEqual([
+      closedSnapshotError,
+      new Error(`Agent ${agent.id} is not durably closed after close (lastStatus: idle)`),
+    ]);
+    expect(storage.archiveWriteCount).toBe(0);
 
-    expect(closeCount).toBe(1);
+    await storage.flush();
+    const reloadedStorage = new AgentStorage(storagePath, logger);
+    expect(await reloadedStorage.get(agent.id)).toMatchObject({
+      id: agent.id,
+      lastStatus: "idle",
+    });
+    expect((await reloadedStorage.get(agent.id))?.archivedAt).toBeUndefined();
   } finally {
-    closeAllowed.resolve();
+    await manager.flush().catch(() => undefined);
+    await storage.flush().catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("archive preserves provider close and child cascade failures", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-archive-combined-failure-"));
+  const storagePath = join(workdir, "agents");
+  const providerCloseError = new Error("parent provider cleanup failed");
+  const childArchiveError = new Error("managed child archive failed");
+  let failingChildId: string | null = null;
+  let sessionCount = 0;
+
+  class FailingChildArchiveStorage extends AgentStorage {
+    override async upsert(record: StoredAgentRecord): Promise<void> {
+      if (record.id === failingChildId && record.archivedAt) {
+        throw childArchiveError;
+      }
+      await super.upsert(record);
+    }
+  }
+
+  const storage = new FailingChildArchiveStorage(storagePath, logger);
+  const client = new (class extends TestAgentClient {
+    override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+      sessionCount += 1;
+      const closeError = sessionCount === 1 ? providerCloseError : null;
+      return new (class extends TestAgentSession {
+        override async close(): Promise<void> {
+          if (closeError) {
+            throw closeError;
+          }
+        }
+      })(config);
+    }
+  })();
+  const manager = new AgentManager({ clients: { codex: client }, registry: storage, logger });
+
+  try {
+    const parent = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+    const child = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      labels: { [PARENT_AGENT_ID_LABEL]: parent.id },
+      workspaceId: undefined,
+    });
+    failingChildId = child.id;
+
+    const archiveError = await manager.archiveAgent(parent.id).catch((error: unknown) => error);
+    expect(archiveError).toBeInstanceOf(AggregateError);
+    if (!(archiveError instanceof AggregateError)) {
+      throw archiveError;
+    }
+    expect(archiveError.message).toBe(`Agent ${parent.id} close and archive both failed`);
+    expect(archiveError.errors).toEqual([providerCloseError, childArchiveError]);
+
+    await storage.flush();
+    const reloadedStorage = new AgentStorage(storagePath, logger);
+    expect(await reloadedStorage.get(parent.id)).toMatchObject({
+      id: parent.id,
+      lastStatus: "closed",
+      archivedAt: expect.any(String),
+    });
+    expect(await reloadedStorage.get(child.id)).toMatchObject({
+      id: child.id,
+      lastStatus: "closed",
+    });
+    expect((await reloadedStorage.get(child.id))?.archivedAt).toBeUndefined();
+  } finally {
+    await manager.flush().catch(() => undefined);
+    await storage.flush().catch(() => undefined);
     rmSync(workdir, { recursive: true, force: true });
   }
 });
