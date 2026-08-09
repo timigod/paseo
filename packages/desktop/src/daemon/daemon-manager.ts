@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import path from "node:path";
 import { app, ipcMain, powerMonitor } from "electron";
 import log from "electron-log/main";
-import { resolvePaseoHome, spawnProcess } from "@getpaseo/server";
+import { clearDaemonExplicitStopIntent, resolvePaseoHome, spawnProcess } from "@getpaseo/server";
 import {
   copyAttachmentFileToManagedStorage,
   deleteManagedAttachmentFile,
@@ -26,10 +26,8 @@ import {
 import { createSkillsCommandHandlers, getSkillsController } from "../integrations/skills/index.js";
 import {
   openLocalTransportSession,
-  openWebSocketTransportSession,
   sendLocalTransportMessage,
   closeLocalTransportSession,
-  type WebSocketTransportTarget,
 } from "./local-transport.js";
 import { createNodeEntrypointInvocation, resolveDaemonRunnerEntrypoint } from "./runtime-paths.js";
 import { runExternalCliJsonCommand, runExternalCliTextCommand } from "./cli/external.js";
@@ -367,6 +365,7 @@ async function startDaemon(): Promise<DesktopDaemonStatus> {
     }
   }
 
+  clearDaemonExplicitStopIntent(getPaseoHome());
   const daemonRunner = resolveDaemonRunnerEntrypoint();
   const reclaimStalePidLock =
     current.status === "errored" && current.desktopManaged && current.error === null;
@@ -538,9 +537,6 @@ export function createDaemonCommandHandlers(): Record<string, DesktopCommandHand
     open_local_daemon_transport: async (args) => {
       const target = args as { transportType: "socket" | "pipe"; transportPath: string };
       return await openLocalTransportSession(target);
-    },
-    open_websocket_daemon_transport: async (args) => {
-      return await openWebSocketTransportSession(args as unknown as WebSocketTransportTarget);
     },
     send_local_daemon_transport_message: async (args) => {
       await sendLocalTransportMessage(

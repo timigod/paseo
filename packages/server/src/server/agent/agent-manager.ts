@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
+import type { Dir, Stats } from "node:fs";
+import { opendir, stat } from "node:fs/promises";
 import { resolve } from "node:path";
-import { stat } from "node:fs/promises";
 import {
   AGENT_LIFECYCLE_STATUSES,
   type AgentLifecycleStatus,
@@ -11,6 +12,7 @@ import {
   PARENT_AGENT_ID_LABEL,
 } from "@getpaseo/protocol/agent-labels";
 import type { Logger } from "pino";
+import type { ProviderOptions, ToolPolicy } from "@getpaseo/protocol/agent-types";
 import { z } from "zod";
 import type { TerminalManager } from "../../terminal/terminal-manager.js";
 
@@ -62,7 +64,6 @@ import {
 } from "./agent-stream-coalescer.js";
 import { limitAgentTimelineItemContent } from "./agent-timeline-content.js";
 import { AgentRunState, type ForegroundTurnWaiter } from "./agent-run-state.js";
-import { getAgentProviderDefinition } from "@getpaseo/protocol/provider-manifest";
 import { invokeRewindCapability, type RewindMode } from "./rewind/rewind.js";
 import { isSystemInjectedEnvelope } from "./agent-prompt.js";
 import { stripInternalPaseoMcpServer, withRuntimePaseoMcpServer } from "./runtime-mcp-config.js";
@@ -131,6 +132,11 @@ interface NormalizeConfigOptions {
   env?: Record<string, string>;
 }
 
+interface AgentManagerFileSystem {
+  stat(path: string): Promise<Stats>;
+  opendir(path: string): Promise<Dir>;
+}
+
 interface TimeoutOptions {
   operation: Promise<void>;
   timeoutMs: number;
@@ -157,7 +163,10 @@ function buildStoredAgentConfig(record: StoredAgentRecord): AgentSessionConfig {
   if (record.config.featureValues != null) {
     config.featureValues = record.config.featureValues;
   }
-  if (record.config.extra != null) config.extra = record.config.extra;
+  if (record.config.providerOptions != null) {
+    config.providerOptions = record.config.providerOptions;
+  }
+  if (record.config.toolPolicy != null) config.toolPolicy = record.config.toolPolicy;
   if (record.config.systemPrompt != null) {
     config.systemPrompt = record.config.systemPrompt;
   }
@@ -233,6 +242,15 @@ interface AgentManagerRescueTimeouts {
 interface ProviderEnabledFlag {
   enabled: boolean;
   derivedFromProviderId?: string | null;
+  validateOptions?: (options: ProviderOptions | undefined) => ProviderOptions | undefined;
+  applyOptions?: (
+    config: AgentSessionConfig,
+    options: ProviderOptions | undefined,
+  ) => AgentSessionConfig;
+  applyToolPolicy?: (
+    config: AgentSessionConfig,
+    toolPolicy: ToolPolicy | undefined,
+  ) => AgentSessionConfig;
 }
 type ProviderEnabledMap = Partial<Record<AgentProvider, ProviderEnabledFlag>>;
 type ProviderClientMap = Partial<Record<AgentProvider, AgentClient>>;
@@ -264,6 +282,7 @@ export interface AgentManagerOptions {
   appendSystemPrompt?: string;
   agentStreamCoalesceWindowMs?: number;
   rescueTimeouts?: AgentManagerRescueTimeouts;
+  fileSystem?: AgentManagerFileSystem;
   logger: Logger;
 }
 
@@ -604,6 +623,7 @@ function getFirstUserMessageTextFromRows(rows: readonly AgentTimelineRow[]): str
 export class AgentManager {
   private readonly clients = new Map<AgentProvider, AgentClient>();
   private readonly providerEnabled = new Map<AgentProvider, boolean>();
+  private readonly providerDefinitions = new Map<AgentProvider, ProviderEnabledFlag>();
   private readonly agents = new Map<string, LiveManagedAgent>();
   private readonly timelineStore = new InMemoryAgentTimelineStore();
   private readonly providerSubagents = new ProviderSubagentStore();
@@ -628,6 +648,7 @@ export class AgentManager {
   private onAgentArchived?: AgentArchivedCallback;
   private onWorkspaceStateMayHaveChanged?: (params: { cwd: string }) => void;
   private logger: Logger;
+  private readonly fileSystem: AgentManagerFileSystem;
   private readonly rescueTimeouts: Required<AgentManagerRescueTimeouts>;
   private acceptingAgentRegistrations = true;
 
@@ -642,6 +663,7 @@ export class AgentManager {
     this.configurePaseoTools(options);
     this.appendSystemPrompt = options.appendSystemPrompt ?? "";
     this.logger = options.logger.child({ module: "agent", component: "agent-manager" });
+    this.fileSystem = options.fileSystem ?? { stat, opendir };
     this.rescueTimeouts = {
       reloadSessionCloseMs:
         options.rescueTimeouts?.reloadSessionCloseMs ?? RELOAD_SESSION_CLOSE_TIMEOUT_MS,
@@ -676,9 +698,11 @@ export class AgentManager {
     clients: ProviderClientMap;
   }): void {
     this.providerEnabled.clear();
+    this.providerDefinitions.clear();
     for (const [provider, definition] of Object.entries(input.providerDefinitions)) {
       if (definition) {
         this.providerEnabled.set(provider, definition.enabled);
+        this.providerDefinitions.set(provider, definition);
       }
     }
 
@@ -4349,17 +4373,29 @@ export class AgentManager {
     if (normalized.cwd) {
       normalized.cwd = resolve(normalized.cwd);
       try {
-        const cwdStats = await stat(normalized.cwd);
+        const cwdStats = await this.fileSystem.stat(normalized.cwd);
         if (!cwdStats.isDirectory()) {
           throw new Error(`Working directory is not a directory: ${normalized.cwd}`);
         }
+        const cwdHandle = await this.fileSystem.opendir(normalized.cwd);
+        try {
+          await cwdHandle.read();
+        } finally {
+          await cwdHandle.close();
+        }
       } catch (error) {
-        if (
-          error instanceof Error &&
-          "code" in error &&
-          (error as NodeJS.ErrnoException).code === "ENOENT"
-        ) {
+        const errorCode =
+          error instanceof Error && "code" in error
+            ? (error as NodeJS.ErrnoException).code
+            : undefined;
+        if (errorCode === "ENOENT") {
           throw new Error(`Working directory does not exist: ${normalized.cwd}`, { cause: error });
+        }
+        if (["EACCES", "EPERM"].includes(errorCode ?? "")) {
+          throw new Error(
+            `The Paseo daemon needs access to the folder "${normalized.cwd}". Grant access and try again.`,
+            { cause: error },
+          );
         }
         if (error instanceof Error) {
           throw error;
@@ -4381,25 +4417,38 @@ export class AgentManager {
       }
     }
 
-    if (!normalized.modeId) {
-      normalized.modeId = await this.resolveDefaultModeId(normalized, options.env);
-    }
-
-    return normalized;
+    return this.applyProviderConfiguration(normalized);
   }
 
-  private async resolveDefaultModeId(
-    config: AgentSessionConfig,
-    env?: Record<string, string>,
-  ): Promise<string | undefined> {
-    const providerDefault = await this.clients
-      .get(config.provider)
-      ?.resolveDefaultModeId?.({ config, env });
-    if (providerDefault) return providerDefault;
-    try {
-      return getAgentProviderDefinition(config.provider).defaultModeId ?? undefined;
-    } catch {
-      return undefined;
+  private applyProviderConfiguration(config: AgentSessionConfig): AgentSessionConfig {
+    const definition = this.providerDefinitions.get(config.provider);
+    if (config.providerOptions !== undefined && !definition?.validateOptions) {
+      throw new Error(`Provider '${config.provider}' does not accept providerOptions`);
+    }
+    const validatedOptions = definition?.validateOptions?.(config.providerOptions);
+    const withOptions = definition?.applyOptions
+      ? definition.applyOptions(config, validatedOptions)
+      : config;
+    this.validateToolPolicyServers(withOptions);
+    if (withOptions.toolPolicy && !definition?.applyToolPolicy) {
+      throw new Error(
+        `Provider '${config.provider}' cannot preapprove exact MCP tools for unattended execution`,
+      );
+    }
+    return definition?.applyToolPolicy
+      ? definition.applyToolPolicy(withOptions, withOptions.toolPolicy)
+      : withOptions;
+  }
+
+  private validateToolPolicyServers(config: AgentSessionConfig): void {
+    if (!config.toolPolicy) return;
+    const serverNames = new Set(Object.keys(config.mcpServers ?? {}));
+    for (const grant of config.toolPolicy.preapproved) {
+      if (!serverNames.has(grant.server)) {
+        throw new Error(
+          `toolPolicy preapproval '${grant.server}.${grant.tool}' requires MCP server '${grant.server}' in the same agent request`,
+        );
+      }
     }
   }
 
