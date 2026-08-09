@@ -274,6 +274,10 @@ export interface CreateAgentOptions {
   owner?: AgentOwner;
 }
 
+export interface CloseAgentOptions {
+  persistClosedState?: boolean;
+}
+
 export interface AgentManagerOptions {
   clients?: ProviderClientMap;
   providerDefinitions?: ProviderEnabledMap;
@@ -1509,13 +1513,13 @@ export class AgentManager {
     }
   }
 
-  closeAgent(agentId: string): Promise<void> {
+  closeAgent(agentId: string, options: CloseAgentOptions = {}): Promise<void> {
     const existing = this.inFlightAgentCloses.get(agentId);
     if (existing) {
       return existing;
     }
 
-    const close = this.closeAgentRuntime(agentId);
+    const close = this.closeAgentRuntime(agentId, options);
     this.inFlightAgentCloses.set(agentId, close);
     const clearClose = () => {
       if (this.inFlightAgentCloses.get(agentId) === close) {
@@ -1526,7 +1530,7 @@ export class AgentManager {
     return close;
   }
 
-  private async closeAgentRuntime(agentId: string): Promise<void> {
+  private async closeAgentRuntime(agentId: string, options: CloseAgentOptions): Promise<void> {
     const agent = this.requireAgent(agentId);
     this.logger.trace(
       {
@@ -1551,10 +1555,12 @@ export class AgentManager {
     }
 
     let persistError: unknown;
-    try {
-      await this.persistSnapshot(closedAgent);
-    } catch (error) {
-      persistError = error;
+    if (options.persistClosedState !== false) {
+      try {
+        await this.persistSnapshot(closedAgent);
+      } catch (error) {
+        persistError = error;
+      }
     }
     this.emitClosedAgent(closedAgent, { persist: false });
     this.logger.trace(

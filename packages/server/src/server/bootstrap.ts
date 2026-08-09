@@ -1685,7 +1685,7 @@ async function closeAllAgents(logger: Logger, agentManager: AgentManager): Promi
   await Promise.all(
     agents.map(async (agent) => {
       try {
-        await agentManager.closeAgent(agent.id);
+        await agentManager.closeAgent(agent.id, { persistClosedState: false });
       } catch (err) {
         logger.error({ err, agentId: agent.id }, "Failed to close agent");
       }

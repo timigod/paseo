@@ -342,6 +342,97 @@ describe("paseo daemon bootstrap", () => {
     }
   });
 
+  test("shutdown releases resident agents without closing retained records", async () => {
+    const paseoHomeRoot = await mkdtemp(path.join(os.tmpdir(), "paseo-shutdown-retained-state-"));
+    let closedSessions = 0;
+    const daemonHandle = await createTestPaseoDaemon({
+      paseoHomeRoot,
+      cleanup: false,
+      agentClients: createTestAgentClients({
+        closeSession: async () => {
+          closedSessions += 1;
+        },
+      }),
+    });
+    let stopped = false;
+
+    try {
+      const idleAgent = await daemonHandle.daemon.agentManager.createAgent(
+        { provider: "codex", cwd: paseoHomeRoot },
+        undefined,
+        {
+          workspaceId: "workspace-idle",
+          owner: { kind: "daemon", daemonId: "daemon-idle", executionId: "execution-idle" },
+        },
+      );
+      const runningAgent = await daemonHandle.daemon.agentManager.createAgent(
+        { provider: "codex", cwd: paseoHomeRoot },
+        undefined,
+        {
+          workspaceId: "workspace-running",
+          owner: {
+            kind: "daemon",
+            daemonId: "daemon-running",
+            executionId: "execution-running",
+          },
+        },
+      );
+      const archivedAgent = await daemonHandle.daemon.agentManager.createAgent(
+        { provider: "codex", cwd: paseoHomeRoot },
+        undefined,
+        {
+          workspaceId: "workspace-archived",
+          owner: {
+            kind: "daemon",
+            daemonId: "daemon-archived",
+            executionId: "execution-archived",
+          },
+        },
+      );
+      await daemonHandle.daemon.agentManager.archiveAgent(archivedAgent.id);
+
+      const runningRecord = await daemonHandle.daemon.agentStorage.get(runningAgent.id);
+      if (!runningRecord) {
+        throw new Error("Expected running agent record");
+      }
+      await daemonHandle.daemon.agentStorage.upsert({
+        ...runningRecord,
+        lastStatus: "running",
+      });
+      await daemonHandle.daemon.agentStorage.flush();
+
+      const retainedIds = [idleAgent.id, runningAgent.id, archivedAgent.id];
+      const beforeShutdown = await Promise.all(
+        retainedIds.map((agentId) => daemonHandle.daemon.agentStorage.get(agentId)),
+      );
+      closedSessions = 0;
+
+      await daemonHandle.close();
+      stopped = true;
+
+      const afterShutdown = await Promise.all(
+        retainedIds.map((agentId) => daemonHandle.daemon.agentStorage.get(agentId)),
+      );
+      expect({
+        afterShutdown,
+        beforeShutdown,
+        closedSessions,
+        residentAgents: daemonHandle.daemon.agentManager.listAgents(),
+      }).toEqual({
+        afterShutdown: beforeShutdown,
+        beforeShutdown,
+        closedSessions: 2,
+        residentAgents: [],
+      });
+    } finally {
+      if (!stopped) {
+        await daemonHandle.close();
+      }
+      await rm(paseoHomeRoot, { recursive: true, force: true });
+      await rm(daemonHandle.staticDir, { recursive: true, force: true });
+    }
+  });
+
   test("standalone listener exposes services only", async () => {
     const standalonePort = await findFreePort();
     const upstream = http.createServer((_req, res) => {

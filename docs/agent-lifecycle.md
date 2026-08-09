@@ -10,7 +10,7 @@ initializing → idle → running → idle (or error → closed)
                  └────────┘  (agent completes a turn, awaits next prompt)
 ```
 
-Each live agent in `AgentManager` carries a `lastStatus` of `initializing`, `idle`, `running`, or `error`. `closed` is the persisted, resumable state for an agent record that has no live provider runtime. State transitions persist to disk and stream to subscribed clients via WebSocket.
+Each live agent in `AgentManager` carries a `lastStatus` of `initializing`, `idle`, `running`, or `error`. An explicit runtime closure persists `closed`. State transitions persist to disk and stream to subscribed clients via WebSocket. Daemon shutdown releases provider runtimes without changing each retained record's `lastStatus`.
 
 ## Runtime residency
 
@@ -22,7 +22,8 @@ same Paseo agent ID. Provider history is not appended again when the canonical t
 primed.
 
 Idle agents remain resident indefinitely. Runtime closure happens only through an explicit lifecycle
-action such as archive, replacement, reload, workspace teardown, or daemon shutdown.
+action such as archive, replacement, reload, or workspace teardown. Daemon shutdown releases all
+provider runtimes, but it does not close or archive the retained agent records.
 
 When `daemon.maxActiveAgentRuntimes` is set, every provider runtime holds one host-capacity slot from
 its atomic start reservation until its process exits or its close operation succeeds. Failed starts
