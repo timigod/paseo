@@ -2,10 +2,12 @@ import { spawnSync } from "node:child_process";
 import {
   chmodSync,
   copyFileSync,
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -14,6 +16,8 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
 const packageRoot = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
+const STABLE_MACOS_PATH =
+  "/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
 
 function writeExecutable(filePath: string, contents: string): void {
   writeFileSync(filePath, contents, "utf8");
@@ -23,12 +27,15 @@ function writeExecutable(filePath: string, contents: string): void {
 function createFakeMacBundle(options: { includeHelper: boolean }): {
   root: string;
   shimPath: string;
+  daemonLauncherPath: string;
+  resourcesPath: string;
 } {
   const root = mkdtempSync(join(tmpdir(), "paseo-cli-shim-test-"));
   const appPath = join(root, "Paseo.app");
   const contentsPath = join(appPath, "Contents");
   const resourcesPath = join(contentsPath, "Resources");
   const shimPath = join(resourcesPath, "bin", "paseo");
+  const daemonLauncherPath = join(resourcesPath, "bin", "paseo-daemon-launcher");
   const mainPath = join(contentsPath, "MacOS", "Paseo");
   const helperPath = join(
     contentsPath,
@@ -43,6 +50,8 @@ function createFakeMacBundle(options: { includeHelper: boolean }): {
   mkdirSync(dirname(mainPath), { recursive: true });
   copyFileSync(join(packageRoot, "bin", "paseo"), shimPath);
   chmodSync(shimPath, 0o755);
+  copyFileSync(join(packageRoot, "bin", "paseo-daemon-launcher"), daemonLauncherPath);
+  chmodSync(daemonLauncherPath, 0o755);
 
   writeExecutable(mainPath, "#!/bin/sh\necho main-executable\n");
 
@@ -52,14 +61,15 @@ function createFakeMacBundle(options: { includeHelper: boolean }): {
       helperPath,
       [
         "#!/bin/sh",
-        'printf "helper env=%s/%s cli=%s\\n" "$ELECTRON_RUN_AS_NODE" "$PASEO_NODE_ENV" "$PASEO_CLI"',
+        'printf "helper env=%s/%s cli=%s web=%s\\n" "$ELECTRON_RUN_AS_NODE" "$PASEO_NODE_ENV" "$PASEO_CLI" "${PASEO_WEB_UI_ENABLED:-}"',
+        'printf "path=%s\\n" "$PATH"',
         'printf "args=%s\\n" "$*"',
         "",
       ].join("\n"),
     );
   }
 
-  return { root, shimPath };
+  return { root, shimPath, daemonLauncherPath, resourcesPath };
 }
 
 describe("desktop packaging", () => {
@@ -94,6 +104,16 @@ describe("desktop packaging", () => {
 
     expect(config).toContain("name: Paseo agent link");
     expect(config).toContain("- paseo");
+  });
+
+  it("packages the executable daemon launcher in the macOS resources", () => {
+    const config = readFileSync(join(packageRoot, "electron-builder.yml"), "utf8");
+    const launcherPath = join(packageRoot, "bin", "paseo-daemon-launcher");
+
+    expect(config).toContain(
+      "- from: bin/paseo-daemon-launcher\n      to: bin/paseo-daemon-launcher",
+    );
+    expect(statSync(launcherPath).mode & 0o111).toBe(0o111);
   });
 
   // electron-builder packs production dependencies declared in package.json into
@@ -142,6 +162,62 @@ describe("desktop packaging", () => {
       expect(result.status).toBe(1);
       expect(result.stderr).toContain("Bundled Paseo Helper executable not found");
       expect(result.stdout).not.toContain("main-executable");
+    } finally {
+      rmSync(bundle.root, { recursive: true, force: true });
+    }
+  });
+
+  it("prepends stable macOS command paths and preserves the inherited PATH", () => {
+    if (process.platform === "win32") return;
+
+    const bundle = createFakeMacBundle({ includeHelper: true });
+    try {
+      const result = spawnSync(bundle.daemonLauncherPath, [], {
+        encoding: "utf8",
+        env: { ...process.env, PATH: "/custom/bin:/custom/sbin" },
+      });
+
+      expect(result.status).toBe(0);
+      expect(result.stdout).toContain(
+        `helper env=1/production cli=${join(bundle.resourcesPath, "bin", "paseo")} web=false`,
+      );
+      expect(result.stdout).toContain(`path=${STABLE_MACOS_PATH}:/custom/bin:/custom/sbin\n`);
+      expect(result.stdout).toContain("node-entrypoint-runner.js");
+      expect(result.stdout).toContain("node-script");
+      expect(result.stdout).toContain("@getpaseo/server/dist/scripts/supervisor-entrypoint.js");
+    } finally {
+      rmSync(bundle.root, { recursive: true, force: true });
+    }
+  });
+
+  it("does not read user shell startup files", () => {
+    if (process.platform === "win32") return;
+
+    const bundle = createFakeMacBundle({ includeHelper: true });
+    const home = join(bundle.root, "home");
+    const startupFile = join(home, "startup-file");
+    const startupMarker = join(home, "startup-file-read");
+    mkdirSync(home, { recursive: true });
+    writeFileSync(startupFile, ': > "$PASEO_STARTUP_MARKER"\nexit 91\n', "utf8");
+    for (const name of [".profile", ".zprofile", ".zshrc", ".zshenv"]) {
+      copyFileSync(startupFile, join(home, name));
+    }
+
+    try {
+      const result = spawnSync(bundle.daemonLauncherPath, [], {
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          HOME: home,
+          SHELL: "/bin/zsh",
+          ENV: startupFile,
+          BASH_ENV: startupFile,
+          PASEO_STARTUP_MARKER: startupMarker,
+        },
+      });
+
+      expect(result.status).toBe(0);
+      expect(existsSync(startupMarker)).toBe(false);
     } finally {
       rmSync(bundle.root, { recursive: true, force: true });
     }
