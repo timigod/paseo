@@ -64,6 +64,7 @@ function createFakeMacBundle(options: { includeHelper: boolean }): {
         'printf "helper env=%s/%s cli=%s web=%s\\n" "$ELECTRON_RUN_AS_NODE" "$PASEO_NODE_ENV" "$PASEO_CLI" "${PASEO_WEB_UI_ENABLED:-}"',
         'printf "path=%s\\n" "$PATH"',
         'printf "args=%s\\n" "$*"',
+        'exit "${PASEO_HELPER_EXIT_CODE:-0}"',
         "",
       ].join("\n"),
     );
@@ -185,6 +186,50 @@ describe("desktop packaging", () => {
       expect(result.stdout).toContain("node-entrypoint-runner.js");
       expect(result.stdout).toContain("node-script");
       expect(result.stdout).toContain("@getpaseo/server/dist/scripts/supervisor-entrypoint.js");
+    } finally {
+      rmSync(bundle.root, { recursive: true, force: true });
+    }
+  });
+
+  it("consumes an explicit stop intent without launching the daemon", () => {
+    if (process.platform === "win32") return;
+
+    const bundle = createFakeMacBundle({ includeHelper: true });
+    const paseoHome = join(bundle.root, "paseo-home");
+    const stopIntentPath = join(paseoHome, "daemon-explicit-stop");
+    mkdirSync(paseoHome, { recursive: true });
+    writeFileSync(stopIntentPath, "4242\n", "utf8");
+
+    try {
+      const result = spawnSync(bundle.daemonLauncherPath, [], {
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          PASEO_HOME: paseoHome,
+          PASEO_HELPER_EXIT_CODE: "23",
+        },
+      });
+
+      expect(result.status).toBe(0);
+      expect(existsSync(stopIntentPath)).toBe(false);
+      expect(result.stdout).not.toContain("helper env=");
+    } finally {
+      rmSync(bundle.root, { recursive: true, force: true });
+    }
+  });
+
+  it("propagates an unexpected daemon failure to launchd", () => {
+    if (process.platform === "win32") return;
+
+    const bundle = createFakeMacBundle({ includeHelper: true });
+    try {
+      const result = spawnSync(bundle.daemonLauncherPath, [], {
+        encoding: "utf8",
+        env: { ...process.env, PASEO_HELPER_EXIT_CODE: "23" },
+      });
+
+      expect(result.status).toBe(23);
+      expect(result.stdout).toContain("helper env=");
     } finally {
       rmSync(bundle.root, { recursive: true, force: true });
     }

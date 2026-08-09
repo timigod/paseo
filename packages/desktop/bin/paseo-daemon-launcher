@@ -12,6 +12,16 @@ fi
 export PATH
 unset ENV BASH_ENV
 
+if [ -n "${PASEO_HOME:-}" ]; then
+  STOP_INTENT_PATH="${PASEO_HOME}/daemon-explicit-stop"
+else
+  STOP_INTENT_PATH="${HOME}/.paseo/daemon-explicit-stop"
+fi
+if [ -f "$STOP_INTENT_PATH" ]; then
+  rm -f -- "$STOP_INTENT_PATH"
+  exit 0
+fi
+
 SCRIPT_PATH=$0
 case "$SCRIPT_PATH" in
   /*) ;;
