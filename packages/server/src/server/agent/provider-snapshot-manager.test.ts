@@ -12,6 +12,7 @@ import type {
   ResolveAgentCreateConfigInput,
 } from "./agent-sdk-types.js";
 import type { ManagedAgent } from "./agent-manager.js";
+import { HostAgentRuntimeCapacityController } from "./agent-runtime-capacity.js";
 import {
   GLOBAL_PROVIDER_SNAPSHOT_KEY,
   ProviderSnapshotManager,
@@ -69,6 +70,306 @@ async function withEnv(key: string, value: string, run: () => Promise<void>): Pr
 }
 
 describe("ProviderSnapshotManager public surface", () => {
+  test("configures source-managed extra clients before provider work", async () => {
+    const runtimeCapacityController = new HostAgentRuntimeCapacityController(1);
+    let configuredController: HostAgentRuntimeCapacityController | null = null;
+    const client = createExtraClient("codex", {
+      managesRuntimeCapacityAtSource: true,
+      configureRuntimeCapacityController(controller) {
+        configuredController = controller as HostAgentRuntimeCapacityController;
+      },
+      async isAvailable() {
+        expect(configuredController).toBe(runtimeCapacityController);
+        return false;
+      },
+    });
+    const manager = new ProviderSnapshotManager({
+      logger: createTestLogger(),
+      runtimeCapacityController,
+      extraClients: { codex: client },
+    });
+    try {
+      await manager.getProvider({ provider: "codex", wait: true });
+      expect(configuredController).toBe(runtimeCapacityController);
+    } finally {
+      manager.destroy();
+    }
+  });
+
+  test("rejects source-managed extra clients without capacity injection", () => {
+    const runtimeCapacityController = new HostAgentRuntimeCapacityController(1);
+    expect(
+      () =>
+        new ProviderSnapshotManager({
+          logger: createTestLogger(),
+          runtimeCapacityController,
+          extraClients: {
+            codex: createExtraClient("codex", { managesRuntimeCapacityAtSource: true }),
+          },
+        }),
+    ).toThrow(
+      "Provider 'codex' claims source-managed runtime capacity without configureRuntimeCapacityController",
+    );
+  });
+
+  test("configures replacement extra clients after mutable provider updates", () => {
+    const runtimeCapacityController = new HostAgentRuntimeCapacityController(1);
+    const firstConfigure = vi.fn();
+    const replacementConfigure = vi.fn();
+    const extraClients: Partial<Record<AgentProvider, AgentClient>> = {
+      codex: createExtraClient("codex", {
+        managesRuntimeCapacityAtSource: true,
+        configureRuntimeCapacityController: firstConfigure,
+      }),
+    };
+    const manager = new ProviderSnapshotManager({
+      logger: createTestLogger(),
+      runtimeCapacityController,
+      extraClients,
+    });
+    try {
+      extraClients.codex = createExtraClient("codex", {
+        managesRuntimeCapacityAtSource: true,
+        configureRuntimeCapacityController: replacementConfigure,
+      });
+
+      manager.applyMutableProviderConfig({});
+
+      expect(firstConfigure).toHaveBeenCalledWith(runtimeCapacityController);
+      expect(replacementConfigure).toHaveBeenCalledWith(runtimeCapacityController);
+    } finally {
+      manager.destroy();
+    }
+  });
+
+  test("holds capacity while a manager-managed catalog process is active", async () => {
+    const runtimeCapacityController = new HostAgentRuntimeCapacityController(1);
+    let signalCatalogStarted = () => {};
+    let finishCatalog = () => {};
+    const catalogStarted = new Promise<void>((resolveStarted) => {
+      signalCatalogStarted = resolveStarted;
+    });
+    const catalogFinished = new Promise<void>((resolveFinished) => {
+      finishCatalog = resolveFinished;
+    });
+    const manager = new ProviderSnapshotManager({
+      logger: createTestLogger(),
+      runtimeCapacityController,
+      providerOverrides: {
+        claude: { enabled: false },
+        copilot: { enabled: false },
+        opencode: { enabled: false },
+        pi: { enabled: false },
+        omp: { enabled: false },
+      },
+      extraClients: {
+        codex: createExtraClient("codex", {
+          async isAvailable() {
+            return true;
+          },
+          async fetchCatalog() {
+            signalCatalogStarted();
+            await catalogFinished;
+            return { models: [], modes: [] };
+          },
+        }),
+      },
+    });
+    try {
+      const load = manager.getProvider({ provider: "codex", wait: true });
+      await catalogStarted;
+      let competingReservation = null;
+      try {
+        competingReservation = runtimeCapacityController.reserve();
+      } catch {
+        // The active catalog load owns the only capacity slot.
+      }
+      competingReservation?.release();
+      expect(competingReservation).toBeNull();
+
+      finishCatalog();
+      await load;
+      const releasedReservation = runtimeCapacityController.reserve();
+      releasedReservation.release();
+    } finally {
+      manager.destroy();
+    }
+  });
+
+  test("holds capacity while a manager-managed availability probe is active", async () => {
+    const runtimeCapacityController = new HostAgentRuntimeCapacityController(1);
+    const unrelatedIsAvailable = vi.fn(async () => true);
+    let signalAvailabilityStarted = () => {};
+    let finishAvailability = () => {};
+    const availabilityStarted = new Promise<void>((resolveStarted) => {
+      signalAvailabilityStarted = resolveStarted;
+    });
+    const availabilityFinished = new Promise<void>((resolveFinished) => {
+      finishAvailability = resolveFinished;
+    });
+    const manager = new ProviderSnapshotManager({
+      logger: createTestLogger(),
+      runtimeCapacityController,
+      extraClients: {
+        codex: createExtraClient("codex", {
+          async isAvailable() {
+            signalAvailabilityStarted();
+            await availabilityFinished;
+            return false;
+          },
+        }),
+        claude: createExtraClient("claude", { isAvailable: unrelatedIsAvailable }),
+      },
+    });
+    try {
+      const load = manager.getProvider({ provider: "codex", wait: true });
+      await availabilityStarted;
+
+      expect(() => runtimeCapacityController.reserve()).toThrow(
+        "Host agent runtime capacity reached",
+      );
+
+      finishAvailability();
+      await load;
+      const releasedReservation = runtimeCapacityController.reserve();
+      releasedReservation.release();
+      expect(unrelatedIsAvailable).not.toHaveBeenCalled();
+    } finally {
+      manager.destroy();
+    }
+  });
+
+  test("serializes provider refreshes when host capacity is finite", async () => {
+    let activeAvailabilityProbes = 0;
+    let maxActiveAvailabilityProbes = 0;
+    const createAvailabilityClient = (provider: AgentProvider) =>
+      createExtraClient(provider, {
+        async isAvailable() {
+          activeAvailabilityProbes += 1;
+          maxActiveAvailabilityProbes = Math.max(
+            maxActiveAvailabilityProbes,
+            activeAvailabilityProbes,
+          );
+          await new Promise<void>((resolveTurn) => setImmediate(resolveTurn));
+          activeAvailabilityProbes -= 1;
+          return true;
+        },
+      });
+    const manager = new ProviderSnapshotManager({
+      logger: createTestLogger(),
+      runtimeCapacityController: new HostAgentRuntimeCapacityController(1),
+      extraClients: {
+        codex: createAvailabilityClient("codex"),
+        claude: createAvailabilityClient("claude"),
+      },
+    });
+    try {
+      const entries = await manager.listProviders({
+        cwd: "/tmp/project",
+        providers: ["codex", "claude"],
+        wait: true,
+      });
+
+      expect(entries).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ provider: "codex", status: "ready" }),
+          expect.objectContaining({ provider: "claude", status: "ready" }),
+        ]),
+      );
+      expect(maxActiveAvailabilityProbes).toBe(1);
+    } finally {
+      manager.destroy();
+    }
+  });
+
+  test("holds capacity while a manager-managed diagnostic process is active", async () => {
+    const runtimeCapacityController = new HostAgentRuntimeCapacityController(1);
+    let signalDiagnosticStarted = () => {};
+    let finishDiagnostic = () => {};
+    const diagnosticStarted = new Promise<void>((resolveStarted) => {
+      signalDiagnosticStarted = resolveStarted;
+    });
+    const diagnosticFinished = new Promise<void>((resolveFinished) => {
+      finishDiagnostic = resolveFinished;
+    });
+    const manager = new ProviderSnapshotManager({
+      logger: createTestLogger(),
+      runtimeCapacityController,
+      extraClients: {
+        codex: createExtraClient("codex", {
+          async getDiagnostic() {
+            signalDiagnosticStarted();
+            await diagnosticFinished;
+            return { diagnostic: "codex is ready" };
+          },
+        }),
+      },
+    });
+    try {
+      const diagnostic = manager.getProviderDiagnostic("codex");
+      await diagnosticStarted;
+
+      expect(() => runtimeCapacityController.reserve()).toThrow(
+        "Host agent runtime capacity reached",
+      );
+
+      finishDiagnostic();
+      await diagnostic;
+      const releasedReservation = runtimeCapacityController.reserve();
+      releasedReservation.release();
+    } finally {
+      manager.destroy();
+    }
+  });
+
+  test("does not make manager-managed diagnostic probes compete for the last slot", async () => {
+    const runtimeCapacityController = new HostAgentRuntimeCapacityController(1);
+    let signalDiagnosticStarted = () => {};
+    let finishDiagnostic = () => {};
+    const diagnosticStarted = new Promise<void>((resolveStarted) => {
+      signalDiagnosticStarted = resolveStarted;
+    });
+    const diagnosticFinished = new Promise<void>((resolveFinished) => {
+      finishDiagnostic = resolveFinished;
+    });
+    const fetchCatalog = vi.fn(async () => ({
+      models: [{ provider: "codex" as const, id: "gpt-5.4-mini", label: "GPT 5.4 Mini" }],
+      modes: [] as AgentMode[],
+    }));
+    const manager = new ProviderSnapshotManager({
+      logger: createTestLogger(),
+      runtimeCapacityController,
+      extraClients: {
+        codex: createExtraClient("codex", {
+          async isAvailable() {
+            return true;
+          },
+          fetchCatalog,
+          async getDiagnostic() {
+            signalDiagnosticStarted();
+            await diagnosticFinished;
+            return { diagnostic: "codex is ready" };
+          },
+        }),
+      },
+    });
+    try {
+      const diagnostic = manager.getProviderDiagnostic("codex");
+      await diagnosticStarted;
+      await new Promise<void>((resolveTurn) => setImmediate(resolveTurn));
+
+      expect(fetchCatalog).not.toHaveBeenCalled();
+
+      finishDiagnostic();
+      const result = await diagnostic;
+      expect(fetchCatalog).toHaveBeenCalledTimes(1);
+      expect(result.diagnostic).toContain("Models: 1");
+      expect(result.diagnostic).toContain("Status: Ready");
+    } finally {
+      manager.destroy();
+    }
+  });
+
   test("listRegisteredProviderIds includes the built-in providers", () => {
     const manager = new ProviderSnapshotManager({ logger: createTestLogger() });
     try {

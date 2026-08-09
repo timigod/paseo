@@ -438,6 +438,12 @@ function resolveBrowserToolsEnabled(persisted: ReturnType<typeof loadPersistedCo
   return persisted.daemon?.browserTools?.enabled ?? false;
 }
 
+function resolveMaxActiveAgentRuntimes(
+  persisted: ReturnType<typeof loadPersistedConfig>,
+): number | undefined {
+  return persisted.daemon?.maxActiveAgentRuntimes;
+}
+
 function resolveStaticLoadConfigSettings(
   env: NodeJS.ProcessEnv,
   cli: CliConfigOverrides | undefined,
@@ -449,6 +455,7 @@ function resolveStaticLoadConfigSettings(
       cli?.mcpInjectIntoAgents ?? persisted.daemon?.mcp?.injectIntoAgents ?? false,
     browserToolsEnabled: resolveBrowserToolsEnabled(persisted),
     autoArchiveAfterMerge: persisted.daemon?.autoArchiveAfterMerge ?? false,
+    maxActiveAgentRuntimes: resolveMaxActiveAgentRuntimes(persisted),
     appendSystemPrompt: resolveAppendSystemPrompt(persisted),
     terminalProfiles: persisted.daemon?.terminalProfiles,
     hostnames: mergeHostnames([
@@ -477,6 +484,7 @@ export function loadConfig(
     mcpInjectIntoAgents,
     browserToolsEnabled,
     autoArchiveAfterMerge,
+    maxActiveAgentRuntimes,
     appendSystemPrompt,
     terminalProfiles,
     hostnames,
@@ -517,6 +525,7 @@ export function loadConfig(
     browserToolsEnabled,
     git: resolveGitProcessConfig(env, persisted),
     autoArchiveAfterMerge,
+    maxActiveAgentRuntimes,
     enableTerminalAgentHooks: persisted.daemon?.enableTerminalAgentHooks ?? false,
     appendSystemPrompt,
     terminalProfiles,

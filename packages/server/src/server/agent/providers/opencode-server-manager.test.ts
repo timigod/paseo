@@ -8,6 +8,14 @@ import { afterEach, describe, expect, test, vi } from "vitest";
 
 import { findExecutable } from "../../../executable-resolution/executable-resolution.js";
 import { createTestLogger } from "../../../test-utils/test-logger.js";
+import {
+  AgentRuntimeCapacityError,
+  HostAgentRuntimeCapacityController,
+} from "../agent-runtime-capacity.js";
+import type {
+  AgentRuntimeCapacityController,
+  AgentRuntimeCapacityReservation,
+} from "../agent-sdk-types.js";
 import type {
   ManagedProcessRecord,
   ManagedProcessRecordInput,
@@ -123,6 +131,92 @@ describe("OpenCodeServerManager generations", () => {
     expect(runtime.terminatedPorts).toEqual([4451]);
   });
 
+  test("admits concurrent shared acquisitions and rejects another server generation", async () => {
+    const controller = new HostAgentRuntimeCapacityController(1);
+    const { manager, runtime } = createTestManager([4461, 4462], { autoAnnounce: false });
+    manager.configureRuntimeCapacityController(controller);
+
+    const firstStart = manager.acquireCurrent();
+    const sharedStart = manager.acquireCurrent();
+    await runtime.settle();
+    expect(runtime.launchedPorts).toEqual([4461]);
+
+    runtime.processForPort(4461).announceListening();
+    const [first, shared] = await Promise.all([firstStart, sharedStart]);
+
+    await expect(manager.acquireDedicated({ PASEO_AGENT_ID: "second" })).rejects.toBeInstanceOf(
+      AgentRuntimeCapacityError,
+    );
+    expect(runtime.launchedPorts).toEqual([4461]);
+
+    await shared.release();
+    await first.release();
+  });
+
+  test("uses separate serial reservations for executable discovery and the helper server", async () => {
+    const controller = new RecordingRuntimeCapacityController(1);
+    const { manager } = createTestManager([4462]);
+    manager.configureRuntimeCapacityController(controller);
+
+    const acquisition = await manager.acquireCurrent();
+
+    expect(controller.events).toEqual(["reserve", "release", "reserve", "track"]);
+    await acquisition.release();
+  });
+
+  test("releases capacity after a failed startup is terminated", async () => {
+    const controller = new HostAgentRuntimeCapacityController(1);
+    const { manager, runtime } = createTestManager([4463, 4464], { autoAnnounce: false });
+    manager.configureRuntimeCapacityController(controller);
+
+    const failedStart = manager.acquireCurrent();
+    await runtime.settle();
+    runtime.processForPort(4463).failStartup(new Error("OpenCode failed during startup"));
+
+    await expect(failedStart).rejects.toThrow("OpenCode failed during startup");
+
+    const nextStart = manager.acquireCurrent();
+    await runtime.settle();
+    runtime.processForPort(4464).announceListening();
+    const next = await nextStart;
+
+    expect(runtime.launchedPorts).toEqual([4463, 4464]);
+    await next.release();
+  });
+
+  test("releases capacity after a normal server stop", async () => {
+    const controller = new HostAgentRuntimeCapacityController(1);
+    const { manager, runtime } = createTestManager([4465, 4466]);
+    manager.configureRuntimeCapacityController(controller);
+
+    const first = await manager.acquireCurrent();
+    await first.release();
+    const second = await manager.acquireCurrent();
+
+    expect(runtime.launchedPorts).toEqual([4465, 4466]);
+    await second.release();
+  });
+
+  test("retains capacity after kill timeout until a later cleanup confirms termination", async () => {
+    const controller = new HostAgentRuntimeCapacityController(1);
+    const { manager, runtime } = createTestManager([4467, 4468, 4469], {
+      terminationResults: ["kill-timeout", "terminated"],
+    });
+    manager.configureRuntimeCapacityController(controller);
+
+    const first = await manager.acquireCurrent();
+    await first.release();
+
+    await expect(manager.acquireCurrent()).rejects.toBeInstanceOf(AgentRuntimeCapacityError);
+    expect(runtime.launchedPorts).toEqual([4467]);
+
+    await manager.shutdown();
+    const next = await manager.acquireCurrent();
+
+    expect(runtime.launchedPorts).toEqual([4467, 4469]);
+    await next.release();
+  });
+
   test("startup timeout kills the spawned server and removes its managed-process record", async () => {
     vi.useFakeTimers();
     const { manager, runtime } = createTestManager([4471], { autoAnnounce: false });
@@ -138,16 +232,68 @@ describe("OpenCodeServerManager generations", () => {
     expect(await runtime.managedProcesses.list()).toEqual([]);
   });
 
-  test("shutdown kills a server that is still starting", async () => {
-    const { manager, runtime } = createTestManager([4472], { autoAnnounce: false });
+  test("shutdown prevents a pre-spawn start from crossing its barrier", async () => {
+    const portAllocationGate = new TestGate();
+    const { manager, runtime } = createTestManager([4472], {
+      portAllocationGate,
+    });
+
+    const acquisition = manager.acquireNew();
+    const failure = expect(acquisition).rejects.toThrow(
+      "OpenCode server start canceled by shutdown",
+    );
+    await portAllocationGate.waitUntilReached();
+
+    const shutdown = manager.shutdown();
+    await expect(manager.acquireCurrent()).rejects.toThrow(
+      "OpenCode server start canceled by shutdown",
+    );
+    portAllocationGate.release();
+
+    await shutdown;
+    await failure;
+    expect(runtime.launchedPorts).toEqual([]);
+    expect(await runtime.managedProcesses.list()).toEqual([]);
+  });
+
+  test("shutdown waits for a spawned server that is awaiting readiness to terminate", async () => {
+    const terminationGate = new TestGate();
+    const { manager, runtime } = createTestManager([4473], {
+      autoAnnounce: false,
+      terminationGate,
+    });
 
     const acquisition = manager.acquireCurrent();
+    const failure = expect(acquisition).rejects.toThrow(
+      "OpenCode server start canceled by shutdown",
+    );
     await runtime.settle();
+    expect(runtime.launchedPorts).toEqual([4473]);
 
-    await manager.shutdown();
+    const shutdown = manager.shutdown();
+    await terminationGate.waitUntilReached();
+    expect(runtime.processForPort(4473).signalCode).toBe(null);
+    terminationGate.release();
 
-    await expect(acquisition).rejects.toThrow("OpenCode server exited with code null");
-    expect(runtime.terminatedPorts).toEqual([4472]);
+    await shutdown;
+    await failure;
+    expect(runtime.terminatedPorts).toEqual([4473]);
+    expect(await runtime.managedProcesses.list()).toEqual([]);
+  });
+
+  test("terminates a spawned server before releasing a failed construction reservation", async () => {
+    const { manager, runtime } = createTestManager([4474], { autoAnnounce: false });
+    let reservationReleaseSignal: NodeJS.Signals | null | undefined;
+    manager.configureRuntimeCapacityController(
+      new FailingTrackRuntimeCapacityController(() => {
+        reservationReleaseSignal = runtime.processForPort(4474).signalCode;
+      }),
+    );
+
+    await expect(manager.acquireCurrent()).rejects.toThrow("capacity tracking failed");
+
+    expect(runtime.terminatedPorts).toEqual([4474]);
+    expect(reservationReleaseSignal).toBe("SIGTERM");
     expect(await runtime.managedProcesses.list()).toEqual([]);
   });
 
@@ -348,6 +494,9 @@ function createTestManager(
     autoAnnounce?: boolean;
     baseEnv?: Record<string, string>;
     opencodeHomeDir?: string;
+    portAllocationGate?: TestGate;
+    terminationGate?: TestGate;
+    terminationResults?: Array<"kill-timeout" | "terminated">;
   } = {},
 ): {
   manager: OpenCodeServerManager;
@@ -356,6 +505,9 @@ function createTestManager(
   const { opencodeHomeDir } = options;
   const runtime = new FakeOpenCodeServerRuntime(ports, {
     autoAnnounce: options.autoAnnounce ?? true,
+    portAllocationGate: options.portAllocationGate,
+    terminationGate: options.terminationGate,
+    terminationResults: options.terminationResults ?? [],
   });
   return {
     manager: new OpenCodeServerManager({
@@ -382,12 +534,26 @@ class FakeOpenCodeServerRuntime {
   }> = [];
   private readonly ports: number[];
   private readonly autoAnnounce: boolean;
+  private readonly portAllocationGate?: TestGate;
+  private readonly terminationGate?: TestGate;
+  private readonly terminationResults: Array<"kill-timeout" | "terminated">;
   private readonly processesByChild = new Map<ChildProcess, FakeOpenCodeProcess>();
   private readonly processesByPort = new Map<number, FakeOpenCodeProcess>();
 
-  constructor(ports: number[], options: { autoAnnounce: boolean }) {
+  constructor(
+    ports: number[],
+    options: {
+      autoAnnounce: boolean;
+      portAllocationGate?: TestGate;
+      terminationGate?: TestGate;
+      terminationResults: Array<"kill-timeout" | "terminated">;
+    },
+  ) {
     this.ports = [...ports];
     this.autoAnnounce = options.autoAnnounce;
+    this.portAllocationGate = options.portAllocationGate;
+    this.terminationGate = options.terminationGate;
+    this.terminationResults = [...options.terminationResults];
   }
 
   get launchedPorts(): number[] {
@@ -395,6 +561,7 @@ class FakeOpenCodeServerRuntime {
   }
 
   readonly allocatePort: OpenCodePortAllocator = async () => {
+    await this.portAllocationGate?.pause();
     const port = this.ports.shift();
     if (!port) {
       throw new Error("No fake OpenCode port available");
@@ -422,8 +589,12 @@ class FakeOpenCodeServerRuntime {
   readonly terminateProcess: ProcessTerminator = async (target: TreeKillTarget) => {
     const process = this.processForChild(target as ChildProcess);
     this.terminatedPorts.push(process.port);
-    process.exitBySignal("SIGTERM");
-    return "terminated";
+    await this.terminationGate?.pause();
+    const result = this.terminationResults.shift() ?? "terminated";
+    if (result === "terminated") {
+      process.exitBySignal("SIGTERM");
+    }
+    return result;
   };
 
   processForPort(port: number): FakeOpenCodeProcess {
@@ -435,8 +606,9 @@ class FakeOpenCodeServerRuntime {
   }
 
   async settle(): Promise<void> {
-    await Promise.resolve();
-    await Promise.resolve();
+    for (let step = 0; step < 5; step += 1) {
+      await Promise.resolve();
+    }
   }
 
   private processForChild(child: ChildProcess): FakeOpenCodeProcess {
@@ -445,6 +617,100 @@ class FakeOpenCodeServerRuntime {
       throw new Error("Unknown fake OpenCode process");
     }
     return process;
+  }
+}
+
+class TestGate {
+  private readonly reached: Promise<void>;
+  private readonly released: Promise<void>;
+  private markReached!: () => void;
+  private markReleased!: () => void;
+
+  constructor() {
+    this.reached = new Promise((resolve) => {
+      this.markReached = resolve;
+    });
+    this.released = new Promise((resolve) => {
+      this.markReleased = resolve;
+    });
+  }
+
+  async pause(): Promise<void> {
+    this.markReached();
+    await this.released;
+  }
+
+  waitUntilReached(): Promise<void> {
+    return this.reached;
+  }
+
+  release(): void {
+    this.markReleased();
+  }
+}
+
+class FailingTrackRuntimeCapacityController implements AgentRuntimeCapacityController {
+  private reservations = 0;
+
+  constructor(private readonly onReservationRelease: () => void) {}
+
+  getAvailableRuntimeSlots(): number | null {
+    return null;
+  }
+
+  reserve(): AgentRuntimeCapacityReservation {
+    this.reservations += 1;
+    if (this.reservations === 1) {
+      return {
+        track: () => {
+          throw new Error("temporary reservation must not track a runtime");
+        },
+        release: () => undefined,
+      };
+    }
+    return {
+      track: () => {
+        throw new Error("capacity tracking failed");
+      },
+      release: this.onReservationRelease,
+    };
+  }
+
+  release(): void {
+    throw new Error("failed reservation must not become tracked");
+  }
+}
+
+class RecordingRuntimeCapacityController implements AgentRuntimeCapacityController {
+  readonly events: string[] = [];
+  private readonly controller: HostAgentRuntimeCapacityController;
+
+  constructor(limit: number) {
+    this.controller = new HostAgentRuntimeCapacityController(limit);
+  }
+
+  getAvailableRuntimeSlots(): number | null {
+    return this.controller.getAvailableRuntimeSlots();
+  }
+
+  reserve(): AgentRuntimeCapacityReservation {
+    this.events.push("reserve");
+    const reservation = this.controller.reserve();
+    return {
+      track: (runtime) => {
+        this.events.push("track");
+        reservation.track(runtime);
+      },
+      release: () => {
+        this.events.push("release");
+        reservation.release();
+      },
+    };
+  }
+
+  release(runtime: object): void {
+    this.events.push("runtime-release");
+    this.controller.release(runtime);
   }
 }
 
@@ -467,6 +733,10 @@ class FakeOpenCodeProcess extends EventEmitter {
 
   announceListening(): void {
     this.stdout.emit("data", Buffer.from("listening on"));
+  }
+
+  failStartup(error: Error): void {
+    this.emit("error", error);
   }
 
   exitNormally(): void {

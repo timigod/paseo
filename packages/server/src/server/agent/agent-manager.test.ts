@@ -9,10 +9,12 @@ import { createTestLogger } from "../../test-utils/test-logger.js";
 import {
   AgentManager,
   AgentManagerShuttingDownError,
+  AgentRuntimeCapacityError,
   commandMayHaveChangedExternalState,
   type AgentManagerEvent,
   type ManagedAgent,
 } from "./agent-manager.js";
+import { HostAgentRuntimeCapacityController } from "./agent-runtime-capacity.js";
 import { AgentStorage } from "./agent-storage.js";
 import { toAgentPayload } from "./agent-projections.js";
 import { PARENT_AGENT_ID_LABEL } from "@getpaseo/protocol/agent-labels";
@@ -765,6 +767,261 @@ function fakeCodexEmitting(args: FakeCodexEmitterArgs): AgentClient {
 
 const logger = createTestLogger();
 
+test("rejects concurrent agent starts that exceed host runtime capacity", async () => {
+  const creationStarted = deferred<void>();
+  const creationAllowed = deferred<void>();
+  let createSessionCalls = 0;
+  const client = new (class extends TestAgentClient {
+    override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+      createSessionCalls += 1;
+      creationStarted.resolve();
+      await creationAllowed.promise;
+      return new TestAgentSession(config);
+    }
+  })();
+  const manager = new AgentManager({
+    clients: { codex: client },
+    logger,
+    maxActiveAgentRuntimes: 1,
+  });
+
+  const firstCreation = manager.createAgent({ provider: "codex", cwd: process.cwd() }, undefined, {
+    workspaceId: undefined,
+  });
+  await creationStarted.promise;
+
+  await expect(
+    manager.createAgent({ provider: "codex", cwd: process.cwd() }, undefined, {
+      workspaceId: undefined,
+    }),
+  ).rejects.toMatchObject({
+    name: "AgentRuntimeCapacityError",
+    limit: 1,
+    live: 0,
+    reserved: 1,
+  });
+  expect(createSessionCalls).toBe(1);
+
+  creationAllowed.resolve();
+  const firstAgent = await firstCreation;
+  await manager.closeAgent(firstAgent.id);
+});
+
+test("releases host runtime capacity after an agent start fails", async () => {
+  let createSessionCalls = 0;
+  const client = new (class extends TestAgentClient {
+    override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+      createSessionCalls += 1;
+      if (createSessionCalls === 1) {
+        throw new Error("provider start failed");
+      }
+      return new TestAgentSession(config);
+    }
+  })();
+  const manager = new AgentManager({
+    clients: { codex: client },
+    logger,
+    maxActiveAgentRuntimes: 1,
+  });
+
+  await expect(
+    manager.createAgent({ provider: "codex", cwd: process.cwd() }, undefined, {
+      workspaceId: undefined,
+    }),
+  ).rejects.toThrow("provider start failed");
+
+  const agent = await manager.createAgent({ provider: "codex", cwd: process.cwd() }, undefined, {
+    workspaceId: undefined,
+  });
+  expect(createSessionCalls).toBe(2);
+  await manager.closeAgent(agent.id);
+});
+
+test("releases host runtime capacity after an agent closes", async () => {
+  const manager = new AgentManager({
+    clients: { codex: new TestAgentClient() },
+    logger,
+    maxActiveAgentRuntimes: 1,
+  });
+  const firstAgent = await manager.createAgent(
+    { provider: "codex", cwd: process.cwd() },
+    undefined,
+    { workspaceId: undefined },
+  );
+
+  await expect(
+    manager.createAgent({ provider: "codex", cwd: process.cwd() }, undefined, {
+      workspaceId: undefined,
+    }),
+  ).rejects.toBeInstanceOf(AgentRuntimeCapacityError);
+
+  await manager.closeAgent(firstAgent.id);
+  const secondAgent = await manager.createAgent(
+    { provider: "codex", cwd: process.cwd() },
+    undefined,
+    { workspaceId: undefined },
+  );
+  await manager.closeAgent(secondAgent.id);
+});
+
+test("retains host runtime capacity until failed agent cleanup succeeds", async () => {
+  let closeAttempts = 0;
+  const client = new (class extends TestAgentClient {
+    override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+      const recordClose = () => {
+        closeAttempts += 1;
+        if (closeAttempts === 1) {
+          throw new Error("provider cleanup failed");
+        }
+      };
+      return new (class extends TestAgentSession {
+        override async close(): Promise<void> {
+          recordClose();
+        }
+      })(config);
+    }
+  })();
+  const manager = new AgentManager({
+    clients: { codex: client },
+    logger,
+    maxActiveAgentRuntimes: 1,
+  });
+  const firstAgent = await manager.createAgent(
+    { provider: "codex", cwd: process.cwd() },
+    undefined,
+    { workspaceId: undefined },
+  );
+
+  await expect(manager.closeAgent(firstAgent.id)).rejects.toThrow("provider cleanup failed");
+
+  const secondAgent = await manager.createAgent(
+    { provider: "codex", cwd: process.cwd() },
+    undefined,
+    { workspaceId: undefined },
+  );
+  expect(closeAttempts).toBe(2);
+  await manager.closeAgent(secondAgent.id);
+});
+
+test("uses the client that starts a session to select capacity ownership", async () => {
+  const runtimeCapacityController = new HostAgentRuntimeCapacityController(1);
+  const occupiedRuntime = {};
+  const occupiedReservation = runtimeCapacityController.reserve();
+  occupiedReservation.track(occupiedRuntime);
+  let createSessionCalls = 0;
+  const replacementClient = new (class extends TestAgentClient {
+    override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+      createSessionCalls += 1;
+      return new TestAgentSession(config);
+    }
+  })();
+  const sourceManagedClient = new (class extends TestAgentClient {
+    readonly managesRuntimeCapacityAtSource = true as const;
+
+    configureRuntimeCapacityController(): void {}
+  })();
+  let manager!: AgentManager;
+  manager = new AgentManager({
+    clients: { codex: sourceManagedClient },
+    logger,
+    runtimeCapacityController,
+    idFactory: () => {
+      manager.updateProviderRegistry({
+        providerDefinitions: { codex: { enabled: true } },
+        clients: { codex: replacementClient },
+      });
+      return "00000000-0000-4000-8000-000000000099";
+    },
+  });
+
+  try {
+    await expect(
+      manager.createAgent({ provider: "codex", cwd: process.cwd() }, undefined, {
+        workspaceId: undefined,
+      }),
+    ).rejects.toBeInstanceOf(AgentRuntimeCapacityError);
+    expect(createSessionCalls).toBe(0);
+  } finally {
+    runtimeCapacityController.release(occupiedRuntime);
+  }
+});
+
+test("reserves capacity before manager-owned default-model discovery", async () => {
+  const runtimeCapacityController = new HostAgentRuntimeCapacityController(1);
+  const occupiedRuntime = {};
+  const occupiedReservation = runtimeCapacityController.reserve();
+  occupiedReservation.track(occupiedRuntime);
+  let fetchCatalogCalls = 0;
+  let createSessionCalls = 0;
+  const client = new (class extends TestAgentClient {
+    override async fetchCatalog() {
+      fetchCatalogCalls += 1;
+      return await super.fetchCatalog();
+    }
+
+    override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+      createSessionCalls += 1;
+      return await super.createSession(config);
+    }
+  })();
+  const manager = new AgentManager({
+    clients: { codex: client },
+    logger,
+    runtimeCapacityController,
+  });
+
+  try {
+    await expect(
+      manager.createAgent({ provider: "codex", cwd: process.cwd() }, undefined, {
+        workspaceId: undefined,
+      }),
+    ).rejects.toBeInstanceOf(AgentRuntimeCapacityError);
+    expect(fetchCatalogCalls).toBe(0);
+    expect(createSessionCalls).toBe(0);
+  } finally {
+    runtimeCapacityController.release(occupiedRuntime);
+  }
+});
+
+test("does not reserve runtime capacity for static client command and feature listing", async () => {
+  const runtimeCapacityController = new HostAgentRuntimeCapacityController(1);
+  const occupiedRuntime = {};
+  const occupiedReservation = runtimeCapacityController.reserve();
+  occupiedReservation.track(occupiedRuntime);
+  const command: AgentSlashCommand = {
+    name: "review",
+    description: "Review changes",
+    argumentHint: "",
+    kind: "command",
+  };
+  const feature = createFeature({ id: "fast_mode", label: "Fast mode", value: false });
+  const client = new (class extends TestAgentClient {
+    async listCommands(): Promise<AgentSlashCommand[]> {
+      return [command];
+    }
+
+    async listFeatures(): Promise<AgentFeature[]> {
+      return [feature];
+    }
+  })();
+  const manager = new AgentManager({
+    clients: { codex: client },
+    logger,
+    runtimeCapacityController,
+  });
+
+  try {
+    await expect(
+      manager.listDraftCommands({ provider: "codex", cwd: process.cwd(), model: "gpt-5.4" }),
+    ).resolves.toEqual([command]);
+    await expect(
+      manager.listDraftFeatures({ provider: "codex", cwd: process.cwd(), model: "gpt-5.4" }),
+    ).resolves.toEqual([feature]);
+  } finally {
+    runtimeCapacityController.release(occupiedRuntime);
+  }
+});
+
 test("does not register a session that finishes starting after shutdown begins", async () => {
   const client = new HeldAgentCreationClient();
   const manager = new AgentManager({
@@ -1191,6 +1448,33 @@ test("listDraftCommands uses explicit model config without default model fetchin
   ]);
 });
 
+test("listDraftCommands uses static client commands without checking availability", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-draft-commands-"));
+  const draftCommand: AgentSlashCommand = {
+    name: "review",
+    description: "Review changes",
+    argumentHint: "",
+    kind: "command",
+  };
+  let availabilityCalls = 0;
+  const client = new (class extends TestAgentClient {
+    override async isAvailable(): Promise<boolean> {
+      availabilityCalls += 1;
+      throw new Error("availability probe should not run");
+    }
+
+    async listCommands(): Promise<AgentSlashCommand[]> {
+      return [draftCommand];
+    }
+  })();
+  const manager = new AgentManager({ clients: { codex: client }, logger });
+
+  await expect(
+    manager.listDraftCommands({ provider: "codex", cwd: workdir, model: "gpt-5.4" }),
+  ).resolves.toEqual([draftCommand]);
+  expect(availabilityCalls).toBe(0);
+});
+
 test("listDraftFeatures does not start a fallback session without a model", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-draft-features-"));
   const storagePath = join(workdir, "agents");
@@ -1231,7 +1515,7 @@ test("listDraftFeatures does not start a fallback session without a model", asyn
   expect(client.availabilityCalls).toBe(0);
 });
 
-test("listDraftFeatures uses client feature listing without a model", async () => {
+test("listDraftFeatures uses static client features without checking availability", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-draft-features-"));
   const storagePath = join(workdir, "agents");
   const storage = new AgentStorage(storagePath, logger);
@@ -1277,7 +1561,7 @@ test("listDraftFeatures uses client feature listing without a model", async () =
 
   expect(client.fetchCatalogCalls).toBe(0);
   expect(client.createSessionCalls).toBe(0);
-  expect(client.availabilityCalls).toBe(1);
+  expect(client.availabilityCalls).toBe(0);
   expect(client.featureConfigs).toEqual([
     {
       provider: "codex",
@@ -1748,6 +2032,74 @@ test("listProviderAvailability uses registered client keys, including custom pro
       error: null,
     },
   ]);
+});
+
+test("getProviderAvailability reserves capacity for a manager-managed probe", async () => {
+  const runtimeCapacityController = new HostAgentRuntimeCapacityController(1);
+  const activeRuntime = {};
+  runtimeCapacityController.reserve().track(activeRuntime);
+  const isAvailable = vi.fn(async () => true);
+  const manager = new AgentManager({
+    clients: {
+      codex: {
+        provider: "codex",
+        capabilities: TEST_CAPABILITIES,
+        isAvailable,
+        async createSession() {
+          throw new Error("not implemented");
+        },
+        async resumeSession() {
+          throw new Error("not implemented");
+        },
+      },
+    },
+    logger,
+    runtimeCapacityController,
+  });
+
+  await expect(manager.getProviderAvailability("codex")).resolves.toMatchObject({
+    provider: "codex",
+    available: false,
+    error: expect.stringContaining("Host agent runtime capacity reached"),
+  });
+  expect(isAvailable).not.toHaveBeenCalled();
+  runtimeCapacityController.release(activeRuntime);
+});
+
+test("listProviderAvailability serializes finite-capacity probes", async () => {
+  let activeProbes = 0;
+  let maxActiveProbes = 0;
+  const createClient = (provider: AgentProvider): AgentClient => ({
+    provider,
+    capabilities: TEST_CAPABILITIES,
+    async isAvailable() {
+      activeProbes += 1;
+      maxActiveProbes = Math.max(maxActiveProbes, activeProbes);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      activeProbes -= 1;
+      return true;
+    },
+    async createSession() {
+      throw new Error("not implemented");
+    },
+    async resumeSession() {
+      throw new Error("not implemented");
+    },
+  });
+  const manager = new AgentManager({
+    clients: {
+      codex: createClient("codex"),
+      claude: createClient("claude"),
+    },
+    logger,
+    maxActiveAgentRuntimes: 1,
+  });
+
+  await expect(manager.listProviderAvailability()).resolves.toEqual([
+    { provider: "codex", available: true, error: null },
+    { provider: "claude", available: true, error: null },
+  ]);
+  expect(maxActiveProbes).toBe(1);
 });
 
 test("createAgent passes daemon launch env through the provider launch context", async () => {

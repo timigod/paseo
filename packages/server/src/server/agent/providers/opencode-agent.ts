@@ -33,6 +33,7 @@ import {
   type AgentPromptInput,
   type AgentRunOptions,
   type AgentRunResult,
+  type AgentRuntimeCapacityController,
   type AgentRuntimeInfo,
   type AgentSession,
   type AgentSessionConfig,
@@ -52,6 +53,7 @@ import {
   type ToolCallDetail,
   type ToolCallTimelineItem,
 } from "../agent-sdk-types.js";
+import { withTemporaryRuntimeCapacity } from "../agent-runtime-capacity.js";
 import { importSessionFromPersistence } from "../provider-session-import.js";
 import {
   isDefaultAgentCreateConfigUnattended,
@@ -64,7 +66,6 @@ import {
   type ProviderRuntimeSettings,
 } from "../provider-launch-config.js";
 import { withTimeout } from "../../../utils/promise-timeout.js";
-import { execCommand } from "../../../utils/spawn.js";
 import { mapOpencodeToolCall } from "./opencode/tool-call-mapper.js";
 import {
   OpenCodeServerManager,
@@ -76,6 +77,7 @@ import {
   formatProviderDiagnosticError,
   buildBinaryDiagnosticRows,
   buildCommandResolutionDiagnosticRows,
+  runDiagnosticCommand,
   toDiagnosticErrorMessage,
 } from "./diagnostic-utils.js";
 import { runProviderTurn } from "./provider-runner.js";
@@ -1268,6 +1270,7 @@ function createSdkOpenCodeClient(options: { baseUrl: string; directory: string }
 export class OpenCodeAgentClient implements AgentClient {
   readonly provider = "opencode" as const;
   readonly capabilities = OPENCODE_CAPABILITIES;
+  readonly managesRuntimeCapacityAtSource = true;
   readonly resolveCreateConfig = resolveOpenCodeCreateConfig;
   readonly isCreateConfigUnattended = isOpenCodeCreateConfigUnattended;
 
@@ -1277,6 +1280,7 @@ export class OpenCodeAgentClient implements AgentClient {
   private readonly logger: Logger;
   private readonly runtimeSettings?: ProviderRuntimeSettings;
   private readonly modelContextWindows = new Map<string, number>();
+  private runtimeCapacityController: AgentRuntimeCapacityController | null = null;
 
   constructor(
     logger: Logger,
@@ -1293,6 +1297,11 @@ export class OpenCodeAgentClient implements AgentClient {
       });
     this.createOpenCodeClient = deps.createClient ?? createSdkOpenCodeClient;
     this.resolveHomeDir = deps.resolveHomeDir ?? resolveOpenCodeHomeDir;
+  }
+
+  configureRuntimeCapacityController(controller: AgentRuntimeCapacityController): void {
+    this.runtimeCapacityController = controller;
+    this.serverManager.configureRuntimeCapacityController(controller);
   }
 
   async createSession(
@@ -1554,12 +1563,14 @@ export class OpenCodeAgentClient implements AgentClient {
   }
 
   async isAvailable(): Promise<boolean> {
-    const launch = await resolveProviderLaunch({
-      commandConfig: this.runtimeSettings?.command,
-      defaultBinary: "opencode",
+    return withTemporaryRuntimeCapacity(this.runtimeCapacityController, async () => {
+      const launch = await resolveProviderLaunch({
+        commandConfig: this.runtimeSettings?.command,
+        defaultBinary: "opencode",
+      });
+      const availability = await checkProviderLaunchAvailable(launch);
+      return availability.available;
     });
-    const availability = await checkProviderLaunchAvailable(launch);
-    return availability.available;
   }
 
   async shutdown(): Promise<void> {
@@ -1568,11 +1579,19 @@ export class OpenCodeAgentClient implements AgentClient {
 
   async getDiagnostic(): Promise<{ diagnostic: string }> {
     try {
-      const launch = await resolveProviderLaunch({
-        commandConfig: this.runtimeSettings?.command,
-        defaultBinary: "opencode",
-      });
-      const availability = await checkProviderLaunchAvailable(launch);
+      const { launch, availability } = await withTemporaryRuntimeCapacity(
+        this.runtimeCapacityController,
+        async () => {
+          const resolvedLaunch = await resolveProviderLaunch({
+            commandConfig: this.runtimeSettings?.command,
+            defaultBinary: "opencode",
+          });
+          return {
+            launch: resolvedLaunch,
+            availability: await checkProviderLaunchAvailable(resolvedLaunch),
+          };
+        },
+      );
 
       let authValue = "Not checked";
       const authCommand = availability.available
@@ -1580,7 +1599,8 @@ export class OpenCodeAgentClient implements AgentClient {
         : null;
       if (authCommand) {
         try {
-          const { stdout, stderr } = await execCommand(
+          const { stdout, stderr } = await runDiagnosticCommand(
+            this.runtimeCapacityController,
             authCommand,
             [...launch.args, "auth", "list"],
             {
@@ -1599,8 +1619,11 @@ export class OpenCodeAgentClient implements AgentClient {
         diagnostic: formatProviderDiagnostic("OpenCode", [
           ...(await buildCommandResolutionDiagnosticRows(launch, {
             knownBinaryNames: ["opencode"],
+            runtimeCapacityController: this.runtimeCapacityController ?? undefined,
           })),
-          ...(await buildBinaryDiagnosticRows(launch, availability)),
+          ...(await buildBinaryDiagnosticRows(launch, availability, {
+            runtimeCapacityController: this.runtimeCapacityController ?? undefined,
+          })),
           { label: "Auth", value: authValue },
         ]),
       };

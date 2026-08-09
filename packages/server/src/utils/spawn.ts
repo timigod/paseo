@@ -20,7 +20,7 @@ interface ExternalEnvOptions {
 
 export type SpawnProcessOptions = Omit<SpawnOptions, "env"> & ExternalEnvOptions;
 
-interface ExecCommandOptions extends ExternalEnvOptions {
+export interface ExecCommandOptions extends ExternalEnvOptions {
   cwd?: string;
   encoding?: BufferEncoding;
   killSignal?: NodeJS.Signals;
@@ -29,7 +29,7 @@ interface ExecCommandOptions extends ExternalEnvOptions {
   shell?: boolean | string;
 }
 
-interface ExecCommandResult {
+export interface ExecCommandResult {
   stdout: string;
   stderr: string;
 }

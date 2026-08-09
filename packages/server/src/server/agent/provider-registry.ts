@@ -412,6 +412,8 @@ function wrapClientProvider(
   return {
     provider,
     capabilities: inner.capabilities,
+    managesRuntimeCapacityAtSource: inner.managesRuntimeCapacityAtSource,
+    configureRuntimeCapacityController: inner.configureRuntimeCapacityController?.bind(inner),
     createSession: async (config, launchContext) =>
       wrapSessionProvider(
         provider,
@@ -497,6 +499,7 @@ function wrapClientProvider(
       : undefined,
     isAvailable: () => inner.isAvailable(),
     getDiagnostic: inner.getDiagnostic?.bind(inner),
+    shutdown: inner.shutdown?.bind(inner),
   };
 }
 

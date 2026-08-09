@@ -46,6 +46,24 @@ describe("PersistedConfigSchema daemon append system prompt config", () => {
   });
 });
 
+describe("PersistedConfigSchema daemon agent runtime capacity", () => {
+  test("accepts an optional positive integer limit", () => {
+    const parsed = PersistedConfigSchema.parse({
+      daemon: { maxActiveAgentRuntimes: 3 },
+    });
+
+    expect(parsed.daemon?.maxActiveAgentRuntimes).toBe(3);
+  });
+
+  test.each([0, -1, 1.5])("rejects invalid limit %s", (maxActiveAgentRuntimes) => {
+    const parsed = PersistedConfigSchema.safeParse({
+      daemon: { maxActiveAgentRuntimes },
+    });
+
+    expect(parsed.success).toBe(false);
+  });
+});
+
 describe("PersistedConfigSchema daemon browser tools config", () => {
   test("accepts optional browser tools opt-in", () => {
     const parsed = PersistedConfigSchema.parse({

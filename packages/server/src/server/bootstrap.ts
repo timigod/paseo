@@ -128,6 +128,7 @@ import type { LocalSpeechProviderConfig } from "./speech/providers/local/config.
 import type { RequestedSpeechProviders } from "./speech/speech-types.js";
 import { createSpeechService } from "./speech/speech-runtime.js";
 import { AgentManager } from "./agent/agent-manager.js";
+import { HostAgentRuntimeCapacityController } from "./agent/agent-runtime-capacity.js";
 import { AgentStorage } from "./agent/agent-storage.js";
 import { attachAgentStoragePersistence } from "./persistence-hooks.js";
 import { createAgentMcpServer } from "./agent/mcp-server.js";
@@ -397,6 +398,7 @@ export interface PaseoDaemonConfig {
   };
   autoArchiveAfterMerge?: boolean;
   enableTerminalAgentHooks?: boolean;
+  maxActiveAgentRuntimes?: number;
   appendSystemPrompt?: string;
   terminalProfiles?: TerminalProfile[];
   staticDir: string;
@@ -819,8 +821,12 @@ export async function createPaseoDaemon(
     logger,
   });
   const providerSnapshotLogger = logger.child({ module: "provider-snapshot-manager" });
+  const runtimeCapacityController = new HostAgentRuntimeCapacityController(
+    config.maxActiveAgentRuntimes ?? null,
+  );
   const providerSnapshotManager = new ProviderSnapshotManager({
     logger: providerSnapshotLogger,
+    runtimeCapacityController,
     runtimeSettings: config.agentProviderSettings,
     providerOverrides: config.providerOverrides,
     workspaceGitService,
@@ -833,6 +839,7 @@ export async function createPaseoDaemon(
     clients: initialAgentManagerState.clients,
     providerDefinitions: initialAgentManagerState.providerDefinitions,
     registry: agentStorage,
+    runtimeCapacityController,
     appendSystemPrompt: config.appendSystemPrompt,
     onWorkspaceStateMayHaveChanged: ({ cwd }) => {
       workspaceGitService.onWorkspaceStateMayHaveChanged(cwd);

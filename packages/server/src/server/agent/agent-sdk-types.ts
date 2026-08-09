@@ -690,9 +690,23 @@ export interface ResolveAgentDefaultModeInput {
   env?: Record<string, string>;
 }
 
+export interface AgentRuntimeCapacityReservation {
+  track(runtime: object): void;
+  release(): void;
+}
+
+export interface AgentRuntimeCapacityController {
+  getAvailableRuntimeSlots(): number | null;
+  reserve(): AgentRuntimeCapacityReservation;
+  release(runtime: object): void;
+}
+
 export interface AgentClient {
   readonly provider: AgentProvider;
   readonly capabilities: AgentCapabilityFlags;
+  /** The provider admits each runtime at its actual process or server start boundary. */
+  readonly managesRuntimeCapacityAtSource?: true;
+  configureRuntimeCapacityController?(controller: AgentRuntimeCapacityController): void;
   createSession(
     config: AgentSessionConfig,
     launchContext?: AgentLaunchContext,

@@ -13,9 +13,14 @@ import {
   type AgentMode,
   type AgentModelDefinition,
   type AgentProvider,
+  type AgentRuntimeCapacityController,
   type FetchCatalogOptions,
   type ProviderSnapshotEntry,
 } from "./agent-sdk-types.js";
+import {
+  HostAgentRuntimeCapacityController,
+  UNMANAGED_AGENT_RUNTIME_RESERVATION,
+} from "./agent-runtime-capacity.js";
 import type { ManagedAgent } from "./agent-manager.js";
 import type { WorkspaceGitService } from "../workspace-git-service.js";
 import type { ManagedProcessRegistry } from "../managed-processes/managed-processes.js";
@@ -92,6 +97,7 @@ export interface ProviderSnapshotManagerOptions {
   managedProcesses?: ManagedProcessRegistry;
   isDev?: boolean;
   extraClients?: Partial<Record<AgentProvider, AgentClient>>;
+  runtimeCapacityController?: AgentRuntimeCapacityController;
   refreshTimeoutMs?: number;
   diagnosticTimeoutMs?: number;
 }
@@ -179,6 +185,7 @@ export class ProviderSnapshotManager {
   private readonly refreshTimeoutMs: number;
   private readonly diagnosticTimeoutMs: number;
   private readonly logger: Logger;
+  private readonly runtimeCapacity: AgentRuntimeCapacityController;
   private readonly workspaceGitService?: Pick<WorkspaceGitService, "resolveRepoRoot">;
   private readonly managedProcesses?: ManagedProcessRegistry;
   private readonly isDev: boolean;
@@ -191,10 +198,13 @@ export class ProviderSnapshotManager {
 
   constructor(options: ProviderSnapshotManagerOptions) {
     this.logger = options.logger;
+    this.runtimeCapacity =
+      options.runtimeCapacityController ?? new HostAgentRuntimeCapacityController(null);
     this.workspaceGitService = options.workspaceGitService;
     this.managedProcesses = options.managedProcesses;
     this.isDev = options.isDev === true;
     this.extraClients = options.extraClients ?? {};
+    this.configureClientRuntimeCapacity(this.extraClients);
     this.runtimeSettings = options.runtimeSettings;
     this.providerOverrides = options.providerOverrides;
     this.baseProviderOverrides = options.providerOverrides;
@@ -280,6 +290,7 @@ export class ProviderSnapshotManager {
     }
     for (const [provider, client] of Object.entries(this.extraClients)) {
       if (client) {
+        this.configureClientRuntimeCapacity({ [provider]: client });
         clients[provider] = client;
       }
     }
@@ -292,6 +303,7 @@ export class ProviderSnapshotManager {
       return existing;
     }
     const client = definition.createClient(this.logger);
+    this.configureClientRuntimeCapacity({ [provider]: client });
     this.providerClients[provider] = client;
     return client;
   }
@@ -302,7 +314,7 @@ export class ProviderSnapshotManager {
       await this.warmUpSnapshotForCwd({ cwd: input.cwd, providers: input.providers });
     }
     const providerFilter = input.providers ? new Set(input.providers) : null;
-    const entries = this.getSnapshotForTarget(target);
+    const entries = this.getSnapshotForTarget(target, input.providers);
     return providerFilter ? entries.filter((entry) => providerFilter.has(entry.provider)) : entries;
   }
 
@@ -376,12 +388,18 @@ export class ProviderSnapshotManager {
       };
     }
 
-    const baseDiagnosticPromise = this.getBaseProviderDiagnostic(provider, definition);
-    const snapshotEntryPromise = this.refreshDiagnosticSnapshotEntry(provider, definition);
-    const [baseDiagnostic, entry] = await Promise.all([
-      baseDiagnosticPromise,
-      snapshotEntryPromise,
-    ]);
+    const availableRuntimeSlots = this.runtimeCapacity.getAvailableRuntimeSlots();
+    let baseDiagnostic: string;
+    let entry: ProviderSnapshotEntry;
+    if (availableRuntimeSlots !== null && availableRuntimeSlots < 2) {
+      baseDiagnostic = await this.getBaseProviderDiagnostic(provider, definition);
+      entry = await this.refreshDiagnosticSnapshotEntry(provider, definition);
+    } else {
+      [baseDiagnostic, entry] = await Promise.all([
+        this.getBaseProviderDiagnostic(provider, definition),
+        this.refreshDiagnosticSnapshotEntry(provider, definition),
+      ]);
+    }
 
     const modelCount = entry.status === "ready" ? String(entry.models?.length ?? 0) : "—";
     const status = formatProviderStatus(entry);
@@ -401,6 +419,7 @@ export class ProviderSnapshotManager {
       this.baseProviderOverrides,
       mutableProviders,
     );
+    this.configureClientRuntimeCapacity(this.extraClients);
     this.providerRegistry = this.buildRegistry();
     this.providerClients = { ...this.extraClients } as Record<AgentProvider, AgentClient>;
 
@@ -439,6 +458,39 @@ export class ProviderSnapshotManager {
     this.events.removeAllListeners();
     this.snapshots.clear();
     this.providerLoads.clear();
+  }
+
+  private configureClientRuntimeCapacity(
+    clients: Partial<Record<AgentProvider, AgentClient>>,
+  ): void {
+    const entries = Object.entries(clients) as Array<[AgentProvider, AgentClient]>;
+    for (const [provider, client] of entries) {
+      if (
+        client.managesRuntimeCapacityAtSource &&
+        typeof client.configureRuntimeCapacityController !== "function"
+      ) {
+        throw new Error(
+          `Provider '${provider}' claims source-managed runtime capacity without configureRuntimeCapacityController`,
+        );
+      }
+    }
+    for (const [, client] of entries) {
+      client.configureRuntimeCapacityController?.(this.runtimeCapacity);
+    }
+  }
+
+  private async runWithRuntimeCapacity<T>(
+    client: AgentClient,
+    operation: () => Promise<T>,
+  ): Promise<T> {
+    const reservation = client.managesRuntimeCapacityAtSource
+      ? UNMANAGED_AGENT_RUNTIME_RESERVATION
+      : this.runtimeCapacity.reserve();
+    try {
+      return await operation();
+    } finally {
+      reservation.release();
+    }
   }
 
   private buildRegistry(): Record<AgentProvider, ProviderDefinition> {
@@ -483,8 +535,11 @@ export class ProviderSnapshotManager {
     };
   }
 
-  private getSnapshotForTarget(target: ProviderSnapshotTarget): ProviderSnapshotEntry[] {
-    const providersToWarm = this.resolveProvidersToWarm(target.snapshotCwd);
+  private getSnapshotForTarget(
+    target: ProviderSnapshotTarget,
+    providers?: AgentProvider[],
+  ): ProviderSnapshotEntry[] {
+    const providersToWarm = this.resolveProvidersToWarm(target.snapshotCwd, providers);
     if (providersToWarm.length > 0) {
       void this.warmUp(target, providersToWarm);
     }
@@ -548,7 +603,7 @@ export class ProviderSnapshotManager {
       if (client.getDiagnostic) {
         return (
           await withTimeout(
-            client.getDiagnostic(),
+            this.runWithRuntimeCapacity(client, () => client.getDiagnostic!()),
             this.diagnosticTimeoutMs,
             `Timed out collecting ${definition.label ?? provider} diagnostic after ${
               this.diagnosticTimeoutMs
@@ -701,9 +756,16 @@ export class ProviderSnapshotManager {
   }
 
   private async loadProviders(options: ProviderLoadOptions): Promise<void> {
-    await Promise.allSettled(
-      options.providers.map((provider) => this.loadProvider({ ...options, provider })),
-    );
+    if (this.runtimeCapacity.getAvailableRuntimeSlots() === null) {
+      await Promise.allSettled(
+        options.providers.map((provider) => this.loadProvider({ ...options, provider })),
+      );
+      return;
+    }
+
+    for (const provider of options.providers) {
+      await this.loadProvider({ ...options, provider }).catch(() => undefined);
+    }
   }
 
   private loadProvider(options: ProviderLoadOptions & { provider: AgentProvider }): Promise<void> {
@@ -782,7 +844,7 @@ export class ProviderSnapshotManager {
 
       const client = this.ensureClient(provider, definition);
       const available = await withTimeout(
-        client.isAvailable(),
+        this.runWithRuntimeCapacity(client, () => client.isAvailable()),
         this.refreshTimeoutMs,
         `Timed out checking ${definition.label} availability after ${this.refreshTimeoutMs}ms`,
       );
@@ -793,7 +855,9 @@ export class ProviderSnapshotManager {
 
       const catalogOptions = createFetchCatalogOptions(catalogScope, force);
       const catalog = await withTimeout(
-        definition.fetchCatalog({ ...catalogOptions, timeoutMs: this.refreshTimeoutMs }, client),
+        this.runWithRuntimeCapacity(client, () =>
+          definition.fetchCatalog({ ...catalogOptions, timeoutMs: this.refreshTimeoutMs }, client),
+        ),
         this.refreshTimeoutMs,
         `Timed out refreshing ${definition.label} after ${this.refreshTimeoutMs}ms`,
       );

@@ -188,6 +188,7 @@ Single file, validated with `PersistedConfigSchema`.
     trustedProxies: true | string[], // defaults to ["loopback"]; Express proxy names/CIDRs
     mcp: { enabled: boolean, injectIntoAgents: boolean },
     git: { maxProcessesPerSecond: number, maxProcessConcurrency: number },
+    maxActiveAgentRuntimes: number, // optional positive host-local provider runtime limit
     appendSystemPrompt: string,    // appended to supported provider system/developer prompts
     cors: { allowedOrigins: string[] },
     relay: { enabled: boolean, endpoint: string, publicEndpoint: string, useTls: boolean, publicUseTls: boolean }, // new homes materialize enabled: false
@@ -234,6 +235,12 @@ Single file, validated with `PersistedConfigSchema`.
 ```
 
 All fields are optional with sensible defaults.
+
+`daemon.maxActiveAgentRuntimes` limits live provider runtimes on this host. Create, resume, import,
+recovery, reload, and runtime-producing discovery operations reserve capacity atomically. An absent
+value leaves runtime capacity unbounded. The daemon reads the limit at startup. A configuration
+change requires a daemon restart and does not evict existing runtimes. A reload needs a spare slot
+while its replacement runtime starts.
 
 ### Git process limits
 
