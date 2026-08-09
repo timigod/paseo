@@ -21,6 +21,8 @@ import {
   type OpenCodePortAllocator,
   type OpenCodeServerProcessSpawner,
 } from "./opencode/server-manager.js";
+import { OpenCodeAgentClient } from "./opencode-agent.js";
+import { TestOpenCodeClient } from "./opencode/test-utils/test-opencode-harness.js";
 
 afterEach(() => {
   vi.useRealTimers();
@@ -135,6 +137,106 @@ describe("OpenCodeServerManager generations", () => {
 
     await failure;
     expect(runtime.terminatedPorts).toEqual([4471]);
+    expect(await runtime.managedProcesses.list()).toEqual([]);
+  });
+
+  test("catalog deadline cancels an unowned server startup", async () => {
+    vi.useFakeTimers();
+    const { manager, runtime } = createTestManager([4481], { autoAnnounce: false });
+    const client = new OpenCodeAgentClient(createTestLogger(), undefined, {
+      serverManager: manager,
+      createClient: () => new TestOpenCodeClient().asSdkClient(),
+    });
+    let catalogError: unknown;
+    const catalog = client
+      .fetchCatalog({
+        scope: "workspace",
+        cwd: "/tmp/opencode-catalog-deadline",
+        force: false,
+        timeoutMs: 250,
+      })
+      .catch((error: unknown) => {
+        catalogError = error;
+      });
+    await runtime.settle();
+
+    try {
+      await vi.advanceTimersByTimeAsync(250);
+
+      expect(catalogError).toMatchObject({
+        message: "OpenCode server acquisition timed out within the 250ms catalog budget",
+      });
+      expect(runtime.terminatedPorts).toEqual([4481]);
+      expect(await runtime.managedProcesses.list()).toEqual([]);
+    } finally {
+      await manager.shutdown();
+      await catalog;
+    }
+  });
+
+  test("catalog deadline leaves a shared server startup alive", async () => {
+    vi.useFakeTimers();
+    const { manager, runtime } = createTestManager([4482], { autoAnnounce: false });
+    const owner = manager.acquireCurrent();
+    await runtime.settle();
+    const client = new OpenCodeAgentClient(createTestLogger(), undefined, {
+      serverManager: manager,
+      createClient: () => new TestOpenCodeClient().asSdkClient(),
+    });
+    const catalog = client.fetchCatalog({
+      scope: "workspace",
+      cwd: "/tmp/opencode-catalog-shared",
+      force: false,
+      timeoutMs: 250,
+    });
+    const failure = expect(catalog).rejects.toThrow(
+      "OpenCode server acquisition timed out within the 250ms catalog budget",
+    );
+
+    await vi.advanceTimersByTimeAsync(250);
+    await failure;
+    expect(runtime.terminatedPorts).toEqual([]);
+
+    runtime.processForPort(4482).announceListening();
+    const acquisition = await owner;
+    expect(acquisition.server.url).toBe("http://127.0.0.1:4482");
+
+    await acquisition.release();
+    expect(runtime.terminatedPorts).toEqual([4482]);
+    expect(await runtime.managedProcesses.list()).toEqual([]);
+  });
+
+  test("forced catalog deadline keeps the current server generation", async () => {
+    vi.useFakeTimers();
+    const { manager, runtime } = createTestManager([4483, 4484], { autoAnnounce: false });
+    const currentStart = manager.acquireCurrent();
+    await runtime.settle();
+    runtime.processForPort(4483).announceListening();
+    const current = await currentStart;
+    const client = new OpenCodeAgentClient(createTestLogger(), undefined, {
+      serverManager: manager,
+      createClient: () => new TestOpenCodeClient().asSdkClient(),
+    });
+    const catalog = client.fetchCatalog({
+      scope: "workspace",
+      cwd: "/tmp/opencode-catalog-force",
+      force: true,
+      timeoutMs: 250,
+    });
+    const failure = expect(catalog).rejects.toThrow(
+      "OpenCode server acquisition timed out within the 250ms catalog budget",
+    );
+    await runtime.settle();
+
+    await vi.advanceTimersByTimeAsync(250);
+    await failure;
+    expect(runtime.terminatedPorts).toEqual([4484]);
+
+    const retained = await manager.acquireCurrent();
+    expect(retained.server.url).toBe(current.server.url);
+    await retained.release();
+    await current.release();
+    expect(runtime.terminatedPorts).toEqual([4484, 4483]);
     expect(await runtime.managedProcesses.list()).toEqual([]);
   });
 

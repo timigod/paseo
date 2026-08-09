@@ -68,6 +68,7 @@ import { execCommand } from "../../../utils/spawn.js";
 import { mapOpencodeToolCall } from "./opencode/tool-call-mapper.js";
 import {
   OpenCodeServerManager,
+  type OpenCodeServerAcquisitionOptions,
   type OpenCodeServerManagerLike,
 } from "./opencode/server-manager.js";
 import { resolveOpenCodeHomeDir } from "./opencode/paths.js";
@@ -1400,9 +1401,21 @@ export class OpenCodeAgentClient implements AgentClient {
   }
 
   async fetchCatalog(options: FetchCatalogOptions): Promise<ProviderCatalog> {
+    const timeoutMs =
+      typeof options.timeoutMs === "number" &&
+      Number.isFinite(options.timeoutMs) &&
+      options.timeoutMs > 0
+        ? options.timeoutMs
+        : undefined;
+    const acquisitionOptions: OpenCodeServerAcquisitionOptions | undefined = timeoutMs
+      ? {
+          deadlineAtMs: Date.now() + timeoutMs,
+          timeoutMessage: `OpenCode server acquisition timed out within the ${timeoutMs}ms catalog budget`,
+        }
+      : undefined;
     const acquisition = options.force
-      ? await this.serverManager.acquireNew()
-      : await this.serverManager.acquireCurrent();
+      ? await this.serverManager.acquireNew(acquisitionOptions)
+      : await this.serverManager.acquireCurrent(acquisitionOptions);
     const { url } = acquisition.server;
     const isGlobalCatalog = options.scope === "global";
 
