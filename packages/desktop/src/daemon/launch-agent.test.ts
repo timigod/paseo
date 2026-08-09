@@ -13,6 +13,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   createPaseoLaunchAgentPlist,
   PASEO_LAUNCH_AGENT_LABEL,
+  PaseoLaunchAgentOwnershipError,
   reconcilePaseoLaunchAgent,
   resolvePaseoLaunchAgentPath,
 } from "./launch-agent";
@@ -49,7 +50,12 @@ describe("Paseo LaunchAgent", () => {
       `<string>${path.join(resourcesPath, "bin", "paseo-daemon-launcher")}</string>`,
     );
     expect(plist).toContain("<key>PASEO_DESKTOP_MANAGED</key>");
-    expect(plist).toContain("<key>KeepAlive</key>");
+    expect(plist).toContain(`  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>`);
+    expect(plist).not.toContain("<key>KeepAlive</key>\n  <true/>");
   });
 
   it("leaves an unchanged owned service file in place", () => {
@@ -95,9 +101,18 @@ describe("Paseo LaunchAgent", () => {
     mkdirSync(path.dirname(filePath), { recursive: true });
     writeFileSync(filePath, unmanaged);
 
-    expect(() => reconcilePaseoLaunchAgent({ home, resourcesPath, platform: "darwin" })).toThrow(
-      `refusing to overwrite unmanaged LaunchAgent at ${filePath}`,
-    );
+    let thrown: unknown;
+    try {
+      reconcilePaseoLaunchAgent({ home, resourcesPath, platform: "darwin" });
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toBeInstanceOf(PaseoLaunchAgentOwnershipError);
+    expect(thrown).toMatchObject({
+      name: "PaseoLaunchAgentOwnershipError",
+      filePath,
+      message: `refusing to overwrite unmanaged LaunchAgent at ${filePath}`,
+    });
     expect(readFileSync(filePath, "utf8")).toBe(unmanaged);
   });
 });

@@ -15,6 +15,13 @@ export interface PaseoLaunchAgentResult {
   changed: boolean;
 }
 
+export class PaseoLaunchAgentOwnershipError extends Error {
+  constructor(public readonly filePath: string) {
+    super(`refusing to overwrite unmanaged LaunchAgent at ${filePath}`);
+    this.name = "PaseoLaunchAgentOwnershipError";
+  }
+}
+
 function escapeXml(value: string): string {
   return value
     .replaceAll("&", "&amp;")
@@ -74,7 +81,10 @@ export function createPaseoLaunchAgentPlist(input: {
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>
-  <true/>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
   <key>StandardOutPath</key>
   ${text(path.join(logDirectory, "launchd.stdout.log"))}
   <key>StandardErrorPath</key>
@@ -91,7 +101,7 @@ function readExistingManagedLaunchAgent(filePath: string): string | null {
     !existing.includes(`<string>${PASEO_LAUNCH_AGENT_LABEL}</string>`) ||
     !existing.includes("<key>PASEO_DESKTOP_MANAGED</key>")
   ) {
-    throw new Error(`refusing to overwrite unmanaged LaunchAgent at ${filePath}`);
+    throw new PaseoLaunchAgentOwnershipError(filePath);
   }
   return existing;
 }

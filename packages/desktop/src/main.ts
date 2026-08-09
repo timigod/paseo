@@ -81,7 +81,10 @@ import {
   isDesktopManagedDaemonRunningSync,
   stopDesktopDaemonViaCli,
 } from "./daemon/daemon-manager.js";
-import { reconcilePaseoLaunchAgent } from "./daemon/launch-agent.js";
+import {
+  PaseoLaunchAgentOwnershipError,
+  reconcilePaseoLaunchAgent,
+} from "./daemon/launch-agent.js";
 import {
   createQuitLifecycle,
   stopDesktopManagedDaemonOnQuitIfNeeded,
@@ -1045,6 +1048,9 @@ void runDesktopStartup({
         log.info("[desktop daemon] reconciled persistent LaunchAgent", { path: result.path });
       }
     } catch (error) {
+      if (!(error instanceof PaseoLaunchAgentOwnershipError)) {
+        throw error;
+      }
       log.warn("[desktop daemon] could not reconcile persistent LaunchAgent", error);
     }
   },
