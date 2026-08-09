@@ -25,6 +25,14 @@ import type {
   ManagedProcessVerification,
 } from "../../../managed-processes/managed-processes.js";
 import {
+  UNMANAGED_AGENT_RUNTIME_RESERVATION,
+  withTemporaryRuntimeCapacity,
+} from "../../agent-runtime-capacity.js";
+import type {
+  AgentRuntimeCapacityController,
+  AgentRuntimeCapacityReservation,
+} from "../../agent-sdk-types.js";
+import {
   createProviderEnvSpec,
   resolveProviderCommandPrefix,
   type ProviderRuntimeSettings,
@@ -50,6 +58,7 @@ export interface OpenCodeServerManagerLike {
   acquireNew(options?: OpenCodeServerAcquisitionOptions): Promise<OpenCodeServerAcquisition>;
   acquireDedicated(env: Record<string, string>): Promise<OpenCodeServerAcquisition>;
   acquireExisting(url: string): OpenCodeServerAcquisition | null;
+  configureRuntimeCapacityController(controller: AgentRuntimeCapacityController): void;
   shutdown(): Promise<void>;
 }
 
@@ -68,6 +77,10 @@ export interface OpenCodeServerGeneration {
   ownershipToken?: string;
   cleanupRequested: boolean;
   cleanupComplete: boolean;
+  runtimeCapacityController: AgentRuntimeCapacityController | null;
+  runtimeCapacityReservation: AgentRuntimeCapacityReservation;
+  runtimeCapacityTracked: boolean;
+  runtimeCapacityReleased: boolean;
 }
 
 interface OpenCodeServerStartup {
@@ -130,6 +143,7 @@ export class OpenCodeServerManager implements OpenCodeServerManagerLike {
   private readonly resolveHomeDir: () => string;
   private readonly spawnServerProcess: OpenCodeServerProcessSpawner;
   private readonly startupTimeoutMs: number;
+  private runtimeCapacityController: AgentRuntimeCapacityController | null = null;
 
   constructor(options: OpenCodeServerManagerOptions) {
     this.logger = options.logger;
@@ -145,6 +159,10 @@ export class OpenCodeServerManager implements OpenCodeServerManagerLike {
     this.resolveHomeDir = options.resolveHomeDir ?? resolveOpenCodeHomeDir;
     this.spawnServerProcess = options.spawnServerProcess ?? spawnProcess;
     this.startupTimeoutMs = options.startupTimeoutMs ?? OPENCODE_SERVER_STARTUP_TIMEOUT_MS;
+  }
+
+  configureRuntimeCapacityController(controller: AgentRuntimeCapacityController): void {
+    this.runtimeCapacityController = controller;
   }
 
   static getInstance(
@@ -256,7 +274,6 @@ export class OpenCodeServerManager implements OpenCodeServerManagerLike {
     const server = this.findLiveServerByUrl(url);
     return server ? this.acquireServer(server) : null;
   }
-
   private findLiveServerByUrl(url: string): OpenCodeServerGeneration | null {
     const servers = [
       ...(this.currentServer ? [this.currentServer] : []),
@@ -306,7 +323,7 @@ export class OpenCodeServerManager implements OpenCodeServerManagerLike {
       return;
     }
 
-    this.retiredServers.delete(server);
+    this.retiredServers.add(server);
     await this.killServer(server);
   }
 
@@ -513,7 +530,10 @@ export class OpenCodeServerManager implements OpenCodeServerManagerLike {
     const port = await this.portAllocator();
     this.assertStartupCanContinue(signal);
     const url = `http://127.0.0.1:${port}`;
-    const launchPrefix = await this.resolveCommandPrefix();
+    const runtimeCapacityController = this.runtimeCapacityController;
+    const launchPrefix = await withTemporaryRuntimeCapacity(runtimeCapacityController, () =>
+      this.resolveCommandPrefix(),
+    );
     this.assertStartupCanContinue(signal);
     const launchCommand = await resolveOpenCodeLaunchCommand(launchPrefix.command);
     this.assertStartupCanContinue(signal);
@@ -526,19 +546,33 @@ export class OpenCodeServerManager implements OpenCodeServerManagerLike {
 
     const ownsProcessGroup = process.platform !== "win32";
     const ownershipToken = ownsProcessGroup ? randomUUID() : undefined;
-    const serverProcess = this.spawnServerProcess(launchCommand, serverArgs, {
-      cwd: serverCwd,
-      detached: ownsProcessGroup,
-      stdio: ["ignore", "pipe", "pipe"],
-      ...createProviderEnvSpec({
-        baseEnv: this.baseEnv,
-        runtimeSettings: this.runtimeSettings,
-        overlays: [
-          launchEnv,
-          ownershipToken ? { [MANAGED_PROCESS_OWNERSHIP_TOKEN_ENV]: ownershipToken } : undefined,
-        ],
-      }),
-    });
+    const runtimeCapacityReservation =
+      runtimeCapacityController?.reserve() ?? UNMANAGED_AGENT_RUNTIME_RESERVATION;
+    try {
+      this.assertStartupCanContinue(signal);
+    } catch (error) {
+      runtimeCapacityReservation.release();
+      throw error;
+    }
+    let serverProcess: ChildProcess;
+    try {
+      serverProcess = this.spawnServerProcess(launchCommand, serverArgs, {
+        cwd: serverCwd,
+        detached: ownsProcessGroup,
+        stdio: ["ignore", "pipe", "pipe"],
+        ...createProviderEnvSpec({
+          baseEnv: this.baseEnv,
+          runtimeSettings: this.runtimeSettings,
+          overlays: [
+            launchEnv,
+            ownershipToken ? { [MANAGED_PROCESS_OWNERSHIP_TOKEN_ENV]: ownershipToken } : undefined,
+          ],
+        }),
+      });
+    } catch (error) {
+      runtimeCapacityReservation.release();
+      throw error;
+    }
     let managedProcessIdentity: ManagedProcessRecord | undefined;
     let managedProcessId: string | undefined;
     const serverRef: { current?: OpenCodeServerGeneration } = {};
@@ -591,6 +625,10 @@ export class OpenCodeServerManager implements OpenCodeServerManagerLike {
       ownershipToken,
       cleanupRequested: false,
       cleanupComplete: false,
+      runtimeCapacityController,
+      runtimeCapacityReservation,
+      runtimeCapacityTracked: false,
+      runtimeCapacityReleased: false,
     };
     serverRef.current = server;
     this.allServers.add(server);
@@ -682,6 +720,7 @@ export class OpenCodeServerManager implements OpenCodeServerManagerLike {
           server.cleanupComplete = true;
           this.allServers.delete(server);
           this.retiredServers.delete(server);
+          this.releaseServerRuntimeCapacity(server);
         }
         failStartup(new Error(buildStartupErrorMessage(headline)));
       });
@@ -710,6 +749,13 @@ export class OpenCodeServerManager implements OpenCodeServerManagerLike {
           }
         }
       });
+      try {
+        runtimeCapacityReservation.track(serverProcess);
+        server.runtimeCapacityTracked = true;
+      } catch (error) {
+        const trackError = error instanceof Error ? error : new Error(String(error));
+        failStartup(trackError);
+      }
       if (signal?.aborted) {
         abortFromSignal();
       }
@@ -738,8 +784,8 @@ export class OpenCodeServerManager implements OpenCodeServerManagerLike {
       exitBeforeReady,
       readinessDeadline,
     ])
-      .catch((error) => {
-        void this.killServer(server).catch((cleanupError) => {
+      .catch(async (error) => {
+        await this.killServer(server).catch((cleanupError) => {
           this.logger.warn({ err: cleanupError }, "OpenCode server cleanup failed");
         });
         if (this.currentServer === server) {
@@ -752,7 +798,6 @@ export class OpenCodeServerManager implements OpenCodeServerManagerLike {
           clearTimeout(readinessTimeout);
         }
       });
-
     return server;
   }
 
@@ -985,6 +1030,7 @@ export class OpenCodeServerManager implements OpenCodeServerManagerLike {
     } else {
       this.removeManagedServerRecord(server);
     }
+    this.releaseServerRuntimeCapacity(server);
     server.cleanupComplete = true;
     this.retiredServers.delete(server);
     this.allServers.delete(server);
@@ -1029,6 +1075,18 @@ export class OpenCodeServerManager implements OpenCodeServerManagerLike {
         `OpenCode helper cleanup is incomplete for record ${leftover.id}; refusing to start another helper`,
       );
     }
+  }
+
+  private releaseServerRuntimeCapacity(server: OpenCodeServerGeneration): void {
+    if (server.runtimeCapacityReleased) {
+      return;
+    }
+    server.runtimeCapacityReleased = true;
+    if (server.runtimeCapacityTracked) {
+      server.runtimeCapacityController?.release(server.process);
+      return;
+    }
+    server.runtimeCapacityReservation.release();
   }
 
   private async recordManagedServerProcess(options: {

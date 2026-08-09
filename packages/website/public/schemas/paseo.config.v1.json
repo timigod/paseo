@@ -92,6 +92,10 @@
             "enableTerminalAgentHooks": {
               "type": "boolean"
             },
+            "maxActiveAgentRuntimes": {
+              "type": "integer",
+              "exclusiveMinimum": 0
+            },
             "appendSystemPrompt": {
               "type": "string"
             },

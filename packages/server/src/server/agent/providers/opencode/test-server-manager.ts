@@ -1,3 +1,4 @@
+import type { AgentRuntimeCapacityController } from "../../agent-sdk-types.js";
 import type { OpenCodeServerAcquisition, OpenCodeServerManagerLike } from "./server-manager.js";
 
 export interface TestOpenCodeServerAcquisition {
@@ -10,6 +11,11 @@ export interface TestOpenCodeServerAcquisition {
 export class TestOpenCodeServerManager implements OpenCodeServerManagerLike {
   readonly acquisitions: TestOpenCodeServerAcquisition[] = [];
   readonly server = { port: 1234, url: "http://127.0.0.1:1234" };
+  runtimeCapacityController: AgentRuntimeCapacityController | null = null;
+
+  configureRuntimeCapacityController(controller: AgentRuntimeCapacityController): void {
+    this.runtimeCapacityController = controller;
+  }
 
   async acquireCurrent(): Promise<OpenCodeServerAcquisition> {
     return this.recordAcquisition({ kind: "current" });

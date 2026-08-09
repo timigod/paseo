@@ -1,5 +1,6 @@
 import type { OpencodeClient } from "@opencode-ai/sdk/v2/client";
 
+import type { AgentRuntimeCapacityController } from "../../../agent-sdk-types.js";
 import type { OpenCodeServerAcquisition, OpenCodeServerManagerLike } from "../server-manager.js";
 
 interface OpenCodeResponse {
@@ -18,6 +19,11 @@ export class TestOpenCodeHarness implements OpenCodeServerManagerLike {
   private readonly clients: TestOpenCodeClient[] = [];
 
   server = { port: 1234, url: "http://127.0.0.1:1234" };
+  runtimeCapacityController: AgentRuntimeCapacityController | null = null;
+
+  configureRuntimeCapacityController(controller: AgentRuntimeCapacityController): void {
+    this.runtimeCapacityController = controller;
+  }
 
   enqueueClient(client: TestOpenCodeClient): void {
     this.clients.push(client);

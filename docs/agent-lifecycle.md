@@ -24,6 +24,12 @@ primed.
 Idle agents remain resident indefinitely. Runtime closure happens only through an explicit lifecycle
 action such as archive, replacement, reload, workspace teardown, or daemon shutdown.
 
+When `daemon.maxActiveAgentRuntimes` is set, every provider runtime holds one host-capacity slot from
+its atomic start reservation until its process exits or its close operation succeeds. Failed starts
+release their reservation. `AgentManager` owns this admission unless a provider admits runtimes at
+its process source. OpenCode charges each live helper server at the actual spawn boundary instead of
+charging each logical agent session.
+
 A provider runtime can still die on its own — crash, OOM kill, host suspend. Work the agent parked
 inside that process dies with it: Claude Code's background Bash shells, `Monitor` watches, and
 workflows all live in the CLI process, and the completion notification that would have woken the

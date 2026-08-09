@@ -3,7 +3,9 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, test } from "vitest";
 
+import { HostAgentRuntimeCapacityController } from "../agent-runtime-capacity.js";
 import {
+  buildBinaryDiagnosticRows,
   buildCommandResolutionDiagnosticRows,
   toDiagnosticErrorMessage,
 } from "./diagnostic-utils.js";
@@ -124,6 +126,26 @@ describe("buildCommandResolutionDiagnosticRows", () => {
     );
 
     expect(rows).toContainEqual({ label: "PATH matches", value: "not checked" });
+  });
+});
+
+describe("buildBinaryDiagnosticRows", () => {
+  test("does not start a version probe when host runtime capacity is full", async () => {
+    const runtimeCapacityController = new HostAgentRuntimeCapacityController(1);
+    const existingRuntime = {};
+    runtimeCapacityController.reserve().track(existingRuntime);
+
+    const rows = await buildBinaryDiagnosticRows(
+      { command: process.execPath, args: [], source: "override" },
+      { available: true, resolvedPath: process.execPath },
+      { runtimeCapacityController },
+    );
+
+    expect(rows).toContainEqual({
+      label: "Version",
+      value: expect.stringContaining("Host agent runtime capacity reached"),
+    });
+    runtimeCapacityController.release(existingRuntime);
   });
 });
 
