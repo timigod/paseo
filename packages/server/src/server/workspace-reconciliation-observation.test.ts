@@ -18,6 +18,7 @@ import {
   type ProjectUpdate,
   type ReconciliationClock,
   type ReconciliationTimer,
+  shouldPassivelyObservePath,
   WorkspaceReconciliationService,
 } from "./workspace-reconciliation-service.js";
 
@@ -144,7 +145,12 @@ class TestClock implements ReconciliationClock {
     delayMs: number,
     intervalMs: number | null,
   ): TestTimer {
-    const timer = { callback, dueAt: this.now + delayMs, intervalMs, unref: () => undefined };
+    const timer = {
+      callback,
+      dueAt: this.now + delayMs,
+      intervalMs,
+      unref: () => undefined,
+    };
     this.timers.add(timer);
     return timer;
   }
@@ -175,7 +181,10 @@ class ObservedPlacements {
   private started = false;
   private checkoutReadCount = 0;
 
-  constructor(private readonly specs: ProjectSpec[]) {
+  constructor(
+    private readonly specs: ProjectSpec[],
+    options: { yieldToEventLoop?: () => Promise<void> } = {},
+  ) {
     cleanupPaths.push(this.home);
     const logger = createTestLogger();
     this.projects = new ObservedProjectRegistry(path.join(this.home, "projects.json"), logger);
@@ -193,9 +202,12 @@ class ObservedPlacements {
     this.service = new WorkspaceReconciliationService({
       projectRegistry: this.projects,
       workspaceRegistry: this.workspaces,
-      workspaceGitService: { getCheckout: async (cwd) => this.readCheckout(cwd) },
+      workspaceGitService: {
+        getCheckout: async (cwd) => this.readCheckout(cwd),
+      },
       logger,
       watchProjectRoot,
+      yieldToEventLoop: options.yieldToEventLoop,
       clock: this.clock,
       debounceMs: DEBOUNCE_MS,
       rescanIntervalMs: RESCAN_INTERVAL_MS,
@@ -389,6 +401,63 @@ class ObservedPlacements {
   }
 }
 
+describe("passive project observation boundary", () => {
+  test("does not probe macOS protected home folders in the background", () => {
+    const homeDirectory = "/Users/example";
+    expect(
+      shouldPassivelyObservePath("/Users/example/Documents/work", {
+        platform: "darwin",
+        homeDirectory,
+      }),
+    ).toBe(false);
+    expect(
+      shouldPassivelyObservePath("/Users/example/Downloads", {
+        platform: "darwin",
+        homeDirectory,
+      }),
+    ).toBe(false);
+    expect(
+      shouldPassivelyObservePath("/Users/example/Code/project", {
+        platform: "darwin",
+        homeDirectory,
+      }),
+    ).toBe(true);
+    expect(
+      shouldPassivelyObservePath("/Users/example/Documents-copy/project", {
+        platform: "darwin",
+        homeDirectory,
+      }),
+    ).toBe(true);
+    expect(
+      shouldPassivelyObservePath("/Users/example/Documents/work", {
+        platform: "linux",
+        homeDirectory,
+      }),
+    ).toBe(true);
+  });
+
+  test("yields between project watcher installations", async () => {
+    const lifecycle: string[] = [];
+    const observed = new ObservedPlacements(
+      [
+        { id: "project-one", root: "one" },
+        { id: "project-two", root: "two" },
+      ],
+      {
+        yieldToEventLoop: async () => {
+          lifecycle.push("yield");
+        },
+      },
+    );
+
+    await observed.start();
+
+    expect(lifecycle).toEqual(["yield", "yield"]);
+    expect(observed.watchedRoots()).toEqual(["one", "two"]);
+    observed.dispose();
+  });
+});
+
 describe("observed workspace placement", () => {
   test("installs and publishes a new project before add resolves without Git feedback", async () => {
     const observed = new ObservedPlacements([]);
@@ -399,7 +468,10 @@ describe("observed workspace placement", () => {
 
     expect(observed.watchedRoots()).toEqual(["new"]);
     expect(observed.projectUpdates).toEqual([
-      { kind: "upsert", project: expect.objectContaining({ projectId: "project-new" }) },
+      {
+        kind: "upsert",
+        project: expect.objectContaining({ projectId: "project-new" }),
+      },
     ]);
     expect(observed.lifecycle).toEqual([
       "watch installed:new",
@@ -473,7 +545,11 @@ describe("observed workspace placement", () => {
 
   test("archives missing workspace directories on the periodic pass", async () => {
     const observed = new ObservedPlacements([
-      { id: "project-one", root: "repo", workspaces: [{ id: "workspace-one", cwd: "repo" }] },
+      {
+        id: "project-one",
+        root: "repo",
+        workspaces: [{ id: "workspace-one", cwd: "repo" }],
+      },
     ]);
     await observed.start();
     await observed.deleteWorkspaceDirectory("workspace-one");
@@ -487,7 +563,11 @@ describe("observed workspace placement", () => {
 
   test("preserves a periodic full pass queued behind metadata reconciliation", async () => {
     const observed = new ObservedPlacements([
-      { id: "project-one", root: "repo", workspaces: [{ id: "workspace-one", cwd: "repo" }] },
+      {
+        id: "project-one",
+        root: "repo",
+        workspaces: [{ id: "workspace-one", cwd: "repo" }],
+      },
     ]);
     await observed.start();
     const metadataRead = observed.holdNextReconciliation();
@@ -509,7 +589,11 @@ describe("observed workspace placement", () => {
 
   test("contains a failed reconciliation and converges on the next change", async () => {
     const observed = new ObservedPlacements([
-      { id: "project-one", root: "repo", workspaces: [{ id: "workspace-one", cwd: "repo" }] },
+      {
+        id: "project-one",
+        root: "repo",
+        workspaces: [{ id: "workspace-one", cwd: "repo" }],
+      },
     ]);
     await observed.start();
     observed.makeProjectGit("project-one", "main");
@@ -565,7 +649,11 @@ describe("observed workspace placement", () => {
     expect(mutation.watchedRoots()).toEqual([]);
 
     const reconciliation = new ObservedPlacements([
-      { id: "project-one", root: "repo", workspaces: [{ id: "workspace-one", cwd: "repo" }] },
+      {
+        id: "project-one",
+        root: "repo",
+        workspaces: [{ id: "workspace-one", cwd: "repo" }],
+      },
     ]);
     await reconciliation.start();
     reconciliation.makeProjectGit("project-one");

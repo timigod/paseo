@@ -1,4 +1,6 @@
 import { statSync, watch as watchPath } from "node:fs";
+import { homedir } from "node:os";
+import path from "node:path";
 import type { ProjectCheckoutLitePayload } from "@getpaseo/protocol/messages";
 import type pino from "pino";
 import type {
@@ -62,7 +64,12 @@ const watchProjectRoot: ProjectRootWatch = (rootPath, options, onChange, onError
 };
 
 export type ReconciliationChange =
-  | { kind: "workspace_archived"; workspaceId: string; directory: string; reason: string }
+  | {
+      kind: "workspace_archived";
+      workspaceId: string;
+      directory: string;
+      reason: string;
+    }
   | {
       kind: "project_updated";
       projectId: string;
@@ -92,10 +99,43 @@ export interface WorkspaceReconciliationServiceOptions {
   onWorkspaceArchived?: (workspaceId: string) => void | Promise<void>;
   onWorkspacesChanged?: (workspaceIds: string[]) => Promise<void>;
   watchProjectRoot?: ProjectRootWatch;
+  shouldPassivelyObservePath?: (targetPath: string) => boolean;
+  yieldToEventLoop?: () => Promise<void>;
   clock?: ReconciliationClock;
   rescanIntervalMs?: number;
   debounceMs?: number;
 }
+
+const MACOS_PROTECTED_HOME_DIRECTORIES = [
+  "Desktop",
+  "Documents",
+  "Downloads",
+  "Movies",
+  "Music",
+  "Pictures",
+] as const;
+
+export function shouldPassivelyObservePath(
+  targetPath: string,
+  options: { platform?: NodeJS.Platform; homeDirectory?: string } = {},
+): boolean {
+  if ((options.platform ?? process.platform) !== "darwin") return true;
+
+  const homeDirectory = path.resolve(options.homeDirectory ?? homedir());
+  const candidate = path.resolve(targetPath);
+  if (candidate === homeDirectory) return false;
+
+  return !MACOS_PROTECTED_HOME_DIRECTORIES.some((directory) => {
+    const protectedRoot = path.join(homeDirectory, directory);
+    const relative = path.relative(protectedRoot, candidate);
+    return relative === "" || (!relative.startsWith(`..${path.sep}`) && relative !== "..");
+  });
+}
+
+const yieldToEventLoop = (): Promise<void> =>
+  new Promise((resolve) => {
+    setImmediate(resolve);
+  });
 
 interface ProjectReconciliationInput {
   project: PersistedProjectRecord;
@@ -123,10 +163,15 @@ export class WorkspaceReconciliationService {
   private readonly onWorkspaceArchived: ((workspaceId: string) => void | Promise<void>) | null;
   private readonly onWorkspacesChanged: ((workspaceIds: string[]) => Promise<void>) | null;
   private readonly watchProjectRoot: ProjectRootWatch;
+  private readonly shouldPassivelyObservePath: (targetPath: string) => boolean;
+  private readonly yieldToEventLoop: () => Promise<void>;
   private readonly clock: ReconciliationClock;
   private readonly rescanIntervalMs: number;
   private readonly debounceMs: number;
-  private readonly watchers: Array<{ rootPath: string; watcher: ProjectRootWatcher }> = [];
+  private readonly watchers: Array<{
+    rootPath: string;
+    watcher: ProjectRootWatcher;
+  }> = [];
   private unsubscribeRegistry: (() => void) | null = null;
   private rescanTimer: ReconciliationTimer | null = null;
   private debounceTimer: ReconciliationTimer | null = null;
@@ -146,6 +191,9 @@ export class WorkspaceReconciliationService {
     this.onWorkspaceArchived = options.onWorkspaceArchived ?? null;
     this.onWorkspacesChanged = options.onWorkspacesChanged ?? null;
     this.watchProjectRoot = options.watchProjectRoot ?? watchProjectRoot;
+    this.shouldPassivelyObservePath =
+      options.shouldPassivelyObservePath ?? shouldPassivelyObservePath;
+    this.yieldToEventLoop = options.yieldToEventLoop ?? yieldToEventLoop;
     this.clock = options.clock ?? systemClock;
     this.rescanIntervalMs = options.rescanIntervalMs ?? DEFAULT_RESCAN_INTERVAL_MS;
     this.debounceMs = options.debounceMs ?? DEFAULT_DEBOUNCE_MS;
@@ -162,9 +210,15 @@ export class WorkspaceReconciliationService {
           await this.syncProjectRootWatches();
           if (this.disposed) return;
           if (mutation.kind === "upsert" && mutation.project && !mutation.project.archivedAt) {
-            this.onProjectUpdate?.({ kind: "upsert", project: mutation.project });
+            this.onProjectUpdate?.({
+              kind: "upsert",
+              project: mutation.project,
+            });
           } else {
-            this.onProjectUpdate?.({ kind: "remove", projectId: mutation.projectId });
+            this.onProjectUpdate?.({
+              kind: "remove",
+              projectId: mutation.projectId,
+            });
           }
         } catch (error) {
           this.logger.warn({ err: error }, "Project reconciliation mutation handling failed");
@@ -198,14 +252,23 @@ export class WorkspaceReconciliationService {
     ]);
     const workspacesByProject = new Map<string, PersistedWorkspaceRecord[]>();
     for (const workspace of workspaces) {
-      if (workspace.archivedAt || this.inspectDirectory(workspace.cwd) !== "directory") continue;
+      if (
+        workspace.archivedAt ||
+        !this.shouldPassivelyObservePath(workspace.cwd) ||
+        this.inspectDirectory(workspace.cwd) !== "directory"
+      ) {
+        continue;
+      }
       const siblings = workspacesByProject.get(workspace.projectId) ?? [];
       siblings.push(workspace);
       workspacesByProject.set(workspace.projectId, siblings);
     }
     await this.reconcileGitMetadataForProjects(
       projects.filter(
-        (project) => !project.archivedAt && this.inspectDirectory(project.rootPath) === "directory",
+        (project) =>
+          !project.archivedAt &&
+          this.shouldPassivelyObservePath(project.rootPath) &&
+          this.inspectDirectory(project.rootPath) === "directory",
       ),
       workspacesByProject,
       changes,
@@ -225,7 +288,9 @@ export class WorkspaceReconciliationService {
     const activeWorkspaces = allWorkspaces.filter((w) => !w.archivedAt);
     const workspaceDirectoryStates = activeWorkspaces.map((workspace) => ({
       workspace,
-      state: this.inspectDirectory(workspace.cwd),
+      state: this.shouldPassivelyObservePath(workspace.cwd)
+        ? this.inspectDirectory(workspace.cwd)
+        : ("unreadable" as const),
     }));
 
     const workspacesByProject = new Map<string, PersistedWorkspaceRecord[]>();
@@ -265,7 +330,11 @@ export class WorkspaceReconciliationService {
     //    Projects persist until explicitly removed, even when they currently have
     //    zero active workspaces, so they still reconcile their own metadata.
     await this.reconcileGitMetadataForProjects(
-      activeProjects.filter((project) => this.inspectDirectory(project.rootPath) === "directory"),
+      activeProjects.filter(
+        (project) =>
+          this.shouldPassivelyObservePath(project.rootPath) &&
+          this.inspectDirectory(project.rootPath) === "directory",
+      ),
       workspacesByProject,
       changes,
     );
@@ -302,7 +371,10 @@ export class WorkspaceReconciliationService {
       checkoutReads.push({ cwd, checkout });
       return checkout;
     };
-    const roots: Array<{ rootPath: string; projects: PersistedProjectRecord[] }> = [];
+    const roots: Array<{
+      rootPath: string;
+      projects: PersistedProjectRecord[];
+    }> = [];
     for (const project of projectsToReconcile) {
       const root = roots.find((candidate) =>
         areEquivalentPaths(candidate.rootPath, project.rootPath),
@@ -405,7 +477,9 @@ export class WorkspaceReconciliationService {
     if (this.disposed) return;
     const projects = await this.projectRegistry.list();
     if (this.disposed) return;
-    const activeProjects = projects.filter((project) => !project.archivedAt);
+    const activeProjects = projects.filter(
+      (project) => !project.archivedAt && this.shouldPassivelyObservePath(project.rootPath),
+    );
 
     for (let index = this.watchers.length - 1; index >= 0; index -= 1) {
       const target = this.watchers[index]!;
@@ -418,6 +492,11 @@ export class WorkspaceReconciliationService {
     }
 
     for (const project of activeProjects) {
+      // fs.watch() can take long enough across a large registry to starve the
+      // daemon heartbeat. Yield between roots so the supervisor can observe
+      // liveness while startup installs the passive observers.
+      await this.yieldToEventLoop();
+      if (this.disposed) return;
       const alreadyWatching = this.watchers.some((target) =>
         areEquivalentPaths(target.rootPath, project.rootPath),
       );
