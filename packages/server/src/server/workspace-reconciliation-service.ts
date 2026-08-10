@@ -119,10 +119,18 @@ export function shouldPassivelyObservePath(
   targetPath: string,
   options: { platform?: NodeJS.Platform; homeDirectory?: string } = {},
 ): boolean {
-  if ((options.platform ?? process.platform) !== "darwin") return true;
-
   const homeDirectory = path.resolve(options.homeDirectory ?? homedir());
   const candidate = path.resolve(targetPath);
+  const managedWorktreesRoot = path.join(homeDirectory, ".paseo", "worktrees");
+  const managedRelative = path.relative(managedWorktreesRoot, candidate);
+  if (
+    managedRelative === "" ||
+    (!managedRelative.startsWith(`..${path.sep}`) && managedRelative !== "..")
+  ) {
+    return false;
+  }
+
+  if ((options.platform ?? process.platform) !== "darwin") return true;
   if (candidate === homeDirectory) return false;
 
   return !MACOS_PROTECTED_HOME_DIRECTORIES.some((directory) => {

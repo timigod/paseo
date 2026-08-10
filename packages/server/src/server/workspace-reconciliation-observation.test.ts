@@ -423,6 +423,12 @@ describe("passive project observation boundary", () => {
       }),
     ).toBe(true);
     expect(
+      shouldPassivelyObservePath("/Users/example/.paseo/worktrees/owner/task", {
+        platform: "darwin",
+        homeDirectory,
+      }),
+    ).toBe(false);
+    expect(
       shouldPassivelyObservePath("/Users/example/Documents-copy/project", {
         platform: "darwin",
         homeDirectory,
@@ -434,6 +440,12 @@ describe("passive project observation boundary", () => {
         homeDirectory,
       }),
     ).toBe(true);
+    expect(
+      shouldPassivelyObservePath("/Users/example/.paseo/worktrees/owner/task", {
+        platform: "linux",
+        homeDirectory,
+      }),
+    ).toBe(false);
   });
 
   test("yields between project watcher installations", async () => {
