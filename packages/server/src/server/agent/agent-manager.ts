@@ -278,10 +278,14 @@ export interface CreateAgentOptions {
 
 export interface CloseAgentOptions {
   persistClosedState?: boolean;
+  emitClosedState?: boolean;
+  hibernateIdleOnly?: boolean;
 }
 
 interface CloseAgentRequirements {
   persistClosedState: boolean;
+  emitClosedState: boolean;
+  hibernateIdleOnly: boolean;
 }
 
 interface InFlightAgentClose {
@@ -311,6 +315,7 @@ export interface AgentManagerOptions {
   runtimeCapacityController?: AgentRuntimeCapacityController;
   maxActiveAgentRuntimes?: number;
   rescueTimeouts?: AgentManagerRescueTimeouts;
+  idleRuntimeHibernationGraceMs?: number | null;
   fileSystem?: AgentManagerFileSystem;
   logger: Logger;
 }
@@ -322,6 +327,11 @@ function resolveRuntimeCapacityController(
     options.runtimeCapacityController ??
     new HostAgentRuntimeCapacityController(options.maxActiveAgentRuntimes ?? null)
   );
+}
+
+function resolveIdleRuntimeHibernationGraceMs(options: AgentManagerOptions): number | null {
+  if (options.idleRuntimeHibernationGraceMs === null) return null;
+  return Math.max(1_000, options.idleRuntimeHibernationGraceMs ?? 30_000);
 }
 
 export interface ReleaseWorkspaceIfUnownedOptions {
@@ -725,6 +735,8 @@ export class AgentManager {
   private readonly fileSystem: AgentManagerFileSystem;
   private readonly rescueTimeouts: Required<AgentManagerRescueTimeouts>;
   private readonly runtimeCapacity: AgentRuntimeCapacityController;
+  private readonly idleRuntimeHibernationGraceMs: number | null;
+  private readonly idleRuntimeHibernationTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private acceptingAgentRegistrations = true;
 
   constructor(options: AgentManagerOptions) {
@@ -740,6 +752,7 @@ export class AgentManager {
     this.logger = options.logger.child({ module: "agent", component: "agent-manager" });
     this.fileSystem = options.fileSystem ?? { stat, opendir };
     this.runtimeCapacity = resolveRuntimeCapacityController(options);
+    this.idleRuntimeHibernationGraceMs = resolveIdleRuntimeHibernationGraceMs(options);
     this.rescueTimeouts = {
       reloadSessionCloseMs:
         options.rescueTimeouts?.reloadSessionCloseMs ?? RELOAD_SESSION_CLOSE_TIMEOUT_MS,
@@ -833,6 +846,10 @@ export class AgentManager {
 
   prepareForShutdown(): void {
     this.acceptingAgentRegistrations = false;
+    for (const timer of this.idleRuntimeHibernationTimers.values()) {
+      clearTimeout(timer);
+    }
+    this.idleRuntimeHibernationTimers.clear();
   }
 
   setPaseoToolsEnabled(enabled: boolean): void {
@@ -1566,21 +1583,33 @@ export class AgentManager {
 
   closeAgent(agentId: string, options: CloseAgentOptions = {}): Promise<void> {
     const persistClosedState = options.persistClosedState !== false;
+    const emitClosedState = options.emitClosedState !== false;
+    const hibernateIdleOnly = options.hibernateIdleOnly === true;
     const existing = this.inFlightAgentCloses.get(agentId);
     if (existing) {
       if (persistClosedState) {
         existing.requirements.persistClosedState = true;
       }
+      if (emitClosedState) {
+        existing.requirements.emitClosedState = true;
+      }
+      if (!hibernateIdleOnly) {
+        existing.requirements.hibernateIdleOnly = false;
+      }
       return existing.promise;
     }
 
-    const requirements = { persistClosedState };
+    const requirements = { persistClosedState, emitClosedState, hibernateIdleOnly };
     const promise = this.closeAgentRuntime(agentId, requirements);
     const close = { promise, requirements };
     this.inFlightAgentCloses.set(agentId, close);
     const clearClose = () => {
       if (this.inFlightAgentCloses.get(agentId) === close) {
         this.inFlightAgentCloses.delete(agentId);
+      }
+      const retained = this.agents.get(agentId);
+      if (retained?.session && retained.lifecycle === "idle") {
+        this.scheduleIdleRuntimeHibernation(retained);
       }
     };
     void promise.then(clearClose, clearClose);
@@ -1605,6 +1634,12 @@ export class AgentManager {
       "agent.manager.close.start",
     );
     await this.drainSessionEvents(agentId);
+    if (
+      requirements.hibernateIdleOnly &&
+      !this.canHibernateIdleRuntime(agent, { ignoreInFlightClose: true })
+    ) {
+      return;
+    }
     this.cancelRunningProviderSubagents(agentId);
     const closedAgent = this.prepareAgentForClosure(agent, "agent closed");
     let closeError: unknown;
@@ -1622,7 +1657,9 @@ export class AgentManager {
         persistError = error;
       }
     }
-    this.emitClosedAgent(closedAgent, { persist: false });
+    if (requirements.emitClosedState) {
+      this.emitClosedAgent(closedAgent, { persist: false });
+    }
     this.logger.trace(
       {
         agentId,
@@ -2394,6 +2431,7 @@ export class AgentManager {
     options?: AgentRunOptions,
   ): AsyncGenerator<AgentStreamEvent> {
     const existingAgent = this.requireSessionAgent(agentId);
+    this.cancelIdleRuntimeHibernation(agentId);
     this.logger.trace(
       {
         agentId,
@@ -2572,6 +2610,9 @@ export class AgentManager {
     if (!shouldHoldBusyForReplacement) {
       this.touchUpdatedAt(mutableAgent);
       this.emitState(mutableAgent);
+      if (mutableAgent.lifecycle === "idle") {
+        this.scheduleIdleRuntimeHibernation(mutableAgent);
+      }
     }
   }
 
@@ -3252,6 +3293,7 @@ export class AgentManager {
       this.assertAgentRegistrationActive(managed);
       this.emitState(managed, { persist: false });
       this.subscribeToSession(managed);
+      this.scheduleIdleRuntimeHibernation(managed);
       return { ...managed };
     } catch (error) {
       const installedAgent = this.agents.get(resolvedAgentId);
@@ -3416,6 +3458,7 @@ export class AgentManager {
     agent: LiveManagedAgent,
     cancelReason: string,
   ): ManagedAgentClosed {
+    this.cancelIdleRuntimeHibernation(agent.id);
     this.agentStreamCoalescer.flushAndDiscard(agent.id);
     this.agents.delete(agent.id);
     this.previousStatuses.delete(agent.id);
@@ -3466,6 +3509,69 @@ export class AgentManager {
       this.enqueueSessionEvent(agentId, event);
     });
     agent.unsubscribeSession = unsubscribe;
+  }
+
+  private cancelIdleRuntimeHibernation(agentId: string): void {
+    const timer = this.idleRuntimeHibernationTimers.get(agentId);
+    if (!timer) return;
+    clearTimeout(timer);
+    this.idleRuntimeHibernationTimers.delete(agentId);
+  }
+
+  private canHibernateIdleRuntime(
+    agent: ActiveManagedAgent,
+    options?: { ignoreInFlightClose?: boolean },
+  ): boolean {
+    const client = this.clients.get(agent.provider);
+    return (
+      this.acceptingAgentRegistrations &&
+      this.idleRuntimeHibernationGraceMs !== null &&
+      client?.capabilities.supportsIdleRuntimeHibernation === true &&
+      agent.lifecycle === "idle" &&
+      agent.activeForegroundTurnId === null &&
+      !this.runs.hasRun(agent.id) &&
+      agent.pendingPermissions.size === 0 &&
+      agent.inFlightPermissionResponses.size === 0 &&
+      !agent.pendingReplacement &&
+      !agent.lastError &&
+      agent.persistence !== null &&
+      (options?.ignoreInFlightClose === true || !this.inFlightAgentCloses.has(agent.id)) &&
+      !this.inFlightAgentArchives.has(agent.id) &&
+      !Array.from(this.inFlightAtomicFinishes.values()).some(
+        (finish) => finish.agentId === agent.id,
+      ) &&
+      !this.providerSubagents.list(agent.id).some((subagent) => subagent.status === "running")
+    );
+  }
+
+  private scheduleIdleRuntimeHibernation(agent: ActiveManagedAgent): void {
+    this.cancelIdleRuntimeHibernation(agent.id);
+    if (!this.canHibernateIdleRuntime(agent)) return;
+    const graceMs = this.idleRuntimeHibernationGraceMs;
+    if (graceMs === null) return;
+    const timer = setTimeout(() => {
+      this.idleRuntimeHibernationTimers.delete(agent.id);
+      this.trackBackgroundTask(this.hibernateIdleRuntime(agent.id));
+    }, graceMs);
+    timer.unref?.();
+    this.idleRuntimeHibernationTimers.set(agent.id, timer);
+  }
+
+  private async hibernateIdleRuntime(agentId: string): Promise<void> {
+    const agent = this.agents.get(agentId);
+    if (!agent || agent.session === null || !this.canHibernateIdleRuntime(agent)) return;
+    try {
+      const persistence = agent.session.describePersistence();
+      if (!persistence || persistence.sessionId !== agent.persistence?.sessionId) return;
+      await this.persistSnapshot(agent);
+      await this.closeAgent(agentId, {
+        persistClosedState: false,
+        emitClosedState: false,
+        hibernateIdleOnly: true,
+      });
+    } catch (error) {
+      this.logger.warn({ err: error, agentId }, "Failed to hibernate idle agent runtime");
+    }
   }
 
   private enqueueSessionEvent(agentId: string, event: AgentStreamEvent): void {
@@ -4158,6 +4264,9 @@ export class AgentManager {
       (agent as ActiveManagedAgent).lifecycle = "idle";
       this.emitState(agent);
     }
+    if (!agent.activeForegroundTurnId && agent.lifecycle === "idle") {
+      this.scheduleIdleRuntimeHibernation(agent);
+    }
     void this.refreshRuntimeInfo(agent);
   }
 
@@ -4186,6 +4295,7 @@ export class AgentManager {
       "handleStreamEvent: turn_failed",
     );
     if (terminalDisposition === "stale") return;
+    this.cancelIdleRuntimeHibernation(agent.id);
     if (!isForegroundEvent && !agent.activeForegroundTurnId) {
       agent.lifecycle = "error";
     }
@@ -4236,6 +4346,9 @@ export class AgentManager {
     if (!isForegroundEvent && !agent.activeForegroundTurnId) {
       this.emitState(agent);
     }
+    if (!agent.activeForegroundTurnId && agent.lifecycle === "idle") {
+      this.scheduleIdleRuntimeHibernation(agent);
+    }
   }
 
   private onStreamTurnStarted(params: {
@@ -4245,6 +4358,7 @@ export class AgentManager {
     flags: StreamEventFlags;
   }): void {
     const { agent, eventTurnId, isForegroundEvent, flags } = params;
+    this.cancelIdleRuntimeHibernation(agent.id);
     this.logger.trace(
       {
         agentId: agent.id,
@@ -4278,6 +4392,7 @@ export class AgentManager {
     agent: ActiveManagedAgent,
     event: Extract<AgentStreamEvent, { type: "permission_requested" }>,
   ): void {
+    this.cancelIdleRuntimeHibernation(agent.id);
     const hadPendingPermissions = agent.pendingPermissions.size > 0;
     agent.pendingPermissions.set(event.request.id, event.request);
     if (!hadPendingPermissions && !agent.internal) {

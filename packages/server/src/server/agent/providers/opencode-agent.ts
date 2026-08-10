@@ -102,6 +102,7 @@ import {
 const OPENCODE_CAPABILITIES: AgentCapabilityFlags = {
   supportsStreaming: true,
   supportsSessionPersistence: true,
+  supportsIdleRuntimeHibernation: true,
   supportsSessionListing: true,
   supportsDynamicModes: true,
   supportsMcpServers: true,

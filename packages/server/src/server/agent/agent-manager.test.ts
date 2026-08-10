@@ -8672,6 +8672,120 @@ test("idle agents remain resident until an explicit lifecycle action closes them
   }
 });
 
+test("eligible idle runtimes hibernate and resume the same durable agent", async () => {
+  vi.useFakeTimers();
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-idle-hibernation-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const capacity = new HostAgentRuntimeCapacityController(1);
+  let closeCount = 0;
+  let resumeCount = 0;
+  const createSession = (config: AgentSessionConfig, sessionId?: string): AgentSession => {
+    const persistedSessionId = sessionId;
+    return new (class extends TestAgentSession {
+      override describePersistence(): AgentPersistenceHandle {
+        const handle = super.describePersistence();
+        return {
+          ...handle,
+          sessionId: persistedSessionId ?? handle.sessionId,
+        };
+      }
+
+      override async close(): Promise<void> {
+        closeCount += 1;
+      }
+    })(config);
+  };
+  const client = new (class extends TestAgentClient {
+    override readonly capabilities = {
+      ...TEST_CAPABILITIES,
+      supportsSessionPersistence: true,
+      supportsIdleRuntimeHibernation: true,
+    };
+
+    override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+      return createSession(config);
+    }
+
+    override async resumeSession(
+      handle: AgentPersistenceHandle,
+      config?: Partial<AgentSessionConfig>,
+    ): Promise<AgentSession> {
+      resumeCount += 1;
+      return createSession(
+        {
+          provider: this.provider,
+          cwd: config?.cwd ?? workdir,
+        },
+        handle.sessionId,
+      );
+    }
+  })();
+  const manager = new AgentManager({
+    clients: { codex: client },
+    registry: storage,
+    runtimeCapacityController: capacity,
+    idleRuntimeHibernationGraceMs: 1_000,
+    logger,
+  });
+
+  try {
+    const created = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: "workspace-idle-hibernation",
+    });
+    const sessionId = created.persistence?.sessionId;
+    expect(sessionId).toBeTruthy();
+    expect(capacity.getAvailableRuntimeSlots()).toBe(0);
+
+    await vi.advanceTimersByTimeAsync(1_000);
+    await manager.flush();
+    await storage.flush();
+
+    expect(manager.getAgent(created.id)).toBeNull();
+    expect(closeCount).toBe(1);
+    expect(capacity.getAvailableRuntimeSlots()).toBe(1);
+    expect(await storage.get(created.id)).toMatchObject({
+      id: created.id,
+      lastStatus: "idle",
+      workspaceId: "workspace-idle-hibernation",
+      persistence: { sessionId },
+    });
+
+    const blocker = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: "workspace-capacity-blocker",
+    });
+    await expect(
+      ensureAgentLoaded(created.id, {
+        agentManager: manager,
+        agentStorage: storage,
+        logger,
+      }),
+    ).rejects.toThrow("Host agent runtime capacity reached");
+    expect(manager.getAgent(created.id)).toBeNull();
+    expect((await storage.get(created.id))?.lastStatus).toBe("idle");
+    expect(resumeCount).toBe(0);
+    await manager.closeAgent(blocker.id);
+
+    const resumed = await ensureAgentLoaded(created.id, {
+      agentManager: manager,
+      agentStorage: storage,
+      logger,
+    });
+
+    expect(resumed.id).toBe(created.id);
+    expect(resumed.workspaceId).toBe("workspace-idle-hibernation");
+    expect(resumed.persistence?.sessionId).toBe(sessionId);
+    expect(resumeCount).toBe(1);
+    expect(capacity.getAvailableRuntimeSlots()).toBe(0);
+  } finally {
+    const live = manager.listAgents();
+    await Promise.all(live.map((agent) => manager.closeAgent(agent.id))).catch(() => undefined);
+    await manager.flush().catch(() => undefined);
+    await storage.flush().catch(() => undefined);
+    vi.useRealTimers();
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
 test("archiving a closed parent still cascades to its managed children", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-closed-parent-archive-"));
   const storage = new AgentStorage(join(workdir, "agents"), logger);
