@@ -2,6 +2,7 @@ const fs = require("fs");
 const path = require("path");
 
 const { smokePackagedDesktopApp } = require("../e2e/packaged-app-smoke.js");
+const { assertPackagedArchiveExactSource } = require("./build-provenance-gate.js");
 
 const EXECUTABLE_NAME = "Paseo";
 
@@ -112,6 +113,15 @@ function fmtMB(bytes) {
 exports.default = async function afterPack(context) {
   const platform = context.electronPlatformName;
   const arch = ARCH_MAP[context.arch] || process.arch;
+
+  const resourcesDir =
+    platform === "darwin"
+      ? path.join(context.appOutDir, `${EXECUTABLE_NAME}.app`, "Contents", "Resources")
+      : path.join(context.appOutDir, "resources");
+  assertPackagedArchiveExactSource({
+    archivePath: path.join(resourcesDir, "app.asar"),
+    workspaceRoot: path.resolve(__dirname, "..", "..", ".."),
+  });
 
   pruneNativeModules(context.appOutDir, platform, arch);
 

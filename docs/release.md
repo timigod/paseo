@@ -377,6 +377,29 @@ The GitHub Release body is populated automatically by the `Release Notes Sync` w
 - The download page's "What's new" link deep-links the **minor group** anchor (`/changelog#release-0.3`), not the exact entry: promotion collapses the beta entries into one stable entry, so the minor group remains the durable target. A version with no entry in the bundled changelog — a tag whose changelog commit hasn't redeployed the site yet — links the plain `/changelog` instead of a dead anchor.
 - The website itself is deployed by `Deploy Website` (Cloudflare Workers), which redeploys on `release: published` for non-prerelease releases and on pushes to `main` that touch `CHANGELOG.md` or `packages/website/**`.
 
+## Desktop build provenance
+
+Desktop packaging accepts server and CLI output only from a clean build of the
+source commit being packaged:
+
+- `npm run build:server:clean` writes `build-receipt.json` to the server and CLI
+  `dist` directories. `npm run build:server` removes these receipts because an
+  incremental build does not certify one source commit.
+- `npm run build:desktop` runs the clean server and CLI build. Its Electron
+  Builder wrapper rejects a dirty tree and any missing, dirty, or stale receipt.
+  The release workflow's version-only change to
+  `packages/desktop/package.json` is the only accepted tracked change.
+- The Electron Builder `afterPack` hook checks the receipts inside `app.asar`
+  before signing. The macOS `afterSign` hook checks the sealed app again.
+- Read an installed bundle before activation and require the intended commit:
+
+  ```bash
+  node packages/desktop/scripts/build-provenance-gate.js read "/Applications/Paseo.app" --expect-commit <sha>
+  ```
+
+If the gate rejects a build, commit or drop the source changes. Then run the
+canonical desktop build again. Do not invoke Electron Builder directly.
+
 ## Fixing a failed release build
 
 **NEVER bump the version to fix a build problem.** New versions are reserved for meaningful product changes (features, fixes, improvements). Build/CI failures are fixed on the current version.
