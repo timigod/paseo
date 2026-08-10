@@ -221,6 +221,40 @@ describe("OpenCodeServerManager generations", () => {
     await acquisition.release();
   });
 
+  test("acquisition deadline cancels command-prefix discovery and releases capacity", async () => {
+    vi.useFakeTimers();
+    const controller = new HostAgentRuntimeCapacityController(1);
+    const neverSettles = new Promise<{ command: string; args: string[] }>(() => undefined);
+    const { manager, runtime } = createTestManager([4470], {
+      resolveCommandPrefix: () => neverSettles,
+    });
+    manager.configureRuntimeCapacityController(controller);
+    const acquisition = manager.acquireNew({
+      deadlineAtMs: Date.now() + 250,
+      timeoutMessage: "OpenCode server acquisition timed out within the test budget",
+    });
+    let acquisitionRejected = false;
+    const failure = expect(acquisition)
+      .rejects.toThrow("OpenCode server acquisition timed out within the test budget")
+      .then(() => {
+        acquisitionRejected = true;
+        return undefined;
+      });
+    await runtime.settle();
+
+    expect(controller.getSnapshot()).toEqual({ limit: 1, live: 0, starting: 1, available: 0 });
+    expect(runtime.spawnCalls).toEqual([]);
+
+    await vi.advanceTimersByTimeAsync(250);
+    await runtime.settle();
+
+    expect(acquisitionRejected).toBe(true);
+    await failure;
+    expect(controller.getSnapshot()).toEqual({ limit: 1, live: 0, starting: 0, available: 1 });
+    expect(runtime.spawnCalls).toEqual([]);
+    await manager.shutdown();
+  });
+
   test("releases capacity after a failed startup is terminated", async () => {
     const controller = new HostAgentRuntimeCapacityController(1);
     const { manager, runtime } = createTestManager([4463, 4464], { autoAnnounce: false });
@@ -968,6 +1002,7 @@ function createTestManager(
     startupTimeoutMs?: number;
     portAllocationGate?: TestGate;
     terminationGate?: TestGate;
+    resolveCommandPrefix?: OpenCodeCommandPrefixResolver;
   } = {},
 ): {
   manager: OpenCodeServerManager;
@@ -992,7 +1027,7 @@ function createTestManager(
       startupTimeoutMs: options.startupTimeoutMs,
       managedProcesses: runtime.managedProcesses,
       portAllocator: runtime.allocatePort,
-      resolveCommandPrefix: runtime.resolveCommandPrefix,
+      resolveCommandPrefix: options.resolveCommandPrefix ?? runtime.resolveCommandPrefix,
       ...(opencodeHomeDir ? { resolveHomeDir: () => opencodeHomeDir } : {}),
       spawnServerProcess: runtime.spawnServerProcess,
       terminateProcess: runtime.terminateProcess,

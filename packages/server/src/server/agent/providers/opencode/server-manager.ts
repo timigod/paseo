@@ -539,6 +539,29 @@ export class OpenCodeServerManager implements OpenCodeServerManagerLike {
     this.assertAcceptingAcquisitions();
   }
 
+  private waitForStartupOperation<T>(operation: Promise<T>, signal?: AbortSignal): Promise<T> {
+    if (!signal) {
+      return operation;
+    }
+    if (signal.aborted) {
+      return Promise.reject(this.readStartupAbortReason(signal));
+    }
+    return new Promise<T>((resolve, reject) => {
+      const abort = () => reject(this.readStartupAbortReason(signal));
+      signal.addEventListener("abort", abort, { once: true });
+      operation.then(
+        (value) => {
+          signal.removeEventListener("abort", abort);
+          return resolve(value);
+        },
+        (error: unknown) => {
+          signal.removeEventListener("abort", abort);
+          return reject(error);
+        },
+      );
+    });
+  }
+
   private async startServer(
     launchEnv?: Record<string, string>,
     signal?: AbortSignal,
@@ -551,7 +574,7 @@ export class OpenCodeServerManager implements OpenCodeServerManagerLike {
     const url = `http://127.0.0.1:${port}`;
     const runtimeCapacityController = this.runtimeCapacityController;
     const launchPrefix = await withTemporaryRuntimeCapacity(runtimeCapacityController, () =>
-      this.resolveCommandPrefix(),
+      this.waitForStartupOperation(this.resolveCommandPrefix(), signal),
     );
     this.assertStartupCanContinue(signal);
     const launchCommand = await resolveOpenCodeLaunchCommand(launchPrefix.command);
