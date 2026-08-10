@@ -54,7 +54,9 @@ function flushMicrotasks(): Promise<void> {
   return new Promise((done) => setImmediate(done));
 }
 
-function buildHarness(opts: { emitCwdRejects?: boolean } = {}) {
+function buildHarness(
+  opts: { emitCwdRejects?: boolean; shouldPassivelyObservePath?: (cwd: string) => boolean } = {},
+) {
   const listeners = new Map<string, WorkspaceGitListener>();
   const registerCalls: string[] = [];
   const unsubscribeCalls: string[] = [];
@@ -81,6 +83,7 @@ function buildHarness(opts: { emitCwdRejects?: boolean } = {}) {
 
   const service = createWorkspaceGitObserverService({
     workspaceGitService,
+    shouldPassivelyObservePath: opts.shouldPassivelyObservePath,
     describeWorkspaceRecordWithGitData: async (workspace) => {
       describeCalls.push(workspace);
       if (!describeResult) {
@@ -130,6 +133,21 @@ function buildHarness(opts: { emitCwdRejects?: boolean } = {}) {
     },
   };
 }
+
+test("does not subscribe to a workspace outside the passive observation boundary", () => {
+  const h = buildHarness({
+    shouldPassivelyObservePath: (cwd) => cwd !== WS1,
+  });
+
+  h.service.syncObservers([makeDescriptor({ id: "ws1", workspaceDirectory: WS1 })]);
+
+  expect(h.registerCalls).toEqual([]);
+  expect(h.service.getMetrics()).toEqual({
+    watchedDirectoryCount: 0,
+    workspaceRecordCount: 0,
+    subscriptionCount: 0,
+  });
+});
 
 describe("syncObservers", () => {
   test("registers a WorkspaceGitService subscription for a git workspace", () => {

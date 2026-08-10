@@ -66,7 +66,10 @@ import { getErrorMessage, getErrorMessageOr } from "@getpaseo/protocol/error-uti
 import { getAgentStatusPriority } from "@getpaseo/protocol/agent-state-bucket";
 import { getParentAgentIdFromLabels } from "@getpaseo/protocol/agent-labels";
 import type { WorkspaceGitRuntimeSnapshot, WorkspaceGitService } from "./workspace-git-service.js";
-import type { ProjectUpdate } from "./workspace-reconciliation-service.js";
+import {
+  shouldPassivelyObservePath,
+  type ProjectUpdate,
+} from "./workspace-reconciliation-service.js";
 import {
   CLIENT_SHUTDOWN_RPC_REASON,
   normalizeClientRestartRpcReason,
@@ -827,6 +830,8 @@ export class Session {
     });
     this.workspaceGitObserver = createWorkspaceGitObserverService({
       workspaceGitService: this.workspaceGitService,
+      shouldPassivelyObservePath: (cwd) =>
+        shouldPassivelyObservePath(cwd, { managedWorktreesRoot: this.worktreesRoot }),
       describeWorkspaceRecordWithGitData: (workspace) =>
         this.describeWorkspaceRecordWithGitData(workspace),
       emitWorkspaceUpdateForCwd: (cwd) => this.emitWorkspaceUpdateForCwd(cwd),

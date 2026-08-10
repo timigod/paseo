@@ -117,11 +117,17 @@ const MACOS_PROTECTED_HOME_DIRECTORIES = [
 
 export function shouldPassivelyObservePath(
   targetPath: string,
-  options: { platform?: NodeJS.Platform; homeDirectory?: string } = {},
+  options: {
+    platform?: NodeJS.Platform;
+    homeDirectory?: string;
+    managedWorktreesRoot?: string;
+  } = {},
 ): boolean {
   const homeDirectory = path.resolve(options.homeDirectory ?? homedir());
   const candidate = path.resolve(targetPath);
-  const managedWorktreesRoot = path.join(homeDirectory, ".paseo", "worktrees");
+  const managedWorktreesRoot = path.resolve(
+    options.managedWorktreesRoot ?? path.join(homeDirectory, ".paseo", "worktrees"),
+  );
   const managedRelative = path.relative(managedWorktreesRoot, candidate);
   if (
     managedRelative === "" ||

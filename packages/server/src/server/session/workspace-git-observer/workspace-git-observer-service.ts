@@ -53,6 +53,7 @@ export interface WorkspaceGitObserverService {
 
 export function createWorkspaceGitObserverService(deps: {
   workspaceGitService: Pick<WorkspaceGitService, "registerWorkspace">;
+  shouldPassivelyObservePath?: (cwd: string) => boolean;
   describeWorkspaceRecordWithGitData: (
     workspace: PersistedWorkspaceRecord,
   ) => Promise<WorkspaceDescriptorPayload>;
@@ -68,6 +69,7 @@ export function createWorkspaceGitObserverService(deps: {
 }): WorkspaceGitObserverService {
   const {
     workspaceGitService,
+    shouldPassivelyObservePath = () => true,
     describeWorkspaceRecordWithGitData,
     emitWorkspaceUpdateForCwd,
     emitWorkspaceUpdateForWorkspaceId,
@@ -155,7 +157,7 @@ export function createWorkspaceGitObserverService(deps: {
     if (currentState && currentState.cwd !== normalizedCwd) {
       removeForWorkspaceId(options.workspaceId);
     }
-    if (!options.isGit) {
+    if (!options.isGit || !shouldPassivelyObservePath(normalizedCwd)) {
       removeForWorkspaceId(options.workspaceId);
       return;
     }
