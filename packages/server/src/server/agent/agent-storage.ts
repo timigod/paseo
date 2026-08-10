@@ -4,7 +4,12 @@ import { z } from "zod";
 import type { Logger } from "pino";
 
 import { writeJsonFileAtomic } from "../atomic-file.js";
-import { AgentFeatureSchema, AgentStatusSchema } from "../messages.js";
+import {
+  AgentFeatureSchema,
+  AgentFinishReceiptSchema,
+  AgentStatusSchema,
+  type AgentFinishReceipt,
+} from "../messages.js";
 import { toStoredAgentRecord } from "./agent-projections.js";
 import type { ManagedAgent } from "./agent-manager.js";
 import type { AgentSessionConfig } from "./agent-sdk-types.js";
@@ -74,6 +79,7 @@ const STORED_AGENT_SCHEMA = z.object({
   attentionTimestamp: z.string().nullable().optional(),
   internal: z.boolean().optional(),
   archivedAt: z.string().nullable().optional(),
+  atomicFinishReceipt: AgentFinishReceiptSchema.optional(),
   owner: AgentOwnerSchema.optional(),
 });
 
@@ -130,6 +136,32 @@ export class AgentStorage {
     await this.load();
     const agentId = this.daemonAgentIdsByExecution.get(daemonExecutionKey(owner));
     return agentId ? (this.cache.get(agentId) ?? null) : null;
+  }
+
+  async findAtomicFinishReceipt(operationId: string): Promise<AgentFinishReceipt | null> {
+    await this.load();
+    for (const record of this.cache.values()) {
+      if (record.atomicFinishReceipt?.operationId === operationId) {
+        return record.atomicFinishReceipt;
+      }
+    }
+    return null;
+  }
+
+  async setAtomicFinishReceipt(agentId: string, receipt: AgentFinishReceipt): Promise<void> {
+    await this.load();
+    await this.queueRecordMutation(agentId, (existing) => {
+      if (!existing) {
+        throw new Error(`Agent ${agentId} not found`);
+      }
+      if (
+        existing.atomicFinishReceipt &&
+        existing.atomicFinishReceipt.operationId !== receipt.operationId
+      ) {
+        throw new Error(`Agent ${agentId} already has an atomic finish receipt`);
+      }
+      return { ...existing, atomicFinishReceipt: receipt };
+    });
   }
 
   async upsert(record: StoredAgentRecord): Promise<void> {
@@ -240,6 +272,9 @@ export class AgentStorage {
       // stale pre-archive record after the archive mutation.
       if (existing && existing.archivedAt !== undefined) {
         record.archivedAt = existing.archivedAt;
+      }
+      if (existing?.atomicFinishReceipt) {
+        record.atomicFinishReceipt = existing.atomicFinishReceipt;
       }
       return record;
     });

@@ -17,6 +17,7 @@ import type { ScheduleService } from "./schedule/service.js";
 import type { CheckoutDiffManager, CheckoutDiffMetrics } from "./checkout-diff-manager.js";
 import type { DaemonConfigStore, MutableDaemonConfig } from "./daemon-config-store.js";
 import {
+  ATOMIC_FINISH_CONTRACT,
   type ServerInfoStatusPayload,
   type SessionOutboundMessage,
   type WorkspaceSetupSnapshot,
@@ -1614,6 +1615,8 @@ export class VoiceAssistantWebSocketServer {
         workspaceScriptManagement: true,
         // COMPAT(projectCustomIcon): added in v0.2.0, remove after 2027-01-20.
         projectCustomIcon: true,
+        // COMPAT(atomicFinishLateRivalFenceV2): added in v0.3.2, remove after 2027-08-10.
+        [ATOMIC_FINISH_CONTRACT]: true,
       },
     };
   }

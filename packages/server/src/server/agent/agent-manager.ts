@@ -14,6 +14,7 @@ import {
 } from "@getpaseo/protocol/agent-labels";
 import type { Logger } from "pino";
 import type { ProviderOptions, ToolPolicy } from "@getpaseo/protocol/agent-types";
+import { ATOMIC_FINISH_CONTRACT, type AgentFinishReceipt } from "@getpaseo/protocol/messages";
 import { z } from "zod";
 import type { TerminalManager } from "../../terminal/terminal-manager.js";
 
@@ -327,6 +328,22 @@ export interface ReleaseWorkspaceIfUnownedOptions {
   workspaceId: string;
   finishedAgentId: string;
   release: () => Promise<void>;
+}
+
+export interface FinishAgentOptions {
+  operationId: string;
+  agentId: string;
+  workspaceId: string;
+  releaseWorkspace: () => Promise<{
+    workspaceReleased: boolean;
+    removedDirectory: boolean;
+  }>;
+}
+
+interface InFlightAtomicFinish {
+  agentId: string;
+  workspaceId: string;
+  promise: Promise<AgentFinishReceipt>;
 }
 
 interface WorkspaceAgentRegistrationState {
@@ -689,6 +706,7 @@ export class AgentManager {
   private readonly agentRegistrationTasks = new Set<Promise<void>>();
   private readonly inFlightAgentCloses = new Map<string, InFlightAgentClose>();
   private readonly inFlightAgentArchives = new Map<string, Promise<{ archivedAt: string }>>();
+  private readonly inFlightAtomicFinishes = new Map<string, InFlightAtomicFinish>();
   private readonly retainedAgentRuntimeCleanups = new Set<AgentSession>();
   private retainedAgentRuntimeCleanupRetry: Promise<void> | null = null;
   private readonly workspaceAgentRegistrations = new Map<string, WorkspaceAgentRegistrationState>();
@@ -1757,6 +1775,85 @@ export class AgentManager {
       return true;
     } finally {
       this.releasingWorkspaces.delete(workspaceId);
+    }
+  }
+
+  async finishAgent(options: FinishAgentOptions): Promise<AgentFinishReceipt> {
+    const registry = this.requireRegistry();
+    const durableReceipt = await registry.findAtomicFinishReceipt(options.operationId);
+    if (durableReceipt) {
+      this.assertAtomicFinishIdentity(durableReceipt, options);
+      return durableReceipt;
+    }
+
+    const inFlight = this.inFlightAtomicFinishes.get(options.operationId);
+    if (inFlight) {
+      if (inFlight.agentId !== options.agentId || inFlight.workspaceId !== options.workspaceId) {
+        throw new Error(`Atomic finish operation ${options.operationId} has different ownership`);
+      }
+      return inFlight.promise;
+    }
+
+    const promise = this.finishAgentOnce(options);
+    const operation = {
+      agentId: options.agentId,
+      workspaceId: options.workspaceId,
+      promise,
+    };
+    this.inFlightAtomicFinishes.set(options.operationId, operation);
+    try {
+      return await promise;
+    } finally {
+      if (this.inFlightAtomicFinishes.get(options.operationId) === operation) {
+        this.inFlightAtomicFinishes.delete(options.operationId);
+      }
+    }
+  }
+
+  private async finishAgentOnce(options: FinishAgentOptions): Promise<AgentFinishReceipt> {
+    const registry = this.requireRegistry();
+    const record = await registry.get(options.agentId);
+    if (!record) {
+      throw new Error(`Agent ${options.agentId} not found`);
+    }
+    if (record.workspaceId !== options.workspaceId) {
+      throw new Error(
+        `Agent ${options.agentId} does not belong to workspace ${options.workspaceId}`,
+      );
+    }
+
+    const archivedAt = record.archivedAt || (await this.archiveAgent(options.agentId)).archivedAt;
+    let releaseResult = { workspaceReleased: false, removedDirectory: false };
+    const releaseAuthorized = await this.releaseWorkspaceIfUnowned({
+      workspaceId: options.workspaceId,
+      finishedAgentId: options.agentId,
+      release: async () => {
+        releaseResult = await options.releaseWorkspace();
+      },
+    });
+    const receipt: AgentFinishReceipt = {
+      contract: ATOMIC_FINISH_CONTRACT,
+      operationId: options.operationId,
+      agentId: options.agentId,
+      workspaceId: options.workspaceId,
+      archivedAt,
+      workspaceReleased: releaseAuthorized && releaseResult.workspaceReleased,
+      removedDirectory: releaseAuthorized && releaseResult.removedDirectory,
+    };
+    await registry.setAtomicFinishReceipt(options.agentId, receipt);
+    return receipt;
+  }
+
+  private assertAtomicFinishIdentity(
+    receipt: AgentFinishReceipt,
+    options: Pick<FinishAgentOptions, "operationId" | "agentId" | "workspaceId">,
+  ): void {
+    if (
+      receipt.operationId !== options.operationId ||
+      receipt.agentId !== options.agentId ||
+      receipt.workspaceId !== options.workspaceId
+    ) {
+      throw new Error(`Atomic finish operation ${options.operationId} has different ownership`);
     }
   }
 

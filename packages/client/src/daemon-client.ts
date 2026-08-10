@@ -2,6 +2,7 @@ import type { z } from "zod";
 import { CLIENT_CAPS, type ClientCapability } from "@getpaseo/protocol/client-capabilities";
 import type { AgentAttentionNotificationPayload } from "@getpaseo/protocol/agent-attention-notification";
 import {
+  ATOMIC_FINISH_CONTRACT,
   AgentCreateFailedStatusPayloadSchema,
   AgentCreatedStatusPayloadSchema,
   AgentRefreshedStatusPayloadSchema,
@@ -72,6 +73,7 @@ import type {
   ProjectGithubCloneProtocol,
   ProjectGithubCloneResponse,
   ArchiveWorkspaceResponseMessage,
+  AgentFinishResponseMessage,
   WorkspaceSetupStatusResponseMessage,
   ListCommandsResponse,
   ListProviderFeaturesResponseMessage,
@@ -843,7 +845,15 @@ export type WorkspaceGithubSearchRepositoriesPayload =
   WorkspaceGithubSearchRepositoriesResponse["payload"];
 type ProjectGithubClonePayload = ProjectGithubCloneResponse["payload"];
 type ArchiveWorkspacePayload = ArchiveWorkspaceResponseMessage["payload"];
+export type AgentFinishPayload = AgentFinishResponseMessage["payload"];
 type WorkspaceSetupStatusPayload = WorkspaceSetupStatusResponseMessage["payload"];
+
+export interface FinishAgentOptions {
+  operationId: string;
+  agentId: string;
+  workspaceId: string;
+  requestId?: string;
+}
 
 export interface FetchAgentResult {
   agent: AgentSnapshotPayload;
@@ -2332,6 +2342,23 @@ export class DaemonClient {
         workspaceId,
       },
       responseType: "archive_workspace_response",
+    });
+  }
+
+  async finishAgent(options: FinishAgentOptions): Promise<AgentFinishPayload> {
+    if (this.lastServerInfoMessage?.features?.[ATOMIC_FINISH_CONTRACT] !== true) {
+      throw new Error("The target host does not support atomic finish v2.");
+    }
+    return this.sendNamespacedCorrelatedSessionRequest({
+      requestId: options.requestId,
+      message: {
+        type: "agent.finish.request",
+        contract: ATOMIC_FINISH_CONTRACT,
+        operationId: options.operationId,
+        agentId: options.agentId,
+        workspaceId: options.workspaceId,
+        releaseWorkspace: true,
+      },
     });
   }
 

@@ -7,6 +7,7 @@ import {
   type Logger,
 } from "./daemon-client";
 import { CLIENT_CAPS } from "@getpaseo/protocol/client-capabilities";
+import { ATOMIC_FINISH_CONTRACT } from "@getpaseo/protocol/messages";
 import { BROWSER_AUTOMATION_COMMAND_NAMES } from "@getpaseo/protocol/browser-automation/rpc-schemas";
 import {
   decodeFileTransferFrame,
@@ -311,6 +312,85 @@ test("Hub management requires daemon support before dispatching requests", async
     "Update the host to use Hub relationship management.",
   );
   expect(mock.sent).toEqual([]);
+});
+
+test("atomic finish requires the target host capability and returns its receipt", async () => {
+  const legacyTransport = createMockTransport();
+  const legacyClient = new DaemonClient({
+    url: "ws://legacy-host",
+    clientId: "atomic_finish_legacy",
+    transportFactory: () => legacyTransport.transport,
+    reconnect: { enabled: false },
+  });
+  clients.push(legacyClient);
+  const legacyConnect = legacyClient.connect();
+  legacyTransport.triggerOpen();
+  await legacyConnect;
+
+  await expect(
+    legacyClient.finishAgent({
+      operationId: "operation-1",
+      agentId: "agent-1",
+      workspaceId: "workspace-1",
+    }),
+  ).rejects.toThrow("The target host does not support atomic finish v2.");
+  expect(legacyTransport.sent).toEqual([]);
+
+  const capableTransport = createMockTransport();
+  const capableClient = new DaemonClient({
+    url: "ws://capable-host",
+    clientId: "atomic_finish_capable",
+    transportFactory: () => capableTransport.transport,
+    reconnect: { enabled: false },
+  });
+  clients.push(capableClient);
+  const capableConnect = capableClient.connect();
+  capableTransport.triggerOpen({ features: { [ATOMIC_FINISH_CONTRACT]: true } });
+  await capableConnect;
+
+  const finish = capableClient.finishAgent({
+    operationId: "operation-1",
+    agentId: "agent-1",
+    workspaceId: "workspace-1",
+    requestId: "request-1",
+  });
+  await Promise.resolve();
+  const request = parseSentFrame(capableTransport.sent[0]);
+  capableTransport.triggerMessage(
+    wrapSessionMessage({
+      type: "agent.finish.response",
+      payload: {
+        requestId: "request-1",
+        contract: ATOMIC_FINISH_CONTRACT,
+        operationId: "operation-1",
+        agentId: "agent-1",
+        workspaceId: "workspace-1",
+        archivedAt: "2026-08-10T12:00:00.000Z",
+        workspaceReleased: true,
+        removedDirectory: false,
+      },
+    }),
+  );
+
+  await expect(finish).resolves.toEqual({
+    requestId: "request-1",
+    contract: ATOMIC_FINISH_CONTRACT,
+    operationId: "operation-1",
+    agentId: "agent-1",
+    workspaceId: "workspace-1",
+    archivedAt: "2026-08-10T12:00:00.000Z",
+    workspaceReleased: true,
+    removedDirectory: false,
+  });
+  expect(request).toEqual({
+    type: "agent.finish.request",
+    requestId: "request-1",
+    contract: ATOMIC_FINISH_CONTRACT,
+    operationId: "operation-1",
+    agentId: "agent-1",
+    workspaceId: "workspace-1",
+    releaseWorkspace: true,
+  });
 });
 
 test("sets the complete viewed timeline subscription only when the daemon supports it", async () => {

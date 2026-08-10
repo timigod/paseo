@@ -3,7 +3,10 @@ import { z } from "zod";
 import {
   AgentSnapshotPayloadSchema,
   AgentTimelineItemPayloadSchema,
+  AgentFinishRequestSchema,
+  AgentFinishResponseMessageSchema,
   ArchiveWorkspaceResponseMessageSchema,
+  ATOMIC_FINISH_CONTRACT,
   ServerInfoStatusPayloadSchema,
   WSHelloMessageSchema,
 } from "./messages.js";
@@ -125,6 +128,56 @@ describe("wire schema compatibility", () => {
       version: null,
       features: { agentTurnIdentity: true },
     });
+  });
+
+  test("old clients ignore the optional atomic finish capability", () => {
+    const LegacyServerInfoSchema = z.object({
+      status: z.literal("server_info"),
+      serverId: z.string(),
+      features: z.object({}),
+    });
+    const payload = {
+      status: "server_info" as const,
+      serverId: "server-1",
+      features: { [ATOMIC_FINISH_CONTRACT]: true },
+    };
+
+    expect(ServerInfoStatusPayloadSchema.parse(payload).features).toEqual({
+      [ATOMIC_FINISH_CONTRACT]: true,
+    });
+    expect(LegacyServerInfoSchema.parse(payload)).toEqual({
+      status: "server_info",
+      serverId: "server-1",
+      features: {},
+    });
+  });
+
+  test("atomic finish request and response preserve the complete contract", () => {
+    const request = {
+      type: "agent.finish.request" as const,
+      requestId: "request-1",
+      contract: ATOMIC_FINISH_CONTRACT,
+      operationId: "operation-1",
+      agentId: "agent-1",
+      workspaceId: "workspace-1",
+      releaseWorkspace: true as const,
+    };
+    const response = {
+      type: "agent.finish.response" as const,
+      payload: {
+        requestId: "request-1",
+        contract: ATOMIC_FINISH_CONTRACT,
+        operationId: "operation-1",
+        agentId: "agent-1",
+        workspaceId: "workspace-1",
+        archivedAt: "2026-08-10T12:00:00.000Z",
+        workspaceReleased: true,
+        removedDirectory: false,
+      },
+    };
+
+    expect(AgentFinishRequestSchema.parse(request)).toEqual(request);
+    expect(AgentFinishResponseMessageSchema.parse(response)).toEqual(response);
   });
 
   test("assistant timeline message ids are optional on the wire", () => {

@@ -15,6 +15,7 @@ import { addImportOptions, runImportCommand } from "./import.js";
 import { runUpdateCommand } from "./update.js";
 import { runDetachCommand } from "./detach.js";
 import { addOpenOptions, runOpenCommand } from "./open.js";
+import { addFinishOptions, runFinishCommand } from "./finish.js";
 import { withOutput } from "../../output/index.js";
 import {
   addDaemonHostOption,
@@ -76,6 +77,10 @@ export function createAgentCommand(): Command {
 
   addJsonAndDaemonHostOptions(addArchiveOptions(agent.command("archive"))).action(
     withOutput(runArchiveCommand),
+  );
+
+  addJsonAndDaemonHostOptions(addFinishOptions(agent.command("finish"))).action(
+    withOutput(runFinishCommand),
   );
 
   addJsonAndDaemonHostOptions(addReloadOptions(agent.command("reload"))).action(

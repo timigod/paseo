@@ -6933,6 +6933,111 @@ test("archiveAgent closes before it persists archivedAt", async () => {
   expect(lifecycles).toEqual(["closed", "closed"]);
 });
 
+test("atomic finish rejects a mismatched workspace before archiving the agent", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-finish-identity-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const manager = new AgentManager({
+    clients: { codex: new TestAgentClient() },
+    registry: storage,
+    logger,
+  });
+  const agent = await manager.createAgent(
+    { provider: "codex", cwd: workdir },
+    "00000000-0000-4000-8000-000000000152",
+    { workspaceId: "workspace-owned" },
+  );
+  let releaseCalls = 0;
+
+  await expect(
+    manager.finishAgent({
+      operationId: "operation-wrong-workspace",
+      agentId: agent.id,
+      workspaceId: "workspace-rival",
+      releaseWorkspace: async () => {
+        releaseCalls += 1;
+        return { workspaceReleased: true, removedDirectory: true };
+      },
+    }),
+  ).rejects.toThrow(`Agent ${agent.id} does not belong to workspace workspace-rival`);
+
+  expect({ releaseCalls, archivedAt: (await storage.get(agent.id))?.archivedAt }).toEqual({
+    releaseCalls: 0,
+    archivedAt: undefined,
+  });
+  await manager.closeAgent(agent.id);
+  rmSync(workdir, { recursive: true, force: true });
+});
+
+test("atomic finish joins concurrent calls and returns its durable receipt after reload", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-finish-retry-"));
+  const storagePath = join(workdir, "agents");
+  const storage = new AgentStorage(storagePath, logger);
+  const manager = new AgentManager({
+    clients: { codex: new TestAgentClient() },
+    registry: storage,
+    logger,
+  });
+  const workspaceId = "workspace-finish-retry";
+  const agent = await manager.createAgent(
+    { provider: "codex", cwd: workdir },
+    "00000000-0000-4000-8000-000000000153",
+    { workspaceId },
+  );
+  const releaseStarted = deferred<void>();
+  const allowRelease = deferred<void>();
+  const archiveAgent = vi.spyOn(manager, "archiveAgent");
+  let releaseCalls = 0;
+  const options = {
+    operationId: "operation-retry",
+    agentId: agent.id,
+    workspaceId,
+    releaseWorkspace: async () => {
+      releaseCalls += 1;
+      releaseStarted.resolve();
+      await allowRelease.promise;
+      return { workspaceReleased: true, removedDirectory: false };
+    },
+  };
+
+  const first = manager.finishAgent(options);
+  await releaseStarted.promise;
+  const concurrentRetry = manager.finishAgent(options);
+  allowRelease.resolve();
+  const [firstReceipt, concurrentReceipt] = await Promise.all([first, concurrentRetry]);
+
+  const reloadedStorage = new AgentStorage(storagePath, logger);
+  const reloadedManager = new AgentManager({ registry: reloadedStorage, logger });
+  const durableRetry = await reloadedManager.finishAgent({
+    ...options,
+    releaseWorkspace: async () => {
+      throw new Error("durable retry must not release again");
+    },
+  });
+
+  expect({
+    firstReceipt,
+    concurrentReceipt,
+    durableRetry,
+    releaseCalls,
+    archiveCalls: archiveAgent.mock.calls.length,
+  }).toEqual({
+    firstReceipt: {
+      contract: "paseo.atomic-finish.late-rival-fence.v2",
+      operationId: "operation-retry",
+      agentId: agent.id,
+      workspaceId,
+      archivedAt: expect.any(String),
+      workspaceReleased: true,
+      removedDirectory: false,
+    },
+    concurrentReceipt: firstReceipt,
+    durableRetry: firstReceipt,
+    releaseCalls: 1,
+    archiveCalls: 1,
+  });
+  rmSync(workdir, { recursive: true, force: true });
+});
+
 test("releases a workspace after an archived agent is loaded only for history", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-release-history-agent-"));
   const storage = new AgentStorage(join(workdir, "agents"), logger);

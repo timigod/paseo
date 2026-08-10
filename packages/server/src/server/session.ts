@@ -239,7 +239,11 @@ import {
   handlePaseoWorktreeListRequest as handleWorktreeListRequest,
   handleWorkspaceSetupStatusRequest as handleWorkspaceSetupStatusRequestMessage,
 } from "./worktree-session.js";
-import { archiveByScope, type ActiveWorkspaceRef } from "./workspace-archive-service.js";
+import {
+  archiveByScope,
+  type ActiveWorkspaceRef,
+  type ArchiveResult,
+} from "./workspace-archive-service.js";
 import { WorkspaceSetupRuntime } from "./workspace-setup-runtime.js";
 
 function resolveWorkspaceSetupRuntime(
@@ -1846,6 +1850,7 @@ export class Session {
       this.dispatchAgentRelationshipMessage(msg) ??
       this.dispatchAgentTimelineMessage(msg, source) ??
       this.dispatchHubExecutionMessage(msg) ??
+      this.dispatchAgentFinishMessage(msg) ??
       this.dispatchAgentLifecycleMessage(msg) ??
       this.dispatchAgentConfigMessage(msg) ??
       this.dispatchCheckoutMessage(msg) ??
@@ -1972,6 +1977,10 @@ export class Session {
       return this.hubExecutionController?.controlExecution(msg);
     }
     return undefined;
+  }
+
+  private dispatchAgentFinishMessage(msg: SessionInboundMessage): Promise<void> | undefined {
+    return msg.type === "agent.finish.request" ? this.handleAgentFinishRequest(msg) : undefined;
   }
 
   private dispatchAgentLifecycleMessage(msg: SessionInboundMessage): Promise<void> | undefined {
@@ -6043,32 +6052,9 @@ export class Session {
         throw new Error(`Workspace not found: ${request.workspaceId}`);
       }
 
-      const { removedDirectory } = await archiveByScope(
-        {
-          paseoHome: this.paseoHome,
-          paseoWorktreesBaseRoot: this.worktreesRoot,
-          github: this.github,
-          workspaceGitService: this.workspaceGitService,
-          agentManager: this.agentManager,
-          agentStorage: this.agentStorage,
-          findWorkspaceIdForCwd: (cwd) => this.findWorkspaceIdForCwd(cwd),
-          getWorkspace: (workspaceId) => this.workspaceRegistry.get(workspaceId),
-          listActiveWorkspaces: () => this.listActiveWorkspaceRefs(),
-          archiveWorkspaceRecord: (workspaceId) => this.archiveWorkspaceRecord(workspaceId),
-          emitWorkspaceUpdatesForWorkspaceIds: (workspaceIds) =>
-            this.emitWorkspaceUpdatesForWorkspaceIds(workspaceIds),
-          markWorkspaceArchiving: (workspaceIds, archivingAt) =>
-            this.markWorkspaceArchiving(workspaceIds, archivingAt),
-          clearWorkspaceArchiving: (workspaceIds) => this.clearWorkspaceArchiving(workspaceIds),
-          killTerminalsForWorkspace: (workspaceId) =>
-            this.terminalController.killTerminalsForWorkspace(workspaceId),
-          stopWorkspaceSetup: (workspaceId) => this.workspaceSetupRuntime.stop(workspaceId),
-          sessionLogger: this.sessionLogger,
-        },
-        {
-          scope: { kind: "workspace", workspaceId: existing.workspaceId },
-          requestId: request.requestId,
-        },
+      const { removedDirectory } = await this.archiveWorkspaceById(
+        existing.workspaceId,
+        request.requestId,
       );
 
       const archivedWorkspace = await this.workspaceRegistry.get(request.workspaceId);
@@ -6099,6 +6085,56 @@ export class Session {
         },
       });
     }
+  }
+
+  private async handleAgentFinishRequest(
+    request: Extract<SessionInboundMessage, { type: "agent.finish.request" }>,
+  ): Promise<void> {
+    const receipt = await this.agentManager.finishAgent({
+      operationId: request.operationId,
+      agentId: request.agentId,
+      workspaceId: request.workspaceId,
+      releaseWorkspace: async () => {
+        const result = await this.archiveWorkspaceById(request.workspaceId, request.requestId);
+        return {
+          workspaceReleased: result.archivedWorkspaceIds.includes(request.workspaceId),
+          removedDirectory: result.removedDirectory,
+        };
+      },
+    });
+    this.emit({
+      type: "agent.finish.response",
+      payload: { ...receipt, requestId: request.requestId },
+    });
+  }
+
+  private archiveWorkspaceById(workspaceId: string, requestId: string): Promise<ArchiveResult> {
+    return archiveByScope(
+      {
+        paseoHome: this.paseoHome,
+        paseoWorktreesBaseRoot: this.worktreesRoot,
+        github: this.github,
+        workspaceGitService: this.workspaceGitService,
+        agentManager: this.agentManager,
+        agentStorage: this.agentStorage,
+        findWorkspaceIdForCwd: (cwd) => this.findWorkspaceIdForCwd(cwd),
+        getWorkspace: (id) => this.workspaceRegistry.get(id),
+        listActiveWorkspaces: () => this.listActiveWorkspaceRefs(),
+        archiveWorkspaceRecord: (id) => this.archiveWorkspaceRecord(id),
+        emitWorkspaceUpdatesForWorkspaceIds: (workspaceIds) =>
+          this.emitWorkspaceUpdatesForWorkspaceIds(workspaceIds),
+        markWorkspaceArchiving: (workspaceIds, archivingAt) =>
+          this.markWorkspaceArchiving(workspaceIds, archivingAt),
+        clearWorkspaceArchiving: (workspaceIds) => this.clearWorkspaceArchiving(workspaceIds),
+        killTerminalsForWorkspace: (id) => this.terminalController.killTerminalsForWorkspace(id),
+        stopWorkspaceSetup: (id) => this.workspaceSetupRuntime.stop(id),
+        sessionLogger: this.sessionLogger,
+      },
+      {
+        scope: { kind: "workspace", workspaceId },
+        requestId,
+      },
+    );
   }
 
   private async handleWorkspaceClearAttentionRequest(

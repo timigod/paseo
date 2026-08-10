@@ -2138,6 +2138,28 @@ export const ArchiveWorkspaceRequestSchema = z.object({
   requestId: z.string(),
 });
 
+export const ATOMIC_FINISH_CONTRACT = "paseo.atomic-finish.late-rival-fence.v2" as const;
+
+export const AgentFinishRequestSchema = z.object({
+  type: z.literal("agent.finish.request"),
+  requestId: z.string(),
+  contract: z.literal(ATOMIC_FINISH_CONTRACT),
+  operationId: z.string().min(1),
+  agentId: z.string().min(1),
+  workspaceId: z.string().min(1),
+  releaseWorkspace: z.literal(true),
+});
+
+export const AgentFinishReceiptSchema = z.object({
+  contract: z.literal(ATOMIC_FINISH_CONTRACT),
+  operationId: z.string().min(1),
+  agentId: z.string().min(1),
+  workspaceId: z.string().min(1),
+  archivedAt: z.string().min(1),
+  workspaceReleased: z.boolean(),
+  removedDirectory: z.boolean(),
+});
+
 // Create a new workspace record. Unlike open_project, this never deduplicates by
 // directory: it always produces a fresh workspace. The source discriminates
 // between an existing local directory and a newly created paseo worktree.
@@ -2678,6 +2700,7 @@ export const SessionInboundMessageSchema = z.discriminatedUnion("type", [
   WorkspaceGithubSearchRepositoriesRequestSchema,
   ProjectGithubCloneRequestSchema,
   ArchiveWorkspaceRequestSchema,
+  AgentFinishRequestSchema,
   WorkspaceCreateRequestSchema,
   WorkspaceClearAttentionRequestSchema,
   FileExplorerRequestSchema,
@@ -2987,6 +3010,8 @@ export const ServerInfoStatusPayloadSchema = z
         workspaceScriptManagement: z.boolean().optional(),
         // COMPAT(projectCustomIcon): added in v0.2.0, remove after 2027-01-20.
         projectCustomIcon: z.boolean().optional(),
+        // COMPAT(atomicFinishLateRivalFenceV2): added in v0.3.2, remove after 2027-08-10.
+        "paseo.atomic-finish.late-rival-fence.v2": z.boolean().optional(),
       })
       .optional(),
   })
@@ -3677,6 +3702,11 @@ export const ArchiveWorkspaceResponseMessageSchema = z.object({
     removedDirectory: z.boolean().optional(),
     error: z.string().nullable(),
   }),
+});
+
+export const AgentFinishResponseMessageSchema = z.object({
+  type: z.literal("agent.finish.response"),
+  payload: AgentFinishReceiptSchema.extend({ requestId: z.string() }),
 });
 
 export const FetchAgentResponseMessageSchema = z.object({
@@ -5454,6 +5484,7 @@ export const SessionOutboundMessageSchema = z.discriminatedUnion("type", [
   LegacyListAvailableEditorsResponseMessageSchema,
   LegacyOpenInEditorResponseMessageSchema,
   ArchiveWorkspaceResponseMessageSchema,
+  AgentFinishResponseMessageSchema,
   FetchAgentResponseMessageSchema,
   FetchAgentTimelineResponseMessageSchema,
   AgentTimelineListPromptsResponseMessageSchema,
@@ -5657,6 +5688,8 @@ export type LegacyOpenInEditorResponseMessage = z.infer<
   typeof LegacyOpenInEditorResponseMessageSchema
 >;
 export type ArchiveWorkspaceResponseMessage = z.infer<typeof ArchiveWorkspaceResponseMessageSchema>;
+export type AgentFinishResponseMessage = z.infer<typeof AgentFinishResponseMessageSchema>;
+export type AgentFinishReceipt = z.infer<typeof AgentFinishReceiptSchema>;
 export type FetchAgentResponseMessage = z.infer<typeof FetchAgentResponseMessageSchema>;
 export type FetchAgentTimelineResponseMessage = z.infer<
   typeof FetchAgentTimelineResponseMessageSchema
@@ -5949,6 +5982,7 @@ export type WorkspaceGithubSearchRepositoriesRequest = z.infer<
 export type ProjectGithubCloneRequest = z.infer<typeof ProjectGithubCloneRequestSchema>;
 export type ProjectGithubCloneProtocol = z.infer<typeof ProjectGithubCloneProtocolSchema>;
 export type ArchiveWorkspaceRequest = z.infer<typeof ArchiveWorkspaceRequestSchema>;
+export type AgentFinishRequest = z.infer<typeof AgentFinishRequestSchema>;
 export type WorkspaceClearAttentionRequest = z.infer<typeof WorkspaceClearAttentionRequestSchema>;
 export type FileExplorerRequest = z.infer<typeof FileExplorerRequestSchema>;
 export type FileExplorerResponse = z.infer<typeof FileExplorerResponseSchema>;

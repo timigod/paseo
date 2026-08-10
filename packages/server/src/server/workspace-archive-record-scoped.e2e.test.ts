@@ -160,10 +160,21 @@ test("archiving one of two workspaces sharing a cwd spares the sibling and the d
   expect(await terminalIdsForWorkspace(cwd, workspaceA)).toContain(terminalAId);
   expect(await terminalIdsForWorkspace(cwd, workspaceB)).toContain(terminalBId);
 
-  // Archive workspace A by its workspaceId. Because two workspaces share the cwd,
-  // teardown must be scoped to A's workspaceId, not the directory.
-  const archive = await ctx.client.archiveWorkspace(workspaceA);
-  expect(archive.error).toBe(null);
+  const finish = await ctx.client.finishAgent({
+    operationId: "finish-shared-cwd-a",
+    agentId: agentA.id,
+    workspaceId: workspaceA,
+  });
+  expect(finish).toEqual({
+    requestId: expect.any(String),
+    contract: "paseo.atomic-finish.late-rival-fence.v2",
+    operationId: "finish-shared-cwd-a",
+    agentId: agentA.id,
+    workspaceId: workspaceA,
+    archivedAt: expect.any(String),
+    workspaceReleased: true,
+    removedDirectory: false,
+  });
 
   await expect
     .poll(async () => (await activeWorkspaceIds()).has(workspaceA), {
@@ -190,6 +201,53 @@ test("archiving one of two workspaces sharing a cwd spares the sibling and the d
   expect(existsSync(cwd)).toBe(true);
 
   await ctx.client.killTerminal(terminalBId);
+}, 60000);
+
+test("atomic finish reports removal of the last Paseo-owned worktree", async () => {
+  const repoDir = createGitRepo();
+  const result = await ctx.client.createWorkspace({
+    source: {
+      kind: "worktree",
+      cwd: repoDir,
+      worktreeSlug: "atomic-finish-last-reference",
+      baseBranch: "main",
+    },
+  });
+  const workspace = result.workspace;
+  if (!workspace?.workspaceDirectory) {
+    throw new Error(result.error ?? "Failed to create worktree workspace");
+  }
+  const agent = await ctx.client.createAgent({
+    ...getFullAccessConfig("codex"),
+    cwd: workspace.workspaceDirectory,
+    workspaceId: workspace.id,
+    title: "Atomic finish agent",
+    initialPrompt: "Say done.",
+  });
+
+  const finish = await ctx.client.finishAgent({
+    operationId: "finish-last-worktree-reference",
+    agentId: agent.id,
+    workspaceId: workspace.id,
+  });
+  const retry = await ctx.client.finishAgent({
+    operationId: "finish-last-worktree-reference",
+    agentId: agent.id,
+    workspaceId: workspace.id,
+  });
+
+  expect(finish).toEqual({
+    requestId: expect.any(String),
+    contract: "paseo.atomic-finish.late-rival-fence.v2",
+    operationId: "finish-last-worktree-reference",
+    agentId: agent.id,
+    workspaceId: workspace.id,
+    archivedAt: expect.any(String),
+    workspaceReleased: true,
+    removedDirectory: true,
+  });
+  expect({ ...retry, requestId: finish.requestId }).toEqual(finish);
+  expect(existsSync(workspace.workspaceDirectory)).toBe(false);
 }, 60000);
 
 test("archiving a workspace removes it from every subscribed client", async () => {
