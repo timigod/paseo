@@ -6034,7 +6034,7 @@ export class Session {
         throw new Error(`Workspace not found: ${request.workspaceId}`);
       }
 
-      await archiveByScope(
+      const { removedDirectory } = await archiveByScope(
         {
           paseoHome: this.paseoHome,
           paseoWorktreesBaseRoot: this.worktreesRoot,
@@ -6070,6 +6070,7 @@ export class Session {
           requestId: request.requestId,
           workspaceId: request.workspaceId,
           archivedAt,
+          removedDirectory,
           error: null,
         },
       });
