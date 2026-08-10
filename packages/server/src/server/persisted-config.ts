@@ -363,16 +363,29 @@ function getLogger(logger: LoggerLike | undefined): LoggerLike | undefined {
   return logger?.child({ module: "config" });
 }
 
-// Removed config fields are stripped before parsing so the strict schema does not
-// reject a config written by an older release. The stripped values are discarded,
-// not migrated — there is no back-compat for the removed `providers.openai.voice`
-// block (use `providers.openai.stt` / `providers.openai.tts`).
-function stripRemovedConfigFields(parsed: unknown): unknown {
+// Legacy config fields are migrated or stripped before parsing so the strict
+// schema does not reject a config written by an older release.
+function migrateLegacyConfigFields(parsed: unknown): unknown {
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
     return parsed;
   }
 
   const root = { ...(parsed as Record<string, unknown>) };
+  const daemon = root.daemon;
+  if (daemon && typeof daemon === "object" && !Array.isArray(daemon)) {
+    const daemonRecord = { ...(daemon as Record<string, unknown>) };
+    // COMPAT(maxActiveAgents): added 2026-08-09, remove after 2027-02-09.
+    // Preserve the pre-v0.3.1 private capacity key under its shipped public name.
+    if (
+      daemonRecord.maxActiveAgentRuntimes === undefined &&
+      daemonRecord.maxActiveAgents !== undefined
+    ) {
+      daemonRecord.maxActiveAgentRuntimes = daemonRecord.maxActiveAgents;
+    }
+    delete daemonRecord.maxActiveAgents;
+    root.daemon = daemonRecord;
+  }
+
   const providers = root.providers;
   if (!providers || typeof providers !== "object" || Array.isArray(providers)) {
     return root;
@@ -440,7 +453,7 @@ export function loadPersistedConfig(paseoHome: string, logger?: LoggerLike): Per
     });
   }
 
-  const migrated = stripRemovedConfigFields(parsed);
+  const migrated = migrateLegacyConfigFields(parsed);
   const result = PersistedConfigSchema.safeParse(migrated);
   if (!result.success) {
     const issues = result.error.issues

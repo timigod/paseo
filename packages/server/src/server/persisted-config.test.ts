@@ -707,6 +707,49 @@ describe("loadPersistedConfig", () => {
     }
   });
 
+  test("migrates the legacy daemon agent capacity key", () => {
+    const home = createTempHome();
+    const configPath = path.join(home, "config.json");
+    try {
+      writeFileSync(
+        configPath,
+        `${JSON.stringify({ version: 1, daemon: { maxActiveAgents: 14 } }, null, 2)}\n`,
+      );
+
+      const config = loadPersistedConfig(home);
+
+      expect(config.daemon?.maxActiveAgentRuntimes).toBe(14);
+      expect(config.daemon).not.toHaveProperty("maxActiveAgents");
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  test("prefers the current daemon agent capacity key over the legacy key", () => {
+    const home = createTempHome();
+    const configPath = path.join(home, "config.json");
+    try {
+      writeFileSync(
+        configPath,
+        `${JSON.stringify(
+          {
+            version: 1,
+            daemon: { maxActiveAgents: 14, maxActiveAgentRuntimes: 16 },
+          },
+          null,
+          2,
+        )}\n`,
+      );
+
+      const config = loadPersistedConfig(home);
+
+      expect(config.daemon?.maxActiveAgentRuntimes).toBe(16);
+      expect(config.daemon).not.toHaveProperty("maxActiveAgents");
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
   test("loads a config that still uses the removed providers.openai.voice block", () => {
     const home = createTempHome();
     const configPath = path.join(home, "config.json");
