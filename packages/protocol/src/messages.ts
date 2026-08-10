@@ -2905,6 +2905,13 @@ const ServerCapabilitiesFromUnknownSchema = z
     return parsed.data;
   });
 
+export const AgentRuntimeCapacitySnapshotSchema = z.object({
+  limit: z.number().int().positive().nullable(),
+  live: z.number().int().nonnegative().nullable(),
+  starting: z.number().int().nonnegative().nullable(),
+  available: z.number().int().nonnegative().nullable(),
+});
+
 export const ServerInfoStatusPayloadSchema = z
   .object({
     status: z.literal("server_info"),
@@ -2914,6 +2921,8 @@ export const ServerInfoStatusPayloadSchema = z
     // COMPAT(desktopManaged): added in v0.1.X, remove optional parsing after 2027-01-16.
     desktopManaged: z.boolean().optional(),
     capabilities: ServerCapabilitiesFromUnknownSchema.optional(),
+    // COMPAT(runtimeCapacity): added in v0.3.2. Older daemons omit this field.
+    runtimeCapacity: AgentRuntimeCapacitySnapshotSchema.optional(),
     // COMPAT(providersSnapshot): added in v0.1.48, remove gating when all clients use snapshot
     features: z
       .object({
@@ -3012,6 +3021,8 @@ export const ServerInfoStatusPayloadSchema = z
         projectCustomIcon: z.boolean().optional(),
         // COMPAT(atomicFinishLateRivalFenceV2): added in v0.3.2, remove after 2027-08-10.
         "paseo.atomic-finish.late-rival-fence.v2": z.boolean().optional(),
+        // COMPAT(runtimeCapacity): added in v0.3.2, remove after 2027-08-10.
+        runtimeCapacity: z.boolean().optional(),
       })
       .optional(),
   })
@@ -5628,6 +5639,7 @@ export type ServerCapabilityState = z.infer<typeof ServerCapabilityStateSchema>;
 export type ServerVoiceCapabilities = z.infer<typeof ServerVoiceCapabilitiesSchema>;
 export type ServerCapabilities = z.infer<typeof ServerCapabilitiesSchema>;
 export type ServerInfoStatusPayload = z.infer<typeof ServerInfoStatusPayloadSchema>;
+export type AgentRuntimeCapacitySnapshot = z.infer<typeof AgentRuntimeCapacitySnapshotSchema>;
 export type RpcErrorMessage = z.infer<typeof RpcErrorMessageSchema>;
 export type ArtifactMessage = z.infer<typeof ArtifactMessageSchema>;
 export type AgentUpdateMessage = z.infer<typeof AgentUpdateMessageSchema>;

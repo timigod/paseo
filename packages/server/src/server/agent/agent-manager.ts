@@ -39,6 +39,7 @@ import {
   type AgentRunResult,
   type AgentRuntimeCapacityController,
   type AgentRuntimeCapacityReservation,
+  type AgentRuntimeCapacitySnapshot,
   type AgentSession,
   type AgentSessionConfig,
   type AgentStreamEvent,
@@ -1045,6 +1046,17 @@ export class AgentManager {
       availability.push(await this.getProviderAvailability(provider));
     }
     return availability;
+  }
+
+  getRuntimeCapacitySnapshot(): AgentRuntimeCapacitySnapshot {
+    return (
+      this.runtimeCapacity.getSnapshot?.() ?? {
+        limit: null,
+        live: null,
+        starting: null,
+        available: this.runtimeCapacity.getAvailableRuntimeSlots(),
+      }
+    );
   }
 
   async getProviderAvailability(provider: AgentProvider): Promise<ProviderAvailability> {

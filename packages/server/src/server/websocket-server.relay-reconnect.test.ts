@@ -251,6 +251,12 @@ function createServer(options?: {
         pendingPermissionAgents: 0,
         erroredAgents: 0,
       })),
+      getRuntimeCapacitySnapshot: vi.fn(() => ({
+        limit: 24,
+        live: 0,
+        starting: 0,
+        available: 24,
+      })),
     }),
     createStub<AgentStorage>({}),
     createStub<DownloadTokenStore>({}),

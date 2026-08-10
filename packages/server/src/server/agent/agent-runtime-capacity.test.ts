@@ -22,7 +22,30 @@ describe("HostAgentRuntimeCapacityController", () => {
 
     first.release();
     expect(controller.getAvailableRuntimeSlots()).toBe(1);
+    expect(controller.getSnapshot()).toEqual({
+      limit: 1,
+      live: 0,
+      starting: 0,
+      available: 1,
+    });
     expect(() => controller.reserve()).not.toThrow();
+  });
+
+  test("reports live and starting runtimes from the authoritative admission controller", () => {
+    const controller = new HostAgentRuntimeCapacityController(3);
+    const runtime = {};
+    controller.reserve().track(runtime);
+    const starting = controller.reserve();
+
+    expect(controller.getSnapshot()).toEqual({
+      limit: 3,
+      live: 1,
+      starting: 1,
+      available: 1,
+    });
+
+    starting.release();
+    controller.release(runtime);
   });
 
   test("keeps a started runtime charged until that exact runtime is released", () => {

@@ -693,8 +693,16 @@ export interface AgentRuntimeCapacityReservation {
   release(): void;
 }
 
+export interface AgentRuntimeCapacitySnapshot {
+  limit: number | null;
+  live: number | null;
+  starting: number | null;
+  available: number | null;
+}
+
 export interface AgentRuntimeCapacityController {
   getAvailableRuntimeSlots(): number | null;
+  getSnapshot?(): AgentRuntimeCapacitySnapshot;
   reserve(): AgentRuntimeCapacityReservation;
   release(runtime: object): void;
 }

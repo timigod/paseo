@@ -1,6 +1,7 @@
 import type { Command } from "commander";
 import { createRequire } from "node:module";
 import { getOrCreateServerId, findExecutable, execCommand } from "@getpaseo/server";
+import type { AgentRuntimeCapacitySnapshot } from "@getpaseo/protocol/messages";
 import { connectToDaemon } from "../../utils/client.js";
 import type { CommandOptions, ListResult, OutputSchema } from "../../output/index.js";
 import { resolveLocalDaemonState } from "./local-daemon.js";
@@ -32,6 +33,7 @@ interface DaemonStatus {
   cliVersion: string;
   daemonVersion: string | null;
   desktopManaged: boolean;
+  runtimeCapacity: AgentRuntimeCapacitySnapshot | null;
   providers: ProviderBinaryStatus[];
   note?: string;
 }
@@ -131,6 +133,14 @@ function toStatusRows(status: DaemonStatus): StatusRow[] {
     { key: "Daemon Version", value: status.daemonVersion ?? "-" },
   ];
 
+  if (status.runtimeCapacity) {
+    const { limit, live, starting, available } = status.runtimeCapacity;
+    rows.push({
+      key: "Runtime Capacity",
+      value: formatRuntimeCapacity({ limit, live, starting, available }),
+    });
+  }
+
   if (status.note) {
     rows.push({ key: "Note", value: status.note });
   }
@@ -154,6 +164,11 @@ function toStatusRows(status: DaemonStatus): StatusRow[] {
   }
 
   return rows;
+}
+
+export function formatRuntimeCapacity(capacity: AgentRuntimeCapacitySnapshot): string {
+  if (capacity.limit === null) return "unlimited";
+  return `${capacity.live ?? "?"} live + ${capacity.starting ?? "?"} starting / ${capacity.limit}; ${capacity.available ?? "?"} available`;
 }
 
 const PROVIDER_BINARIES: { label: string; binary: string }[] = [
@@ -202,6 +217,7 @@ interface DaemonProbeResult {
   connectedDaemon: DaemonStatus["connectedDaemon"];
   localDaemonOverride?: DaemonStatus["localDaemon"];
   daemonVersion?: string | null;
+  runtimeCapacity?: AgentRuntimeCapacitySnapshot | null;
   daemonNodeOverride?: string;
   daemonProviders?: ProviderBinaryStatus[];
   relayStatus?: string;
@@ -251,7 +267,9 @@ async function probeDaemonOverWebsocket(args: {
     return { connectedDaemon: "unreachable" };
   }
 
-  const daemonVersion = client.getLastServerInfoMessage()?.version ?? null;
+  const serverInfo = client.getLastServerInfoMessage();
+  const daemonVersion = serverInfo?.version ?? null;
+  const runtimeCapacity = serverInfo?.runtimeCapacity ?? null;
   try {
     const statusPayload = await client.getDaemonStatus({
       timeout: DAEMON_STATUS_PROBE_TIMEOUT_MS,
@@ -275,6 +293,7 @@ async function probeDaemonOverWebsocket(args: {
       return {
         connectedDaemon: "reachable",
         daemonVersion: statusPayload.version ?? daemonVersion,
+        runtimeCapacity,
         daemonNodeOverride: statusPayload.nodePath,
         daemonProviders,
         relayStatus,
@@ -287,6 +306,7 @@ async function probeDaemonOverWebsocket(args: {
     return {
       connectedDaemon: "reachable",
       daemonVersion: statusPayload.version ?? daemonVersion,
+      runtimeCapacity,
       daemonNodeOverride: statusPayload.nodePath,
       daemonProviders,
       relayStatus,
@@ -295,6 +315,7 @@ async function probeDaemonOverWebsocket(args: {
     return {
       connectedDaemon: "reachable",
       daemonVersion,
+      runtimeCapacity,
       note: state.running
         ? `Local daemon PID is running but daemon detail request to ${host} failed`
         : `Connected daemon websocket is reachable at ${host} but daemon status request failed`,
@@ -310,6 +331,7 @@ interface ProbeMergeState {
   localDaemon: DaemonStatus["localDaemon"];
   daemonNode: string;
   daemonVersion: string | null;
+  runtimeCapacity: AgentRuntimeCapacitySnapshot | null;
   daemonProviders: ProviderBinaryStatus[] | undefined;
   relayStatus: string;
   note: string | undefined;
@@ -322,6 +344,8 @@ function applyProbeToStatus(input: ProbeMergeState): Omit<ProbeMergeState, "prob
     localDaemon: probe.localDaemonOverride ?? input.localDaemon,
     daemonNode: probe.daemonNodeOverride ?? input.daemonNode,
     daemonVersion: probe.daemonVersion !== undefined ? probe.daemonVersion : input.daemonVersion,
+    runtimeCapacity:
+      probe.runtimeCapacity !== undefined ? probe.runtimeCapacity : input.runtimeCapacity,
     daemonProviders: probe.daemonProviders ?? input.daemonProviders,
     relayStatus: probe.relayStatus ?? input.relayStatus,
     note: probe.note ? appendNote(input.note, probe.note) : input.note,
@@ -394,6 +418,7 @@ export async function runStatusCommand(
   let localDaemon: DaemonStatus["localDaemon"] = state.running ? "running" : "stopped";
   let connectedDaemon: DaemonStatus["connectedDaemon"] = "not_probed";
   let daemonVersion: string | null = null;
+  let runtimeCapacity: AgentRuntimeCapacitySnapshot | null = null;
   let daemonProviders: ProviderBinaryStatus[] | undefined;
   let relayStatus = selectRelayStatus({ persisted: relayConfigFromLocalState(state) });
   let note: string | undefined;
@@ -410,6 +435,7 @@ export async function runStatusCommand(
       localDaemon,
       daemonNode,
       daemonVersion,
+      runtimeCapacity,
       daemonProviders,
       relayStatus,
       note,
@@ -419,6 +445,7 @@ export async function runStatusCommand(
       localDaemon,
       daemonNode,
       daemonVersion,
+      runtimeCapacity,
       daemonProviders,
       relayStatus,
       note,
@@ -451,6 +478,7 @@ export async function runStatusCommand(
     cliNode,
     cliVersion,
     daemonVersion,
+    runtimeCapacity,
     desktopManaged: state.pidInfo?.desktopManaged === true,
     providers,
     note,

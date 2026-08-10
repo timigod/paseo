@@ -1524,6 +1524,7 @@ export class VoiceAssistantWebSocketServer {
       // COMPAT(desktopManaged): added in v0.1.X, remove optional parsing after 2027-01-16.
       desktopManaged: this.daemonRuntimeConfig?.desktopManaged === true,
       ...(this.serverCapabilities ? { capabilities: this.serverCapabilities } : {}),
+      runtimeCapacity: this.agentManager.getRuntimeCapacitySnapshot(),
       features: {
         // COMPAT(providersSnapshot): keep optional until all clients rely on snapshot flow.
         providersSnapshot: true,
@@ -1617,6 +1618,8 @@ export class VoiceAssistantWebSocketServer {
         projectCustomIcon: true,
         // COMPAT(atomicFinishLateRivalFenceV2): added in v0.3.2, remove after 2027-08-10.
         [ATOMIC_FINISH_CONTRACT]: true,
+        // COMPAT(runtimeCapacity): added in v0.3.2, remove after 2027-08-10.
+        runtimeCapacity: true,
       },
     };
   }

@@ -282,6 +282,12 @@ function createVoiceAssistantWebSocketServer(params: {
       withActiveForegroundTurn: 0,
       timelineStats: { totalItems: 0, maxItemsPerAgent: 0 },
     }),
+    getRuntimeCapacitySnapshot: () => ({
+      limit: 24,
+      live: 0,
+      starting: 0,
+      available: 24,
+    }),
   };
   const daemonConfigStore = {
     onChange: () => () => {},

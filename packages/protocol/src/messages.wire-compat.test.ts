@@ -152,6 +152,33 @@ describe("wire schema compatibility", () => {
     });
   });
 
+  test("runtime capacity is optional for old daemons and ignored by old clients", () => {
+    const LegacyServerInfoSchema = z.object({
+      status: z.literal("server_info"),
+      serverId: z.string(),
+      features: z.object({}),
+    });
+    const payload = {
+      status: "server_info" as const,
+      serverId: "server-1",
+      runtimeCapacity: { limit: 24, live: 7, starting: 1, available: 16 },
+      features: { runtimeCapacity: true },
+    };
+
+    expect(ServerInfoStatusPayloadSchema.parse(payload)).toMatchObject(payload);
+    expect(
+      ServerInfoStatusPayloadSchema.parse({
+        status: "server_info",
+        serverId: "legacy-server",
+      }).runtimeCapacity,
+    ).toBeUndefined();
+    expect(LegacyServerInfoSchema.parse(payload)).toEqual({
+      status: "server_info",
+      serverId: "server-1",
+      features: {},
+    });
+  });
+
   test("atomic finish request and response preserve the complete contract", () => {
     const request = {
       type: "agent.finish.request" as const,

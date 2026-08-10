@@ -1,6 +1,7 @@
 import type {
   AgentRuntimeCapacityController,
   AgentRuntimeCapacityReservation,
+  AgentRuntimeCapacitySnapshot,
 } from "./agent-sdk-types.js";
 
 export class AgentRuntimeCapacityError extends Error {
@@ -31,6 +32,15 @@ export class HostAgentRuntimeCapacityController implements AgentRuntimeCapacityC
       return null;
     }
     return Math.max(this.limit - this.liveRuntimes.size - this.reservations, 0);
+  }
+
+  getSnapshot(): AgentRuntimeCapacitySnapshot {
+    return {
+      limit: this.limit,
+      live: this.liveRuntimes.size,
+      starting: this.reservations,
+      available: this.getAvailableRuntimeSlots(),
+    };
   }
 
   reserve(): AgentRuntimeCapacityReservation {
