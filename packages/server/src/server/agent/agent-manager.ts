@@ -3539,6 +3539,7 @@ export class AgentManager {
       this.acceptingAgentRegistrations &&
       this.idleRuntimeHibernationGraceMs !== null &&
       client?.capabilities.supportsIdleRuntimeHibernation === true &&
+      !agent.internal &&
       agent.lifecycle === "idle" &&
       agent.activeForegroundTurnId === null &&
       !this.runs.hasRun(agent.id) &&

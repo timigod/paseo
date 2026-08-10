@@ -8786,6 +8786,52 @@ test("eligible idle runtimes hibernate and resume the same durable agent", async
   }
 });
 
+test("internal idle agents remain under their parent lifecycle", async () => {
+  vi.useFakeTimers();
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-internal-idle-"));
+  let closeCount = 0;
+  const client = new (class extends TestAgentClient {
+    override readonly capabilities = {
+      ...TEST_CAPABILITIES,
+      supportsSessionPersistence: true,
+      supportsIdleRuntimeHibernation: true,
+    };
+
+    override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+      return new (class extends TestAgentSession {
+        override async close(): Promise<void> {
+          closeCount += 1;
+        }
+      })(config);
+    }
+  })();
+  const manager = new AgentManager({
+    clients: { codex: client },
+    runtimeCapacityController: new HostAgentRuntimeCapacityController(1),
+    idleRuntimeHibernationGraceMs: 1_000,
+    logger,
+  });
+
+  try {
+    const created = await manager.createAgent(
+      { provider: "codex", cwd: workdir, internal: true },
+      undefined,
+      { workspaceId: undefined },
+    );
+    await vi.advanceTimersByTimeAsync(1_000);
+    await manager.flush();
+
+    expect(manager.getAgent(created.id)).toMatchObject({ id: created.id, lifecycle: "idle" });
+    expect(closeCount).toBe(0);
+  } finally {
+    const live = manager.listAgents();
+    await Promise.all(live.map((agent) => manager.closeAgent(agent.id))).catch(() => undefined);
+    await manager.flush().catch(() => undefined);
+    vi.useRealTimers();
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
 test("archiving a closed parent still cascades to its managed children", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-closed-parent-archive-"));
   const storage = new AgentStorage(join(workdir, "agents"), logger);
