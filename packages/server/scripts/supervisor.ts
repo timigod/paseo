@@ -3,9 +3,9 @@ import { mkdirSync } from "node:fs";
 import path from "node:path";
 import { createStream as createRotatingFileStream } from "rotating-file-stream";
 import { signalProcessTree } from "../src/utils/tree-kill.js";
+import { WorkerLiveness } from "./worker-liveness.js";
 
 const WORKER_HEARTBEAT_INTERVAL_MS = 1_000;
-const WORKER_HEARTBEAT_TIMEOUT_MS = 15_000;
 const WORKER_TERMINATION_GRACE_MS = 10_000;
 
 interface SupervisorLogFileOptions {
@@ -250,7 +250,7 @@ export function runSupervisor(options: SupervisorOptions): SupervisorController 
     }
 
     const currentChild = child;
-    let lastWorkerHeartbeatAt = Date.now();
+    const workerLiveness = new WorkerLiveness();
     const heartbeat = setInterval(() => {
       const message: SupervisorHeartbeatMessage = { type: "paseo:supervisor-heartbeat" };
       if (currentChild.connected) {
@@ -271,16 +271,18 @@ export function runSupervisor(options: SupervisorOptions): SupervisorController 
       if (child !== currentChild || restarting || shuttingDown) {
         return;
       }
-      const heartbeatAgeMs = Date.now() - lastWorkerHeartbeatAt;
-      if (heartbeatAgeMs < WORKER_HEARTBEAT_TIMEOUT_MS) {
+      const timeout = workerLiveness.getExpiredReason();
+      if (!timeout) {
         return;
       }
-      writeLifecycleLog("Worker heartbeat timed out; restarting worker", {
-        heartbeatAgeMs,
+      writeLifecycleLog("Worker liveness timed out; restarting worker", {
+        reason: timeout.reason,
+        phase: workerLiveness.getPhase(),
+        ageMs: timeout.ageMs,
         supervisorPid: process.pid,
         workerPid: currentChild.pid ?? null,
       });
-      requestRestart("worker_heartbeat_timeout");
+      requestRestart(timeout.reason);
     }, WORKER_HEARTBEAT_INTERVAL_MS);
     workerWatchdog.unref();
 
@@ -300,7 +302,7 @@ export function runSupervisor(options: SupervisorOptions): SupervisorController 
 
     child.on("message", (msg: unknown) => {
       if (isWorkerHeartbeatMessage(msg)) {
-        lastWorkerHeartbeatAt = Date.now();
+        workerLiveness.recordHeartbeat();
         return;
       }
       const lifecycleMessage = parseLifecycleMessage(msg);
@@ -309,7 +311,11 @@ export function runSupervisor(options: SupervisorOptions): SupervisorController 
       }
 
       if (lifecycleMessage.type === "paseo:ready") {
-        writeLifecycleLog("Worker ready", { listen: lifecycleMessage.listen });
+        workerLiveness.markReady();
+        writeLifecycleLog("Worker ready", {
+          listen: lifecycleMessage.listen,
+          heartbeatWatchdogPhase: workerLiveness.getPhase(),
+        });
         Promise.resolve(options.onWorkerReady?.({ listen: lifecycleMessage.listen })).catch(
           (error) => {
             const message = error instanceof Error ? error.message : String(error);

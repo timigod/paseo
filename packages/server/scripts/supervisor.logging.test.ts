@@ -193,6 +193,7 @@ describe("supervisor durable logging", () => {
     const result = await runSupervisorFixture({
       timeoutMs: 10_000,
       workerSource: `
+        process.send?.({ type: "paseo:ready", listen: "fixture" });
         setInterval(() => {
           process.send?.({ type: "paseo:worker-heartbeat" });
         }, 250);
@@ -217,6 +218,7 @@ describe("supervisor durable logging", () => {
         const marker = process.argv[1] + ".started";
         if (!existsSync(marker)) {
           writeFileSync(marker, "started");
+          process.send?.({ type: "paseo:ready", listen: "fixture" });
           let heartbeatCount = 0;
           const heartbeat = setInterval(() => {
             process.send?.({ type: "paseo:worker-heartbeat" });
@@ -272,9 +274,10 @@ describe("supervisor durable logging", () => {
           import { existsSync, writeFileSync } from "node:fs";
 
           const marker = process.argv[1] + ".started";
-          if (!existsSync(marker)) {
-            writeFileSync(marker, "started");
-            let heartbeatCount = 0;
+        if (!existsSync(marker)) {
+          writeFileSync(marker, "started");
+          process.send?.({ type: "paseo:ready", listen: "fixture" });
+          let heartbeatCount = 0;
             const heartbeat = setInterval(() => {
               process.send?.({ type: "paseo:worker-heartbeat" });
               heartbeatCount += 1;
@@ -291,7 +294,8 @@ describe("supervisor durable logging", () => {
 
       expect(result.code).toBe(0);
       expect(result.signal).toBeNull();
-      expect(result.log).toContain('"msg":"Worker heartbeat timed out; restarting worker"');
+      expect(result.log).toContain('"msg":"Worker liveness timed out; restarting worker"');
+      expect(result.log).toContain('"reason":"worker_heartbeat_timeout"');
       expect(result.log).toContain('"msg":"Worker did not exit after SIGTERM; forcing SIGKILL"');
       expect(result.log).toContain('"signal":"SIGKILL"');
     },
