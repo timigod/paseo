@@ -124,6 +124,35 @@ describe("OpenCodeServerManager generations", () => {
     expect(runtime.terminatedPorts).toEqual([4255, 4254]);
   });
 
+  test("a forced acquisition rotates when its prerequisite remains held", async () => {
+    const { manager, runtime } = createTestManager([4256, 4257], { autoAnnounce: false });
+    const current = manager.acquireCurrent();
+    const forced = manager.acquireNew();
+    const observeForced = forced.catch(() => undefined);
+
+    try {
+      await runtime.settle();
+      expect(runtime.launchedPorts).toEqual([4256]);
+
+      runtime.processForPort(4256).announceListening();
+      const currentAcquisition = await current;
+      await vi.waitFor(() => expect(runtime.launchedPorts).toEqual([4256, 4257]));
+
+      runtime.processForPort(4257).announceListening();
+      const forcedAcquisition = await forced;
+      expect(currentAcquisition.server.url).toBe("http://127.0.0.1:4256");
+      expect(forcedAcquisition.server.url).toBe("http://127.0.0.1:4257");
+
+      await forcedAcquisition.release();
+      await currentAcquisition.release();
+      expect(runtime.terminatedPorts).toEqual([4257, 4256]);
+      expect(await runtime.managedProcesses.list()).toEqual([]);
+    } finally {
+      await manager.shutdown();
+      await observeForced;
+    }
+  });
+
   test("release is idempotent", async () => {
     const { manager, runtime } = createTestManager([4301, 4302]);
 

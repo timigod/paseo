@@ -235,11 +235,30 @@ export class OpenCodeServerManager implements OpenCodeServerManagerLike {
   async acquireNew(options?: OpenCodeServerAcquisitionOptions): Promise<OpenCodeServerAcquisition> {
     this.assertAcceptingAcquisitions();
     this.throwIfAcquisitionTimedOut(options);
-    if (this.currentStartup && !this.newServerStartup) {
-      const currentAcquisition = await this.acquireFromStartup(this.currentStartup, options);
-      await currentAcquisition.release();
+    const currentStartup = this.currentStartup;
+    if (currentStartup && !this.newServerStartup) {
+      const prerequisite = await this.acquireFromStartup(currentStartup, options);
+      const prerequisiteServer = currentStartup.server;
+      await prerequisite.release();
       this.assertAcceptingAcquisitions();
       this.throwIfAcquisitionTimedOut(options);
+
+      // A concurrent current acquisition can start a replacement while the
+      // prerequisite generation is being released. Join that replacement
+      // instead of starting a competing forced generation.
+      const replacementStartup = this.currentStartup;
+      if (replacementStartup) {
+        return this.acquireFromStartup(replacementStartup, options);
+      }
+
+      const replacementServer = this.currentServer;
+      if (
+        replacementServer &&
+        replacementServer !== prerequisiteServer &&
+        this.isServerLive(replacementServer)
+      ) {
+        return this.acquireServer(replacementServer);
+      }
     }
     const acquisition = await this.acquireFromStartup(this.getNewServerStartup(), options);
     try {
